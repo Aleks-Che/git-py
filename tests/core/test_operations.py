@@ -31,6 +31,7 @@ from src.core.operations import (
     pull,
     push,
     rebase_branch,
+    rename_branch,
     reset,
     stash_pop,
     stash_push,
@@ -108,6 +109,43 @@ def test_checkout_branch_switches_head(committed_repo: RepositoryManager) -> Non
 def test_checkout_unknown_branch_raises(committed_repo: RepositoryManager) -> None:
     with pytest.raises(InvalidRefError):
         checkout_branch(committed_repo, "nope")
+
+
+def test_rename_branch_changes_ref_name(committed_repo: RepositoryManager) -> None:
+    create_branch(committed_repo, "feature", target_sha=committed_repo.head_commit.sha)
+    rename_branch(committed_repo, "feature", "renamed")
+    names = {b.name for b in committed_repo.branches if not b.is_remote}
+    assert "feature" not in names
+    assert "renamed" in names
+
+
+def test_rename_branch_preserves_target_sha(committed_repo: RepositoryManager) -> None:
+    create_branch(committed_repo, "feature", target_sha=committed_repo.head_commit.sha)
+    target = committed_repo.head_commit.sha
+    rename_branch(committed_repo, "feature", "renamed")
+    branch = next(b for b in committed_repo.branches if b.name == "renamed")
+    assert branch.target_sha == target
+
+
+def test_rename_branch_unknown_raises(committed_repo: RepositoryManager) -> None:
+    with pytest.raises(InvalidRefError):
+        rename_branch(committed_repo, "does-not-exist", "renamed")
+
+
+def test_rename_branch_collides_without_force(committed_repo: RepositoryManager) -> None:
+    create_branch(committed_repo, "a")
+    create_branch(committed_repo, "b")
+    with pytest.raises(GitError, match="already exists"):
+        rename_branch(committed_repo, "a", "b")
+
+
+def test_rename_branch_collides_with_force(committed_repo: RepositoryManager) -> None:
+    create_branch(committed_repo, "a")
+    create_branch(committed_repo, "b")
+    rename_branch(committed_repo, "a", "b", force=True)
+    names = [b.name for b in committed_repo.branches if not b.is_remote]
+    assert "a" not in names
+    assert names.count("b") == 1
 
 
 # ----- merge / cherry-pick / revert ----------------------------------------

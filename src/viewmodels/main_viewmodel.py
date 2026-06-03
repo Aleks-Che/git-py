@@ -149,8 +149,7 @@ class MainViewModel(QObject):
         except GitError as exc:
             self.error_occurred.emit(f"Undo failed: {exc}")
             return
-        self._graph_view_model.refresh_graph()
-        self._commit_panel_view_model.refresh_status()
+        self._refresh_all_views()
 
     def redo(self) -> None:
         """Redo the most recently undone command; refreshes views on success."""
@@ -161,8 +160,90 @@ class MainViewModel(QObject):
         except GitError as exc:
             self.error_occurred.emit(f"Redo failed: {exc}")
             return
+        self._refresh_all_views()
+
+    # ----- branch commands ---------------------------------------------
+
+    def checkout_branch(self, name: str) -> None:
+        """Switch ``HEAD`` to ``name`` via :class:`CheckoutCommand`.
+
+        Refreshes every view (graph + commit panel + branch panel)
+        on success because a checkout changes the working tree, the
+        status, and the current branch marker in the left panel all
+        at once. :class:`DirtyWorkTreeError` is surfaced through
+        :attr:`error_occurred` so the panel can decide whether to
+        offer a forced checkout (Stage 5+).
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        from src.viewmodels.commands import CheckoutCommand  # local import: avoids cycle
+
+        command = CheckoutCommand(self._repo_manager, name)
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            return
+        self._refresh_all_views()
+
+    def create_branch(self, name: str, target_sha: str | None = None) -> None:
+        """Create a local branch via :class:`CreateBranchCommand`."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        from src.viewmodels.commands import CreateBranchCommand
+
+        command = CreateBranchCommand(self._repo_manager, name, target_sha)
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            return
+        self._refresh_all_views()
+
+    def delete_branch(self, name: str, force: bool = False) -> None:
+        """Delete a local branch via :class:`DeleteBranchCommand`."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        from src.viewmodels.commands import DeleteBranchCommand
+
+        command = DeleteBranchCommand(self._repo_manager, name, force=force)
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            return
+        self._refresh_all_views()
+
+    def rename_branch(self, old_name: str, new_name: str, force: bool = False) -> None:
+        """Rename a local branch via :class:`RenameBranchCommand`."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        from src.viewmodels.commands import RenameBranchCommand
+
+        command = RenameBranchCommand(
+            self._repo_manager,
+            old_name,
+            new_name,
+            force=force,
+        )
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            return
+        self._refresh_all_views()
+
+    # ----- internals ---------------------------------------------------
+
+    def _refresh_all_views(self) -> None:
+        """Refresh graph, commit panel, and branch panel after a state change."""
         self._graph_view_model.refresh_graph()
         self._commit_panel_view_model.refresh_status()
+        self._branch_panel_view_model.refresh()
 
 
 __all__ = ["MainViewModel"]

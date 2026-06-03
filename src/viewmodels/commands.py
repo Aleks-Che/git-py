@@ -19,7 +19,14 @@ from collections import deque
 import pygit2
 from PySide6.QtCore import QObject, Signal
 
-from src.core.operations import commit_changes, reset
+from src.core.operations import (
+    checkout_branch,
+    commit_changes,
+    create_branch,
+    delete_branch,
+    rename_branch,
+    reset,
+)
 from src.core.repository import RepositoryManager
 
 
@@ -156,4 +163,160 @@ class CommitCommand(GitCommand):
         return f"commit{suffix}"
 
 
-__all__ = ["CommandProcessor", "CommitCommand", "GitCommand"]
+# ----- branches ---------------------------------------------------------
+
+
+class CheckoutCommand(GitCommand):
+    """Switch ``HEAD`` to ``target_branch``; undo by switching back.
+
+    The previous branch shorthand is captured on :meth:`execute` and
+    restored on :meth:`undo`. If the previous ``HEAD`` was unborn
+    (e.g. this is the first checkout of a fresh repo) the undo is a
+    no-op — there is nothing meaningful to return to.
+    """
+
+    def __init__(self, repo: RepositoryManager, target_branch: str) -> None:
+        self._repo = repo
+        self._target_branch = target_branch
+        self._previous_branch: str | None = None
+
+    def execute(self) -> None:
+        previous = self._previous_branch_for_undo()
+        checkout_branch(self._repo, self._target_branch)
+        self._previous_branch = previous
+
+    def undo(self) -> None:
+        if self._previous_branch is None:
+            return
+        checkout_branch(self._repo, self._previous_branch)
+
+    @property
+    def name(self) -> str:
+        return f"checkout {self._target_branch}"
+
+    def _previous_branch_for_undo(self) -> str | None:
+        """Snapshot the current branch *before* switching.
+
+        ``HEAD.shorthand`` is safe to read as long as HEAD is not
+        unborn; an unborn HEAD returns ``None`` so :meth:`undo` becomes
+        a no-op.
+        """
+        repo = self._repo.repo
+        if repo.head_is_unborn:
+            return None
+        return repo.head.shorthand
+
+
+class CreateBranchCommand(GitCommand):
+    """Create local branch ``name``; undo by deleting it.
+
+    ``force=True`` is used for the undo because the branch was just
+    created by us — there is no way it could have become the current
+    branch or be checked out elsewhere in the small window between
+    execute and undo.
+    """
+
+    def __init__(
+        self,
+        repo: RepositoryManager,
+        name: str,
+        target_sha: str | None = None,
+    ) -> None:
+        self._repo = repo
+        self._name = name
+        self._target_sha = target_sha
+        self._existed_before = False
+
+    def execute(self) -> None:
+        existing = {b.name for b in self._repo.branches}
+        self._existed_before = self._name in existing
+        create_branch(self._repo, self._name, self._target_sha)
+
+    def undo(self) -> None:
+        if self._existed_before:
+            # We didn't create the branch (it pre-existed) — undo is
+            # a no-op, otherwise we'd be destroying user data.
+            return
+        delete_branch(self._repo, self._name, force=True)
+
+    @property
+    def name(self) -> str:
+        return f"create branch {self._name}"
+
+
+class DeleteBranchCommand(GitCommand):
+    """Delete local branch ``name``; undo by recreating it on its old target.
+
+    The deleted branch's ``target_sha`` is captured on :meth:`execute`
+    so :meth:`undo` can put the ref back at the same commit. If the
+    target SHA can no longer be resolved (e.g. the repo was rewritten
+    by another command) the undo is a silent no-op — failing loudly
+    here would be more confusing than the original deletion.
+    """
+
+    def __init__(self, repo: RepositoryManager, name: str, force: bool = False) -> None:
+        self._repo = repo
+        self._name = name
+        self._force = force
+        self._target_sha: str | None = None
+        self._existed_before = False
+
+    def execute(self) -> None:
+        existing = {b.name for b in self._repo.branches}
+        self._existed_before = self._name in existing
+        if self._existed_before:
+            branch = self._repo.repo.lookup_branch(self._name)
+            self._target_sha = str(branch.target)
+        delete_branch(self._repo, self._name, force=self._force)
+
+    def undo(self) -> None:
+        if not self._existed_before or self._target_sha is None:
+            return
+        create_branch(self._repo, self._name, self._target_sha)
+
+    @property
+    def name(self) -> str:
+        return f"delete branch {self._name}"
+
+
+class RenameBranchCommand(GitCommand):
+    """Rename ``old_name`` to ``new_name``; undo by swapping the names back.
+
+    Undo uses ``force=True`` so it can clobber any branch the user
+    created at the *old* name between execute and undo — that branch
+    was created on top of the deleted one, and rolling back means we
+    want the original state back regardless.
+    """
+
+    def __init__(
+        self,
+        repo: RepositoryManager,
+        old_name: str,
+        new_name: str,
+        force: bool = False,
+    ) -> None:
+        self._repo = repo
+        self._old_name = old_name
+        self._new_name = new_name
+        self._force = force
+
+    def execute(self) -> None:
+        rename_branch(self._repo, self._old_name, self._new_name, force=self._force)
+
+    def undo(self) -> None:
+        rename_branch(self._repo, self._new_name, self._old_name, force=True)
+
+    @property
+    def name(self) -> str:
+        return f"rename branch {self._old_name} → {self._new_name}"
+
+
+__all__ = [
+    "CheckoutCommand",
+    "CommandProcessor",
+    "CommitCommand",
+    "CreateBranchCommand",
+    "DeleteBranchCommand",
+    "GitCommand",
+    "RenameBranchCommand",
+]

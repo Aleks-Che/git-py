@@ -194,6 +194,37 @@ def checkout_branch(
             ) from exc
 
 
+def rename_branch(
+    repo: RepositoryManager | pygit2.Repository,
+    old_name: str,
+    new_name: str,
+    force: bool = False,
+) -> str:
+    """Rename local branch ``old_name`` to ``new_name``. Returns ``new_name``.
+
+    If ``force`` is ``False`` (default) the rename will fail when the
+    target name already exists, matching ``git branch -m``'s default
+    safety check. Pass ``force=True`` to overwrite a colliding branch
+    (matches ``git branch -M``).
+    """
+    with unwrap(repo) as r:
+        try:
+            branch = r.lookup_branch(old_name)
+        except (KeyError, ValueError) as exc:
+            raise InvalidRefError(f"Unknown branch: {old_name!r}") from exc
+        if branch is None:
+            raise InvalidRefError(f"Unknown branch: {old_name!r}")
+        try:
+            branch.rename(new_name, force)
+        except pygit2.AlreadyExistsError as exc:
+            raise GitError(
+                f"Branch {new_name!r} already exists (pass force=True to overwrite).",
+            ) from exc
+        except pygit2.GitError as exc:
+            raise GitError(f"Failed to rename branch {old_name!r}: {exc}") from exc
+    return new_name
+
+
 # ----- merge / rebase / cherry-pick / revert --------------------------------
 
 
@@ -576,6 +607,7 @@ __all__ = [
     "pull",
     "push",
     "rebase_branch",
+    "rename_branch",
     "reset",
     "revert",
     "stash_pop",

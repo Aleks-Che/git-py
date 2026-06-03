@@ -77,7 +77,7 @@
 
 ## Прогресс разработки
 
-**Общий прогресс:** `[████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]` 3 / 11 этапов (27%)
+**Общий прогресс:** `[██████████░░░░░░░░░░░░░░░░░░░░░]` 4 / 11 этапов (36%)
 
 Легенда:
 - `[ ]` — не начато
@@ -106,10 +106,10 @@
   - Дата завершения: `2026-06-03`
   - Комментарий: `MainViewModel` (QObject, владеет `RepositoryManager` + `CommandProcessor` + дочерними VM; сигналы `repository_changed` / `error_occurred`; `commit_changes/stage_file/unstage_file/undo/redo`); `CommitPanelViewModel` (`file_changes`, `staged_files` (восстанавливается из raw `pygit2` status flags, не из `FileStatus`), `selected_file`, `current_diff`, `commit_message` + 5 сигналов; `stage_file` через `index.add`+write, `unstage_file` через новую `core.operations.unstage_changes` — `git reset HEAD -- <path>` под капотом, потому что `index.remove` для tracked-файла оставлял `INDEX_DELETED` в staged-сете); `CommitCommand(GitCommand)` с undo через `reset("HEAD", mode="soft")`; `CommitPanel` (правая верхняя панель: `QPlainTextEdit` для сообщения, `QListWidget` с чекбоксами + статус-бейджи M/U/D/R/A/C/T/I, `QTextEdit` для диффа); WIP-узел в графе (синтетический `CommitInfo` с `sha="WIP"` prepend-ится в `GraphViewModel.refresh_graph()`; в `core/graph.py` ничего не трогали — ядро остаётся чистым); `MainWindow` (вместо прямого `RepositoryManager` — `MainViewModel`; правая сторона = вертикальный сплиттер: `CommitPanel` сверху, `CommitDetailPanel` снизу; Undo/Redo привязаны к `command_processor` + `stack_changed` → `setEnabled`); `core/operations.py`: `unstage_changes(repo, path)` (no-op если путь не в индексе, `index.remove` для unborn HEAD, иначе `git reset HEAD -- <path>`). **52 новых теста** (22 CommitPanelViewModel + 16 CommitCommand + 3 WIP в graph VM + 1 WIP в widget + 10 CommitPanel UI), итого **176/176 проходят**, `ruff check` чисто. Заглушка `BranchPanelViewModel` поднята до `QObject` с `set_repository`/`error_occurred` (для совместимости с `MainViewModel`), реальная реализация остаётся на Этап 4.
 
-- [ ] **Этап 4: Работа с ветками и переключение** — _не начато_
-  - Дата начала: `—`
-  - Дата завершения: `—`
-  - Комментарий: `—`
+- [x] **Этап 4: Работа с ветками и переключение** — _завершён_
+  - Дата начала: `2026-06-03`
+  - Дата завершения: `2026-06-03`
+  - Комментарий: `BranchPanelViewModel` поднят из заглушки до полноценного read-only VM: 5 свойств (`local_branches`/`remote_branches`/`tags`/`stash_list`/`current_branch_name`) + единый сигнал `references_changed`; VM не имеет мутирующих глаголов — все мутации идут через `MainViewModel` → `GitCommand` → `CommandProcessor`. `core/operations.py`: `rename_branch(repo, old, new, force=False)` (ловит `pygit2.AlreadyExistsError` → `GitError`, остальные `pygit2.GitError` → `GitError`). `commands.py`: 4 новых команды — `CheckoutCommand` (запоминает `head.shorthand` для undo, `None` на unborn HEAD → no-op), `CreateBranchCommand` (force=True при undo, no-op если ветка пре-существовала), `DeleteBranchCommand` (запоминает `target_sha` для восстановления), `RenameBranchCommand` (undo через swap имён с force=True). `MainViewModel`: 4 verb-метода (`checkout_branch`/`create_branch`/`delete_branch`/`rename_branch`) + приватный `_refresh_all_views()` (graph + commit panel + branch panel) — checkout обновляет все три панели, потому что меняется и worktree, и HEAD; undo/redo переехали на общий `_refresh_all_views`. `LeftPanel`: полноценный `QTreeWidget` с тремя группами (Branches→Local/Remote, Tags, Stash), текущая ветка выделена жирным "(HEAD)"; двойной клик по локальной ветке → checkout, по remote/tag → create branch; контекстное меню: на local — Checkout/Create/Rename/Delete, на remote/tag — Create, на stash — Apply (disabled, Этап 7); drag-and-drop с локальной ветки → заглушка `QMessageBox` "будет на Этапе 5". `MainWindow`: `LeftPanel` теперь принимает `(branch_panel_vm, main_vm)`. **60 новых тестов** (5 core/operations rename_branch + 14 BranchPanelViewModel + 19 branch_commands + 11 MainViewModel branch-методов + 11 LeftPanel UI), итого **236/236 проходят**, `ruff check` чисто. Замечания: `pygit2.Branch.rename()` не принимает kw-args — `branch.rename(new_name, force)` позиционно; `setData(column, role, value)` — 3 аргумента в PySide6. Реальный merge/rebase через drag-and-drop и force-checkout остаются на Этапы 5/6.
 
 - [ ] **Этап 5: Слияние и rebase** — _не начато_
   - Дата начала: `—`
@@ -142,7 +142,6 @@
   - Комментарий: `—`
 
 ### Текущий статус
-
-- **Активный этап:** `Этап 4: Работа с ветками и переключение`
+- **Активный этап:** `Этап 5: Слияние и rebase`
 - **Последнее обновление:** `2026-06-03`
-- **Следующий шаг:** `Левая панель LeftPanel: дерево веток (локальные/удалённые), тегов, stash; двойной клик — checkout; контекстное меню (создать из коммита/HEAD, удалить, переименовать); CheckoutCommand через CommandProcessor. В BranchPanelViewModel поднять заглушку до полноценной реализации.`
+- **Следующий шаг:** `MergeCommand/RebaseCommand с undo (reset --hard ORIG_HEAD / reflog-откат); обнаружение конфликтов через pygit2.GitError → MergeConflictError; визуальный трёхпанельный редактор конфликтов; drag-and-drop ветки A на B → контекстное меню "Merge A into B" / "Rebase A onto B" (в LeftPanel уже есть dropEvent-стаб).`

@@ -1,9 +1,11 @@
 """Main application window: menu, panels, status bar.
 
 Stage 3 wires the central :class:`MainViewModel` into the window and
-adds the WIP / commit panel to the right side. Layout:
+adds the WIP / commit panel to the right side. Stage 4 swaps the
+left-panel stub for the real references tree
+(:class:`LeftPanel`). Layout:
 
-* **Left:** :class:`LeftPanel` (Stage 0 stub; real branches in Stage 4)
+* **Left:** :class:`LeftPanel` — branches / tags / stash tree
 * **Centre:** :class:`GraphWidget` (Stage 2)
 * **Right (vertical splitter):**
     * :class:`CommitPanel` — file list, message field, commit button
@@ -143,7 +145,10 @@ class MainWindow(QMainWindow):
         self._action_redo.setEnabled(proc.can_redo)
 
     def _build_central(self) -> None:
-        self._left_panel = LeftPanel()
+        self._left_panel = LeftPanel(
+            self._main_vm.branch_panel_view_model(),
+            self._main_vm,
+        )
         self._graph_widget = GraphWidget(self._main_vm.graph_view_model())
         self._commit_panel = CommitPanel(self._main_vm)
         self._detail_panel = CommitDetailPanel(self._main_vm.graph_view_model())
