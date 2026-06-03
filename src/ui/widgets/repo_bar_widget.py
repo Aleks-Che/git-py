@@ -1,0 +1,209 @@
+"""Repository tab bar widget — tabs for each open repository + a ``+`` button.
+
+Uses ``QTabBar.setTabButton`` with a lightweight ``QWidget`` that
+paints its own ``×`` glyph, completely bypassing ``QPushButton`` style
+padding.  The glyph is hidden by default and revealed when the
+mouse hovers over the parent tab.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter
+from PySide6.QtWidgets import QHBoxLayout, QPushButton, QTabBar, QWidget
+
+from src.viewmodels.repo_tabs_viewmodel import RepoTabViewModel
+
+
+class _CloseTabButton(QWidget):
+    """A minimal widget that paints a ``×`` when *hovered*.
+
+    Because it is a plain ``QWidget`` (not ``QPushButton``), no
+    style‑sheet or platform‑style padding is added — the tab bar
+    sees exactly the size we report.
+    """
+
+    clicked_signal = Signal(int)
+
+    def __init__(self, tab_index: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._tab_index = tab_index
+        self._hovered = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(14, 14)
+
+    # -- hover state ----------------------------------------------------
+
+    def set_hovered(self, hovered: bool) -> None:
+        """Show / hide the ``×`` glyph."""
+        if self._hovered != hovered:
+            self._hovered = hovered
+            self.update()
+
+    # -- Qt overrides --------------------------------------------------
+
+    def sizeHint(self) -> QSize:  # noqa: N802 — Qt override
+        return QSize(14, 14)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 — Qt override
+        return QSize(14, 14)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked_signal.emit(self._tab_index)
+
+    def paintEvent(self, _event: object) -> None:  # noqa: N802
+        if not self._hovered:
+            return
+        painter = QPainter(self)
+        painter.setPen(QColor("#8B8B8B"))
+        painter.setFont(QFont("Segoe UI", 11))
+        # Shift the glyph upward within the widget so it aligns
+        # visually with the tab text (the tab's bottom padding
+        # pushes the QTabBar-centering downward).
+        r = self.rect().adjusted(0, -2, 0, -2)
+        painter.drawText(r, Qt.AlignmentFlag.AlignCenter, "\u00d7")
+        painter.end()
+
+
+class RepoBarWidget(QWidget):
+    """Horizontal bar: ``[Tab1] [Tab2] [+]``.
+
+    Each tab shows the repository folder name and a close glyph that
+    appears on tab hover.
+    """
+
+    add_requested = Signal()
+
+    def __init__(self, view_model: RepoTabViewModel, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._vm = view_model
+        self._updating_tab_bar: bool = False
+        self._hovered_tab: int = -1
+        self._close_buttons: dict[int, _CloseTabButton] = {}
+
+        self.setObjectName("repo-bar")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self._tab_bar = QTabBar(self)
+        self._tab_bar.setDocumentMode(True)
+        self._tab_bar.setTabsClosable(False)
+        self._tab_bar.setMovable(True)
+        self._tab_bar.setExpanding(False)
+        self._tab_bar.setDrawBase(False)
+        self._tab_bar.setMouseTracking(True)
+        self._tab_bar.installEventFilter(self)
+        self._tab_bar.currentChanged.connect(self._on_tab_selected)
+        layout.addWidget(self._tab_bar, stretch=1)
+
+        # Delay hiding so the mouse can move from tab to × without
+        # the glyph disappearing.
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.setInterval(200)
+        self._hide_timer.timeout.connect(self._on_hide_timer)
+
+        self._add_btn = QPushButton("+", self)
+        self._add_btn.setObjectName("repo-add-btn")
+        self._add_btn.setFixedSize(28, 28)
+        self._add_btn.setFlat(True)
+        self._add_btn.clicked.connect(self._on_add_clicked)
+        layout.addWidget(self._add_btn)
+
+        self._vm.tabs_changed.connect(self._rebuild_tabs)
+        self._vm.active_tab_changed.connect(self._on_active_tab_changed)
+
+        self._rebuild_tabs(self._vm.tabs)
+        self._sync_tab_bar_index(self._vm.active_index)
+
+    # ----- event filter -------------------------------------------------
+
+    def eventFilter(  # noqa: N802
+        self,
+        obj: QWidget,
+        event: QEvent,
+    ) -> bool:
+        if obj is self._tab_bar:
+            if event.type() in (QEvent.Type.HoverMove, QEvent.Type.HoverEnter):
+                self._hide_timer.stop()
+                tab_idx = self._tab_bar.tabAt(event.pos())
+                self._set_hovered_tab(tab_idx)
+            elif event.type() == QEvent.Type.HoverLeave:
+                self._hide_timer.start()
+        elif isinstance(obj, _CloseTabButton):
+            if event.type() == QEvent.Type.Enter:
+                self._hide_timer.stop()
+                self._set_hovered_tab(obj._tab_index)
+            elif event.type() == QEvent.Type.Leave:
+                self._hide_timer.start()
+        return super().eventFilter(obj, event)
+
+    # ----- hover management ---------------------------------------------
+
+    def _set_hovered_tab(self, index: int) -> None:
+        for idx, btn in self._close_buttons.items():
+            btn.set_hovered(idx == index)
+        self._hovered_tab = index
+
+    def _on_hide_timer(self) -> None:
+        self._set_hovered_tab(-1)
+
+    # ----- internals ----------------------------------------------------
+
+    def _rebuild_tabs(self, paths: list[str]) -> None:
+        self._close_buttons.clear()
+        self._updating_tab_bar = True
+        self._tab_bar.blockSignals(True)
+        while self._tab_bar.count() > 0:
+            self._tab_bar.removeTab(0)
+        for path in paths:
+            label = _tab_label(path)
+            idx = self._tab_bar.addTab(label)
+            self._tab_bar.setTabData(idx, path)
+            self._tab_bar.setTabToolTip(idx, path)
+            self._install_close_button(idx)
+        self._tab_bar.blockSignals(False)
+        self._updating_tab_bar = False
+        self._sync_tab_bar_index(self._vm.active_index)
+
+    def _install_close_button(self, index: int) -> None:
+        btn = _CloseTabButton(index, self._tab_bar)
+        btn.clicked_signal.connect(self._on_tab_close_requested)
+        btn.installEventFilter(self)
+        self._tab_bar.setTabButton(
+            index, QTabBar.ButtonPosition.RightSide, btn,
+        )
+        self._close_buttons[index] = btn
+
+    def _sync_tab_bar_index(self, index: int) -> None:
+        if 0 <= index < self._tab_bar.count() and self._tab_bar.currentIndex() != index:
+            self._tab_bar.setCurrentIndex(index)
+
+    def _on_tab_selected(self, index: int) -> None:
+        if self._updating_tab_bar:
+            return
+        if 0 <= index < self._tab_bar.count():
+            self._vm.set_active_tab(index)
+
+    def _on_tab_close_requested(self, index: int) -> None:
+        self._vm.remove_tab(index)
+
+    def _on_active_tab_changed(self, index: int) -> None:
+        if index < 0 or index >= self._tab_bar.count():
+            return
+        if self._tab_bar.currentIndex() != index:
+            self._sync_tab_bar_index(index)
+
+    def _on_add_clicked(self) -> None:
+        self.add_requested.emit()
+
+
+def _tab_label(path: str) -> str:
+    return Path(path).resolve().name or path
+
+
+__all__ = ["RepoBarWidget"]

@@ -61,12 +61,14 @@ from PySide6.QtWidgets import (
 from src.core.exceptions import GitError, RepositoryNotFoundError
 from src.core.repository import RepositoryManager
 from src.ui.dialogs.clone_dialog import CloneDialog
+from src.ui.dialogs.open_or_clone_dialog import OpenOrCloneDialog
 from src.ui.dialogs.remote_manage_dialog import RemoteManageDialog
 from src.ui.widgets.commit_detail_panel import CommitDetailPanel
 from src.ui.widgets.commit_panel import CommitPanel
 from src.ui.widgets.graph_widget import GraphWidget
 from src.ui.widgets.left_panel import LeftPanel
 from src.ui.widgets.log_widget import LogWidget
+from src.ui.widgets.repo_bar_widget import RepoBarWidget
 from src.ui.widgets.terminal_widget import TerminalWidget
 from src.utils.config import (
     SPLITTER_KEY_HORIZONTAL,
@@ -77,6 +79,7 @@ from src.utils.config import (
     save_config,
 )
 from src.viewmodels.main_viewmodel import MainViewModel
+from src.viewmodels.repo_tabs_viewmodel import RepoTabViewModel
 
 
 class MainWindow(QMainWindow):
@@ -111,6 +114,9 @@ class MainWindow(QMainWindow):
         self._right_splitter: QSplitter | None = None
 
         self._build_menu()
+        self._build_repo_bar()
+        # Force the remote toolbar to sit on the row below the tab bar.
+        self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
         self._build_toolbar()
         self._build_central()
         self._build_status_bar()
@@ -144,7 +150,51 @@ class MainWindow(QMainWindow):
         """Return the central :class:`MainViewModel`."""
         return self._main_vm
 
-    # ----- menu / status bar -------------------------------------------
+    def repo_tabs_view_model(self) -> RepoTabViewModel:
+        """Return the :class:`RepoTabViewModel` driving the tab bar."""
+        return self._repo_tabs_vm
+
+    # ----- repo tab bar ------------------------------------------------
+
+    def _build_repo_bar(self) -> None:
+        """Build the repository tab bar between menu and remote toolbar."""
+        self._repo_tabs_vm = RepoTabViewModel(self)
+        self._repo_bar = RepoBarWidget(self._repo_tabs_vm, self)
+        toolbar = QToolBar("Repositories", self)
+        toolbar.setObjectName("repo-tab-toolbar")
+        toolbar.setMovable(False)
+        toolbar.addWidget(self._repo_bar)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
+
+        self._repo_bar.add_requested.connect(self._on_add_repository)
+        self._repo_tabs_vm.active_tab_changed.connect(self._on_tab_changed)
+
+    def _on_add_repository(self) -> None:
+        """Show ``OpenOrCloneDialog`` when the ``+`` tab is clicked."""
+        dialog = OpenOrCloneDialog(self)
+        choice = dialog.choice()
+        if choice == "open":
+            self._open_repository_dialog()
+        elif choice == "clone":
+            self._open_clone_dialog()
+
+    def _on_tab_changed(self, index: int) -> None:
+        """Switch the active repository to the tab at *index*."""
+        path = self._repo_tabs_vm.active_path
+        if path is None:
+            self.set_repository(None)
+            return
+        current = self._main_vm.repository_manager()
+        if current is not None and current.path is not None:
+            if _same_path(current.path, path):
+                return
+        manager = RepositoryManager()
+        try:
+            manager.open(path)
+        except (RepositoryNotFoundError, GitError) as exc:
+            self._on_error(str(exc))
+            return
+        self.set_repository(manager)
 
     def _build_menu(self) -> None:
         bar = self.menuBar()
@@ -157,7 +207,7 @@ class MainWindow(QMainWindow):
 
         self._action_close = QAction("&Close Repository", self)
         self._action_close.setEnabled(False)
-        self._action_close.triggered.connect(lambda: self.set_repository(None))
+        self._action_close.triggered.connect(self._close_current_tab)
         file_menu.addAction(self._action_close)
 
         self._action_clone = QAction("&Clone…", self)
@@ -315,7 +365,7 @@ class MainWindow(QMainWindow):
     # ----- state persistence (Stage 9) ---------------------------------
 
     def _restore_state(self) -> None:
-        """Apply saved window size and splitter sizes from the config file.
+        """Apply saved window size, splitter sizes, and repo tabs from config.
 
         No-op when :attr:`_config_path` is ``None`` — the constructor
         is the only place that calls this, and the absence of a path
@@ -339,9 +389,14 @@ class MainWindow(QMainWindow):
             and len(right_vertical) == 2
         ):
             self._right_splitter.setSizes(right_vertical)
+        # Restore repository tabs.
+        recent_repos = config.get("recent_repos", [])
+        active_repo = config.get("active_repo")
+        if recent_repos:
+            self._repo_tabs_vm.load_from_state(recent_repos, active_repo)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt naming
-        """Persist the current geometry and splitter sizes before close.
+        """Persist geometry, splitter sizes, and repo tabs before close.
 
         We write to disk *before* delegating to ``super().closeEvent``
         so a crash inside the base implementation cannot leave the
@@ -360,6 +415,10 @@ class MainWindow(QMainWindow):
                     self._right_splitter.sizes()
                 )
             config["splitter_sizes"] = splitter_sizes
+            # Persist repo tabs.
+            tab_state = self._repo_tabs_vm.save_to_state()
+            config["recent_repos"] = tab_state["paths"]
+            config["active_repo"] = tab_state["active_path"]
             save_config(self._config_path, config)
         super().closeEvent(event)
 
@@ -397,6 +456,8 @@ class MainWindow(QMainWindow):
         else:
             self._status.showMessage(f"Repository: {path}")
             self._action_close.setEnabled(True)
+            # Ensure there is a tab for this repository (no-op if already present).
+            self._repo_tabs_vm.add_tab(path)
         self._update_remote_actions()
 
     def _update_remote_actions(self) -> None:
@@ -476,6 +537,19 @@ class MainWindow(QMainWindow):
             "About git-py",
             "git-py — a GitKraken-like Git client built with PySide6 and pygit2.",
         )
+
+    def _close_current_tab(self) -> None:
+        """Remove the current repo tab (the repo on disk is untouched)."""
+        idx = self._repo_tabs_vm.active_index
+        if idx >= 0:
+            self._repo_tabs_vm.remove_tab(idx)
+
+
+def _same_path(a: str, b: str) -> bool:
+    """Return ``True`` if two paths point to the same directory."""
+    from pathlib import Path
+
+    return Path(a).resolve() == Path(b).resolve()
 
 
 __all__ = ["MainWindow"]

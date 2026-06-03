@@ -208,6 +208,88 @@ QWidget {{
     color: {text};
 }}
 
+/* --- repo tab bar --- */
+
+QToolBar#repo-tab-toolbar {{
+    background-color: {bg_elevated};
+    border-bottom: none;
+    padding: 0;
+    spacing: 0;
+    min-height: 28;
+    max-height: 32;
+}}
+
+QToolBar#repo-tab-toolbar::separator {{
+    background: transparent;
+    width: 0;
+    margin: 0;
+}}
+
+QWidget#repo-bar {{
+    background-color: {bg_elevated};
+}}
+
+QWidget#repo-bar > QTabBar {{
+    background-color: {bg_elevated};
+    qproperty-drawBase: 0;
+    font-size: 12px;
+}}
+
+QWidget#repo-bar > QTabBar::tab {{
+    background-color: {bg_panel};
+    color: {text_dim};
+    padding: 1px 7px 6px 10px;
+    border: 1px solid transparent;
+    border-right: 1px solid {border};
+    margin: 0;
+    border-top-left-radius: 2px;
+    border-top-right-radius: 2px;
+}}
+
+QWidget#repo-bar > QTabBar::tab:hover {{
+    background-color: {bg_hover};
+    color: {text};
+}}
+
+QWidget#repo-bar > QTabBar::tab:selected {{
+    background-color: {bg};
+    color: {text};
+    border-color: {border};
+    border-bottom-color: {bg};
+}}
+
+/* --- floating close button for repo tabs --- */
+QPushButton#tab-close-btn {{
+    background: transparent;
+    color: {text_dim};
+    border: none;
+    font-size: 14px;
+    font-weight: normal;
+    padding: 0;
+    margin: 0;
+}}
+
+QPushButton#tab-close-btn:hover {{
+    background: transparent;
+    color: {text};
+}}
+
+QPushButton#repo-add-btn {{
+    background-color: transparent;
+    color: {text_dim};
+    font-size: 16px;
+    font-weight: bold;
+    border: none;
+    border-radius: 2px;
+    padding: 0;
+    margin: 2px 4px 2px 2px;
+}}
+
+QPushButton#repo-add-btn:hover {{
+    background-color: {bg_hover};
+    color: {text};
+}}
+
 /* --- menus / toolbars / status bar --- */
 
 QMenuBar {{

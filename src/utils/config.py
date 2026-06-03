@@ -57,6 +57,10 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     # :data:`SPLITTER_KEY_HORIZONTAL` and
     # :data:`SPLITTER_KEY_RIGHT_VERTICAL`; values are ``[int, ...]``.
     "splitter_sizes": {},
+    # Recent repositories shown in the tab bar (list of absolute paths).
+    "recent_repos": [],
+    # The active repository path (str or null).
+    "active_repo": None,
 }
 
 # Keys that must be ints (validation on load; bad values fall back).
