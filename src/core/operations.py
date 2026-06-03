@@ -375,6 +375,53 @@ def revert(
     return _to_commit_info(head)
 
 
+def unstage_changes(
+    repo: RepositoryManager | pygit2.Repository,
+    path: str,
+) -> None:
+    """Reset the index entry for ``path`` to match ``HEAD`` (``git reset HEAD -- <path>``).
+
+    libgit2's :meth:`pygit2.Index.remove` drops a path from the index
+    without restoring the ``HEAD`` entry, so a previously-modified
+    file becomes "intent-to-delete" (``INDEX_DELETED``) — the opposite
+    of what the UI wants. We shell out to ``git reset`` because
+    pygit2 1.x has no high-level per-path "reset to HEAD" primitive.
+
+    On an unborn HEAD (or when the path is not in the index at all),
+    the call is a no-op so callers can blindly "unstage" anything.
+    """
+    with unwrap(repo) as r:
+        if path not in r.index:
+            # Path is not in the index — nothing to unstage.
+            return
+        if r.head_is_unborn:
+            # No HEAD to reset to; just drop the staged entry.
+            r.index.remove(path)
+            r.index.write()
+            return
+        workdir = r.workdir
+    if workdir is None:
+        raise GitError("Cannot unstage in a bare repository.")
+    git = shutil.which("git")
+    if git is None:
+        raise GitNotInstalledError("`git` CLI is not in PATH; unstage requires it.")
+    try:
+        completed = subprocess.run(
+            [git, "reset", "HEAD", "--", path],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise GitError(f"Failed to spawn git: {exc}") from exc
+    if completed.returncode != 0:
+        raise GitError(
+            f"Failed to unstage {path!r}: "
+            f"{completed.stderr.strip() or completed.stdout.strip()}",
+        )
+
+
 def reset(
     repo: RepositoryManager | pygit2.Repository,
     target: str,
@@ -533,4 +580,5 @@ __all__ = [
     "revert",
     "stash_pop",
     "stash_push",
+    "unstage_changes",
 ]

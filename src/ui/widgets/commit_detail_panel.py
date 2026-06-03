@@ -1,15 +1,16 @@
 """Right-hand panel that shows details of the currently selected commit.
 
-Stage 2 version: a single read-only :class:`QTextEdit` populated
-from :class:`src.core.repository.RepositoryManager.get_commit`.
-Stage 3 will replace the text view with a proper file list, diff
-preview, and a "Revert / Cherry-pick" action.
+Stage 3 version: read-only :class:`QTextEdit` populated from
+:class:`src.core.repository.RepositoryManager.get_commit`. The
+synthetic WIP node is special-cased: its "details" are a one-line
+pointer to the WIP / commit panel above, since the WIP is where
+the user stages files and types the message.
 """
 from __future__ import annotations
 
 from PySide6.QtWidgets import QLabel, QTextEdit, QVBoxLayout, QWidget
 
-from src.viewmodels.graph_viewmodel import GraphViewModel
+from src.viewmodels.graph_viewmodel import WIP_SHA, GraphViewModel
 
 
 class CommitDetailPanel(QWidget):
@@ -38,6 +39,19 @@ class CommitDetailPanel(QWidget):
     # ----- signal handlers ---------------------------------------------
 
     def _on_commit_selected(self, sha: str) -> None:
+        if sha == WIP_SHA:
+            self._header.setText("WIP: Uncommitted changes")
+            self._body.setHtml(
+                "<p style='color: #8B8B8B;'>"
+                "Use the <b>Commit</b> panel above to stage files and write "
+                "a commit message. The graph node will be replaced by a "
+                "real commit once you click <i>Commit</i>."
+                "</p>"
+            )
+            cursor = self._body.textCursor()
+            cursor.movePosition(cursor.MoveOperation.Start)
+            self._body.setTextCursor(cursor)
+            return
         info = self._view_model.get_commit_details(sha)
         if info is None:
             self._header.setText(f"Unknown commit: {sha[:12]}")

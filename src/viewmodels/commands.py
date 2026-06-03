@@ -16,7 +16,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import deque
 
+import pygit2
 from PySide6.QtCore import QObject, Signal
+
+from src.core.operations import commit_changes, reset
+from src.core.repository import RepositoryManager
 
 
 class GitCommand(ABC):
@@ -93,3 +97,63 @@ class CommandProcessor(QObject):
         self._undo_stack.clear()
         self._redo_stack.clear()
         self.stack_changed.emit()
+
+
+class CommitCommand(GitCommand):
+    """Create a commit on ``HEAD``; undo via ``git reset --soft HEAD~1``.
+
+    Captures the pre-commit HEAD SHA on :meth:`execute` so undo can move
+    the ref back. ``stage_all=False`` because :class:`CommitPanelViewModel`
+    manages the index explicitly (the user picks which files to include
+    in the commit), so the index is already in the right state when this
+    command runs.
+    """
+
+    def __init__(
+        self,
+        repo: RepositoryManager,
+        message: str,
+        author: pygit2.Signature | None = None,
+        committer: pygit2.Signature | None = None,
+    ) -> None:
+        self._repo = repo
+        self._message = message
+        self._author = author
+        self._committer = committer
+        self._previous_head: str | None = None
+
+    def execute(self) -> None:
+        if not self._message or not self._message.strip():
+            from src.core.exceptions import GitError
+
+            raise GitError("Commit message must not be empty.")
+        if not self._repo.repo.head_is_unborn:
+            self._previous_head = str(self._repo.repo.head.target)
+        else:
+            self._previous_head = None
+        commit_changes(
+            self._repo,
+            self._message,
+            author=self._author,
+            committer=self._committer,
+            stage_all=False,
+        )
+
+    def undo(self) -> None:
+        if self._previous_head is None:
+            # First commit (HEAD was unborn before ``execute``). We
+            # cannot ``reset --soft`` past the unborn point, so undo
+            # is a no-op — the user has to clean up manually.
+            return
+        reset(self._repo, self._previous_head, mode="soft")
+
+    @property
+    def name(self) -> str:
+        first_line = self._message.splitlines()[0] if self._message else ""
+        if len(first_line) > 50:
+            first_line = first_line[:49] + "…"
+        suffix = f": {first_line}" if first_line else ""
+        return f"commit{suffix}"
+
+
+__all__ = ["CommandProcessor", "CommitCommand", "GitCommand"]

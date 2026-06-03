@@ -101,10 +101,10 @@
   - Дата завершения: `2026-06-02`
   - Комментарий: `core/graph.py` (DAG + branch-priority lane algorithm + 12-цветная палитра), `core/repository.py.get_all_history()` для обхода всех tip'ов (ветки+теги), `GraphViewModel` (QObject, сигналы `graph_updated`/`commit_selected`/`error_occurred`, методы-глаголы `refresh_graph`/`select_commit`/`get_commit_details`), `GraphWidget` на `QGraphicsView` (узлы-эллипсы с цветом ветки, L-shape линии до родителей, ref-чипы HEAD/ветки/теги, тёмная тема, клик-выделение), `CommitDetailPanel` (read-only QTextEdit с HTML), `MainWindow` (2 панели Graph+Detail; `File>Open` через QFileDialog; `MainViewModel` пока не трогаем). Алгоритм раскладки: phase 1 — priority walk (HEAD→локальные→remote) по первому родителю; phase 2 — orphan walk для коммитов без веток. **58 новых тестов** (20 graph + 14 viewmodel + 8 widget + 5 `get_all_history` + 11 прочих обновлений), итого **124/124 проходят**, `ruff check` чисто. Известные ограничения (Stage 10): полная перерисовка сцены на каждый `graph_updated` без виртуализации; `RenderConfig` пока хардкод — мигрирует в `utils/config.py` на Этапе 9.
 
-- [ ] **Этап 3: Рабочая директория и коммиты** — _не начато_
-  - Дата начала: `—`
-  - Дата завершения: `—`
-  - Комментарий: `—`
+- [x] **Этап 3: Рабочая директория и коммиты** — _завершён_
+  - Дата начала: `2026-06-03`
+  - Дата завершения: `2026-06-03`
+  - Комментарий: `MainViewModel` (QObject, владеет `RepositoryManager` + `CommandProcessor` + дочерними VM; сигналы `repository_changed` / `error_occurred`; `commit_changes/stage_file/unstage_file/undo/redo`); `CommitPanelViewModel` (`file_changes`, `staged_files` (восстанавливается из raw `pygit2` status flags, не из `FileStatus`), `selected_file`, `current_diff`, `commit_message` + 5 сигналов; `stage_file` через `index.add`+write, `unstage_file` через новую `core.operations.unstage_changes` — `git reset HEAD -- <path>` под капотом, потому что `index.remove` для tracked-файла оставлял `INDEX_DELETED` в staged-сете); `CommitCommand(GitCommand)` с undo через `reset("HEAD", mode="soft")`; `CommitPanel` (правая верхняя панель: `QPlainTextEdit` для сообщения, `QListWidget` с чекбоксами + статус-бейджи M/U/D/R/A/C/T/I, `QTextEdit` для диффа); WIP-узел в графе (синтетический `CommitInfo` с `sha="WIP"` prepend-ится в `GraphViewModel.refresh_graph()`; в `core/graph.py` ничего не трогали — ядро остаётся чистым); `MainWindow` (вместо прямого `RepositoryManager` — `MainViewModel`; правая сторона = вертикальный сплиттер: `CommitPanel` сверху, `CommitDetailPanel` снизу; Undo/Redo привязаны к `command_processor` + `stack_changed` → `setEnabled`); `core/operations.py`: `unstage_changes(repo, path)` (no-op если путь не в индексе, `index.remove` для unborn HEAD, иначе `git reset HEAD -- <path>`). **52 новых теста** (22 CommitPanelViewModel + 16 CommitCommand + 3 WIP в graph VM + 1 WIP в widget + 10 CommitPanel UI), итого **176/176 проходят**, `ruff check` чисто. Заглушка `BranchPanelViewModel` поднята до `QObject` с `set_repository`/`error_occurred` (для совместимости с `MainViewModel`), реальная реализация остаётся на Этап 4.
 
 - [ ] **Этап 4: Работа с ветками и переключение** — _не начато_
   - Дата начала: `—`
@@ -143,6 +143,6 @@
 
 ### Текущий статус
 
-- **Активный этап:** `Этап 3: Рабочая директория и коммиты`
-- **Последнее обновление:** `2026-06-02`
-- **Следующий шаг:** `Реализовать CommitPanel (список файлов с чекбоксами + diff preview), CommitCommand через CommandProcessor, кнопку Commit и staging/unstaging; отобразить WIP-узел на графе; обновление графа/статуса после коммита.`
+- **Активный этап:** `Этап 4: Работа с ветками и переключение`
+- **Последнее обновление:** `2026-06-03`
+- **Следующий шаг:** `Левая панель LeftPanel: дерево веток (локальные/удалённые), тегов, stash; двойной клик — checkout; контекстное меню (создать из коммита/HEAD, удалить, переименовать); CheckoutCommand через CommandProcessor. В BranchPanelViewModel поднять заглушку до полноценной реализации.`

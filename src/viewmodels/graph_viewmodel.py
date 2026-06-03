@@ -6,14 +6,17 @@ recomputes the lane layout whenever the repository changes, and
 exposes the result plus user-driven ``commit_selected`` events as
 Qt signals so any number of widgets can listen.
 
-Stage 2 keeps the ViewModel standalone — there's no
-:class:`src.viewmodels.main_viewmodel.MainViewModel` yet to own the
-repository. :class:`src.ui.main_window.MainWindow` is expected to
-construct a ``GraphViewModel`` itself and call :meth:`set_repository`
-when the user opens a repo. Stage 3 will switch to wiring it through
-the central ``MainViewModel``.
+Stage 3 also synthesises a "WIP" commit node whenever the working
+tree has any uncommitted changes. The WIP node is a real
+:class:`CommitInfo` with ``sha="WIP"`` and ``message="WIP:
+Uncommitted changes"``; prepending it to the history lets
+:func:`src.core.graph.compute_layout` lay it out above ``HEAD``
+in the same lane. ``core/`` stays free of any knowledge about
+working-tree status — the synthesis happens here, in the ViewModel.
 """
 from __future__ import annotations
+
+import time
 
 from PySide6.QtCore import QObject, Signal
 
@@ -21,6 +24,9 @@ from src.core.exceptions import GitError
 from src.core.graph import compute_layout, nodes_to_rows
 from src.core.models import CommitInfo
 from src.core.repository import RepositoryManager
+
+WIP_SHA = "WIP"
+WIP_MESSAGE = "WIP: Uncommitted changes"
 
 
 class GraphViewModel(QObject):
@@ -72,6 +78,11 @@ class GraphViewModel(QObject):
         Silently emits an empty list when no repository is bound
         or the repository is empty. Any :class:`GitError` from Core
         is translated to :attr:`error_occurred` — never re-raised.
+
+        If the working tree has any status entries (modified, new,
+        deleted, ...), a virtual WIP commit is synthesised and
+        prepended to the history so the user sees an uncommitted
+        node above HEAD.
         """
         if self._repo is None or not self._repo.is_open:
             self.graph_updated.emit([])
@@ -81,6 +92,13 @@ class GraphViewModel(QObject):
             branches = self._repo.branches
             tags = self._repo.tags
             head_target, head_shorthand = self._head_info()
+            status = self._repo.get_status()
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            return
+        if status:
+            history = [self._wip_commit(head_target)] + history
+        try:
             nodes = compute_layout(history, branches, tags, head_target, head_shorthand)
         except GitError as exc:
             self.error_occurred.emit(str(exc))
@@ -120,3 +138,24 @@ class GraphViewModel(QObject):
             return None, None
         head = self._repo.repo.head
         return str(head.target), head.shorthand
+
+    @staticmethod
+    def _wip_commit(head_target: str | None) -> CommitInfo:
+        """Build the synthetic WIP :class:`CommitInfo` shown above ``HEAD``.
+
+        ``parents`` is the real HEAD SHA when HEAD exists, otherwise
+        an empty list (an unborn-HEAD WIP node is the only node in
+        the graph; this is the "stage the first commit" state).
+        """
+        return CommitInfo(
+            sha=WIP_SHA,
+            short_sha="WIP",
+            message=WIP_MESSAGE,
+            author_name="",
+            author_email="",
+            author_time=int(time.time()),
+            committer_name="",
+            committer_email="",
+            committer_time=int(time.time()),
+            parents=[head_target] if head_target else [],
+        )

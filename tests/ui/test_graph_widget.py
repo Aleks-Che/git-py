@@ -208,3 +208,31 @@ def test_main_window_wires_graph_view_model(qtbot, tmp_git_repo: Path) -> None:
     ]
     assert len(nodes) == 2
     window.close()
+
+
+# ----- WIP node (Stage 3) ---------------------------------------------
+
+
+def test_widget_renders_wip_node_when_worktree_dirty(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A modified worktree file adds a WIP ellipse above the real nodes."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    (tmp_git_repo / "f.txt").write_text("v3\n")
+    vm = GraphViewModel(mgr)
+    widget = GraphWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    nodes = [item for item in widget.scene().items() if isinstance(item, QGraphicsEllipseItem)]
+    # 2 real commits + 1 WIP node.
+    assert len(nodes) == 3
+    shas = {node.data(0) for node in nodes}
+    assert "WIP" in shas
+    # WIP node should be tagged with sha="WIP" so clicks route to the
+    # special case in CommitDetailPanel.
+    wip_node = widget._node_items["WIP"]  # noqa: SLF001
+    assert wip_node.data(0) == "WIP"

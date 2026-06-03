@@ -64,6 +64,8 @@ class RenderConfig:
     edge_width: int = 2
     selection_ring_width: int = 2
     subject_max_chars: int = 60
+    wip_color: str = "#8B8B8B"
+    wip_node_radius: int = 7
 
 
 class GraphWidget(QGraphicsView):
@@ -170,17 +172,27 @@ class GraphWidget(QGraphicsView):
     def _draw_commit(self, row: dict) -> None:
         x = self._lane_x(row["lane"])
         y = self._row_y(row["row"])
-        color = QColor(row["color"])
+        is_wip = row["sha"] == "WIP"
+        if is_wip:
+            color = QColor(self._cfg.wip_color)
+            radius = self._cfg.wip_node_radius
+            pen = QPen(color, 1, Qt.PenStyle.DashLine)
+            brush = QBrush(QColor(self._cfg.background_color))
+        else:
+            color = QColor(row["color"])
+            radius = self._cfg.node_radius
+            pen = QPen(QColor(self._cfg.background_color), 1)
+            brush = QBrush(color)
 
         # Node ellipse.
         node = QGraphicsEllipseItem(
-            x - self._cfg.node_radius,
-            y - self._cfg.node_radius,
-            self._cfg.node_radius * 2,
-            self._cfg.node_radius * 2,
+            x - radius,
+            y - radius,
+            radius * 2,
+            radius * 2,
         )
-        node.setBrush(QBrush(color))
-        node.setPen(QPen(QColor(self._cfg.background_color), 1))
+        node.setBrush(brush)
+        node.setPen(pen)
         node.setData(0, row["sha"])  # tag the item with its SHA for hit-testing
         node.setCursor(Qt.CursorShape.PointingHandCursor)
         self._scene.addItem(node)
@@ -202,7 +214,8 @@ class GraphWidget(QGraphicsView):
         if len(subject) > self._cfg.subject_max_chars:
             subject = subject[: self._cfg.subject_max_chars - 1] + "…"
         subject_item = QGraphicsSimpleTextItem(subject)
-        subject_item.setBrush(QColor(self._cfg.text_color))
+        subject_color = QColor(self._cfg.dim_text_color) if is_wip else QColor(self._cfg.text_color)
+        subject_item.setBrush(subject_color)
         subject_item.setFont(self.font())
         subject_item.setPos(text_x, y - subject_item.boundingRect().height() / 2)
         self._scene.addItem(subject_item)
