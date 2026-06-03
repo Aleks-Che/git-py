@@ -187,13 +187,13 @@ class LeftPanel(QTreeWidget):
     # ----- user actions ------------------------------------------------
 
     def _on_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
-        """Double-click on a local branch → checkout; remote / tag → create branch."""
+        """Double-click: local branch → checkout; remote → checkout remote; tag → create branch."""
         kind = item.data(0, _ROLE_KIND)
         name = item.data(0, _ROLE_NAME)
         if kind == _KIND_LOCAL_BRANCH and name:
             self._main_vm.checkout_branch(name)
         elif kind == _KIND_REMOTE_BRANCH and name:
-            self._main_vm.create_branch(name)
+            self._main_vm.checkout_remote_branch(name)
         elif kind == _KIND_TAG and name:
             self._main_vm.create_branch(name)
 

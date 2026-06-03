@@ -279,6 +279,49 @@ class MainViewModel(QObject):
         self._log("checkout", f"Checkout {name!r} succeeded — HEAD is now {name}")
         return True
 
+    def checkout_remote_branch(self, remote_name: str) -> bool:
+        """Create a local tracking branch from ``remote_name`` and switch to it.
+
+        ``remote_name`` is in the form ``origin/feature``. The remote prefix
+        (e.g. ``origin``) is stripped so the local branch is just ``feature``.
+        If a local branch with that name already exists the checkout proceeds
+        directly; otherwise a branch is created at the remote-tracking tip
+        first.
+
+        Returns ``True`` on success, ``False`` on failure.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            self._log("checkout",
+                      f"Checkout remote {remote_name!r} failed: no repo", level="error")
+            return False
+        if "/" not in remote_name:
+            self.error_occurred.emit(f"Not a remote branch: {remote_name!r}")
+            return False
+        local_name = remote_name.split("/", 1)[1]
+        self._log("checkout", f"Checkout remote {remote_name!r} -> local {local_name!r}")
+
+        remote_branches = {
+            b.name: b for b in self._repo_manager.branches if b.is_remote
+        }
+        remote_info = remote_branches.get(remote_name)
+        if remote_info is None:
+            self.error_occurred.emit(f"Unknown remote branch: {remote_name!r}")
+            self._log("checkout",
+                      f"Unknown remote branch: {remote_name!r}", level="error")
+            return False
+
+        target_sha = remote_info.target_sha
+
+        existing = {b.name for b in self._repo_manager.branches if not b.is_remote}
+        if local_name not in existing:
+            self._log("checkout",
+                      f"Creating local branch {local_name!r} at {target_sha[:7]}")
+            if not self._create_branch_internal(local_name, target_sha):
+                return False
+
+        return self.checkout_branch(local_name)
+
     def create_branch(self, name: str, target_sha: str | None = None) -> None:
         """Create a local branch via :class:`CreateBranchCommand`."""
         if self._repo_manager is None or not self._repo_manager.is_open:
@@ -301,6 +344,20 @@ class MainViewModel(QObject):
             return
         self._refresh_all_views()
         self._log("branch", f"Branch {name!r} created")
+
+    def _create_branch_internal(self, name: str, target_sha: str) -> bool:
+        """Create a local branch without refreshing views; returns success flag."""
+        from src.viewmodels.commands import CreateBranchCommand
+
+        command = CreateBranchCommand(self._repo_manager, name, target_sha)
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("branch", f"Create branch {name!r} failed: {exc}", level="error")
+            return False
+        self._log("branch", f"Branch {name!r} created at {target_sha[:7]}")
+        return True
 
     def delete_branch(self, name: str, force: bool = False) -> None:
         """Delete a local branch via :class:`DeleteBranchCommand`."""
@@ -379,6 +436,7 @@ class MainViewModel(QObject):
             self._run_async(
                 command,
                 on_success=lambda: self._refresh_all_views(),
+                log_tag="merge",
             )
             return
         self._execute_merge_sync(command, source, target)
@@ -405,6 +463,7 @@ class MainViewModel(QObject):
             self._run_async(
                 command,
                 on_success=lambda: self._refresh_all_views(),
+                log_tag="rebase",
             )
             return
         self._execute_rebase_sync(command, upstream)
@@ -504,6 +563,8 @@ class MainViewModel(QObject):
                 self._log("fetch", f"Fetch failed: {exc}", level="error")
             return
         self._refresh_all_views()
+        if not silent:
+            self._log("fetch", "Fetch succeeded")
 
     def _execute_clone_sync(self, url: str, path: str) -> None:
         try:
@@ -681,6 +742,7 @@ class MainViewModel(QObject):
             self._run_async(
                 command,
                 on_success=lambda: self._refresh_all_views(),
+                log_tag="push",
             )
             return
         self._execute_push_sync(command)
@@ -713,6 +775,7 @@ class MainViewModel(QObject):
             self._run_async(
                 command,
                 on_success=lambda: self._refresh_all_views(),
+                log_tag="pull",
             )
             return
         self._execute_pull_sync(command, remote_name, refspec)
@@ -748,6 +811,7 @@ class MainViewModel(QObject):
                 command,
                 on_success=lambda: self._refresh_all_views(),
                 silent_on_failure=silent,
+                log_tag="fetch" if not silent else "",
             )
             return
         self._execute_fetch_sync(command, silent)
@@ -1042,6 +1106,7 @@ class MainViewModel(QObject):
         on_success: object,
         *,
         silent_on_failure: bool = False,
+        log_tag: str = "",
     ) -> None:
         """Run ``command.execute()`` on a worker thread.
 
@@ -1055,6 +1120,9 @@ class MainViewModel(QObject):
         is still surfaced because the user must resolve it. The
         auto-fetch timer uses silent mode so a dropped connection
         does not flash a status-bar error every minute.
+
+        ``log_tag`` is used to emit success/failure log entries
+        (e.g. ``"fetch"``, ``"push"``).
         """
         if self._is_busy:
             return
@@ -1062,19 +1130,19 @@ class MainViewModel(QObject):
         self.busy_changed.emit(True)
 
         def _work() -> None:
-            # Runs on the worker thread. CommandProcessor.execute
-            # pushes the command to the undo stack and emits
-            # ``stack_changed`` — both safe because the re-entrancy
-            # guard has disabled every UI button that could race.
             self._command_processor.execute(command)  # type: ignore[arg-type]
 
         def _on_result(_: object) -> None:
+            if log_tag:
+                self._log(log_tag, "Operation succeeded")
             on_success()  # type: ignore[operator]
 
         worker = AsyncWorker(_work)
         worker.signals.result.connect(_on_result)
         worker.signals.failed.connect(
-            lambda message: self._on_async_failed(command, message, silent_on_failure),
+            lambda message: self._on_async_failed(
+                command, message, silent_on_failure, log_tag=log_tag,
+            ),
         )
         worker.signals.finished.connect(self._on_async_finished)
         QThreadPool.globalInstance().start(worker)
@@ -1084,12 +1152,12 @@ class MainViewModel(QObject):
         command: object,
         message: str,
         silent: bool = False,
+        *,
+        log_tag: str = "",
     ) -> None:
         """Map a worker exception back into the VM's error/conflict paths."""
-        # ``message`` is the stringified exception raised on the
-        # worker thread. We don't have the exception instance, so we
-        # re-create the state by checking the repository for in-progress
-        # markers and surfacing the appropriate error.
+        if log_tag:
+            self._log(log_tag, f"Operation failed: {message}", level="error")
         if self._repo_manager is None:
             if not silent:
                 self.error_occurred.emit(message)
