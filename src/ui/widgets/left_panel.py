@@ -17,17 +17,21 @@ Layout: a single :class:`QTreeWidget` with three top-level groups:
 
 Context menu (right-click):
 
-* On a local branch: **Checkout**, **Create Branch from here…**,
-  **Rename…**, **Delete**.
-* On a remote branch: **Create Branch from here…** (Stage 5 will
-  add a real "create tracking branch and checkout" option; for now
-  we just refuse remote-checkout with a clear message).
-* On a tag: **Create Branch from here…**.
+* On a local branch: **Checkout**, **Merge into current…**,
+  **Rebase onto current…**, **Create Branch from here…**,
+  **Rename…**, **Delete**, **Cherry-pick HEAD…** (a placeholder —
+  real cherry-pick is in Stage 5+).
+* On a remote branch: **Create Branch from here…**.
+* On a tag: **Create Branch from here…**, **Cherry-pick {tag}…**.
 * On empty space (or top-level group): **Create Branch from HEAD…**.
 
-Drag-and-drop is enabled on local-branch leaves and on the empty
-top-level area, but a real merge / rebase is a Stage 5 feature —
-for now the drop event shows an informational :class:`QMessageBox`.
+Drag-and-drop: dragging a local branch onto another local branch
+opens a small menu with **Merge {source} into {target}** and
+**Rebase {source} onto {target}**. The actual operations are
+invoked on :class:`MainViewModel`; the panel never touches Git
+state directly. The ``source == target`` and ``source is the
+current branch`` cases are filtered out — both would be no-ops
+or merge into self.
 
 All actions ultimately call the corresponding verb method on
 :class:`MainViewModel`; the panel never raises Git errors itself,
@@ -35,8 +39,8 @@ the ViewModel forwards them to its ``error_occurred`` signal.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QFont
+from PySide6.QtCore import QMimeData, Qt
+from PySide6.QtGui import QAction, QDragEnterEvent, QDragMoveEvent, QDropEvent, QFont
 from PySide6.QtWidgets import (
     QInputDialog,
     QLineEdit,
@@ -219,20 +223,7 @@ class LeftPanel(QTreeWidget):
             return []
         actions: list[QAction] = []
         if kind == _KIND_LOCAL_BRANCH:
-            checkout = QAction("Checkout", self)
-            checkout.triggered.connect(lambda: self._main_vm.checkout_branch(name))
-            actions.append(checkout)
-            actions.append(QAction(self))  # visual separator; exec skips it
-            actions[-1].setSeparator(True)
-            create_from = QAction(f"Create Branch from {name}…", self)
-            create_from.triggered.connect(lambda: self._prompt_create_branch(from_name=name))
-            actions.append(create_from)
-            rename = QAction("Rename…", self)
-            rename.triggered.connect(lambda: self._prompt_rename(old_name=name))
-            actions.append(rename)
-            delete = QAction("Delete…", self)
-            delete.triggered.connect(lambda: self._prompt_delete(name))
-            actions.append(delete)
+            actions.extend(self._local_branch_actions(name))
         elif kind == _KIND_REMOTE_BRANCH:
             create_from = QAction(f"Create Branch from {name}…", self)
             create_from.triggered.connect(lambda: self._prompt_create_branch(from_name=name))
@@ -241,24 +232,197 @@ class LeftPanel(QTreeWidget):
             create_from = QAction(f"Create Branch from {name}…", self)
             create_from.triggered.connect(lambda: self._prompt_create_branch(from_name=name))
             actions.append(create_from)
+            actions.extend(self._tag_cherry_pick_actions(name))
         elif kind == _KIND_STASH:
             apply = QAction("Apply (Stage 7)", self)
             apply.setEnabled(False)
             actions.append(apply)
         return actions
 
-    # ----- drag-and-drop stub -----------------------------------------
+    def _local_branch_actions(self, name: str) -> list[QAction]:
+        """Build the context-menu actions for a local branch leaf."""
+        actions: list[QAction] = []
+        checkout = QAction("Checkout", self)
+        checkout.triggered.connect(lambda: self._main_vm.checkout_branch(name))
+        actions.append(checkout)
+        actions.extend(self._merge_rebase_against_current(name))
+        actions.append(QAction(self))  # visual separator; exec skips it
+        actions[-1].setSeparator(True)
+        create_from = QAction(f"Create Branch from {name}…", self)
+        create_from.triggered.connect(lambda: self._prompt_create_branch(from_name=name))
+        actions.append(create_from)
+        rename = QAction("Rename…", self)
+        rename.triggered.connect(lambda: self._prompt_rename(old_name=name))
+        actions.append(rename)
+        delete = QAction("Delete…", self)
+        delete.triggered.connect(lambda: self._prompt_delete(name))
+        actions.append(delete)
+        return actions
 
-    def dropEvent(self, event) -> None:  # noqa: ANN001, N802 - QDropEvent + Qt override
+    def _merge_rebase_against_current(self, name: str) -> list[QAction]:
+        """Add Merge / Rebase / Cherry-pick actions that target the current HEAD.
+
+        If ``name`` *is* the current branch the actions are added but
+        disabled — merging a branch into itself is a no-op. Cherry-pick
+        is a placeholder for now; the real dialog is in Stage 5+.
+        """
+        actions: list[QAction] = []
+        mgr = self._main_vm.repository_manager()
+        is_current = (
+            mgr is not None
+            and not mgr.repo.head_is_unborn
+            and mgr.repo.head.shorthand == name
+        )
+        merge = QAction(f"Merge {name} into current…", self)
+        merge.triggered.connect(
+            lambda: self._main_vm.merge_branch(name, target=self._current_branch_name()),
+        )
+        merge.setEnabled(not is_current)
+        actions.append(merge)
+        rebase = QAction(f"Rebase {name} onto current…", self)
+        rebase.triggered.connect(
+            lambda: self._rebase_source_onto_target(name, self._current_branch_name()),
+        )
+        rebase.setEnabled(not is_current)
+        actions.append(rebase)
+        return actions
+
+    def _tag_cherry_pick_actions(self, tag_name: str) -> list[QAction]:
+        actions: list[QAction] = []
+        cherry = QAction(f"Cherry-pick {tag_name}…", self)
+        cherry.triggered.connect(lambda: self._prompt_cherry_pick(label=tag_name))
+        actions.append(cherry)
+        return actions
+
+    def _current_branch_name(self) -> str:
+        mgr = self._main_vm.repository_manager()
+        if mgr is None or mgr.repo.head_is_unborn:
+            return ""
+        return mgr.repo.head.shorthand
+
+    def _prompt_cherry_pick(self, label: str) -> None:
+        """Ask for a SHA and dispatch :meth:`MainViewModel.cherry_pick`."""
+        sha, ok = QInputDialog.getText(
+            self,
+            "Cherry-pick",
+            f"Cherry-pick commit SHA for {label}:",
+            QLineEdit.EchoMode.Normal,
+            "",
+        )
+        if not ok:
+            return
+        sha = sha.strip()
+        if not sha:
+            return
+        self._main_vm.cherry_pick(sha)
+
+    # ----- drag-and-drop ---------------------------------------------
+
+    def mimeData(self, items):  # noqa: ANN001, N802 - Qt override + return type
+        """Return a :class:`QMimeData` whose text is the bare branch name.
+
+        The default :class:`QTreeWidget` implementation uses the
+        item's display text — which for the current branch is
+        ``"name  (HEAD)"``. Overriding here gives the drop handler
+        a clean identifier to work with.
+        """
+        data = super().mimeData(items)
+        if not items or self._group_local is None:
+            return data
+        item = items[0]
+        if item.parent() is not self._group_local:
+            return data
+        name = item.data(0, _ROLE_NAME)
+        if isinstance(data, QMimeData) and name:
+            data.setText(str(name))
+        return data
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
         if event.mimeData().hasText():
-            QMessageBox.information(
-                self,
-                "Drag and drop",
-                "Drag-and-drop merge/rebase will be implemented on Stage 5.",
-            )
             event.acceptProposedAction()
         else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # noqa: N802
+        if event.mimeData().hasText():
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802 - Qt override
+        if not event.mimeData().hasText():
             super().dropEvent(event)
+            return
+        source_name = event.mimeData().text()
+        target_item = self.itemAt(event.position().toPoint())
+        actions = self._on_drop(source_name, target_item)
+        if not actions:
+            event.ignore()
+            return
+        menu = QMenu(self)
+        for action in actions:
+            menu.addAction(action)
+        menu.exec(event.position().toPoint())
+        event.acceptProposedAction()
+
+    def _on_drop(
+        self,
+        source_name: str,
+        target_item: QTreeWidgetItem | None,
+    ) -> list[QAction]:
+        """Return the menu actions a drop would show, or ``[]`` to ignore.
+
+        Exposed (single-underscore) so tests can verify the menu
+        contents without running a real ``QMenu.exec()``. The drop
+        itself is filtered:
+
+        * No target or invalid target → ``[]`` (ignore).
+        * ``source == target`` → ``[]`` (merging a branch into itself).
+        * Target is not a local branch → ``[]`` (we only allow
+          dropping on local branches for now).
+        """
+        if not source_name or target_item is None:
+            return []
+        target_kind = target_item.data(0, _ROLE_KIND)
+        target_name = target_item.data(0, _ROLE_NAME)
+        if not target_kind or not target_name:
+            return []
+        if source_name == target_name:
+            return []
+        if target_kind != _KIND_LOCAL_BRANCH:
+            return []
+        return self._drop_actions(source_name, target_name)
+
+    def _drop_actions(self, source: str, target: str) -> list[QAction]:
+        """Build the list of actions for a drop on ``target`` of ``source``."""
+        actions: list[QAction] = []
+        merge = QAction(f"Merge {source} into {target}", self)
+        merge.triggered.connect(
+            lambda: self._main_vm.merge_branch(source, target=target),
+        )
+        actions.append(merge)
+        rebase = QAction(f"Rebase {source} onto {target}", self)
+        rebase.triggered.connect(
+            lambda: self._rebase_source_onto_target(source, target),
+        )
+        actions.append(rebase)
+        return actions
+
+    def _rebase_source_onto_target(self, source: str, target: str) -> None:
+        """Issue the two-command sequence: checkout ``source`` then rebase onto ``target``.
+
+        The two commands are pushed onto the undo stack separately
+        so the user can undo each step independently. If the user is
+        already on ``source`` the checkout is a no-op (the VM still
+        calls into the processor, which is fine).
+        """
+        mgr = self._main_vm.repository_manager()
+        current = None
+        if mgr is not None and not mgr.repo.head_is_unborn:
+            current = mgr.repo.head.shorthand
+        if current != source:
+            self._main_vm.checkout_branch(source)
+        self._main_vm.rebase_branch(target)
 
     # ----- prompts (small dialogs) ------------------------------------
 

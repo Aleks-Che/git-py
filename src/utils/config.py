@@ -16,7 +16,24 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "theme": "dark",
     "panel_layout": {},
     "hotkeys": {},
+    # Merge operations touching more than this many files are routed
+    # through :class:`AsyncWorker` so the UI stays responsive.
+    # Rebase is always async regardless of size.
+    "merge_async_threshold": 50,
 }
+
+# Keys that must be ints (validation on load; bad values fall back).
+_INT_KEYS = frozenset({"merge_async_threshold"})
+
+
+def get_int(config: dict[str, Any], key: str, default: int) -> int:
+    """Read an int-valued config key, returning ``default`` on bad / missing values."""
+    value = config.get(key)
+    if isinstance(value, bool):  # bool is a subclass of int, reject explicitly
+        return default
+    if isinstance(value, int):
+        return value
+    return default
 
 
 def load_config(path: Path | str) -> dict[str, Any]:

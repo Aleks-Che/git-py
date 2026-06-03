@@ -3,7 +3,10 @@
 Stage 3 wires the central :class:`MainViewModel` into the window and
 adds the WIP / commit panel to the right side. Stage 4 swaps the
 left-panel stub for the real references tree
-(:class:`LeftPanel`). Layout:
+(:class:`LeftPanel`). Stage 5 adds a re-entrancy guard + spinner for
+long-running operations (rebase, large merge).
+
+Layout:
 
 * **Left:** :class:`LeftPanel` — branches / tags / stash tree
 * **Centre:** :class:`GraphWidget` (Stage 2)
@@ -18,6 +21,12 @@ constructor argument (preferred) or look it up via
 :meth:`MainWindow.main_view_model`. The toolbar Undo / Redo actions
 bind to :meth:`MainViewModel.undo` / :meth:`MainViewModel.redo` and
 their enabled state tracks the processor's ``stack_changed`` signal.
+
+Per ``docs/DEVELOPMENT_RULES.md`` section 3, long-running operations
+(rebase, large merges) are routed through :class:`AsyncWorker`. While
+such an operation is in flight :attr:`MainViewModel.busy_changed`
+fires; the window disables mutating toolbar actions and shows a
+spinner in the status bar.
 """
 from __future__ import annotations
 
@@ -27,6 +36,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QSplitter,
     QStatusBar,
 )
@@ -49,12 +59,15 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("git-py")
         self.resize(1280, 800)
 
-        self._main_vm = MainViewModel(self)
+        # ``async_enabled=True`` enables the long-running path for
+        # rebase and large merges (see ``MainViewModel.busy_changed``).
+        self._main_vm = MainViewModel(self, async_enabled=True)
         self._repo_manager: RepositoryManager | None = None
 
         self._build_menu()
         self._build_central()
         self._build_status_bar()
+        self._main_vm.busy_changed.connect(self._on_busy_changed)
 
     # ----- public API (also used by tests) -----------------------------
 
@@ -184,10 +197,28 @@ class MainWindow(QMainWindow):
     def _build_status_bar(self) -> None:
         self._status = QStatusBar(self)
         self._status.showMessage("No repository")
+        # Indeterminate spinner shown while a long-running Git
+        # operation (rebase, large merge) is running on a worker
+        # thread. Hidden by default; ``_on_busy_changed`` toggles it.
+        self._busy_spinner = QProgressBar(self)
+        self._busy_spinner.setRange(0, 0)  # indeterminate marquee
+        self._busy_spinner.setMaximumWidth(140)
+        self._busy_spinner.setTextVisible(False)
+        self._busy_spinner.hide()
+        self._status.addPermanentWidget(self._busy_spinner)
         self.setStatusBar(self._status)
 
         self._main_vm.error_occurred.connect(self._on_error)
         self._main_vm.repository_changed.connect(self._on_repository_changed)
+
+    def _on_busy_changed(self, busy: bool) -> None:
+        """Show / hide the spinner and toggle the re-entrancy guard."""
+        self._busy_spinner.setVisible(busy)
+        if busy:
+            self._status.showMessage("Working…")
+        # Disable the toolbar buttons that could race with the worker.
+        for action in (self._action_undo, self._action_redo, self._action_close):
+            action.setEnabled(action.isEnabled() and not busy)
 
     def _on_error(self, message: str) -> None:
         self._status.showMessage(f"Error: {message}", 8000)

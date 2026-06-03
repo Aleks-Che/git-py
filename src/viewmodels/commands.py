@@ -20,12 +20,18 @@ import pygit2
 from PySide6.QtCore import QObject, Signal
 
 from src.core.operations import (
+    abort_rebase,
     checkout_branch,
+    cherry_pick,
     commit_changes,
     create_branch,
     delete_branch,
+    is_rebase_in_progress,
+    merge_branch,
+    rebase_branch,
     rename_branch,
     reset,
+    revert,
 )
 from src.core.repository import RepositoryManager
 
@@ -311,12 +317,184 @@ class RenameBranchCommand(GitCommand):
         return f"rename branch {self._old_name} → {self._new_name}"
 
 
+# ----- merge / rebase / cherry-pick / revert --------------------------------
+
+
+class MergeCommand(GitCommand):
+    """Merge ``source`` into the current HEAD; undo by resetting back.
+
+    Captures the pre-merge HEAD SHA on :meth:`execute` so undo can
+    move the ref back. Handles three outcomes:
+
+    * **Up-to-date** — no SHA change; undo is a no-op.
+    * **Fast-forward** — the current branch ref is moved to
+      ``source_oid``; undo is ``reset(_previous_head_sha, hard)``.
+    * **Three-way merge** — a merge commit with two parents is
+      created; undo is ``reset(_previous_head_sha, hard)``.
+
+    A conflict (``MergeConflictError`` from the core layer) propagates
+    out of :meth:`execute`; the processor therefore does *not* push
+    the command onto the undo stack on failure, and the ViewModel
+    picks up the conflict state from the exception.
+    """
+
+    def __init__(
+        self,
+        repo: RepositoryManager,
+        source: str,
+        target: str | None = None,
+        message: str | None = None,
+    ) -> None:
+        self._repo = repo
+        self._source = source
+        self._target = target
+        self._message = message
+        self._previous_head: str | None = None
+        self._head_moved = False
+
+    def execute(self) -> None:
+        pygit2_repo = self._repo.repo
+        if not pygit2_repo.head_is_unborn:
+            self._previous_head = str(pygit2_repo.head.target)
+        else:
+            self._previous_head = None
+        merge_branch(
+            self._repo,
+            self._source,
+            target=self._target,
+            message=self._message,
+        )
+        if self._previous_head is None:
+            self._head_moved = False
+        else:
+            self._head_moved = str(pygit2_repo.head.target) != self._previous_head
+
+    def undo(self) -> None:
+        if self._previous_head is None or not self._head_moved:
+            # Nothing moved (up-to-date) or the original HEAD was
+            # unborn — undo is a silent no-op so the user is not
+            # left with a half-applied state.
+            return
+        reset(self._repo, self._previous_head, mode="hard")
+
+    @property
+    def name(self) -> str:
+        suffix = f" into {self._target}" if self._target else ""
+        return f"merge {self._source}{suffix}"
+
+
+class RebaseCommand(GitCommand):
+    """Rebase the current branch onto ``upstream``; undo by resetting.
+
+    Pre-rebase HEAD SHA is captured so undo can move the ref back.
+    If the rebase is still in flight (conflict) when undo runs, the
+    command aborts the in-progress rebase via ``git rebase --abort``
+    instead of resetting — aborting leaves the tree at the pre-rebase
+    state, which is exactly what the user wants.
+
+    ``RebaseConflictError`` propagates out of :meth:`execute` so the
+    processor does not push the command on failure.
+    """
+
+    def __init__(self, repo: RepositoryManager, upstream: str) -> None:
+        self._repo = repo
+        self._upstream = upstream
+        self._previous_head: str | None = None
+
+    def execute(self) -> None:
+        pygit2_repo = self._repo.repo
+        if not pygit2_repo.head_is_unborn:
+            self._previous_head = str(pygit2_repo.head.target)
+        rebase_branch(self._repo, self._upstream)
+
+    def undo(self) -> None:
+        if is_rebase_in_progress(self._repo):
+            # Conflict mid-rebase: abort to roll back to the pre-rebase
+            # state. ``previous_head`` is irrelevant here — the abort
+            # already restores the original branch.
+            abort_rebase(self._repo)
+            return
+        if self._previous_head is None:
+            return
+        reset(self._repo, self._previous_head, mode="hard")
+
+    @property
+    def name(self) -> str:
+        return f"rebase onto {self._upstream}"
+
+
+class CherryPickCommand(GitCommand):
+    """Cherry-pick ``sha`` onto the current HEAD; undo by resetting --mixed.
+
+    :func:`src.core.operations.cherry_pick` only *stages* the change
+    (matching ``git cherry-pick --no-commit`` semantics) — the user
+    makes a follow-up commit themselves, which lands on the undo
+    stack as a separate :class:`CommitCommand`. Undoing this command
+    clears the staged changes by resetting the index to match the
+    pre-pick HEAD; combined with the ``CommitCommand`` undo, the
+    cherry-pick is fully reverted.
+    """
+
+    def __init__(self, repo: RepositoryManager, sha: str) -> None:
+        self._repo = repo
+        self._sha = sha
+        self._previous_head: str | None = None
+
+    def execute(self) -> None:
+        pygit2_repo = self._repo.repo
+        if not pygit2_repo.head_is_unborn:
+            self._previous_head = str(pygit2_repo.head.target)
+        cherry_pick(self._repo, self._sha)
+
+    def undo(self) -> None:
+        if self._previous_head is None:
+            return
+        # ``--mixed`` resets the index to match HEAD but leaves the
+        # worktree alone. The cherry-pick only touched the index, so
+        # this cleanly reverts the staged change.
+        reset(self._repo, self._previous_head, mode="mixed")
+
+    @property
+    def name(self) -> str:
+        short = self._sha[:7] if len(self._sha) >= 7 else self._sha
+        return f"cherry-pick {short}"
+
+
+class RevertCommand(GitCommand):
+    """Revert ``sha``; undo by resetting --mixed (mirror of cherry-pick)."""
+
+    def __init__(self, repo: RepositoryManager, sha: str) -> None:
+        self._repo = repo
+        self._sha = sha
+        self._previous_head: str | None = None
+
+    def execute(self) -> None:
+        pygit2_repo = self._repo.repo
+        if not pygit2_repo.head_is_unborn:
+            self._previous_head = str(pygit2_repo.head.target)
+        revert(self._repo, self._sha)
+
+    def undo(self) -> None:
+        if self._previous_head is None:
+            return
+        reset(self._repo, self._previous_head, mode="mixed")
+
+    @property
+    def name(self) -> str:
+        short = self._sha[:7] if len(self._sha) >= 7 else self._sha
+        return f"revert {short}"
+
+
 __all__ = [
     "CheckoutCommand",
+    "CherryPickCommand",
     "CommandProcessor",
     "CommitCommand",
     "CreateBranchCommand",
     "DeleteBranchCommand",
     "GitCommand",
+    "MergeCommand",
+    "RebaseCommand",
     "RenameBranchCommand",
+    "RevertCommand",
 ]

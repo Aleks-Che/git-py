@@ -20,9 +20,11 @@ in ``PATH``.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pygit2
@@ -354,6 +356,209 @@ def rebase_branch(
         raise GitError(f"Rebase failed: {completed.stderr.strip() or completed.stdout.strip()}")
 
 
+# ----- merge / rebase state checks, abort, and finalize --------------------
+
+
+def _git_dir(repo: pygit2.Repository) -> Path:
+    """Return the path to the repository's git directory.
+
+    For a normal repo this is ``<workdir>/.git``; for a bare repo it is
+    the repo's own directory. ``pygit2.Repository.path`` is the git dir
+    in both cases. Worktrees are not supported yet (Stage 5+).
+    """
+    return Path(repo.path)
+
+
+def is_merge_in_progress(repo: RepositoryManager | pygit2.Repository) -> bool:
+    """Return ``True`` if a merge is in progress (``.git/MERGE_HEAD`` exists)."""
+    with unwrap(repo) as r:
+        merge_head = _git_dir(r) / "MERGE_HEAD"
+    return merge_head.is_file()
+
+
+def is_rebase_in_progress(repo: RepositoryManager | pygit2.Repository) -> bool:
+    """Return ``True`` if a rebase is in progress.
+
+    Checks both ``.git/rebase-apply/`` (interactive rebase / ``git am``)
+    and ``.git/rebase-merge/`` (non-interactive rebase) directories. A
+    bare repo is never in a rebase.
+    """
+    with unwrap(repo) as r:
+        if r.is_bare:
+            return False
+        gd = _git_dir(r)
+    return (gd / "rebase-apply").is_dir() or (gd / "rebase-merge").is_dir()
+
+
+def _run_git_in_workdir(
+    repo: pygit2.Repository,
+    args: list[str],
+) -> subprocess.CompletedProcess[str]:
+    """Run ``git <args>`` in ``repo.workdir``; raise domain errors on failure."""
+    workdir = repo.workdir
+    if workdir is None:
+        raise GitError("Cannot run git in a bare repository.")
+    git = shutil.which("git")
+    if git is None:
+        raise GitNotInstalledError("`git` CLI is not in PATH.")
+    try:
+        return subprocess.run(
+            [git, *args],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise GitError(f"Failed to spawn git: {exc}") from exc
+
+
+def abort_merge(repo: RepositoryManager | pygit2.Repository) -> None:
+    """Abort the in-progress merge via ``git merge --abort``.
+
+    Raises :class:`GitError` if there is no merge in progress or the
+    command fails. The caller is expected to verify
+    :func:`is_merge_in_progress` first; calling ``abort_merge`` on a
+    clean tree is an error.
+    """
+    with unwrap(repo) as r:
+        if not is_merge_in_progress(r):
+            raise GitError("No merge in progress.")
+        completed = _run_git_in_workdir(r, ["merge", "--abort"])
+    if completed.returncode != 0:
+        raise GitError(
+            f"git merge --abort failed: "
+            f"{completed.stderr.strip() or completed.stdout.strip()}",
+        )
+
+
+def abort_rebase(repo: RepositoryManager | pygit2.Repository) -> None:
+    """Abort the in-progress rebase via ``git rebase --abort``."""
+    with unwrap(repo) as r:
+        if not is_rebase_in_progress(r):
+            raise GitError("No rebase in progress.")
+        completed = _run_git_in_workdir(r, ["rebase", "--abort"])
+    if completed.returncode != 0:
+        raise GitError(
+            f"git rebase --abort failed: "
+            f"{completed.stderr.strip() or completed.stdout.strip()}",
+        )
+
+
+def complete_merge(
+    repo: RepositoryManager | pygit2.Repository,
+    source: str,
+    target: str | None = None,
+    message: str | None = None,
+) -> str:
+    """Finalize a resolved merge by creating the merge commit.
+
+    Assumes the index has no more conflicts and contains the resolved
+    tree. Returns the new merge commit's SHA.
+
+    - ``source`` is the ref / branch / SHA that was being merged in
+      (kept as the second parent of the merge commit).
+    - ``target`` defaults to the current branch; the target ref is
+      moved to the new commit (matches ``git merge`` semantics for the
+      in-progress case).
+    - ``message`` defaults to ``"Merge {source} into {target}"``.
+
+    Raises :class:`GitError` if no merge is in progress. The MERGE_HEAD
+    / MERGE_MSG state files are cleared on success so the repo leaves
+    the in-progress state.
+    """
+    with unwrap(repo) as r:
+        if r.head_is_unborn:
+            raise GitError("Cannot complete a merge: HEAD is unborn.")
+        if not is_merge_in_progress(r):
+            raise GitError("No merge in progress.")
+        try:
+            source_oid = r.revparse_single(source).peel(pygit2.Commit).id
+        except (KeyError, pygit2.GitError, ValueError) as exc:
+            raise InvalidRefError(f"Unknown source: {source!r}") from exc
+        conflicts = _collect_conflicts(r)
+        if conflicts:
+            raise MergeConflictError(
+                f"Cannot complete merge: conflicts remain in {len(conflicts)} file(s).",
+                conflicting_paths=conflicts,
+            )
+        head_oid = r.head.target
+        try:
+            tree_oid = r.index.write_tree()
+            target_name = target or r.head.shorthand
+            merge_msg = message or f"Merge {source} into {target_name}"
+            merge_oid = r.create_commit(
+                "HEAD",
+                _now_signature(),
+                _now_signature(),
+                merge_msg,
+                tree_oid,
+                [head_oid, source_oid],
+            )
+            ref = r.lookup_reference(f"refs/heads/{target_name}")
+            ref.set_target(merge_oid)
+        except pygit2.GitError as exc:
+            raise GitError(f"Failed to create merge commit: {exc}") from exc
+        # Clear in-progress state so is_merge_in_progress() returns False
+        # and the worktree / status refreshes to "clean".
+        for state_file in ("MERGE_HEAD", "MERGE_MSG"):
+            path = _git_dir(r) / state_file
+            if path.is_file():
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    raise GitError(
+                        f"Failed to clear {state_file}: {exc}",
+                    ) from exc
+    return str(merge_oid)
+
+
+def complete_rebase_continue(repo: RepositoryManager | pygit2.Repository) -> bool:
+    """Continue an in-progress rebase after the user resolved conflicts.
+
+    Runs ``git rebase --continue`` with ``GIT_EDITOR=true`` so the
+    command does not block waiting for input — the original commit
+    message is reused (``--continue`` does not change it).
+
+    Returns ``True`` if the rebase is fully done, ``False`` if more
+    commits still have to be applied (and the next step produced new
+    conflicts).
+    """
+    with unwrap(repo) as r:
+        if not is_rebase_in_progress(r):
+            raise GitError("No rebase in progress.")
+        workdir = r.workdir
+    if workdir is None:
+        raise GitError("Cannot continue a rebase in a bare repository.")
+    git = shutil.which("git")
+    if git is None:
+        raise GitNotInstalledError("`git` CLI is not in PATH.")
+    env = {**os.environ, "GIT_EDITOR": "true"}
+    try:
+        completed = subprocess.run(
+            [git, "rebase", "--continue"],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+    except OSError as exc:
+        raise GitError(f"Failed to spawn git: {exc}") from exc
+    if completed.returncode != 0:
+        if "conflict" in (completed.stderr + completed.stdout).lower():
+            # Not an error per se: there are more commits to apply and
+            # the next one conflicted. Return False so the caller can
+            # prompt for resolution again.
+            return False
+        raise GitError(
+            f"git rebase --continue failed: "
+            f"{completed.stderr.strip() or completed.stdout.strip()}",
+        )
+    with unwrap(repo) as r:
+        return not is_rebase_in_progress(r)
+
+
 def cherry_pick(
     repo: RepositoryManager | pygit2.Repository,
     sha: str,
@@ -393,7 +598,7 @@ def revert(
         except (KeyError, pygit2.GitError, ValueError) as exc:
             raise InvalidRefError(f"Unknown revision: {sha!r}") from exc
         try:
-            r.revert(commit.id)
+            r.revert(commit)
         except pygit2.GitError as exc:
             raise GitError(f"Revert failed: {exc}") from exc
         conflicts = _collect_conflicts(r)
@@ -597,12 +802,18 @@ def pull(
 
 
 __all__ = [
+    "abort_merge",
+    "abort_rebase",
     "cherry_pick",
     "checkout_branch",
     "commit_changes",
+    "complete_merge",
+    "complete_rebase_continue",
     "create_branch",
     "delete_branch",
     "fetch",
+    "is_merge_in_progress",
+    "is_rebase_in_progress",
     "merge_branch",
     "pull",
     "push",

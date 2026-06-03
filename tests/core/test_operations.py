@@ -18,21 +18,29 @@ from src.core.exceptions import (
     GitNotInstalledError,
     InvalidRefError,
     MergeConflictError,
+    RebaseConflictError,
 )
 from src.core.models import FileStatus
 from src.core.operations import (
+    abort_merge,
+    abort_rebase,
     checkout_branch,
     cherry_pick,
     commit_changes,
+    complete_merge,
+    complete_rebase_continue,
     create_branch,
     delete_branch,
     fetch,
+    is_merge_in_progress,
+    is_rebase_in_progress,
     merge_branch,
     pull,
     push,
     rebase_branch,
     rename_branch,
     reset,
+    revert,
     stash_pop,
     stash_push,
 )
@@ -342,3 +350,232 @@ def test_push_to_unknown_remote_raises(committed_repo: RepositoryManager) -> Non
 def test_fetch_from_unknown_remote_raises(committed_repo: RepositoryManager) -> None:
     with pytest.raises(InvalidRefError):
         fetch(committed_repo, "no-such-remote")
+
+
+# ----- merge / rebase state, abort, and finalize ---------------------------
+
+
+def _create_conflict_setup(
+    committed_repo: RepositoryManager,
+) -> None:
+    """Build a 2-way conflict in ``hello.txt`` on the current branch.
+
+    Starts from ``committed_repo`` (HEAD on ``main`` with one tracked
+    file ``hello.txt``). Branches ``feature`` off HEAD, edits
+    ``hello.txt`` to a feature version, commits. Switches back to
+    ``main``, edits ``hello.txt`` to a main version, commits. The two
+    branches now diverge on the same line.
+    """
+    create_branch(committed_repo, "feature")
+    checkout_branch(committed_repo, "feature")
+    assert committed_repo.path is not None
+    (Path(committed_repo.path) / "hello.txt").write_text("feature says hi\n")
+    commit_changes(committed_repo, "feature hello")
+    checkout_branch(committed_repo, "main")
+    (Path(committed_repo.path) / "hello.txt").write_text("main says hi\n")
+    commit_changes(committed_repo, "main hello")
+
+
+def test_is_merge_in_progress_false_on_clean(committed_repo: RepositoryManager) -> None:
+    assert is_merge_in_progress(committed_repo) is False
+
+
+def test_is_merge_in_progress_true_during_conflict(
+    committed_repo: RepositoryManager,
+) -> None:
+    _create_conflict_setup(committed_repo)
+    with pytest.raises(MergeConflictError):
+        merge_branch(committed_repo, "feature")
+    assert is_merge_in_progress(committed_repo) is True
+
+
+def test_abort_merge_restores_clean_state(committed_repo: RepositoryManager) -> None:
+    _create_conflict_setup(committed_repo)
+    with pytest.raises(MergeConflictError):
+        merge_branch(committed_repo, "feature")
+    abort_merge(committed_repo)
+    assert is_merge_in_progress(committed_repo) is False
+    # Worktree returns to the main version of hello.txt.
+    assert committed_repo.path is not None
+    assert (Path(committed_repo.path) / "hello.txt").read_text() == "main says hi\n"
+
+
+def test_abort_merge_without_in_progress_raises(
+    committed_repo: RepositoryManager,
+) -> None:
+    with pytest.raises(GitError, match="No merge in progress"):
+        abort_merge(committed_repo)
+
+
+def test_abort_merge_without_git_cli_raises(
+    committed_repo: RepositoryManager,
+    monkeypatch,
+) -> None:
+    _create_conflict_setup(committed_repo)
+    with pytest.raises(MergeConflictError):
+        merge_branch(committed_repo, "feature")
+    monkeypatch.setattr(shutil, "which", lambda _: None)
+    with pytest.raises(GitNotInstalledError):
+        abort_merge(committed_repo)
+
+
+def test_complete_merge_finalizes_resolved_conflict(
+    committed_repo: RepositoryManager,
+) -> None:
+    _create_conflict_setup(committed_repo)
+    feature_head = next(
+        b.target_sha for b in committed_repo.branches if b.name == "feature"
+    )
+    with pytest.raises(MergeConflictError):
+        merge_branch(committed_repo, "feature")
+    # User resolves: pick "main" version, then stage.
+    assert committed_repo.path is not None
+    (Path(committed_repo.path) / "hello.txt").write_text("resolved!\n")
+    committed_repo.repo.index.add("hello.txt")
+    committed_repo.repo.index.write()
+    new_sha = complete_merge(committed_repo, "feature", target="main")
+    assert is_merge_in_progress(committed_repo) is False
+    assert committed_repo.head_commit.sha == new_sha
+    # Two parents: main's previous HEAD and the feature tip.
+    parents = committed_repo.head_commit.parents
+    assert len(parents) == 2
+    assert feature_head in parents
+    # Target branch ref now points at the merge commit.
+    main_ref = committed_repo.repo.lookup_reference("refs/heads/main")
+    assert str(main_ref.target) == new_sha
+
+
+def test_complete_merge_with_remaining_conflicts_raises(
+    committed_repo: RepositoryManager,
+) -> None:
+    _create_conflict_setup(committed_repo)
+    with pytest.raises(MergeConflictError):
+        merge_branch(committed_repo, "feature")
+    # No resolution attempted.
+    with pytest.raises(MergeConflictError, match="conflicts remain"):
+        complete_merge(committed_repo, "feature", target="main")
+
+
+def test_complete_merge_without_in_progress_raises(
+    committed_repo: RepositoryManager,
+) -> None:
+    with pytest.raises(GitError, match="No merge in progress"):
+        complete_merge(committed_repo, "feature")
+
+
+def test_complete_merge_unknown_source_raises(
+    committed_repo: RepositoryManager,
+) -> None:
+    _create_conflict_setup(committed_repo)
+    with pytest.raises(MergeConflictError):
+        merge_branch(committed_repo, "feature")
+    # Resolve the conflict so the "conflicts remain" guard is passed.
+    assert committed_repo.path is not None
+    (Path(committed_repo.path) / "hello.txt").write_text("ok\n")
+    committed_repo.repo.index.add("hello.txt")
+    committed_repo.repo.index.write()
+    with pytest.raises(InvalidRefError):
+        complete_merge(committed_repo, "no-such-source")
+
+
+# ----- rebase ----------------------------------------------------------------
+
+
+def test_is_rebase_in_progress_false_on_clean(
+    committed_repo: RepositoryManager,
+) -> None:
+    assert is_rebase_in_progress(committed_repo) is False
+
+
+def test_is_rebase_in_progress_true_during_conflict(
+    committed_repo: RepositoryManager,
+) -> None:
+    # Build a divergent history: main has commit A, feature has commit
+    # A' (same parent, different content) so rebase feature onto main
+    # conflicts on hello.txt.
+    _create_conflict_setup(committed_repo)
+    # We are on main; switch to feature and try to rebase onto main.
+    checkout_branch(committed_repo, "feature")
+    with pytest.raises(RebaseConflictError):
+        rebase_branch(committed_repo, "main")
+    assert is_rebase_in_progress(committed_repo) is True
+
+
+def test_abort_rebase_restores_clean_state(
+    committed_repo: RepositoryManager,
+) -> None:
+    _create_conflict_setup(committed_repo)
+    feature_head_before = committed_repo.repo.lookup_reference(
+        "refs/heads/feature",
+    ).target
+    checkout_branch(committed_repo, "feature")
+    with pytest.raises(RebaseConflictError):
+        rebase_branch(committed_repo, "main")
+    abort_rebase(committed_repo)
+    assert is_rebase_in_progress(committed_repo) is False
+    feature_head_after = committed_repo.repo.lookup_reference(
+        "refs/heads/feature",
+    ).target
+    assert feature_head_after == feature_head_before
+
+
+def test_abort_rebase_without_in_progress_raises(
+    committed_repo: RepositoryManager,
+) -> None:
+    with pytest.raises(GitError, match="No rebase in progress"):
+        abort_rebase(committed_repo)
+
+
+def test_complete_rebase_continue_without_in_progress_raises(
+    committed_repo: RepositoryManager,
+) -> None:
+    with pytest.raises(GitError, match="No rebase in progress"):
+        complete_rebase_continue(committed_repo)
+
+
+# ----- cherry-pick / revert (smoke) ------------------------------------------
+
+
+def test_cherry_pick_clean_returns_commit_info(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    mgr = RepositoryManager(str(tmp_git_repo))
+    base = make_commit("base", files={"a.txt": "A\n"})
+    feat = make_commit("adds-b", files={"b.txt": "B\n"}, parents=[base])
+    # cherry_pick only stages the change; HEAD does not move.
+    info = cherry_pick(mgr, str(feat))
+    assert info.sha == mgr.head_commit.sha
+    # b.txt was added by the cherry-pick; check it's staged in the index.
+    assert "b.txt" in mgr.repo.index
+
+
+def test_cherry_pick_conflict_raises_with_paths(
+    committed_repo: RepositoryManager,
+) -> None:
+    # feature modifies hello.txt, main modifies hello.txt differently
+    # (so cherry-picking feature onto main conflicts).
+    create_branch(committed_repo, "feature", target_sha=committed_repo.head_commit.sha)
+    assert committed_repo.path is not None
+    (Path(committed_repo.path) / "hello.txt").write_text("feature side\n")
+    commit_changes(committed_repo, "feature side")
+    checkout_branch(committed_repo, "main")
+    (Path(committed_repo.path) / "hello.txt").write_text("main side\n")
+    commit_changes(committed_repo, "main side")
+    feature_sha = next(
+        b.target_sha for b in committed_repo.branches if b.name == "feature"
+    )
+    with pytest.raises(MergeConflictError) as exc_info:
+        cherry_pick(committed_repo, feature_sha)
+    assert "hello.txt" in exc_info.value.conflicting_paths
+
+
+def test_revert_clean_returns_commit_info(
+    committed_repo: RepositoryManager,
+) -> None:
+    target_sha = committed_repo.head_commit.sha
+    info = revert(committed_repo, target_sha)
+    # ``revert()`` mirrors ``cherry_pick()`` — it stages the inverse
+    # change but does not commit. The returned CommitInfo is HEAD,
+    # which has not moved.
+    assert info.sha == target_sha
