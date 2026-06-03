@@ -6,7 +6,8 @@ left-panel stub for the real references tree
 (:class:`LeftPanel`). Stage 5 adds a re-entrancy guard + spinner for
 long-running operations (rebase, large merge). Stage 6 adds a
 ``Remote`` toolbar with Push / Pull / Fetch, a ``File > Clone…``
-dialog, and a ``Remote > Manage Remotes…`` dialog.
+dialog, and a ``Remote > Manage Remotes…`` dialog. Stage 9 adds
+persistence for window size and splitter positions.
 
 Layout:
 
@@ -30,11 +31,22 @@ Per ``docs/DEVELOPMENT_RULES.md`` section 3, long-running operations
 :class:`AsyncWorker`. While such an operation is in flight
 :attr:`MainViewModel.busy_changed` fires; the window disables mutating
 toolbar actions and shows a spinner in the status bar.
+
+Stage 9 persistence
+-------------------
+The constructor accepts an optional ``config_path``. When provided,
+the window restores its size and splitter positions from the JSON
+file on construction and writes them back on
+:meth:`closeEvent`. When ``config_path`` is ``None`` (the default,
+used by all existing tests) persistence is disabled — no file is
+read or written, so tests do not pollute the user's real config.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
     QMainWindow,
@@ -56,27 +68,57 @@ from src.ui.widgets.graph_widget import GraphWidget
 from src.ui.widgets.left_panel import LeftPanel
 from src.ui.widgets.log_widget import LogWidget
 from src.ui.widgets.terminal_widget import TerminalWidget
+from src.utils.config import (
+    SPLITTER_KEY_HORIZONTAL,
+    SPLITTER_KEY_RIGHT_VERTICAL,
+    load_config,
+    load_splitter_sizes,
+    load_window_size,
+    save_config,
+)
 from src.viewmodels.main_viewmodel import MainViewModel
 
 
 class MainWindow(QMainWindow):
     """Top-level window: graph + (commit panel / commit detail) over a terminal stub."""
 
-    def __init__(self) -> None:
+    def __init__(self, config_path: Path | str | None = None) -> None:
         super().__init__()
         self.setWindowTitle("git-py")
+        # Default size is overridden by :meth:`_restore_state` when
+        # ``config_path`` is provided. We still call ``resize`` here
+        # so callers that disable persistence (passing ``None``) see
+        # the same initial size as before Stage 9.
         self.resize(1280, 800)
 
         # ``async_enabled=True`` enables the long-running path for
         # rebase and large merges (see ``MainViewModel.busy_changed``).
         self._main_vm = MainViewModel(self, async_enabled=True)
         self._repo_manager: RepositoryManager | None = None
+        # ``config_path`` is the JSON file used for window /
+        # splitter persistence. ``None`` disables persistence
+        # entirely; the field is read by :meth:`_restore_state` and
+        # :meth:`closeEvent`.
+        self._config_path: Path | None = (
+            Path(config_path) if config_path is not None else None
+        )
+
+        # Splitter references are kept on ``self`` so the persistence
+        # layer can read / write their sizes in :meth:`_restore_state`
+        # and :meth:`closeEvent`. They are populated by
+        # :meth:`_build_central`.
+        self._top_splitter: QSplitter | None = None
+        self._right_splitter: QSplitter | None = None
 
         self._build_menu()
         self._build_toolbar()
         self._build_central()
         self._build_status_bar()
         self._main_vm.busy_changed.connect(self._on_busy_changed)
+        # ``_restore_state`` runs *after* the central widget is built
+        # because :meth:`setSizes` needs the children to be parented
+        # and laid out once.
+        self._restore_state()
 
     # ----- public API (also used by tests) -----------------------------
 
@@ -220,6 +262,7 @@ class MainWindow(QMainWindow):
         right_splitter.setStretchFactor(0, 1)
         right_splitter.setStretchFactor(1, 1)
         right_splitter.setSizes([320, 320])
+        self._right_splitter = right_splitter
 
         top = QSplitter(self)
         top.addWidget(self._left_panel)
@@ -228,6 +271,7 @@ class MainWindow(QMainWindow):
         top.setStretchFactor(0, 1)
         top.setStretchFactor(1, 4)
         top.setStretchFactor(2, 3)
+        self._top_splitter = top
 
         self._terminal = TerminalWidget(self)
         self._terminal.setMaximumHeight(180)
@@ -267,6 +311,57 @@ class MainWindow(QMainWindow):
         self._main_vm.repository_changed.connect(self._on_repository_changed)
         self._main_vm.log_message.connect(self._log_widget.append_log)
         self._main_vm.error_occurred.connect(self._log_widget.append_log)
+
+    # ----- state persistence (Stage 9) ---------------------------------
+
+    def _restore_state(self) -> None:
+        """Apply saved window size and splitter sizes from the config file.
+
+        No-op when :attr:`_config_path` is ``None`` — the constructor
+        is the only place that calls this, and the absence of a path
+        means persistence was explicitly disabled (e.g. in unit
+        tests). The default window size from :meth:`__init__` is
+        left untouched in that case.
+        """
+        if self._config_path is None:
+            return
+        config = load_config(self._config_path)
+        width, height = load_window_size(config)
+        self.resize(width, height)
+        splitter_sizes = load_splitter_sizes(config)
+        horizontal = splitter_sizes.get(SPLITTER_KEY_HORIZONTAL)
+        if horizontal is not None and self._top_splitter is not None and len(horizontal) == 3:
+            self._top_splitter.setSizes(horizontal)
+        right_vertical = splitter_sizes.get(SPLITTER_KEY_RIGHT_VERTICAL)
+        if (
+            right_vertical is not None
+            and self._right_splitter is not None
+            and len(right_vertical) == 2
+        ):
+            self._right_splitter.setSizes(right_vertical)
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt naming
+        """Persist the current geometry and splitter sizes before close.
+
+        We write to disk *before* delegating to ``super().closeEvent``
+        so a crash inside the base implementation cannot leave the
+        on-disk state one resize behind. When :attr:`_config_path` is
+        ``None`` this method is effectively a pass-through — the
+        configuration file is left untouched.
+        """
+        if self._config_path is not None:
+            config = load_config(self._config_path)
+            config["window_size"] = [self.width(), self.height()]
+            splitter_sizes: dict[str, list[int]] = {}
+            if self._top_splitter is not None:
+                splitter_sizes[SPLITTER_KEY_HORIZONTAL] = self._top_splitter.sizes()
+            if self._right_splitter is not None:
+                splitter_sizes[SPLITTER_KEY_RIGHT_VERTICAL] = (
+                    self._right_splitter.sizes()
+                )
+            config["splitter_sizes"] = splitter_sizes
+            save_config(self._config_path, config)
+        super().closeEvent(event)
 
     def _on_busy_changed(self, busy: bool) -> None:
         """Show / hide the spinner and toggle the re-entrancy guard."""

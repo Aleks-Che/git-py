@@ -130,10 +130,10 @@
   - Дата завершения: `—`
   - Комментарий: `—`
 
-- [ ] **Этап 9: Конфигурация и темизация** — _не начато_
-  - Дата начала: `—`
+- [~] **Этап 9: Конфигурация и темизация** — _в работе (под-этапы: темизация ✓, персистентность окна ✓)_
+  - Дата начала: `2026-06-03`
   - Дата завершения: `—`
-  - Комментарий: `—`
+  - Комментарий: **Темизация.** `src/utils/theme.py` — `Theme` (frozen dataclass: surface/text/accent/graph-цвета), `DARK_THEME` (палитра VS Code Dark+ поверх существующих цветов графа: bg `#1E1E1E`, text `#D4D4D4`, text_dim `#8B8B8B`, accent `#007ACC`), `get_theme(name)` (резолв из реестра; неизвестное имя → `UserWarning` + `DARK_THEME`), `stylesheet_for_theme(theme)` (pure функция `Theme -> str` через `{name}`-подстановку в QSS-шаблон), `apply_theme(app, theme)` (`app.setStyleSheet`). QSS покрывает QMainWindow/QDialog/QMenuBar/QMenu/QToolBar/QToolButton/QStatusBar/QSplitter/QTabWidget+QTabBar/QLineEdit/QPlainTextEdit/QTextEdit/QComboBox/QPushButton (включая :default с акцентом)/QDialogButtonBox/QListWidget/QTreeWidget/QTableWidget/QHeaderView/QProgressBar/QToolTip/QScrollBar (вертикальный+горизонтальный)/QGraphicsView/QLabel. `src/main.py` — `apply_theme(app, get_theme("dark"))` сразу после создания `QApplication`, до конструктора `MainWindow`. `src/ui/widgets/graph_widget.py::RenderConfig` — цвета переехали на `DARK_THEME.*`; добавлен kw-only `theme: Theme | None = None` в `GraphWidget.__init__`. **Персистентность окна.** `src/utils/config.py` — `default_config_path()` (Qt `AppConfigLocation` / `git-py/config.json`), `load_window_size(config)` / `load_splitter_sizes(config)` (coercion-функции; bool/float/negative/неправильная форма → defaults), `DEFAULT_WINDOW_WIDTH/HEIGHT = 1280/800`, ключи `SPLITTER_KEY_HORIZONTAL` / `SPLITTER_KEY_RIGHT_VERTICAL`. `src/ui/main_window.py` — `__init__(config_path: Path | str | None = None)` (None отключает персистентность — для существующих тестов, чтобы не трогать реальный user config); `_top_splitter` / `_right_splitter` теперь `self.*` (раньше были локальные переменные); `_restore_state()` в конце `__init__` (resize + setSizes для обоих сплиттеров, только если config_path задан); `closeEvent()` сливает текущее состояние в JSON, не теряя чужие ключи. `src/main.py` — `MainWindow(config_path=default_config_path())`. **Тесты.** `tests/ui/test_theme.py` (41 кейс) + `tests/ui/test_window_persistence.py` (31 кейс): 9 параметризованных кейсов на отказ невалидных window_size, 7 на отказ невалидных splitter_sizes, roundtrip save/load, mkdir -p, `MainWindow(config_path=None)` не пишет на диск, persist + restore размера окна через close → reopen, persist + restore splitter sizes, fallback на defaults при битом config, merge с существующими ключами (theme/panel_layout выживают), end-to-end "пользовательский сценарий" (resize + drag horizontal splitter → close → reopen, проверка пропорций). **Все 477/477 тестов проходят, ruff чисто.** Существующие 11 тестов `MainWindow()` без аргументов работают без изменений. Светлая тема + Settings dialog с переключателем — следующая итерация. Stage 7/8 (stash UI, undo UI) — по-прежнему не начаты.
 
 - [ ] **Этап 10: Тестирование и стабилизация** — _не начато_
   - Дата начала: `—`
@@ -141,6 +141,6 @@
   - Комментарий: `—`
 
 ### Текущий статус
-- **Активный этап:** `Этап 7: Stash и дополнительные инструменты`
+- **Активный этап:** `Этап 9: Конфигурация и темизация` (под-этапы: темизация ✓, персистентность окна ✓)
 - **Последнее обновление:** `2026-06-03`
-- **Следующий шаг:** `Stash кнопки на тулбаре (push/pop), частичный stash (только staged файлы), встроенный терминал (QProcess → shell в корне репо), поиск по коммитам (SHA/автор/message) с фильтрацией графа.`
+- **Следующий шаг:** `Settings-диалог с переключателем тёмная/светлая (LIGHT_THEME реальная палитра), сохранение выбора темы в config.json, импорт/экспорт настроек. Stage 7/8 (stash UI, undo UI) — по-прежнему не начаты, ставятся в очередь после Этапа 9.`

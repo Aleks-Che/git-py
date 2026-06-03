@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
 )
 
+from src.utils.theme import DARK_THEME, Theme
 from src.viewmodels.graph_viewmodel import GraphViewModel
 
 
@@ -44,8 +45,12 @@ from src.viewmodels.graph_viewmodel import GraphViewModel
 class RenderConfig:
     """Visual constants for the graph widget.
 
-    Hard-coded for Stage 2; Stage 9 will move them into
-    :mod:`src.utils.config`.
+    Spatial dimensions are stable across themes; **colours** default
+    to :data:`src.utils.theme.DARK_THEME` so the scene background
+    matches the surrounding :class:`QGraphicsView` (which is styled
+    by the QSS in :mod:`src.utils.theme`). Stage 9 will introduce
+    user-customisable colours; for now the graph respects whatever
+    theme the rest of the app uses.
     """
 
     lane_width: int = 30
@@ -56,16 +61,35 @@ class RenderConfig:
     ref_chip_height: int = 16
     ref_chip_padding: int = 6
     ref_chip_gap: int = 4
-    background_color: str = "#1E1E1E"
-    text_color: str = "#D4D4D4"
-    dim_text_color: str = "#8B8B8B"
-    selection_color: str = "#FFFFFF"
-    edge_color: str = "#5A5A5A"
+    background_color: str = DARK_THEME.bg
+    text_color: str = DARK_THEME.text
+    dim_text_color: str = DARK_THEME.text_dim
+    selection_color: str = DARK_THEME.graph_selection
+    edge_color: str = DARK_THEME.graph_edge
     edge_width: int = 2
     selection_ring_width: int = 2
     subject_max_chars: int = 60
-    wip_color: str = "#8B8B8B"
+    wip_color: str = DARK_THEME.graph_wip
     wip_node_radius: int = 7
+
+
+def _config_for_theme(theme: Theme | None) -> RenderConfig:
+    """Return a :class:`RenderConfig` whose colour fields come from ``theme``.
+
+    ``None`` falls back to :data:`DARK_THEME` — the historical default
+    that kept the graph looking the same as before the global
+    theming pass. Spatial constants are unchanged.
+    """
+    if theme is None:
+        return RenderConfig()
+    return RenderConfig(
+        background_color=theme.bg,
+        text_color=theme.text,
+        dim_text_color=theme.text_dim,
+        selection_color=theme.graph_selection,
+        edge_color=theme.graph_edge,
+        wip_color=theme.graph_wip,
+    )
 
 
 class GraphWidget(QGraphicsView):
@@ -75,12 +99,24 @@ class GraphWidget(QGraphicsView):
     ``graph_updated`` / ``commit_selected`` and forwards clicks via
     ``view_model.select_commit``. It does **not** query the
     repository on its own.
+
+    The optional ``theme`` keyword lets the caller supply a
+    :class:`src.utils.theme.Theme`; the scene background, text
+    colours, edge colour, selection ring and WIP node colour are all
+    pulled from it. Omitting ``theme`` (the historical default) is
+    equivalent to passing :data:`DARK_THEME`.
     """
 
-    def __init__(self, view_model: GraphViewModel, parent=None) -> None:
+    def __init__(
+        self,
+        view_model: GraphViewModel,
+        parent=None,
+        *,
+        theme: Theme | None = None,
+    ) -> None:
         super().__init__(parent)
         self._view_model = view_model
-        self._cfg = RenderConfig()
+        self._cfg = _config_for_theme(theme)
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)

@@ -5,12 +5,35 @@ parameters, and panel layout live in JSON/YAML configs and are
 persisted on exit / restored on launch. The helpers here intentionally
 tolerate missing or malformed files: a fresh install should never fail
 because the config is absent.
+
+Stage 9 extensions
+------------------
+Window geometry and splitter sizes are persisted to the same JSON
+file (under the ``window_size`` and ``splitter_sizes`` keys). Two
+specialised helpers (:func:`load_window_size`,
+:func:`load_splitter_sizes`) do the coercion; :func:`default_config_path`
+returns the per-user path Qt recommends for app config.
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
 from typing import Any
+
+# Default window size used when no config exists yet or when the
+# saved value is unusable. Matches the historical hard-coded value
+# in :class:`src.ui.main_window.MainWindow.__init__` so users who
+# upgrade keep the same starting geometry.
+DEFAULT_WINDOW_WIDTH = 1280
+DEFAULT_WINDOW_HEIGHT = 800
+
+# ``splitter_sizes`` is a ``{name: [int, ...]}`` mapping; this constant
+# lists the splitter names :class:`MainWindow` writes. The two
+# splitters the user explicitly asked to persist are
+# ``"horizontal"`` (left panel | graph | right panel) and
+# ``"right_vertical"`` (commit panel | commit detail).
+SPLITTER_KEY_HORIZONTAL = "horizontal"
+SPLITTER_KEY_RIGHT_VERTICAL = "right_vertical"
 
 _DEFAULT_CONFIG: dict[str, Any] = {
     "theme": "dark",
@@ -26,6 +49,14 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     # Whether the auto-fetch timer is enabled. Default off; the UI
     # toggle (Stage 9) will flip this on first launch.
     "auto_fetch_enabled": False,
+    # Persisted window size. Filled in by :class:`MainWindow` on
+    # close; restored on next launch. Missing / invalid → use
+    # :data:`DEFAULT_WINDOW_WIDTH` / :data:`DEFAULT_WINDOW_HEIGHT`.
+    "window_size": [DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT],
+    # Persisted ``QSplitter`` sizes. Keys are
+    # :data:`SPLITTER_KEY_HORIZONTAL` and
+    # :data:`SPLITTER_KEY_RIGHT_VERTICAL`; values are ``[int, ...]``.
+    "splitter_sizes": {},
 }
 
 # Keys that must be ints (validation on load; bad values fall back).
@@ -60,3 +91,99 @@ def save_config(path: Path | str, data: dict[str, Any]) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+def default_config_path() -> Path:
+    """Return the per-user config path the app uses in production.
+
+    Uses Qt's :class:`QStandardPaths.AppConfigLocation`, which on
+    common platforms resolves to:
+
+    * **Windows:** ``%APPDATA%\\git-py\\config.json``
+    * **macOS:**   ``~/Library/Preferences/git-py/config.json``
+    * **Linux:**   ``~/.config/git-py/config.json``
+
+    The directory is created lazily by :func:`save_config`; this
+    function only computes the path. Tests should pass a ``tmp_path``
+    explicitly to :class:`MainWindow` to avoid touching the real
+    user config.
+    """
+    from PySide6.QtCore import QStandardPaths
+
+    base = QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.AppConfigLocation,
+    )
+    return Path(base) / "git-py" / "config.json"
+
+
+def _coerce_window_size(value: Any) -> tuple[int, int] | None:
+    """Coerce ``value`` to ``(width, height)`` or ``None`` on any failure.
+
+    Both components must be positive integers. A boolean is rejected
+    explicitly (``bool`` is a subclass of ``int`` in Python and would
+    otherwise slip through the ``int`` check).
+    """
+    if not isinstance(value, list | tuple) or len(value) != 2:
+        return None
+    raw_w, raw_h = value
+    if isinstance(raw_w, bool) or isinstance(raw_h, bool):
+        return None
+    if not isinstance(raw_w, int) or not isinstance(raw_h, int):
+        return None
+    if raw_w <= 0 or raw_h <= 0:
+        return None
+    return raw_w, raw_h
+
+
+def load_window_size(config: dict[str, Any]) -> tuple[int, int]:
+    """Return ``(width, height)`` from ``config``; defaults if missing / invalid."""
+    size = _coerce_window_size(config.get("window_size"))
+    if size is None:
+        return (DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
+    return size
+
+
+def _coerce_splitter_sizes(value: Any) -> dict[str, list[int]]:
+    """Coerce ``value`` to a ``{name: [int, ...]}`` mapping; ``{}`` on failure.
+
+    Each entry's values must be non-negative integers. A boolean in
+    the list is rejected (same rationale as :func:`_coerce_window_size`).
+    """
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, list[int]] = {}
+    for key, sizes in value.items():
+        if not isinstance(key, str) or not isinstance(sizes, list | tuple):
+            continue
+        coerced: list[int] = []
+        for s in sizes:
+            if isinstance(s, bool) or not isinstance(s, int):
+                coerced = []
+                break
+            if s < 0:
+                coerced = []
+                break
+            coerced.append(s)
+        if not coerced:
+            continue
+        result[key] = coerced
+    return result
+
+
+def load_splitter_sizes(config: dict[str, Any]) -> dict[str, list[int]]:
+    """Return the persisted splitter sizes from ``config``; ``{}`` on failure."""
+    return _coerce_splitter_sizes(config.get("splitter_sizes"))
+
+
+__all__ = [
+    "DEFAULT_WINDOW_HEIGHT",
+    "DEFAULT_WINDOW_WIDTH",
+    "SPLITTER_KEY_HORIZONTAL",
+    "SPLITTER_KEY_RIGHT_VERTICAL",
+    "default_config_path",
+    "get_int",
+    "load_config",
+    "load_splitter_sizes",
+    "load_window_size",
+    "save_config",
+]

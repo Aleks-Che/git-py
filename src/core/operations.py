@@ -187,13 +187,16 @@ def checkout_branch(
     Returns ``None`` on success. When ``GIT_CHECKOUT_SAFE`` is used and
     the working tree has uncommitted changes, returns a dict
     ``{"dirty_files": [str, ...]}`` so the caller can surface the exact
-    file list to the user. The working tree is NOT touched in that case
-    — the pre-check happens before any files are modified.
+    file list to the user.
 
-    Implementation: HEAD is moved first (atomic ``set_head``), then the
-    working tree is updated via ``checkout_head``. If ``checkout_head``
-    fails, HEAD is rolled back to the previous branch so the repository
-    is never left with HEAD on one branch and files from another.
+    Implementation:
+    1. Pre-check: if SAFE and dirty, return dirty list without touching
+       any files.
+    2. ``set_head`` — atomically move HEAD to the target branch.
+    3. ``checkout_head`` — update the working tree to match HEAD.
+    4. Post-verify: if the working tree is still dirty after step 3,
+       HEAD is rolled back. This catches the Windows edge case where
+       ``checkout_head(FORCE)`` silently skips locked files.
     """
     with unwrap(repo) as r:
         refname = f"refs/heads/{name}"
@@ -220,15 +223,32 @@ def checkout_branch(
         try:
             r.checkout_head(strategy=strategy)
         except pygit2.GitError as exc:
-            if previous_head is not None:
-                try:
-                    r.set_head(previous_head)
-                except pygit2.GitError:
-                    pass
+            _rollback_head(r, previous_head)
             raise DirtyWorkTreeError(
                 f"Cannot update working tree for {name!r}: {exc}",
             ) from exc
+
+        remaining = _dirty_paths(r)
+        if remaining:
+            _rollback_head(r, previous_head)
+            n = len(remaining)
+            preview = ", ".join(remaining[:10])
+            suffix = f" and {n - 10} more" if n > 10 else ""
+            raise DirtyWorkTreeError(
+                f"Checkout to {name!r} did not fully update the working tree "
+                f"({n} file(s) still differ): {preview}{suffix}",
+            )
     return None
+
+
+def _rollback_head(repo: pygit2.Repository, previous_head: str | None) -> None:
+    """Restore HEAD to *previous_head* after a failed checkout."""
+    if previous_head is None:
+        return
+    try:
+        repo.set_head(previous_head)
+    except pygit2.GitError:
+        pass
 
 
 def _dirty_paths(repo: pygit2.Repository) -> list[str]:
