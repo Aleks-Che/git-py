@@ -194,7 +194,7 @@ class GraphWidget(QGraphicsView):
             self._draw_placeholder("No commits to display")
             return
 
-        # Pass 1: connecting lines (so they sit underneath the nodes).
+        # Pass 1: connecting lines (drawn behind nodes).
         row_by_sha: dict[str, dict] = {r["sha"]: r for r in rows}
         for row in rows:
             for parent_sha in row["parents"]:
@@ -601,13 +601,40 @@ class GraphWidget(QGraphicsView):
             path.moveTo(cx, cy + r)
             path.lineTo(px, py - r)
         else:
-            # L-shape: down, across at the row midpoint, down to parent.
+            # Rounded L-shape: from child center, with rounded corners, to parent center.
             mid_y = (cy + py) / 2
+            cr = 8
+            k = 0.5522847498
             path = QPainterPath()
-            path.moveTo(cx, cy + r)
-            path.lineTo(cx, mid_y)
-            path.lineTo(px, mid_y)
-            path.lineTo(px, py - r)
+            path.moveTo(cx, cy)
+            path.lineTo(cx, mid_y - cr)
+            if px > cx:
+                path.cubicTo(
+                    cx, mid_y - cr * (1 - k),
+                    cx + cr * (1 - k), mid_y,
+                    cx + cr, mid_y,
+                )
+            else:
+                path.cubicTo(
+                    cx, mid_y - cr * (1 - k),
+                    cx - cr * (1 - k), mid_y,
+                    cx - cr, mid_y,
+                )
+            if px > cx:
+                path.lineTo(px - cr, mid_y)
+                path.cubicTo(
+                    px - cr * (1 - k), mid_y,
+                    px, mid_y + cr * (1 - k),
+                    px, mid_y + cr,
+                )
+            else:
+                path.lineTo(px + cr, mid_y)
+                path.cubicTo(
+                    px + cr * (1 - k), mid_y,
+                    px, mid_y + cr * (1 - k),
+                    px, mid_y + cr,
+                )
+            path.lineTo(px, py)
         if child["sha"] == "WIP":
             edge_color = QColor(self._cfg.wip_color)
         elif parent["sha"] == child["parents"][0]:

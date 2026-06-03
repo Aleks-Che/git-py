@@ -255,7 +255,7 @@ class GraphTableWidget(QWidget):
         # ── row hover / selection backgrounds ──
         self._draw_row_backgrounds(painter, hh)
 
-        # ── edges (drawn on top of backgrounds, behind nodes) ──
+        # ── edges (drawn behind nodes) ──
         self._draw_edges(painter, hh)
 
         # ── row content (branch chips, nodes, text) ──
@@ -312,10 +312,37 @@ class GraphTableWidget(QWidget):
                     path.lineTo(parent_cx, parent_cy - r)
                 else:
                     mid_y = (child_cy + parent_cy) / 2
-                    path.moveTo(child_cx, child_cy + r)
-                    path.lineTo(child_cx, mid_y)
-                    path.lineTo(parent_cx, mid_y)
-                    path.lineTo(parent_cx, parent_cy - r)
+                    cr = 8
+                    k = 0.5522847498
+                    path.moveTo(child_cx, child_cy)
+                    path.lineTo(child_cx, mid_y - cr)
+                    if parent_cx > child_cx:
+                        path.cubicTo(
+                            child_cx, mid_y - cr * (1 - k),
+                            child_cx + cr * (1 - k), mid_y,
+                            child_cx + cr, mid_y,
+                        )
+                    else:
+                        path.cubicTo(
+                            child_cx, mid_y - cr * (1 - k),
+                            child_cx - cr * (1 - k), mid_y,
+                            child_cx - cr, mid_y,
+                        )
+                    if parent_cx > child_cx:
+                        path.lineTo(parent_cx - cr, mid_y)
+                        path.cubicTo(
+                            parent_cx - cr * (1 - k), mid_y,
+                            parent_cx, mid_y + cr * (1 - k),
+                            parent_cx, mid_y + cr,
+                        )
+                    else:
+                        path.lineTo(parent_cx + cr, mid_y)
+                        path.cubicTo(
+                            parent_cx + cr * (1 - k), mid_y,
+                            parent_cx, mid_y + cr * (1 - k),
+                            parent_cx, mid_y + cr,
+                        )
+                    path.lineTo(parent_cx, parent_cy)
 
                 if row_data["sha"] == "WIP":
                     edge_color = QColor(self._cfg.wip_color)
