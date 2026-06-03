@@ -56,6 +56,7 @@ class MainViewModel(QObject):
     error_occurred = Signal(str)
     conflict_state_changed = Signal(object)  # dict
     busy_changed = Signal(bool)
+    log_message = Signal(str)  # human-readable timestamped log line
 
     def __init__(
         self,
@@ -129,16 +130,20 @@ class MainViewModel(QObject):
         :class:`GitError`) are forwarded to :attr:`error_occurred`; the
         state of the ViewModel is left unchanged on failure.
         """
+        self._log("repo", f"Opening repository at {path}")
         manager = RepositoryManager()
         try:
             manager.open(path)
         except (RepositoryNotFoundError, GitError) as exc:
             self.error_occurred.emit(str(exc))
+            self._log("repo", f"Open repository {path} failed: {exc}", level="error")
             return
         self.set_repository(manager)
+        self._log("repo", f"Repository opened: {path}")
 
     def close_repository(self) -> None:
         """Close the currently open repository (if any)."""
+        self._log("repo", "Closing repository")
         self.set_repository(None)
 
     def set_repository(self, manager: RepositoryManager | None) -> None:
@@ -175,19 +180,23 @@ class MainViewModel(QObject):
         """
         if self._repo_manager is None or not self._repo_manager.is_open:
             self.error_occurred.emit("No repository open.")
+            self._log("commit", "Commit failed: no repository open", level="error")
             return
         from src.viewmodels.commands import CommitCommand  # local import: avoids cycle
 
+        self._log("commit", f"Committing staged changes — message: {message[:80]}")
         command = CommitCommand(self._repo_manager, message)
         try:
             self._command_processor.execute(command)
         except GitError as exc:
             self.error_occurred.emit(str(exc))
+            self._log("commit", f"Commit failed: {exc}", level="error")
             return
         # Refresh downstream views; clear the message field for the next commit.
         self._graph_view_model.refresh_graph()
         self._commit_panel_view_model.refresh_status()
         self._commit_panel_view_model.set_commit_message("")
+        self._log("commit", "Commit succeeded")
 
     def stage_file(self, path: str) -> None:
         """Delegate to :meth:`CommitPanelViewModel.stage_file`."""
@@ -205,8 +214,10 @@ class MainViewModel(QObject):
             self._command_processor.undo()
         except GitError as exc:
             self.error_occurred.emit(f"Undo failed: {exc}")
+            self._log("undo", f"Undo failed: {exc}", level="error")
             return
         self._refresh_all_views()
+        self._log("undo", "Undo succeeded")
 
     def redo(self) -> None:
         """Redo the most recently undone command; refreshes views on success."""
@@ -216,12 +227,14 @@ class MainViewModel(QObject):
             self._command_processor.redo()
         except GitError as exc:
             self.error_occurred.emit(f"Redo failed: {exc}")
+            self._log("redo", f"Redo failed: {exc}", level="error")
             return
         self._refresh_all_views()
+        self._log("redo", "Redo succeeded")
 
     # ----- branch commands ---------------------------------------------
 
-    def checkout_branch(self, name: str) -> None:
+    def checkout_branch(self, name: str) -> bool:
         """Switch ``HEAD`` to ``name`` via :class:`CheckoutCommand`.
 
         Refreshes every view (graph + commit panel + branch panel)
@@ -230,34 +243,49 @@ class MainViewModel(QObject):
         at once. :class:`DirtyWorkTreeError` is surfaced through
         :attr:`error_occurred` so the panel can decide whether to
         offer a forced checkout (Stage 5+).
+
+        Returns ``True`` on success, ``False`` on failure.
         """
         if self._repo_manager is None or not self._repo_manager.is_open:
             self.error_occurred.emit("No repository open.")
-            return
+            self._log("checkout", f"Checkout {name!r} failed: no repository open", level="error")
+            return False
         from src.viewmodels.commands import CheckoutCommand  # local import: avoids cycle
 
+        self._log("checkout", f"Checkout {name!r} — switching HEAD to refs/heads/{name}")
         command = CheckoutCommand(self._repo_manager, name)
         try:
             self._command_processor.execute(command)
         except GitError as exc:
             self.error_occurred.emit(str(exc))
-            return
+            self._log("checkout", f"Checkout {name!r} failed: {exc}", level="error")
+            return False
         self._refresh_all_views()
+        self._log("checkout", f"Checkout {name!r} succeeded — HEAD is now {name}")
+        return True
 
     def create_branch(self, name: str, target_sha: str | None = None) -> None:
         """Create a local branch via :class:`CreateBranchCommand`."""
         if self._repo_manager is None or not self._repo_manager.is_open:
             self.error_occurred.emit("No repository open.")
+            self._log("branch", f"Create branch {name!r} failed: no repo", level="error")
             return
         from src.viewmodels.commands import CreateBranchCommand
 
+        self._log(
+            "branch",
+            f"Creating branch {name!r}"
+            + (f" at {target_sha!r}" if target_sha else " at HEAD"),
+        )
         command = CreateBranchCommand(self._repo_manager, name, target_sha)
         try:
             self._command_processor.execute(command)
         except GitError as exc:
             self.error_occurred.emit(str(exc))
+            self._log("branch", f"Create branch {name!r} failed: {exc}", level="error")
             return
         self._refresh_all_views()
+        self._log("branch", f"Branch {name!r} created")
 
     def delete_branch(self, name: str, force: bool = False) -> None:
         """Delete a local branch via :class:`DeleteBranchCommand`."""
@@ -266,13 +294,16 @@ class MainViewModel(QObject):
             return
         from src.viewmodels.commands import DeleteBranchCommand
 
+        self._log("branch", f"Deleting branch {name!r}" + (" (force)" if force else ""))
         command = DeleteBranchCommand(self._repo_manager, name, force=force)
         try:
             self._command_processor.execute(command)
         except GitError as exc:
             self.error_occurred.emit(str(exc))
+            self._log("branch", f"Delete branch {name!r} failed: {exc}", level="error")
             return
         self._refresh_all_views()
+        self._log("branch", f"Branch {name!r} deleted")
 
     def rename_branch(self, old_name: str, new_name: str, force: bool = False) -> None:
         """Rename a local branch via :class:`RenameBranchCommand`."""
@@ -281,6 +312,7 @@ class MainViewModel(QObject):
             return
         from src.viewmodels.commands import RenameBranchCommand
 
+        self._log("branch", f"Renaming branch {old_name!r} → {new_name!r}")
         command = RenameBranchCommand(
             self._repo_manager,
             old_name,
@@ -291,8 +323,14 @@ class MainViewModel(QObject):
             self._command_processor.execute(command)
         except GitError as exc:
             self.error_occurred.emit(str(exc))
+            self._log(
+                "branch",
+                f"Rename branch {old_name!r} -> {new_name!r} failed: {exc}",
+                level="error",
+            )
             return
         self._refresh_all_views()
+        self._log("branch", f"Branch renamed {old_name!r} → {new_name!r}")
 
     # ----- merge / rebase / cherry-pick / revert -----------------------
 
@@ -309,12 +347,18 @@ class MainViewModel(QObject):
         """
         if self._repo_manager is None or not self._repo_manager.is_open:
             self.error_occurred.emit("No repository open.")
+            self._log("merge", f"Merge {source!r} failed: no repository", level="error")
             return
         if self._is_busy:
             self.error_occurred.emit("Another operation is already in progress.")
             return
         from src.viewmodels.commands import MergeCommand
 
+        self._log(
+            "merge",
+            f"Merge {source!r}"
+            + (f" into {target!r}" if target else " into current"),
+        )
         command = MergeCommand(self._repo_manager, source, target=target)
         if self._async_enabled and self._estimate_merge_size(source) > self._merge_async_threshold:
             self._run_async(
@@ -333,12 +377,14 @@ class MainViewModel(QObject):
         """
         if self._repo_manager is None or not self._repo_manager.is_open:
             self.error_occurred.emit("No repository open.")
+            self._log("rebase", f"Rebase onto {upstream!r} failed: no repository", level="error")
             return
         if self._is_busy:
             self.error_occurred.emit("Another operation is already in progress.")
             return
         from src.viewmodels.commands import RebaseCommand
 
+        self._log("rebase", f"Rebase current branch onto {upstream!r}")
         command = RebaseCommand(self._repo_manager, upstream)
         if self._async_enabled:
             self._run_async(
@@ -357,6 +403,8 @@ class MainViewModel(QObject):
         try:
             self._command_processor.execute(command)  # type: ignore[arg-type]
         except MergeConflictError as exc:
+            n = len(exc.conflicting_paths)
+            self._log("merge", f"Merge {source!r} produced conflicts in {n} file(s)", level="warn")
             self._set_conflict_state(
                 "merge",
                 conflicting_paths=exc.conflicting_paths,
@@ -366,16 +414,43 @@ class MainViewModel(QObject):
             return
         except GitError as exc:
             self.error_occurred.emit(str(exc))
+            self._log("merge", f"Merge {source!r} failed: {exc}", level="error")
             return
         self._refresh_all_views()
+        self._log("merge", f"Merge {source!r} succeeded")
+
+    def _execute_rebase_sync(
+        self,
+        command: object,
+        upstream: str,
+    ) -> None:
+        try:
+            self._command_processor.execute(command)  # type: ignore[arg-type]
+        except RebaseConflictError as exc:
+            self._log("rebase", f"Rebase onto {upstream!r} produced conflicts", level="warn")
+            self._set_conflict_state(
+                "rebase",
+                conflicting_paths=[],
+                upstream=upstream,
+            )
+            self.error_occurred.emit(str(exc))
+            return
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("rebase", f"Rebase onto {upstream!r} failed: {exc}", level="error")
+            return
+        self._refresh_all_views()
+        self._log("rebase", f"Rebase onto {upstream!r} succeeded")
 
     def _execute_push_sync(self, command: object) -> None:
         try:
             self._command_processor.execute(command)  # type: ignore[arg-type]
         except GitError as exc:
             self.error_occurred.emit(str(exc))
+            self._log("push", f"Push failed: {exc}", level="error")
             return
         self._refresh_all_views()
+        self._log("push", "Push succeeded")
 
     def _execute_pull_sync(
         self,
@@ -386,6 +461,7 @@ class MainViewModel(QObject):
         try:
             self._command_processor.execute(command)  # type: ignore[arg-type]
         except MergeConflictError as exc:
+            self._log("pull", "Pull produced merge conflicts", level="warn")
             self._set_conflict_state(
                 "merge",
                 conflicting_paths=exc.conflicting_paths,
@@ -399,8 +475,10 @@ class MainViewModel(QObject):
             return
         except GitError as exc:
             self.error_occurred.emit(str(exc))
+            self._log("pull", f"Pull failed: {exc}", level="error")
             return
         self._refresh_all_views()
+        self._log("pull", "Pull succeeded")
 
     def _execute_fetch_sync(self, command: object, silent: bool) -> None:
         try:
@@ -408,6 +486,7 @@ class MainViewModel(QObject):
         except GitError as exc:
             if not silent:
                 self.error_occurred.emit(str(exc))
+                self._log("fetch", f"Fetch failed: {exc}", level="error")
             return
         self._refresh_all_views()
 
@@ -417,8 +496,10 @@ class MainViewModel(QObject):
             manager.clone(url, path)
         except GitError as exc:
             self.error_occurred.emit(str(exc))
+            self._log("clone", f"Clone failed: {exc}", level="error")
             return
         self.set_repository(manager)
+        self._log("clone", f"Clone finished: {url} → {path}")
 
     def _current_branch_shorthand(self) -> str:
         """Return the current branch shorthand, or ``""`` if unborn / no repo."""
@@ -459,13 +540,16 @@ class MainViewModel(QObject):
         """
         if self._repo_manager is None or not self._repo_manager.is_open:
             self.error_occurred.emit("No repository open.")
+            self._log("cherry-pick", f"Cherry-pick {sha[:7]!r} failed: no repo", level="error")
             return
         from src.viewmodels.commands import CherryPickCommand
 
+        self._log("cherry-pick", f"Cherry-pick {sha[:7].rstrip()}")
         command = CherryPickCommand(self._repo_manager, sha)
         try:
             self._command_processor.execute(command)
         except MergeConflictError as exc:
+            self._log("cherry-pick", f"Cherry-pick {sha[:7]!r} produced conflicts", level="warn")
             self._set_conflict_state(
                 "cherry-pick",
                 conflicting_paths=exc.conflicting_paths,
@@ -474,8 +558,10 @@ class MainViewModel(QObject):
             return
         except GitError as exc:
             self.error_occurred.emit(str(exc))
+            self._log("cherry-pick", f"Cherry-pick {sha[:7]!r} failed: {exc}", level="error")
             return
         self._commit_panel_view_model.refresh_status()
+        self._log("cherry-pick", f"Cherry-pick {sha[:7]!r} staged")
 
     def revert(self, sha: str) -> None:
         """Revert ``sha`` via :class:`RevertCommand`.
@@ -485,13 +571,16 @@ class MainViewModel(QObject):
         """
         if self._repo_manager is None or not self._repo_manager.is_open:
             self.error_occurred.emit("No repository open.")
+            self._log("revert", f"Revert {sha[:7]!r} failed: no repo", level="error")
             return
         from src.viewmodels.commands import RevertCommand
 
+        self._log("revert", f"Revert {sha[:7].rstrip()}")
         command = RevertCommand(self._repo_manager, sha)
         try:
             self._command_processor.execute(command)
         except MergeConflictError as exc:
+            self._log("revert", f"Revert {sha[:7]!r} produced conflicts", level="warn")
             self._set_conflict_state(
                 "revert",
                 conflicting_paths=exc.conflicting_paths,
@@ -500,8 +589,10 @@ class MainViewModel(QObject):
             return
         except GitError as exc:
             self.error_occurred.emit(str(exc))
+            self._log("revert", f"Revert {sha[:7]!r} failed: {exc}", level="error")
             return
         self._commit_panel_view_model.refresh_status()
+        self._log("revert", f"Revert {sha[:7]!r} staged")
 
     def abort_merge(self) -> None:
         """Abort the in-progress merge (``git merge --abort``).
@@ -515,13 +606,16 @@ class MainViewModel(QObject):
             return
         from src.core.operations import abort_merge as core_abort_merge
 
+        self._log("merge", "Aborting in-progress merge")
         try:
             core_abort_merge(self._repo_manager)
         except GitError as exc:
             self.error_occurred.emit(str(exc))
+            self._log("merge", f"Abort merge failed: {exc}", level="error")
             return
         self._clear_conflict_state()
         self._refresh_all_views()
+        self._log("merge", "Merge aborted")
 
     def abort_rebase(self) -> None:
         """Abort the in-progress rebase (``git rebase --abort``)."""
@@ -530,13 +624,16 @@ class MainViewModel(QObject):
             return
         from src.core.operations import abort_rebase as core_abort_rebase
 
+        self._log("rebase", "Aborting in-progress rebase")
         try:
             core_abort_rebase(self._repo_manager)
         except GitError as exc:
             self.error_occurred.emit(str(exc))
+            self._log("rebase", f"Abort rebase failed: {exc}", level="error")
             return
         self._clear_conflict_state()
         self._refresh_all_views()
+        self._log("rebase", "Rebase aborted")
 
     # ----- remotes: push / pull / fetch / add / remove / clone ---------
 
@@ -555,12 +652,15 @@ class MainViewModel(QObject):
         """
         if self._repo_manager is None or not self._repo_manager.is_open:
             self.error_occurred.emit("No repository open.")
+            self._log("push", f"Push to {remote_name!r} failed: no repository", level="error")
             return
         if self._is_busy:
             self.error_occurred.emit("Another operation is already in progress.")
             return
         from src.viewmodels.commands import PushCommand
 
+        spec = refspec or "HEAD"
+        self._log("push", f"Push {remote_name}/{spec}")
         command = PushCommand(self._repo_manager, remote_name, refspec)
         if self._async_enabled:
             self._run_async(
@@ -584,12 +684,15 @@ class MainViewModel(QObject):
         """
         if self._repo_manager is None or not self._repo_manager.is_open:
             self.error_occurred.emit("No repository open.")
+            self._log("pull", f"Pull from {remote_name!r} failed: no repository", level="error")
             return
         if self._is_busy:
             self.error_occurred.emit("Another operation is already in progress.")
             return
         from src.viewmodels.commands import PullCommand
 
+        spec = refspec or "HEAD"
+        self._log("pull", f"Pull {remote_name}/{spec}")
         command = PullCommand(self._repo_manager, remote_name, refspec)
         if self._async_enabled:
             self._run_async(
@@ -618,11 +721,12 @@ class MainViewModel(QObject):
                 self.error_occurred.emit("No repository open.")
             return
         if self._is_busy:
-            # Auto-fetch must never block on user-driven work; the next
-            # tick will retry.
             return
         from src.viewmodels.commands import FetchCommand
 
+        spec = refspec or "all"
+        if not silent:
+            self._log("fetch", f"Fetch {remote_name}/{spec}")
         command = FetchCommand(self._repo_manager, remote_name, refspec)
         if self._async_enabled:
             self._run_async(
@@ -640,13 +744,16 @@ class MainViewModel(QObject):
             return
         from src.viewmodels.commands import AddRemoteCommand
 
+        self._log("remote", f"Add remote {name!r} → {url}")
         command = AddRemoteCommand(self._repo_manager, name, url)
         try:
             self._command_processor.execute(command)
         except GitError as exc:
             self.error_occurred.emit(str(exc))
+            self._log("remote", f"Add remote {name!r} failed: {exc}", level="error")
             return
         self._branch_panel_view_model.refresh()
+        self._log("remote", f"Remote {name!r} added")
 
     def remove_remote(self, name: str) -> None:
         """Remove a remote via :class:`RemoveRemoteCommand` (sync)."""
@@ -655,13 +762,16 @@ class MainViewModel(QObject):
             return
         from src.viewmodels.commands import RemoveRemoteCommand
 
+        self._log("remote", f"Remove remote {name!r}")
         command = RemoveRemoteCommand(self._repo_manager, name)
         try:
             self._command_processor.execute(command)
         except GitError as exc:
             self.error_occurred.emit(str(exc))
+            self._log("remote", f"Remove remote {name!r} failed: {exc}", level="error")
             return
         self._branch_panel_view_model.refresh()
+        self._log("remote", f"Remote {name!r} removed")
 
     def list_remotes(self) -> list[RemoteInfo]:
         """Return a snapshot of the configured remotes, or ``[]`` if none."""
@@ -686,6 +796,7 @@ class MainViewModel(QObject):
         if self._is_busy:
             self.error_occurred.emit("Another operation is already in progress.")
             return
+        self._log("clone", f"Cloning {url} → {path}")
         if not self._async_enabled:
             self._execute_clone_sync(url, path)
             return
@@ -703,13 +814,16 @@ class MainViewModel(QObject):
                 manager = RepositoryManager(path)
             except (RepositoryNotFoundError, GitError) as exc:
                 self.error_occurred.emit(str(exc))
+                self._log("clone", f"Clone succeeded but open failed: {exc}", level="error")
                 return
             self.set_repository(manager)
+            self._log("clone", f"Clone finished: {url} → {path}")
 
         def _on_failure(message: str) -> None:
             self._is_busy = False
             self.busy_changed.emit(False)
             self.error_occurred.emit(message)
+            self._log("clone", f"Clone failed: {message}", level="error")
 
         worker = AsyncWorker(_work)
         worker.signals.result.connect(_on_success)
@@ -791,6 +905,7 @@ class MainViewModel(QObject):
             is_rebase_in_progress,
         )
 
+        self._log("conflict", f"Resolving conflict in {path!r}")
         try:
             full_path = Path(self._repo_manager.path) / path
             full_path.parent.mkdir(parents=True, exist_ok=True)
@@ -799,6 +914,7 @@ class MainViewModel(QObject):
             self._repo_manager.repo.index.write()
         except OSError as exc:
             self.error_occurred.emit(f"Failed to resolve {path!r}: {exc}")
+            self._log("conflict", f"Failed to write resolution for {path!r}: {exc}", level="error")
             return
 
         # Drop the resolved path from the conflict list.
@@ -806,9 +922,9 @@ class MainViewModel(QObject):
         if path in paths:
             paths.remove(path)
         if paths:
-            # Still conflicts left — update the list and keep going.
             self._conflict_state["conflicting_paths"] = paths
             self.conflict_state_changed.emit(dict(self._conflict_state))
+            self._log("conflict", f"Still {len(paths)} conflicting file(s) remaining")
             return
 
         operation = self._conflict_state.get("operation")
@@ -821,19 +937,20 @@ class MainViewModel(QObject):
                 )
             except (GitError, MergeConflictError) as exc:
                 self.error_occurred.emit(str(exc))
+                self._log("merge", f"Complete merge failed: {exc}", level="error")
                 return
             self._clear_conflict_state()
             self._refresh_all_views()
+            self._log("merge", "Merge completed after conflict resolution")
             return
         if operation == "rebase":
             try:
                 more = complete_rebase_continue(self._repo_manager)
             except GitError as exc:
                 self.error_occurred.emit(str(exc))
+                self._log("rebase", f"Rebase continue failed: {exc}", level="error")
                 return
             if more or is_rebase_in_progress(self._repo_manager):
-                # Another commit conflicted. Refetch conflict list from
-                # the index and keep the conflict state active.
                 from src.core.operations import _collect_conflicts
                 from src.core.repository import unwrap
 
@@ -841,19 +958,17 @@ class MainViewModel(QObject):
                     paths = _collect_conflicts(r)
                 self._conflict_state["conflicting_paths"] = paths
                 self.conflict_state_changed.emit(dict(self._conflict_state))
+                self._log("rebase", "More conflicts — continuing rebase")
                 return
             self._clear_conflict_state()
             self._refresh_all_views()
+            self._log("rebase", "Rebase completed after conflict resolution")
             return
         if operation in ("cherry-pick", "revert"):
-            # Cherry-pick / revert only stage the change; the user
-            # makes a follow-up commit through the commit panel. Clear
-            # the conflict state and refresh so the staged file is
-            # visible in the commit panel.
             self._clear_conflict_state()
             self._commit_panel_view_model.refresh_status()
+            self._log(operation, f"{operation} conflict resolved — staged, ready for commit")
             return
-        # Unknown operation — just clear and let the user figure it out.
         self._clear_conflict_state()
         self._refresh_all_views()
 
@@ -866,6 +981,15 @@ class MainViewModel(QObject):
         return self._is_busy
 
     # ----- internals ---------------------------------------------------
+
+    def _log(self, category: str, message: str, level: str = "info") -> None:
+        """Emit a timestamped log line via :attr:`log_message`."""
+        import datetime
+
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        level_tag = {"info": "INFO ", "warn": "WARN ", "error": "ERROR"}.get(level, "INFO ")
+        prefix = f"[{category}]" if category else ""
+        self.log_message.emit(f"{ts} {level_tag}{prefix} {message}")
 
     def _refresh_all_views(self) -> None:
         """Refresh graph, commit panel, and branch panel after a state change."""
@@ -990,13 +1114,17 @@ class MainViewModel(QObject):
             "operation": operation,
             **context,
         }
+        n = len(conflicting_paths)
+        self._log(operation, f"Entered conflict state — {n} conflicting file(s)")
         self.conflict_state_changed.emit(dict(self._conflict_state))
 
     def _clear_conflict_state(self) -> None:
         """Leave the conflict state and notify listeners."""
         if self._conflict_state is None:
             return
+        op = self._conflict_state.get("operation", "unknown")
         self._conflict_state = None
+        self._log(op, "Conflict state cleared")
         self.conflict_state_changed.emit(
             {
                 "in_progress": False,

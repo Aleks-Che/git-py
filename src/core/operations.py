@@ -187,7 +187,7 @@ def checkout_branch(
     with unwrap(repo) as r:
         try:
             r.checkout(f"refs/heads/{name}", strategy=strategy)
-        except KeyError as exc:
+        except (KeyError, ValueError) as exc:
             raise InvalidRefError(f"Unknown branch: {name!r}") from exc
         except pygit2.GitError as exc:
             raise DirtyWorkTreeError(

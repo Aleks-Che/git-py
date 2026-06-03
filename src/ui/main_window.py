@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QSplitter,
     QStatusBar,
+    QTabWidget,
     QToolBar,
 )
 
@@ -53,6 +54,7 @@ from src.ui.widgets.commit_detail_panel import CommitDetailPanel
 from src.ui.widgets.commit_panel import CommitPanel
 from src.ui.widgets.graph_widget import GraphWidget
 from src.ui.widgets.left_panel import LeftPanel
+from src.ui.widgets.log_widget import LogWidget
 from src.ui.widgets.terminal_widget import TerminalWidget
 from src.viewmodels.main_viewmodel import MainViewModel
 
@@ -230,10 +232,18 @@ class MainWindow(QMainWindow):
         self._terminal = TerminalWidget(self)
         self._terminal.setMaximumHeight(180)
 
+        self._log_widget = LogWidget(self)
+        self._log_widget.setMaximumHeight(180)
+
+        self._bottom_tabs = QTabWidget(self)
+        self._bottom_tabs.setMaximumHeight(200)
+        self._bottom_tabs.addTab(self._terminal, "Terminal")
+        self._bottom_tabs.addTab(self._log_widget, "Log")
+
         main_splitter = QSplitter(self)
         main_splitter.setOrientation(Qt.Orientation.Vertical)
         main_splitter.addWidget(top)
-        main_splitter.addWidget(self._terminal)
+        main_splitter.addWidget(self._bottom_tabs)
         main_splitter.setStretchFactor(0, 5)
         main_splitter.setStretchFactor(1, 1)
 
@@ -255,6 +265,8 @@ class MainWindow(QMainWindow):
 
         self._main_vm.error_occurred.connect(self._on_error)
         self._main_vm.repository_changed.connect(self._on_repository_changed)
+        self._main_vm.log_message.connect(self._log_widget.append_log)
+        self._main_vm.error_occurred.connect(self._log_widget.append_log)
 
     def _on_busy_changed(self, busy: bool) -> None:
         """Show / hide the spinner and toggle the re-entrancy guard."""

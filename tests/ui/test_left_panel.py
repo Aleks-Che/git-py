@@ -461,7 +461,10 @@ def test_drop_rebase_action_triggers_checkout_then_rebase(
     main = _child(local, "main  (HEAD)")
 
     calls: list[tuple[str, tuple]] = []
-    monkeypatch.setattr(vm, "checkout_branch", lambda name: calls.append(("checkout", (name,))))
+    monkeypatch.setattr(
+        vm, "checkout_branch",
+        lambda name: calls.append(("checkout", (name,))) or True,
+    )
     monkeypatch.setattr(vm, "rebase_branch", lambda upstream: calls.append(("rebase", (upstream,))))
 
     actions = panel._on_drop("feature", main)  # noqa: SLF001

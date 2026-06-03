@@ -423,14 +423,17 @@ class LeftPanel(QTreeWidget):
         The two commands are pushed onto the undo stack separately
         so the user can undo each step independently. If the user is
         already on ``source`` the checkout is a no-op (the VM still
-        calls into the processor, which is fine).
+        calls into the processor, which is fine). If checkout fails
+        (e.g. dirty worktree), rebase is skipped.
         """
         mgr = self._main_vm.repository_manager()
         current = None
         if mgr is not None and not mgr.repo.head_is_unborn:
             current = mgr.repo.head.shorthand
         if current != source:
-            self._main_vm.checkout_branch(source)
+            ok = self._main_vm.checkout_branch(source)
+            if not ok:
+                return
         self._main_vm.rebase_branch(target)
 
     # ----- prompts (small dialogs) ------------------------------------
