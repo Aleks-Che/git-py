@@ -120,13 +120,38 @@ def test_subject_handles_pygit2_trailing_newline() -> None:
     assert nodes[0].subject == "only subject"
 
 
-def test_refs_include_branches_and_head() -> None:
+def test_refs_include_head_and_branch_refs_hold_branches() -> None:
     sha = "a" * 40
     history = [_commit_info(sha, ts=1)]
     branches = [BranchInfo(name="main", is_head=True, target_sha=sha)]
     nodes = compute_layout(history, branches, [], head_target_sha=sha, head_shorthand="main")
-    # HEAD comes first in the rendered order.
-    assert nodes[0].refs == ["HEAD", "main"]
+    # ``HEAD`` stays in the ref-chip list; branch names moved out to
+    # ``branch_refs`` so the widget can decorate them (check /
+    # monitor) in the left-hand column.
+    assert nodes[0].refs == ["HEAD"]
+    assert len(nodes[0].branch_refs) == 1
+    assert nodes[0].branch_refs[0].name == "main"
+    assert nodes[0].branch_refs[0].is_head is True
+    assert nodes[0].branch_refs[0].is_remote is False
+
+
+def test_branch_refs_order_matches_input() -> None:
+    sha = "a" * 40
+    history = [_commit_info(sha, ts=1)]
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha=sha),
+        BranchInfo(name="feature", is_head=False, target_sha=sha),
+        BranchInfo(name="origin/main", is_head=False, is_remote=True, target_sha=sha),
+    ]
+    nodes = compute_layout(history, branches, [], head_target_sha=sha, head_shorthand="main")
+    # The order must follow the input list so the left column renders
+    # predictably. Local branches first (HEAD's, then the rest), then
+    # remote-tracking refs.
+    assert [b.name for b in nodes[0].branch_refs] == [
+        "main", "feature", "origin/main",
+    ]
+    assert [b.is_head for b in nodes[0].branch_refs] == [True, False, False]
+    assert [b.is_remote for b in nodes[0].branch_refs] == [False, False, True]
 
 
 def test_refs_for_tag_only_commit() -> None:
@@ -290,17 +315,18 @@ def test_compute_layout_with_real_repo(tmp_git_repo: Path) -> None:
     # Rows are 0..n-1.
     assert [n.row for n in nodes] == list(range(len(nodes)))
     by_sha = {n.sha: n for n in nodes}
-    # HEAD's commit must be present and carry the HEAD and main labels.
+    # HEAD's commit must be present. ``HEAD`` lives in the ref-chip
+    # list, the branch name moves to ``branch_refs``.
     head_node = by_sha[head.sha]
     assert "HEAD" in head_node.refs
-    assert "main" in head_node.refs
+    assert any(b.name == "main" and b.is_head for b in head_node.branch_refs)
     # main is HEAD's branch so its tip is on lane 0.
     assert head_node.lane == 0
     # The feature branch's tip is in a different lane.
     feature_branch = next(b for b in branches if b.name == "feature")
     feature_node = by_sha[feature_branch.target_sha]
     assert feature_node.lane != head_node.lane
-    assert "feature" in feature_node.refs
+    assert any(b.name == "feature" for b in feature_node.branch_refs)
 
 
 def test_compute_layout_500_commits_is_fast(tmp_git_repo: Path) -> None:
@@ -337,13 +363,15 @@ def test_nodes_to_rows_returns_serialisable_dicts() -> None:
     assert len(rows) == 1
     row = rows[0]
     # All the keys the widget consumes must be present.
-    for key in ("sha", "short_sha", "subject", "author_name", "author_time",
-                "parents", "refs", "lane", "color", "row"):
+    for key in ("sha", "short_sha", "subject", "author_name", "author_email",
+                "author_time", "parents", "refs", "branch_refs", "lane", "color", "row"):
         assert key in row
-    # Parents and refs must be plain lists (not references into the
-    # dataclass) so they're safe to send across threads.
+    # Parents, refs and branch_refs must be plain lists (not
+    # references into the dataclass) so they're safe to send across
+    # threads.
     assert isinstance(row["parents"], list)
     assert isinstance(row["refs"], list)
+    assert isinstance(row["branch_refs"], list)
 
 
 def test_graphnode_to_dict_round_trip() -> None:
@@ -352,9 +380,11 @@ def test_graphnode_to_dict_round_trip() -> None:
         short_sha="abcdefg",
         subject="hello",
         author_name="tester",
+        author_email="t@example.com",
         author_time=123,
         parents=["b" * 40],
-        refs=["HEAD", "main"],
+        refs=["HEAD"],
+        branch_refs=[],
         lane=2,
         color="#ff0000",
         row=5,
@@ -365,9 +395,11 @@ def test_graphnode_to_dict_round_trip() -> None:
         "short_sha": "abcdefg",
         "subject": "hello",
         "author_name": "tester",
+        "author_email": "t@example.com",
         "author_time": 123,
         "parents": ["b" * 40],
-        "refs": ["HEAD", "main"],
+        "refs": ["HEAD"],
+        "branch_refs": [],
         "lane": 2,
         "color": "#ff0000",
         "row": 5,

@@ -57,7 +57,8 @@ class CommitDetailPanel(QWidget):
             self._header.setText(f"Unknown commit: {sha[:12]}")
             self._body.clear()
             return
-        self._header.setText(info.subject or info.short_sha)
+        subject = (info.message or "").splitlines()[0] if info.message else ""
+        self._header.setText(subject or info.short_sha)
         self._body.setHtml(self._render_html(info))
         # Scroll to top so the user always sees the header.
         cursor = self._body.textCursor()

@@ -162,7 +162,10 @@ def test_graph_updated_carries_head_and_branch_label(
     rows = blocker.args[0]
     head_row = rows[0]  # newest first
     assert "HEAD" in head_row["refs"]
-    assert "main" in head_row["refs"]
+    # Branch names live in ``branch_refs`` now, with their
+    # ``is_head`` / ``is_remote`` metadata, so the widget can draw
+    # decorations in the left-hand column.
+    assert any(b["name"] == "main" and b["is_head"] for b in head_row["branch_refs"])
     # The head commit's first parent must be the previous commit.
     assert rows[1]["sha"] in head_row["parents"]
 

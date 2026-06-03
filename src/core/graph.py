@@ -42,19 +42,43 @@ from src.core.models import BranchInfo, CommitInfo, TagInfo
 # order when a new branch is encountered. Stage 9 will move this to
 # user config; for now it lives here as a constant per the Stage 2 plan.
 BRANCH_PALETTE: tuple[str, ...] = (
-    "#3FB950",  # green
-    "#5B8FF9",  # blue
-    "#E8685A",  # red
-    "#F5B947",  # amber
-    "#A371F7",  # violet
-    "#43BCCD",  # teal
-    "#F25CB0",  # pink
-    "#7BC8A4",  # mint
-    "#F0883E",  # orange
-    "#8B949E",  # grey
-    "#D2A8FF",  # lavender
-    "#56D364",  # lime
+    "#2D9A3E",  # green
+    "#4A7CE6",  # blue
+    "#D04A3E",  # red
+    "#D99F2E",  # amber
+    "#8E5CE3",  # violet
+    "#35A8B8",  # teal
+    "#D9409A",  # pink
+    "#60B48A",  # mint
+    "#DC7020",  # orange
+    "#7A838C",  # grey
+    "#B88BE6",  # lavender
+    "#40BC4E",  # lime
 )
+
+
+@dataclass(frozen=True)
+class BranchRef:
+    """A branch that points at a commit, with display metadata.
+
+    ``is_head`` is ``True`` for the branch ``HEAD`` is currently
+    checked out on (exactly one per repository). ``is_remote`` is
+    ``True`` for remote-tracking refs (``origin/main`` and friends);
+    local branches have it ``False``. The widget uses these flags
+    to choose which decoration to draw next to the branch name.
+    """
+
+    name: str
+    is_head: bool
+    is_remote: bool
+
+    def to_dict(self) -> dict:
+        """Serialise to a plain dict (safe for Qt signal payload)."""
+        return {
+            "name": self.name,
+            "is_head": self.is_head,
+            "is_remote": self.is_remote,
+        }
 
 
 @dataclass
@@ -65,9 +89,11 @@ class GraphNode:
     short_sha: str
     subject: str
     author_name: str
+    author_email: str
     author_time: int
     parents: list[str] = field(default_factory=list)
     refs: list[str] = field(default_factory=list)
+    branch_refs: list[BranchRef] = field(default_factory=list)
     lane: int = 0
     color: str = BRANCH_PALETTE[0]
     row: int = 0
@@ -79,9 +105,11 @@ class GraphNode:
             "short_sha": self.short_sha,
             "subject": self.subject,
             "author_name": self.author_name,
+            "author_email": self.author_email,
             "author_time": self.author_time,
             "parents": list(self.parents),
             "refs": list(self.refs),
+            "branch_refs": [b.to_dict() for b in self.branch_refs],
             "lane": self.lane,
             "color": self.color,
             "row": self.row,
@@ -121,6 +149,7 @@ def compute_layout(
         return []
 
     refs_by_sha = _build_refs_map(branches, tags, head_target_sha, head_shorthand)
+    branch_refs_by_sha = _build_branch_refs_map(branches)
     branch_tips = {b.target_sha for b in branches if b.target_sha}
     lanes = _assign_lanes(history, branches, head_target_sha)
     colors = _assign_colors(history, branch_tips)
@@ -133,9 +162,11 @@ def compute_layout(
                 short_sha=commit.short_sha,
                 subject=_subject(commit.message),
                 author_name=commit.author_name,
+                author_email=commit.author_email,
                 author_time=commit.author_time,
                 parents=list(commit.parents),
                 refs=refs_by_sha.get(commit.sha, []),
+                branch_refs=branch_refs_by_sha.get(commit.sha, []),
                 lane=lanes[commit.sha],
                 color=colors[commit.sha],
                 row=row,
@@ -171,22 +202,45 @@ def _build_refs_map(
     head_target_sha: str | None,
     head_shorthand: str | None,
 ) -> dict[str, list[str]]:
-    """Map commit SHA -> ordered list of ref labels.
+    """Map commit SHA -> ordered list of ref chip labels.
 
-    HEAD is added first (so it always renders at the top of the label
-    stack). Branches follow in input order (typically local first,
-    then remote-tracking). Tags come last. Within each group the
-    original input order is preserved.
+    Branches are intentionally **not** included here — they live in
+    :func:`_build_branch_refs_map` and are rendered in a separate
+    left-hand column by the widget. This map only carries labels
+    that have no extra metadata worth displaying: ``HEAD`` (when
+    present) and tag names, in that order.
     """
     result: dict[str, list[str]] = {}
     if head_target_sha:
         result.setdefault(head_target_sha, []).append("HEAD")
-    for branch in branches:
-        if branch.target_sha:
-            result.setdefault(branch.target_sha, []).append(branch.name)
     for tag in tags:
         if tag.target_sha:
             result.setdefault(tag.target_sha, []).append(tag.name)
+    return result
+
+
+def _build_branch_refs_map(
+    branches: list[BranchInfo],
+) -> dict[str, list[BranchRef]]:
+    """Map commit SHA -> ordered list of :class:`BranchRef` for the widget.
+
+    The order matches the input list, which (per :class:`RepositoryManager`)
+    is local branches first, then remote-tracking refs. ``HEAD``'s branch
+    carries ``is_head=True``; remote-tracking refs carry
+    ``is_remote=True``. Within each group the original input order
+    is preserved so the column renders predictably.
+    """
+    result: dict[str, list[BranchRef]] = {}
+    for branch in branches:
+        if not branch.target_sha:
+            continue
+        result.setdefault(branch.target_sha, []).append(
+            BranchRef(
+                name=branch.name,
+                is_head=branch.is_head,
+                is_remote=branch.is_remote,
+            ),
+        )
     return result
 
 
@@ -313,29 +367,58 @@ def _assign_colors(
 ) -> dict[str, str]:
     """Return ``sha -> hex color`` for every commit in ``history``.
 
-    A commit that is a branch tip gets the next palette colour
-    (cycled). Otherwise it inherits the colour of its first parent.
-    A root commit with no parents uses ``BRANCH_PALETTE[0]``. Tags
-    don't change the colour — they sit on whatever colour the
-    underlying branch has.
+    Branch tips pick up a fresh palette colour in the order they
+    appear in ``history`` (newest first). The colour is then walked
+    **down** the first-parent chain from each tip so that every
+    ancestor on the same lineage inherits the branch colour. Earlier
+    tips (lower palette index) take precedence — once a commit has a
+    colour it is never overwritten. CommitWith no branch tip and
+    whose first parent is already coloured inherit that colour in a
+    final oldest-first pass.
     """
     color_of: dict[str, str] = {}
+    commits_by_sha = {c.sha: c for c in history}
     palette_idx = 0
+
+    # Pass 1: assign colours to branch tips.
+    tips_in_order: list[str] = []
     for commit in history:
         if commit.sha in branch_tips:
             color_of[commit.sha] = BRANCH_PALETTE[palette_idx % len(BRANCH_PALETTE)]
+            tips_in_order.append(commit.sha)
             palette_idx += 1
-        elif commit.parents:
-            color_of[commit.sha] = color_of.get(
-                commit.parents[0], BRANCH_PALETTE[0],
-            )
+
+    # Pass 2: walk down each tip's first-parent chain. Lower-index
+    # tips (earlier in the palette) have priority.
+    for tip_sha in tips_in_order:
+        tip_color = color_of[tip_sha]
+        sha: str | None = tip_sha
+        while sha is not None:
+            commit = commits_by_sha.get(sha)
+            if commit is None or not commit.parents:
+                break
+            parent_sha = commit.parents[0]
+            if parent_sha not in color_of:
+                color_of[parent_sha] = tip_color
+            sha = parent_sha
+
+    # Pass 3: back-fill any remaining uncoloured commits by
+    # inheriting from their first parent (oldest-first so the parent
+    # is already resolved). Root orphans get ``BRANCH_PALETTE[0]``.
+    for commit in reversed(history):
+        if commit.sha in color_of:
+            continue
+        if commit.parents and commit.parents[0] in color_of:
+            color_of[commit.sha] = color_of[commit.parents[0]]
         else:
             color_of[commit.sha] = BRANCH_PALETTE[0]
+
     return color_of
 
 
 __all__ = [
     "BRANCH_PALETTE",
+    "BranchRef",
     "GraphNode",
     "compute_layout",
     "nodes_to_rows",

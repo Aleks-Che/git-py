@@ -25,12 +25,24 @@ re-paint the selection ring when the layout is rebuilt.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import md5
 
 from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QPainter, QPainterPath, QPen
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
+    QApplication,
     QGraphicsEllipseItem,
+    QGraphicsItem,
     QGraphicsPathItem,
+    QGraphicsPixmapItem,
     QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsSimpleTextItem,
@@ -55,8 +67,9 @@ class RenderConfig:
 
     lane_width: int = 30
     lane_offset: int = 30
-    row_height: int = 40
-    node_radius: int = 8
+    branch_label_width: int = 130
+    row_height: int = 48
+    node_radius: int = 14
     label_offset: int = 18
     ref_chip_height: int = 16
     ref_chip_padding: int = 6
@@ -64,6 +77,7 @@ class RenderConfig:
     background_color: str = DARK_THEME.bg
     text_color: str = DARK_THEME.text
     dim_text_color: str = DARK_THEME.text_dim
+    accent_color: str = DARK_THEME.accent
     selection_color: str = DARK_THEME.graph_selection
     edge_color: str = DARK_THEME.graph_edge
     edge_width: int = 2
@@ -71,6 +85,7 @@ class RenderConfig:
     subject_max_chars: int = 60
     wip_color: str = DARK_THEME.graph_wip
     wip_node_radius: int = 7
+    branch_icon_size: int = 12
 
 
 def _config_for_theme(theme: Theme | None) -> RenderConfig:
@@ -86,10 +101,19 @@ def _config_for_theme(theme: Theme | None) -> RenderConfig:
         background_color=theme.bg,
         text_color=theme.text,
         dim_text_color=theme.text_dim,
+        accent_color=theme.accent,
         selection_color=theme.graph_selection,
         edge_color=theme.graph_edge,
         wip_color=theme.graph_wip,
     )
+
+
+def _icon_pen(color: QColor, width: float) -> QPen:
+    """Thin rounded-line pen for checkmarks and monitor glyphs."""
+    pen = QPen(color, width)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    return pen
 
 
 class GraphWidget(QGraphicsView):
@@ -125,10 +149,17 @@ class GraphWidget(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         self._node_items: dict[str, QGraphicsEllipseItem] = {}
+        self._branch_label_items: dict[str, list[QGraphicsItem]] = {}
         self._selected_sha: str | None = None
         self._placeholder: QGraphicsSimpleTextItem | None = None
+        self._rows: list[dict] = []
+        self._avatar_cache: dict[str, QPixmap] = {}
 
         self._view_model.graph_updated.connect(self._on_graph_updated)
+        # Ctrl+Shift+C — copy graph structure to clipboard.
+        self._shortcut_copy = QShortcut("Ctrl+Shift+C", self)
+        self._shortcut_copy.activated.connect(self._copy_structure)
+
         # Pull the current state (in case the ViewModel emitted
         # before the widget was wired up — common during tests).
         self._on_graph_updated([])
@@ -153,8 +184,10 @@ class GraphWidget(QGraphicsView):
 
     def _on_graph_updated(self, rows: list[dict]) -> None:
         """Rebuild the scene from the ViewModel's new layout payload."""
+        self._rows = rows
         self._scene.clear()
         self._node_items.clear()
+        self._branch_label_items.clear()
         self._placeholder = None
 
         if not rows:
@@ -203,7 +236,17 @@ class GraphWidget(QGraphicsView):
         return self._cfg.row_height * row + self._cfg.row_height / 2
 
     def _lane_x(self, lane: int) -> float:
-        return self._cfg.lane_offset + lane * self._cfg.lane_width
+        """Return the scene-x of the centre of ``lane``.
+
+        Lane 0 sits to the right of the left-hand branch-label column;
+        the gap (``lane_offset``) keeps the leftmost node visually
+        clear of the labels.
+        """
+        return (
+            self._cfg.branch_label_width
+            + self._cfg.lane_offset
+            + lane * self._cfg.lane_width
+        )
 
     def _draw_commit(self, row: dict) -> None:
         x = self._lane_x(row["lane"])
@@ -234,10 +277,38 @@ class GraphWidget(QGraphicsView):
         self._scene.addItem(node)
         self._node_items[row["sha"]] = node
 
-        # Ref chips (HEAD / branch / tag) — drawn just above the subject.
+        # Author avatar inside the commit node (skip WIP).
+        if not is_wip:
+            av_size = max(10, radius * 2 - 8)
+            av_pix = self._avatar_for(
+                row.get("author_email") or row.get("author_name", ""),
+                av_size,
+                shape="circle",
+            )
+            av_item = QGraphicsPixmapItem(av_pix)
+            av_item.setPos(x - av_size / 2, y - av_size / 2)
+            av_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self._scene.addItem(av_item)
+
+        # Branch labels drawn in the column to the left of the graph.
+        # Branches (with their ``is_head`` / ``is_remote`` flags) are
+        # rendered here so the user sees the branch name next to the
+        # commit it points at. When a branch is also the currently
+        # checked-out one, a checkmark is drawn to its left; local
+        # branches get a small monitor glyph to their right.
+        self._draw_branch_labels(row, y)
+
+        # Ref chips (HEAD / tag) — drawn just above the subject.
+        # Branches are no longer listed here; they live in the left
+        # column. ``HEAD`` is suppressed whenever an ``is_head``
+        # branch ref is already shown — the checkmark next to the
+        # branch name conveys the same information.
         label_x = x + self._cfg.label_offset
         chip_y = y - self._cfg.ref_chip_height / 2 - 2
+        has_head_branch = any(b.get("is_head") for b in row.get("branch_refs", []))
         for ref_label in row["refs"]:
+            if ref_label == "HEAD" and has_head_branch:
+                continue
             chip = self._draw_ref_chip(ref_label, label_x, chip_y, color)
             label_x += chip.rect().width() + self._cfg.ref_chip_gap
 
@@ -261,6 +332,243 @@ class GraphWidget(QGraphicsView):
         sha_item.setFont(self.font())
         sha_item.setPos(text_x, y + 4)
         self._scene.addItem(sha_item)
+
+    def _draw_branch_labels(self, row: dict, y: float) -> list[QGraphicsItem]:
+        """Render the branch-name column to the left of the graph.
+
+        One coloured chip per branch. Inside the chip (left to right):
+        checkmark (if active), branch name, monitor (if local), and
+        an identicon avatar for the commit author — all in the same
+        contrasting colour as the label text.
+        """
+        items: list[QGraphicsItem] = []
+        branch_refs = row.get("branch_refs", [])
+        self._branch_label_items[row["sha"]] = items
+        if not branch_refs:
+            return items
+
+        # Dedup: suppress remote ``origin/X`` when local ``X`` exists.
+        local_names: set[str] = {
+            b["name"] for b in branch_refs if not b.get("is_remote")
+        }
+        visible = [
+            b for b in branch_refs
+            if not (
+                b.get("is_remote")
+                and b["name"].split("/", 1)[-1] in local_names
+            )
+        ]
+        if not visible:
+            return items
+
+        icon_size = 10
+        pad = 5
+        gap = 3
+        avatar_size = icon_size + 4
+        commit_color = QColor(row["color"])
+        chip_text_color = QColor("#FFFFFF")
+
+        fm = self.fontMetrics()
+        avatar = self._avatar_for(
+            row.get("author_email") or row.get("author_name", ""), avatar_size,
+        )
+
+        column_margin = 6
+        cursor_x = column_margin
+
+        for branch in visible:
+            is_head = branch.get("is_head")
+            is_remote = branch.get("is_remote")
+            display = branch["name"]
+            if is_remote:
+                parts = display.split("/", 1)
+                if len(parts) == 2:
+                    display = parts[1]
+
+            # Elide if needed.
+            reserved = pad * 2 + (icon_size + gap if is_head else 0) + \
+                       (gap + icon_size if not is_remote else 0) + \
+                       gap + avatar_size
+            max_text_w = self._cfg.branch_label_width - column_margin - reserved
+            if max_text_w < 20:
+                max_text_w = 60
+            if fm.horizontalAdvance(display) > max_text_w:
+                display = fm.elidedText(
+                    display, Qt.TextElideMode.ElideRight, max_text_w,
+                )
+
+            text_w = fm.horizontalAdvance(display)
+            text_h = fm.height()
+
+            # Chip layout: [ck?] [name] [mon?] [avatar]
+            content_w = pad
+            if is_head:
+                content_w += icon_size + gap
+            content_w += text_w
+            if not is_remote:
+                content_w += gap + icon_size
+            content_w += gap + avatar_size + pad
+
+            chip_h = max(text_h, icon_size, avatar_size) + pad * 2
+            chip_center_y = chip_h / 2
+
+            # Rounded-rect chip.
+            chip_path = QPainterPath()
+            chip_path.addRoundedRect(QRectF(0, 0, content_w, chip_h), 4, 4)
+            chip = QGraphicsPathItem(chip_path)
+            chip.setBrush(QBrush(commit_color))
+            chip.setPen(QPen(commit_color, 0))
+            chip.setPos(cursor_x, y - chip_center_y)
+            self._scene.addItem(chip)
+            items.append(chip)
+
+            inner_x = pad
+
+            # Checkmark.
+            if is_head:
+                ck = self._make_icon_checkmark(icon_size)
+                ck.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+                ck.setPen(_icon_pen(chip_text_color, 1.6))
+                ck.setParentItem(chip)
+                ck.setPos(inner_x, chip_center_y - icon_size / 2)
+                inner_x += icon_size + gap
+
+            # Branch name.
+            text_item = QGraphicsSimpleTextItem(display)
+            text_item.setBrush(chip_text_color)
+            text_item.setFont(self.font())
+            text_item.setParentItem(chip)
+            text_item.setPos(
+                inner_x,
+                chip_center_y - text_item.boundingRect().height() / 2
+                - text_item.boundingRect().top(),
+            )
+            inner_x += text_w
+
+            # Monitor icon for local branches.
+            if not is_remote:
+                mn = self._make_icon_monitor(icon_size)
+                mn.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+                mn.setPen(_icon_pen(chip_text_color, 1.2))
+                mn.setParentItem(chip)
+                mn.setPos(inner_x + gap, chip_center_y - icon_size / 2)
+                inner_x += gap + icon_size
+
+            # Author identicon.
+            av_item = QGraphicsPixmapItem(avatar)
+            av_item.setParentItem(chip)
+            av_item.setPos(inner_x + gap, chip_center_y - avatar_size / 2)
+
+            cursor_x += content_w + gap
+
+        self._branch_label_items[row["sha"]] = items
+        return items
+
+    # ----- icon helpers (unparented, local coords) ---------------------
+
+    @staticmethod
+    def _make_icon_checkmark(size: int) -> QGraphicsPathItem:
+        """Checkmark path in local ``(0, 0) .. (size, size)`` coords."""
+        path = QPainterPath()
+        path.moveTo(0, size * 0.55)
+        path.lineTo(size * 0.32, size * 0.92)
+        path.lineTo(size, size * 0.08)
+        return QGraphicsPathItem(path)
+
+    @staticmethod
+    def _make_icon_monitor(size: int) -> QGraphicsPathItem:
+        """Monitor glyph path in local ``(0, 0) .. (size, size)`` coords."""
+        path = QPainterPath()
+        screen_h = size * 0.7
+        path.addRoundedRect(QRectF(0, 0, size, screen_h), 1.2, 1.2)
+        nx = size / 2
+        ntop = screen_h
+        nbot = screen_h + size * 0.18
+        path.moveTo(nx, ntop)
+        path.lineTo(nx, nbot)
+        base_h = size * 0.32
+        path.moveTo(nx - base_h, nbot)
+        path.lineTo(nx + base_h, nbot)
+        return QGraphicsPathItem(path)
+
+    # ----- avatars ------------------------------------------------------
+
+    # A small palette of semi-transparent colours for user-avatar circles.
+    # Picked to look distinct from the 12 branch palette colours.
+    _AVATAR_COLORS: tuple[str, ...] = (
+        "#C44A2B", "#B85C8C", "#9A6E3A", "#5B7FA5",
+        "#8B5CF6", "#3B82A0", "#D97706", "#6D8EA0",
+    )
+
+    def _avatar_for(
+        self, seed: str, size: int = 14, *, shape: str = "square",
+    ) -> QPixmap:
+        """Return a small identicon pixmap (5×5 mirrored-block pattern).
+
+        ``shape`` can be ``"square"`` (rounded rect clip) or
+        ``"circle"`` (circular clip).
+        """
+        if not seed:
+            seed = "?"
+        cache_key = f"{seed}_{size}_{shape}"
+        if cache_key not in self._avatar_cache:
+            h_bytes = md5(seed.encode()).digest()  # noqa: S324
+            fg = QColor(self._AVATAR_COLORS[h_bytes[0] % len(self._AVATAR_COLORS)])
+            bg = QColor("#F4F4F4")
+
+            # 5×5 symmetric grid — left 3 columns from hash, right 2
+            # are the horizontal mirror.
+            grid = [[False] * 5 for _ in range(5)]
+            bits = int.from_bytes(h_bytes[3:6], "big")
+            for row in range(5):
+                for col in range(3):
+                    if bits & (1 << (row * 3 + col)):
+                        grid[row][col] = True
+                        grid[row][4 - col] = True
+
+            cell = size / 5.0
+            pix = QPixmap(size, size)
+            pix.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pix)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+            # Clip to the requested shape.
+            clip = QPainterPath()
+            margin = 1.0
+            d = size - margin * 2
+            if shape == "circle":
+                clip.addEllipse(QRectF(margin, margin, d, d))
+            else:
+                clip.addRoundedRect(QRectF(margin, margin, d, d), 3, 3)
+            painter.setClipPath(clip)
+
+            # Background.
+            painter.setBrush(QBrush(bg))
+            painter.setPen(QPen(Qt.PenStyle.NoPen))
+            painter.drawRect(QRectF(0, 0, size, size))
+
+            # Filled cells.
+            painter.setBrush(QBrush(fg))
+            for row in range(5):
+                for col in range(5):
+                    if grid[row][col]:
+                        painter.drawRect(
+                            QRectF(col * cell, row * cell, cell, cell),
+                        )
+
+            # Outline.
+            painter.setClipping(False)
+            outline = QPen(fg.darker(120), 1)
+            painter.setPen(outline)
+            painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+            if shape == "circle":
+                painter.drawEllipse(QRectF(margin, margin, d, d))
+            else:
+                painter.drawRoundedRect(QRectF(margin, margin, d, d), 3, 3)
+
+            painter.end()
+            self._avatar_cache[cache_key] = pix
+        return self._avatar_cache[cache_key]
 
     def _draw_ref_chip(
         self, label: str, x: float, y: float, color: QColor,
@@ -300,12 +608,54 @@ class GraphWidget(QGraphicsView):
             path.lineTo(cx, mid_y)
             path.lineTo(px, mid_y)
             path.lineTo(px, py - r)
-        pen = QPen(QColor(self._cfg.edge_color), self._cfg.edge_width)
+        if child["sha"] == "WIP":
+            edge_color = QColor(self._cfg.wip_color)
+        elif parent["sha"] == child["parents"][0]:
+            # First parent, same lineage or a branch-off: the child's
+            # branch colour is the one that defines this edge.
+            edge_color = QColor(child["color"])
+        else:
+            # Merge from a different branch: the parent's colour
+            # represents the branch being merged in.
+            edge_color = QColor(parent["color"])
+        pen = QPen(edge_color, self._cfg.edge_width)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         item = QGraphicsPathItem(path)
         item.setPen(pen)
         item.setZValue(-1)  # lines below nodes
         self._scene.addItem(item)
+
+    def _copy_structure(self) -> None:
+        """Copy a human-readable graph layout to the clipboard (Ctrl+Shift+C)."""
+        if not self._rows:
+            return
+        lines: list[str] = []
+        for row in self._rows:
+            branch_lines: list[str] = []
+            for b in row.get("branch_refs", []):
+                flags = ", ".join(
+                    f for f in ("head" if b.get("is_head") else None,
+                                "local" if not b.get("is_remote") else "remote")
+                    if f
+                )
+                branch_lines.append(f"  {b['name']} ({flags})")
+            branch_block = "\n".join(branch_lines) if branch_lines else "  (none)"
+            parents = ", ".join(p[:7] for p in row.get("parents", [])) or "(root)"
+            lines.append(
+                f"Row {row['row']:>3} | {row['sha'][:12]:>12} | lane {row['lane']} | "
+                f"{row['color']} | refs={row.get('refs', [])!r} | parents={parents}\n"
+                f"{branch_block}"
+            )
+        text = "\n".join(lines)
+        QApplication.clipboard().setText(text)
+        parent = self.parentWidget()
+        if parent is not None:
+            from PySide6.QtWidgets import QToolTip
+            QToolTip.showText(
+                self.mapToGlobal(self.rect().center()),
+                f"Copied {len(self._rows)} rows to clipboard",
+                self,
+            )
 
     def _refresh_selection_rings(self) -> None:
         for sha, node in self._node_items.items():
