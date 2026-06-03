@@ -65,7 +65,7 @@ from src.ui.dialogs.open_or_clone_dialog import OpenOrCloneDialog
 from src.ui.dialogs.remote_manage_dialog import RemoteManageDialog
 from src.ui.widgets.commit_detail_panel import CommitDetailPanel
 from src.ui.widgets.commit_panel import CommitPanel
-from src.ui.widgets.graph_widget import GraphWidget
+from src.ui.widgets.graph_panel import GraphTableWidget
 from src.ui.widgets.left_panel import LeftPanel
 from src.ui.widgets.log_widget import LogWidget
 from src.ui.widgets.repo_bar_widget import RepoBarWidget
@@ -74,9 +74,11 @@ from src.utils.config import (
     SPLITTER_KEY_HORIZONTAL,
     SPLITTER_KEY_RIGHT_VERTICAL,
     load_config,
+    load_graph_column_widths,
     load_splitter_sizes,
     load_window_size,
     save_config,
+    save_graph_column_widths,
 )
 from src.viewmodels.main_viewmodel import MainViewModel
 from src.viewmodels.repo_tabs_viewmodel import RepoTabViewModel
@@ -301,7 +303,7 @@ class MainWindow(QMainWindow):
             self._main_vm.branch_panel_view_model(),
             self._main_vm,
         )
-        self._graph_widget = GraphWidget(self._main_vm.graph_view_model())
+        self._graph_table = GraphTableWidget(self._main_vm.graph_view_model())
         self._commit_panel = CommitPanel(self._main_vm)
         self._detail_panel = CommitDetailPanel(self._main_vm.graph_view_model())
 
@@ -316,10 +318,10 @@ class MainWindow(QMainWindow):
 
         top = QSplitter(self)
         top.addWidget(self._left_panel)
-        top.addWidget(self._graph_widget)
+        top.addWidget(self._graph_table)
         top.addWidget(right_splitter)
         top.setStretchFactor(0, 1)
-        top.setStretchFactor(1, 4)
+        top.setStretchFactor(1, 5)
         top.setStretchFactor(2, 3)
         self._top_splitter = top
 
@@ -394,6 +396,14 @@ class MainWindow(QMainWindow):
         active_repo = config.get("active_repo")
         if recent_repos:
             self._repo_tabs_vm.load_from_state(recent_repos, active_repo)
+        # Restore per-repo graph column widths for the active repo.
+        # Ignore saved values whose total is unreasonably small
+        # (stale config from a previous version).
+        graph_widths = load_graph_column_widths(config, active_repo)
+        if graph_widths is not None and len(graph_widths) == 3 and sum(graph_widths) >= 300:
+            self._graph_table.set_divider_positions(
+                [graph_widths[0], graph_widths[0] + graph_widths[1]],
+            )
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt naming
         """Persist geometry, splitter sizes, and repo tabs before close.
@@ -419,6 +429,14 @@ class MainWindow(QMainWindow):
             tab_state = self._repo_tabs_vm.save_to_state()
             config["recent_repos"] = tab_state["paths"]
             config["active_repo"] = tab_state["active_path"]
+            # Persist per-repo graph column widths.
+            active = tab_state["active_path"]
+            if active and self._graph_table is not None:
+                divs = self._graph_table.divider_positions()
+                save_graph_column_widths(
+                    config, active,
+                    [divs[0], divs[1] - divs[0], 100],  # [branch_w, graph_w, _]
+                )
             save_config(self._config_path, config)
         super().closeEvent(event)
 

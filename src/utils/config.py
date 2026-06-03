@@ -34,6 +34,11 @@ DEFAULT_WINDOW_HEIGHT = 800
 # ``"right_vertical"`` (commit panel | commit detail).
 SPLITTER_KEY_HORIZONTAL = "horizontal"
 SPLITTER_KEY_RIGHT_VERTICAL = "right_vertical"
+SPLITTER_KEY_GRAPH = "graph"
+
+# Key in the top-level config dict holding per-repo graph column widths.
+# Value is ``{repo_path: [branch_lbl_w, graph_w, commit_msg_w]}``.
+GRAPH_CONFIGS_KEY = "graph_configs"
 
 _DEFAULT_CONFIG: dict[str, Any] = {
     "theme": "dark",
@@ -179,15 +184,54 @@ def load_splitter_sizes(config: dict[str, Any]) -> dict[str, list[int]]:
     return _coerce_splitter_sizes(config.get("splitter_sizes"))
 
 
+def load_graph_column_widths(
+    config: dict[str, Any], repo_path: str | None,
+) -> list[int] | None:
+    """Return ``[branch_lbl_w, graph_w, commit_msg_w]`` for *repo_path*.
+
+    Returns ``None`` when no per-repo entry exists — callers should
+    fall back to the graph panel's built-in defaults.
+    """
+    if not repo_path:
+        return None
+    graph_configs = config.get(GRAPH_CONFIGS_KEY)
+    if not isinstance(graph_configs, dict):
+        return None
+    widths = graph_configs.get(repo_path)
+    if not isinstance(widths, list) or len(widths) != 3:
+        return None
+    result: list[int] = []
+    for w in widths:
+        if isinstance(w, bool) or not isinstance(w, int) or w <= 0:
+            return None
+        result.append(w)
+    return result
+
+
+def save_graph_column_widths(
+    config: dict[str, Any], repo_path: str, widths: list[int],
+) -> None:
+    """Write per-repo graph column widths into *config* (mutates in-place)."""
+    graph_configs: dict[str, Any] = config.setdefault(GRAPH_CONFIGS_KEY, {})
+    if not isinstance(graph_configs, dict):
+        graph_configs = {}
+        config[GRAPH_CONFIGS_KEY] = graph_configs
+    graph_configs[repo_path] = list(widths)
+
+
 __all__ = [
     "DEFAULT_WINDOW_HEIGHT",
     "DEFAULT_WINDOW_WIDTH",
+    "GRAPH_CONFIGS_KEY",
+    "SPLITTER_KEY_GRAPH",
     "SPLITTER_KEY_HORIZONTAL",
     "SPLITTER_KEY_RIGHT_VERTICAL",
     "default_config_path",
     "get_int",
     "load_config",
+    "load_graph_column_widths",
     "load_splitter_sizes",
     "load_window_size",
     "save_config",
+    "save_graph_column_widths",
 ]

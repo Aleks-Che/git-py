@@ -364,7 +364,8 @@ def test_nodes_to_rows_returns_serialisable_dicts() -> None:
     row = rows[0]
     # All the keys the widget consumes must be present.
     for key in ("sha", "short_sha", "subject", "author_name", "author_email",
-                "author_time", "parents", "refs", "branch_refs", "lane", "color", "row"):
+                "author_time", "parents", "refs", "branch_refs", "lane",
+                "display_column", "color", "row"):
         assert key in row
     # Parents, refs and branch_refs must be plain lists (not
     # references into the dataclass) so they're safe to send across
@@ -386,6 +387,7 @@ def test_graphnode_to_dict_round_trip() -> None:
         refs=["HEAD"],
         branch_refs=[],
         lane=2,
+        display_column=1,
         color="#ff0000",
         row=5,
     )
@@ -401,6 +403,61 @@ def test_graphnode_to_dict_round_trip() -> None:
         "refs": ["HEAD"],
         "branch_refs": [],
         "lane": 2,
+        "display_column": 1,
         "color": "#ff0000",
         "row": 5,
     }
+
+
+# ----- lane compaction ---------------------------------------------------
+
+
+def test_single_lane_compacts_to_column_zero() -> None:
+    history = [
+        _commit_info("c" * 40, parents=["b" * 40], message="c", ts=3),
+        _commit_info("b" * 40, parents=["a" * 40], message="b", ts=2),
+        _commit_info("a" * 40, message="a", ts=1),
+    ]
+    nodes = compute_layout(history, [], [], None, None, max_columns=12)
+    assert all(n.display_column == 0 for n in nodes)
+
+
+def test_non_overlapping_branches_share_column() -> None:
+    sha_root, sha_main = "a" * 40, "b" * 40
+    history = [
+        _commit_info(sha_main, parents=[sha_root], ts=2),
+        _commit_info(sha_root, ts=1),
+    ]
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha=sha_main),
+    ]
+    nodes = compute_layout(history, branches, [], head_target_sha=sha_main, head_shorthand="main")
+    assert all(n.display_column == 0 for n in nodes)
+
+
+def test_display_column_respects_max_columns() -> None:
+    sha_a, sha_b, sha_c = "a" * 40, "b" * 40, "c" * 40
+    history = [
+        _commit_info(sha_c, parents=[sha_a], ts=3),
+        _commit_info(sha_b, parents=[sha_a], ts=2),
+        _commit_info(sha_a, ts=1),
+    ]
+    branches = [
+        BranchInfo(name="main", target_sha=sha_c),
+        BranchInfo(name="feature", target_sha=sha_b),
+    ]
+    nodes = compute_layout(history, branches, [], head_target_sha=sha_c, head_shorthand="main",
+                           max_columns=1)
+    cols = {n.display_column for n in nodes}
+    assert cols == {0}
+
+
+def test_display_column_defaults_to_lane_when_uncompacted() -> None:
+    history = [
+        _commit_info("c" * 40, parents=["b" * 40], message="c", ts=3),
+        _commit_info("b" * 40, parents=["a" * 40], message="b", ts=2),
+        _commit_info("a" * 40, message="a", ts=1),
+    ]
+    nodes = compute_layout(history, [], [], None, None, max_columns=12)
+    assert nodes[0].display_column == 0
+    assert nodes[0].lane == 0

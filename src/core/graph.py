@@ -15,7 +15,7 @@ The public API is:
   can be shipped over a Qt signal without leaking the dataclass type
   to the UI layer.
 
-The lane algorithm is a two-phase walk inspired by GitKraken's
+The lane algorithm is a three-phase walk inspired by GitKraken's
 display engine, but kept deliberately simple:
 
 1. **Phase 1 (priority walk).** Order branches by priority — HEAD's
@@ -31,6 +31,11 @@ display engine, but kept deliberately simple:
    is already occupied by a more recent commit, a new lane is
    opened. This handles repositories with no local branches and
    ad-hoc tag-only commits.
+3. **Phase 3 (lane compaction).** Logical lanes are mapped to a
+   limited set of display columns via greedy interval coloring.
+   Lanes whose row ranges do not overlap may share a column,
+   keeping the visual width bounded, controlled by ``max_columns``
+   (default 12).
 """
 from __future__ import annotations
 
@@ -95,6 +100,7 @@ class GraphNode:
     refs: list[str] = field(default_factory=list)
     branch_refs: list[BranchRef] = field(default_factory=list)
     lane: int = 0
+    display_column: int = 0
     color: str = BRANCH_PALETTE[0]
     row: int = 0
 
@@ -111,6 +117,7 @@ class GraphNode:
             "refs": list(self.refs),
             "branch_refs": [b.to_dict() for b in self.branch_refs],
             "lane": self.lane,
+            "display_column": self.display_column,
             "color": self.color,
             "row": self.row,
         }
@@ -131,15 +138,20 @@ def compute_layout(
     tags: list[TagInfo],
     head_target_sha: str | None,
     head_shorthand: str | None,
+    *,
+    max_columns: int = 12,
 ) -> list[GraphNode]:
     """Compute a lane-based layout for ``history``.
 
     ``head_target_sha`` is the SHA ``HEAD`` resolves to (``None`` if
     unborn). ``head_shorthand`` is the symbolic name ``HEAD`` carries
     — a branch name like ``"main"`` when on a branch, or
-    ``"(detached)"`` when HEAD is detached. It's currently unused
-    here but kept in the signature for forward compatibility (Stage
-    3+ will read it to decide which WIP node to draw).
+    ``"(detached)"`` when HEAD is detached.
+
+    ``max_columns`` caps the number of display columns produced by
+    lane compaction. Lanes whose row-range intervals do not overlap
+    may share a display column; when more than ``max_columns``
+    intervals overlap simultaneously, excess ones wrap around.
 
     The returned list is in the same order as ``history`` (newest
     first). Each :class:`GraphNode` has ``row`` matching its position
@@ -153,22 +165,25 @@ def compute_layout(
     branch_tips = {b.target_sha for b in branches if b.target_sha}
     lanes = _assign_lanes(history, branches, head_target_sha)
     colors = _assign_colors(history, branch_tips)
+    column_of_lane = _compact_lanes(history, lanes, max_columns)
 
     nodes: list[GraphNode] = []
     for row, commit in enumerate(history):
+        sha = commit.sha
         nodes.append(
             GraphNode(
-                sha=commit.sha,
+                sha=sha,
                 short_sha=commit.short_sha,
                 subject=_subject(commit.message),
                 author_name=commit.author_name,
                 author_email=commit.author_email,
                 author_time=commit.author_time,
                 parents=list(commit.parents),
-                refs=refs_by_sha.get(commit.sha, []),
-                branch_refs=branch_refs_by_sha.get(commit.sha, []),
-                lane=lanes[commit.sha],
-                color=colors[commit.sha],
+                refs=refs_by_sha.get(sha, []),
+                branch_refs=branch_refs_by_sha.get(sha, []),
+                lane=lanes[sha],
+                display_column=column_of_lane.get(lanes[sha], 0),
+                color=colors[sha],
                 row=row,
             ),
         )
@@ -414,6 +429,64 @@ def _assign_colors(
             color_of[commit.sha] = BRANCH_PALETTE[0]
 
     return color_of
+
+
+def _compact_lanes(
+    history: list[CommitInfo],
+    lane_of: dict[str, int],
+    max_columns: int,
+) -> dict[int, int]:
+    """Compact logical lanes into a limited set of display columns.
+
+    Each lane spans a contiguous row range in ``history`` (row 0 is
+    newest). Two lanes whose ranges overlap must occupy different
+    columns; non-overlapping lanes may share a column. The algorithm
+    uses greedy interval coloring — sort lanes by their topmost row
+    (lowest row number), then assign each the smallest free column
+    that does not conflict with already-placed overlapping lanes.
+
+    ``max_columns`` caps the result: when the greedy assignment
+    exhausts all columns, it wraps around modulo ``max_columns``,
+    reusing the earliest column. This keeps the graph compact at the
+    cost of occasional visual overlap on repos with many
+    simultaneously active branches.
+    """
+    if not history or not lane_of:
+        return {}
+
+    # Build lane -> (min_row, max_row) — the row range each lane occupies.
+    lane_rows: dict[int, tuple[int, int]] = {}
+    for row, commit in enumerate(history):
+        lane = lane_of.get(commit.sha)
+        if lane is None:
+            continue
+        if lane not in lane_rows:
+            lane_rows[lane] = (row, row)
+        else:
+            cur_min, cur_max = lane_rows[lane]
+            lane_rows[lane] = (min(cur_min, row), max(cur_max, row))
+
+    if not lane_rows:
+        return {}
+
+    # Sort lanes by their topmost row (lowest row number = newest on top).
+    sorted_lanes = sorted(lane_rows.items(), key=lambda item: item[1][0])
+
+    lane_column: dict[int, int] = {}
+
+    for lane, (lane_min, lane_max) in sorted_lanes:
+        used_columns: set[int] = set()
+        for other_lane, other_col in lane_column.items():
+            other_min, other_max = lane_rows[other_lane]
+            if not (lane_max < other_min or lane_min > other_max):
+                used_columns.add(other_col)
+
+        col = 0
+        while col in used_columns:
+            col += 1
+        lane_column[lane] = col % max_columns if max_columns > 0 else col
+
+    return lane_column
 
 
 __all__ = [

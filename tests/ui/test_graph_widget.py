@@ -205,12 +205,8 @@ def test_main_window_wires_graph_view_model(qtbot, tmp_git_repo: Path) -> None:
     with qtbot.waitSignal(window.graph_view_model().graph_updated, timeout=2000):
         window.set_repository(mgr)
 
-    # The graph widget should now show two nodes.
-    nodes = [
-        it for it in window._graph_widget.scene().items()  # noqa: SLF001
-        if isinstance(it, QGraphicsEllipseItem)
-    ]
-    assert len(nodes) == 2
+    graph_table = window._graph_table  # noqa: SLF001
+    assert graph_table.row_count() == 2
     window.close()
 
 
