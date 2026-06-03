@@ -68,10 +68,10 @@ class RenderConfig:
     lane_width: int = 30
     lane_offset: int = 30
     branch_label_width: int = 130
-    row_height: int = 48
-    node_radius: int = 14
+    row_height: int = 43
+    node_radius: int = 12
     label_offset: int = 18
-    ref_chip_height: int = 16
+    ref_chip_height: int = 12
     ref_chip_padding: int = 6
     ref_chip_gap: int = 4
     background_color: str = DARK_THEME.bg
@@ -84,7 +84,7 @@ class RenderConfig:
     selection_ring_width: int = 2
     subject_max_chars: int = 60
     wip_color: str = DARK_THEME.graph_wip
-    wip_node_radius: int = 7
+    wip_node_radius: int = 6
     branch_icon_size: int = 12
 
 
@@ -399,7 +399,6 @@ class GraphWidget(QGraphicsView):
                 )
 
             text_w = fm.horizontalAdvance(display)
-            text_h = fm.height()
 
             # Chip layout: [ck?] [name] [mon?] [avatar]
             content_w = pad
@@ -410,7 +409,8 @@ class GraphWidget(QGraphicsView):
                 content_w += gap + icon_size
             content_w += gap + avatar_size + pad
 
-            chip_h = max(text_h, icon_size, avatar_size) + pad * 2
+            # Высота подложки ветки = диаметр ноды коммита
+            chip_h = self._cfg.node_radius * 2
             chip_center_y = chip_h / 2
 
             # Rounded-rect chip.

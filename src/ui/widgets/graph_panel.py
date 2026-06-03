@@ -35,14 +35,14 @@ from src.viewmodels.graph_viewmodel import GraphViewModel
 class RenderConfig:
     """Visual constants for the graph table."""
 
-    row_height: int = 36
-    node_radius: int = 13
+    row_height: int = 32
+    node_radius: int = 11
     edge_width: int = 2
     selection_ring_width: int = 1
     subject_max_chars: int = 80
-    wip_node_radius: int = 5
+    wip_node_radius: int = 4
     branch_icon_size: int = 10
-    ref_chip_height: int = 14
+    ref_chip_height: int = 11
     ref_chip_padding: int = 5
     ref_chip_gap: int = 3
     header_height: int = 28
@@ -451,7 +451,8 @@ class GraphTableWidget(QWidget):
                 content_w += gap + icon_size
             content_w += gap + avatar_size + pad
 
-            chip_h = max(text_h, icon_size, avatar_size) + pad * 2
+            # Высота подложки ветки = диаметр ноды коммита
+            chip_h = self._cfg.node_radius * 2
             chip_top = y_center - chip_h / 2
 
             chip_path = QPainterPath()
@@ -549,7 +550,7 @@ class GraphTableWidget(QWidget):
         painter.restore()
 
         if not is_wip:
-            av_size = max(6, int(radius * 2.5 - 8))
+            av_size = max(6, int(radius * 2.6 - 8))
             av_pix = self._avatar_for(
                 row_data.get("author_email") or row_data.get("author_name", ""),
                 av_size, shape="circle",

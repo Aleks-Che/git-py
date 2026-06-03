@@ -47,18 +47,18 @@ from src.core.models import BranchInfo, CommitInfo, TagInfo
 # order when a new branch is encountered. Stage 9 will move this to
 # user config; for now it lives here as a constant per the Stage 2 plan.
 BRANCH_PALETTE: tuple[str, ...] = (
-    "#2D9A3E",  # green
-    "#4A7CE6",  # blue
-    "#D04A3E",  # red
-    "#D99F2E",  # amber
-    "#8E5CE3",  # violet
-    "#35A8B8",  # teal
-    "#D9409A",  # pink
-    "#60B48A",  # mint
-    "#DC7020",  # orange
-    "#7A838C",  # grey
-    "#B88BE6",  # lavender
-    "#40BC4E",  # lime
+    "#1A5924",  # green
+    "#2B4786",  # blue
+    "#782B24",  # red
+    "#7D5C1A",  # amber
+    "#523583",  # violet
+    "#1E626A",  # teal
+    "#7D2559",  # pink
+    "#38684F",  # mint
+    "#7F4112",  # orange
+    "#464B51",  # grey
+    "#6A5086",  # lavender
+    "#256D2D",  # lime
 )
 
 

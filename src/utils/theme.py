@@ -120,8 +120,8 @@ DARK_THEME = Theme(
     accent_pressed="#005A9E",
 
     graph_selection="#FFFFFF",
-    graph_edge="#5A5A5A",
-    graph_wip="#8B8B8B",
+    graph_edge="#343434",
+    graph_wip="#505050",
 )
 
 
