@@ -189,21 +189,38 @@ def checkout_branch(
     ``{"dirty_files": [str, ...]}`` so the caller can surface the exact
     file list to the user. The working tree is NOT touched in that case
     — the pre-check happens before any files are modified.
+
+    Implementation: HEAD is moved first (atomic ``set_head``), then the
+    working tree is updated via ``checkout_head``. If ``checkout_head``
+    fails the caller gets the *original* pygit2 error message, not a
+    generic "dirty worktree" label, because the failure may be caused
+    by locked files, permissions, index conflicts, etc.
     """
     with unwrap(repo) as r:
+        refname = f"refs/heads/{name}"
+        try:
+            branch = r.lookup_branch(name)
+        except (KeyError, ValueError) as exc:
+            raise InvalidRefError(f"Unknown branch: {name!r}") from exc
+        if branch is None:
+            raise InvalidRefError(f"Unknown branch: {name!r}")
+
         if strategy == pygit2.GIT_CHECKOUT_SAFE:
             dirty = _dirty_paths(r)
             if dirty:
                 return {"dirty_files": dirty}
             strategy = pygit2.GIT_CHECKOUT_FORCE
+
         try:
-            r.checkout(f"refs/heads/{name}", strategy=strategy)
-        except (KeyError, ValueError) as exc:
-            raise InvalidRefError(f"Unknown branch: {name!r}") from exc
+            r.set_head(refname)
+        except pygit2.GitError as exc:
+            raise GitError(f"Cannot switch HEAD to {name!r}: {exc}") from exc
+
+        try:
+            r.checkout_head(strategy=strategy)
         except pygit2.GitError as exc:
             raise DirtyWorkTreeError(
-                f"Cannot check out {name!r}: worktree has uncommitted changes "
-                "(pass force=True to override).",
+                f"Cannot update working tree for {name!r}: {exc}",
             ) from exc
     return None
 
