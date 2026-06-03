@@ -192,9 +192,8 @@ def checkout_branch(
 
     Implementation: HEAD is moved first (atomic ``set_head``), then the
     working tree is updated via ``checkout_head``. If ``checkout_head``
-    fails the caller gets the *original* pygit2 error message, not a
-    generic "dirty worktree" label, because the failure may be caused
-    by locked files, permissions, index conflicts, etc.
+    fails, HEAD is rolled back to the previous branch so the repository
+    is never left with HEAD on one branch and files from another.
     """
     with unwrap(repo) as r:
         refname = f"refs/heads/{name}"
@@ -211,6 +210,8 @@ def checkout_branch(
                 return {"dirty_files": dirty}
             strategy = pygit2.GIT_CHECKOUT_FORCE
 
+        previous_head = r.head.name if not r.head_is_unborn else None
+
         try:
             r.set_head(refname)
         except pygit2.GitError as exc:
@@ -219,6 +220,11 @@ def checkout_branch(
         try:
             r.checkout_head(strategy=strategy)
         except pygit2.GitError as exc:
+            if previous_head is not None:
+                try:
+                    r.set_head(previous_head)
+                except pygit2.GitError:
+                    pass
             raise DirtyWorkTreeError(
                 f"Cannot update working tree for {name!r}: {exc}",
             ) from exc
