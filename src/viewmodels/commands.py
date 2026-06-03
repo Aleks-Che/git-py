@@ -194,13 +194,24 @@ class CheckoutCommand(GitCommand):
 
     def execute(self) -> None:
         previous = self._previous_branch_for_undo()
-        checkout_branch(self._repo, self._target_branch)
+        result = checkout_branch(self._repo, self._target_branch)
+        if result is not None:
+            dirty = result.get("dirty_files", [])
+            n = len(dirty)
+            preview = ", ".join(dirty[:5])
+            suffix = f" and {n - 5} more" if n > 5 else ""
+            from src.core.exceptions import DirtyWorkTreeError
+            raise DirtyWorkTreeError(
+                f"Cannot check out {self._target_branch!r}: "
+                f"working tree has {n} uncommitted change(s) "
+                f"({preview}{suffix}).",
+            )
         self._previous_branch = previous
 
     def undo(self) -> None:
         if self._previous_branch is None:
             return
-        checkout_branch(self._repo, self._previous_branch)
+        checkout_branch(self._repo, self._previous_branch, strategy=pygit2.GIT_CHECKOUT_FORCE)
 
     @property
     def name(self) -> str:

@@ -253,6 +253,21 @@ class MainViewModel(QObject):
         from src.viewmodels.commands import CheckoutCommand  # local import: avoids cycle
 
         self._log("checkout", f"Checkout {name!r} — switching HEAD to refs/heads/{name}")
+        # Log pre-checkout working-tree state for diagnostics.
+        try:
+            status = self._repo_manager.repo.status()
+            dirty_pre = [p for p, _ in status.items()]
+            if dirty_pre:
+                self._log(
+                    "checkout",
+                    f"Working tree has {len(dirty_pre)} uncommitted change(s) "
+                    f"before checkout: {', '.join(dirty_pre[:10])}",
+                    level="warn",
+                )
+            else:
+                self._log("checkout", "Working tree clean before checkout")
+        except Exception:
+            pass  # diagnostic only — never block the actual operation
         command = CheckoutCommand(self._repo_manager, name)
         try:
             self._command_processor.execute(command)

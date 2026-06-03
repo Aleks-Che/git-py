@@ -178,13 +178,24 @@ def checkout_branch(
     repo: RepositoryManager | pygit2.Repository,
     name: str,
     strategy: int = pygit2.GIT_CHECKOUT_SAFE,
-) -> None:
+) -> dict | None:
     """Switch ``HEAD`` to local branch ``name``.
 
     ``strategy`` defaults to ``GIT_CHECKOUT_SAFE`` which refuses to
     overwrite local changes; pass ``GIT_CHECKOUT_FORCE`` to override.
+
+    Returns ``None`` on success. When ``GIT_CHECKOUT_SAFE`` is used and
+    the working tree has uncommitted changes, returns a dict
+    ``{"dirty_files": [str, ...]}`` so the caller can surface the exact
+    file list to the user. The working tree is NOT touched in that case
+    — the pre-check happens before any files are modified.
     """
     with unwrap(repo) as r:
+        if strategy == pygit2.GIT_CHECKOUT_SAFE:
+            dirty = _dirty_paths(r)
+            if dirty:
+                return {"dirty_files": dirty}
+            strategy = pygit2.GIT_CHECKOUT_FORCE
         try:
             r.checkout(f"refs/heads/{name}", strategy=strategy)
         except (KeyError, ValueError) as exc:
@@ -194,6 +205,12 @@ def checkout_branch(
                 f"Cannot check out {name!r}: worktree has uncommitted changes "
                 "(pass force=True to override).",
             ) from exc
+    return None
+
+
+def _dirty_paths(repo: pygit2.Repository) -> list[str]:
+    """Return the list of paths with uncommitted changes (index or worktree)."""
+    return [p for p, _ in repo.status().items()]
 
 
 def rename_branch(
