@@ -1,39 +1,70 @@
 """Main application window: menu, panels, status bar.
 
-Stage 0 wires the bare layout (left panel, graph, commit panel, terminal)
-with a File/Edit/View/Help menu whose actions are all stubs that pop
-an "implemented later" dialog. Real handlers (opening repositories,
-undo/redo via ``CommandProcessor``, panel visibility persistence) land
-in later stages.
+Stage 0 wired the bare layout (left panel, graph, commit panel,
+terminal) with stubbed menu actions. Stage 2 replaces the
+right-hand commit panel with :class:`CommitDetailPanel` and wires
+the graph ViewModel so opening a repository populates the graph
+right away. The left panel and terminal remain Stage 0 stubs — the
+left panel will be re-introduced in Stage 4, the terminal in Stage
+7.
 """
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
+    QFileDialog,
     QMainWindow,
     QMessageBox,
     QSplitter,
     QStatusBar,
 )
 
-from src.ui.widgets.commit_panel import CommitPanel
+from src.core.exceptions import GitError, RepositoryNotFoundError
+from src.core.repository import RepositoryManager
+from src.ui.widgets.commit_detail_panel import CommitDetailPanel
 from src.ui.widgets.graph_widget import GraphWidget
 from src.ui.widgets.left_panel import LeftPanel
 from src.ui.widgets.terminal_widget import TerminalWidget
+from src.viewmodels.graph_viewmodel import GraphViewModel
 
 
 class MainWindow(QMainWindow):
-    """Top-level window: horizontal splitter (left/graph/commit) over a terminal."""
+    """Top-level window: graph + commit detail over a terminal stub."""
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("git-py")
         self.resize(1280, 800)
 
+        self._repo_manager: RepositoryManager | None = None
+        self._graph_view_model = GraphViewModel()
+
         self._build_menu()
         self._build_central()
         self._build_status_bar()
+
+    # ----- public API (also used by tests) -----------------------------
+
+    def set_repository(self, manager: RepositoryManager | None) -> None:
+        """Bind an open repository to the UI.
+
+        Passing ``None`` closes the current repo and clears the
+        graph. Any error surfaced by the ViewModel is shown in the
+        status bar.
+        """
+        self._repo_manager = manager
+        self._graph_view_model.set_repository(manager)
+        if manager is not None:
+            self._status.showMessage(f"Repository: {manager.path}")
+        else:
+            self._status.showMessage("No repository")
+
+    def graph_view_model(self) -> GraphViewModel:
+        """Expose the graph ViewModel for test wiring."""
+        return self._graph_view_model
+
+    # ----- menu / status bar -------------------------------------------
 
     def _build_menu(self) -> None:
         bar = self.menuBar()
@@ -41,8 +72,13 @@ class MainWindow(QMainWindow):
         file_menu = bar.addMenu("&File")
         self._action_open = QAction("&Open Repository…", self)
         self._action_open.setShortcut(QKeySequence.StandardKey.Open)
-        self._action_open.triggered.connect(lambda: self._stub("Open Repository"))
+        self._action_open.triggered.connect(self._open_repository_dialog)
         file_menu.addAction(self._action_open)
+
+        self._action_close = QAction("&Close Repository", self)
+        self._action_close.setEnabled(False)
+        self._action_close.triggered.connect(lambda: self.set_repository(None))
+        file_menu.addAction(self._action_close)
 
         self._action_clone = QAction("&Clone…", self)
         self._action_clone.triggered.connect(lambda: self._stub("Clone"))
@@ -70,7 +106,7 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self._action_redo)
 
         view_menu = bar.addMenu("&View")
-        for label in ("Left Panel", "Commit Panel", "Terminal"):
+        for label in ("Left Panel", "Commit Detail Panel", "Terminal"):
             view_menu.addAction(QAction(label, self, checkable=True, checked=True))
 
         help_menu = bar.addMenu("&Help")
@@ -80,16 +116,16 @@ class MainWindow(QMainWindow):
 
     def _build_central(self) -> None:
         self._left_panel = LeftPanel()
-        self._graph_widget = GraphWidget()
-        self._commit_panel = CommitPanel()
+        self._graph_widget = GraphWidget(self._graph_view_model)
+        self._detail_panel = CommitDetailPanel(self._graph_view_model)
 
         top = QSplitter(self)
         top.addWidget(self._left_panel)
         top.addWidget(self._graph_widget)
-        top.addWidget(self._commit_panel)
+        top.addWidget(self._detail_panel)
         top.setStretchFactor(0, 1)
         top.setStretchFactor(1, 4)
-        top.setStretchFactor(2, 1)
+        top.setStretchFactor(2, 2)
 
         self._terminal = TerminalWidget(self)
         self._terminal.setMaximumHeight(180)
@@ -104,9 +140,32 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(main_splitter)
 
     def _build_status_bar(self) -> None:
-        status = QStatusBar(self)
-        status.showMessage("No repository")
-        self.setStatusBar(status)
+        self._status = QStatusBar(self)
+        self._status.showMessage("No repository")
+        self.setStatusBar(self._status)
+
+        self._graph_view_model.error_occurred.connect(self._on_graph_error)
+
+    def _on_graph_error(self, message: str) -> None:
+        self._status.showMessage(f"Graph error: {message}", 5000)
+
+    # ----- actions -----------------------------------------------------
+
+    def _open_repository_dialog(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Open Git Repository")
+        if not path:
+            return
+        manager = RepositoryManager()
+        try:
+            manager.open(path)
+        except RepositoryNotFoundError as exc:
+            QMessageBox.warning(self, "Open Repository", str(exc))
+            return
+        except GitError as exc:
+            QMessageBox.warning(self, "Open Repository", str(exc))
+            return
+        self.set_repository(manager)
+        self._action_close.setEnabled(True)
 
     def _stub(self, name: str) -> None:
         QMessageBox.information(

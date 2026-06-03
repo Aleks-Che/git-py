@@ -284,6 +284,47 @@ class RepositoryManager:
             result.append(self._to_commit_info(commit))
         return result
 
+    def get_all_history(self, max_count: int = 500) -> list[CommitInfo]:
+        """Walk the full commit DAG reachable from any local branch or tag.
+
+        Used by the graph view, which needs every commit visible in the
+        repository (not just the chain under ``HEAD``). We collect the
+        tip OIDs of every local branch and every tag, walk each one
+        with :data:`pygit2.GIT_SORT_TIME`, deduplicate by SHA, then
+        re-sort the merged set by commit time, newest first.
+
+        Returns an empty list if the repository has no commits.
+        ``max_count`` caps the total; we stop as soon as it is reached
+        (no fancy top-K across walks).
+        """
+        if max_count <= 0 or self.repo.head_is_unborn:
+            return []
+        tip_oids: set[pygit2.Oid] = set()
+        for name in self.repo.branches.local:
+            branch = self.repo.lookup_branch(name)
+            if branch.target is not None:
+                tip_oids.add(branch.target)
+        for ref_name in self.repo.references:
+            if not ref_name.startswith("refs/tags/"):
+                continue
+            ref = self.repo.lookup_reference(ref_name)
+            tip_oids.add(ref.target)
+        seen: set[str] = set()
+        collected: list[pygit2.Commit] = []
+        for tip in tip_oids:
+            for commit in self.repo.walk(tip, pygit2.GIT_SORT_TIME):
+                sha = str(commit.id)
+                if sha in seen:
+                    continue
+                seen.add(sha)
+                collected.append(commit)
+                if len(collected) >= max_count:
+                    break
+            if len(collected) >= max_count:
+                break
+        collected.sort(key=lambda c: -c.commit_time)
+        return [self._to_commit_info(c) for c in collected]
+
     def get_commit(self, sha: str) -> CommitInfo:
         """Resolve any revision (``HEAD``, branch name, short SHA, full SHA) to a commit."""
         try:

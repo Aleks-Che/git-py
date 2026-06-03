@@ -77,7 +77,7 @@
 
 ## Прогресс разработки
 
-**Общий прогресс:** `[████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]` 2 / 11 этапов (18%)
+**Общий прогресс:** `[████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]` 3 / 11 этапов (27%)
 
 Легенда:
 - `[ ]` — не начато
@@ -96,10 +96,10 @@
   - Дата завершения: `2026-06-02`
   - Комментарий: `RepositoryManager` (open/init/clone/is_valid + head_commit/branches/tags/stash_list/get_status/get_history/get_commit), все обёртки из operations.py (commit, branch create/delete, checkout, merge, rebase через `git` CLI, cherry-pick, revert, reset, stash push/pop, push/pull/fetch через локальный bare-origin), diff_parser (parse_diff + diff_to_text), доменные исключения (GitError/RepositoryNotFoundError/MergeConflictError/AuthError/NetworkError/...). 66 модульных тестов core/. Ребазе нужен `git` CLI (pygit2 1.x не имеет высокоуровневого API) — `GitNotInstalledError` если его нет.
 
-- [ ] **Этап 2: Базовая отрисовка графа коммитов** — _не начато_
-  - Дата начала: `—`
-  - Дата завершения: `—`
-  - Комментарий: `—`
+- [x] **Этап 2: Базовая отрисовка графа коммитов** — _завершено_
+  - Дата начала: `2026-06-02`
+  - Дата завершения: `2026-06-02`
+  - Комментарий: `core/graph.py` (DAG + branch-priority lane algorithm + 12-цветная палитра), `core/repository.py.get_all_history()` для обхода всех tip'ов (ветки+теги), `GraphViewModel` (QObject, сигналы `graph_updated`/`commit_selected`/`error_occurred`, методы-глаголы `refresh_graph`/`select_commit`/`get_commit_details`), `GraphWidget` на `QGraphicsView` (узлы-эллипсы с цветом ветки, L-shape линии до родителей, ref-чипы HEAD/ветки/теги, тёмная тема, клик-выделение), `CommitDetailPanel` (read-only QTextEdit с HTML), `MainWindow` (2 панели Graph+Detail; `File>Open` через QFileDialog; `MainViewModel` пока не трогаем). Алгоритм раскладки: phase 1 — priority walk (HEAD→локальные→remote) по первому родителю; phase 2 — orphan walk для коммитов без веток. **58 новых тестов** (20 graph + 14 viewmodel + 8 widget + 5 `get_all_history` + 11 прочих обновлений), итого **124/124 проходят**, `ruff check` чисто. Известные ограничения (Stage 10): полная перерисовка сцены на каждый `graph_updated` без виртуализации; `RenderConfig` пока хардкод — мигрирует в `utils/config.py` на Этапе 9.
 
 - [ ] **Этап 3: Рабочая директория и коммиты** — _не начато_
   - Дата начала: `—`
@@ -143,6 +143,6 @@
 
 ### Текущий статус
 
-- **Активный этап:** `Этап 2: Базовая отрисовка графа коммитов`
+- **Активный этап:** `Этап 3: Рабочая директория и коммиты`
 - **Последнее обновление:** `2026-06-02`
-- **Следующий шаг:** `Спроектировать структуру DAG на основе истории из pygit2; реализовать GraphViewModel с lane-раскладкой; кастомный GraphWidget на QGraphicsView (узлы-коммиты, линии веток, клик-детали).`
+- **Следующий шаг:** `Реализовать CommitPanel (список файлов с чекбоксами + diff preview), CommitCommand через CommandProcessor, кнопку Commit и staging/unstaging; отобразить WIP-узел на графе; обновление графа/статуса после коммита.`

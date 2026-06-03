@@ -192,6 +192,62 @@ def test_get_history_unknown_branch_raises(committed_repo: RepositoryManager) ->
         committed_repo.get_history(branch="does-not-exist")
 
 
+def test_get_all_history_returns_empty_for_unborn_head(tmp_git_repo: Path) -> None:
+    mgr = RepositoryManager(str(tmp_git_repo))
+    assert mgr.get_all_history() == []
+
+
+def test_get_all_history_includes_commits_only_reachable_via_tags(
+    committed_repo: RepositoryManager,
+) -> None:
+    # A tag on a non-tip commit should still bring that commit into the DAG.
+    repo = committed_repo.repo
+    init_sha = committed_repo.get_history()[-1].sha  # oldest commit
+    repo.references.create("refs/tags/at-init", pygit2.Oid(bytes.fromhex(init_sha)))
+    history = committed_repo.get_all_history()
+    shas = {c.sha for c in history}
+    assert committed_repo.head_commit.sha in shas
+    assert init_sha in shas
+
+
+def test_get_all_history_merges_branches(
+    committed_repo: RepositoryManager, make_commit
+) -> None:
+    # Add a feature branch off the initial commit and a commit on it.
+    init_sha = committed_repo.get_history()[-1].sha
+    feat_parents = [pygit2.Oid(bytes.fromhex(init_sha))]
+    make_commit(
+        "feat: add thing",
+        files={"a.txt": "a\n"},
+        ref="refs/heads/feature",
+        parents=feat_parents,
+    )
+    history = committed_repo.get_all_history()
+    shas = {c.sha for c in history}
+    assert committed_repo.head_commit.sha in shas  # main tip
+    assert any(c.message.strip() == "feat: add thing" for c in history)
+    # Newest first.
+    n = len(history)
+    assert all(history[i].author_time >= history[i + 1].author_time for i in range(n - 1))
+
+
+def test_get_all_history_respects_max_count(committed_repo: RepositoryManager) -> None:
+    assert len(committed_repo.get_all_history(max_count=1)) == 1
+
+
+def test_get_all_history_deduplicates_across_tips(
+    committed_repo: RepositoryManager, make_commit
+) -> None:
+    # A commit reachable from two tags is reported exactly once.
+    repo = committed_repo.repo
+    head_sha = committed_repo.head_commit.sha
+    repo.references.create("refs/tags/v1", pygit2.Oid(bytes.fromhex(head_sha)))
+    repo.references.create("refs/tags/v2", pygit2.Oid(bytes.fromhex(head_sha)))
+    history = committed_repo.get_all_history()
+    counts = sum(1 for c in history if c.sha == head_sha)
+    assert counts == 1
+
+
 def test_get_commit_resolves_short_sha(committed_repo: RepositoryManager) -> None:
     full = committed_repo.head_commit.sha
     short = full[:7]
