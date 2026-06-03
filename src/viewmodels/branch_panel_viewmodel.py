@@ -18,6 +18,7 @@ Properties:
 * :attr:`remote_branches` — remote-tracking branches.
 * :attr:`tags` — light + annotated tags.
 * :attr:`stash_list` — stash entries (most recent first).
+* :attr:`remotes` — configured Git remotes (Stage 6).
 * :attr:`current_branch_name` — ``HEAD`` shorthand, or ``None``.
 
 The snapshot is rebuilt from Core on every :meth:`refresh` (no
@@ -28,7 +29,7 @@ from __future__ import annotations
 from PySide6.QtCore import QObject, Signal
 
 from src.core.exceptions import GitError
-from src.core.models import BranchInfo, StashInfo, TagInfo
+from src.core.models import BranchInfo, RemoteInfo, StashInfo, TagInfo
 from src.core.repository import RepositoryManager
 
 
@@ -47,6 +48,7 @@ class BranchPanelViewModel(QObject):
         self._remote_branches: list[BranchInfo] = []
         self._tags: list[TagInfo] = []
         self._stash_list: list[StashInfo] = []
+        self._remotes: list[RemoteInfo] = []
         self._current_branch_name: str | None = None
 
     # ----- read-only state (properties) --------------------------------
@@ -62,6 +64,10 @@ class BranchPanelViewModel(QObject):
 
     def stash_list(self) -> list[StashInfo]:
         return list(self._stash_list)
+
+    def remotes(self) -> list[RemoteInfo]:
+        """List of configured remotes (``origin``, ``upstream``, ...)."""
+        return list(self._remotes)
 
     def current_branch_name(self) -> str | None:
         """``HEAD`` shorthand (``"main"`` on a branch, ``None`` if unborn)."""
@@ -90,6 +96,7 @@ class BranchPanelViewModel(QObject):
             self._remote_branches = []
             self._tags = []
             self._stash_list = []
+            self._remotes = []
             self._current_branch_name = None
             self.references_changed.emit()
             return
@@ -99,6 +106,9 @@ class BranchPanelViewModel(QObject):
             self._remote_branches = [b for b in all_branches if b.is_remote]
             self._tags = self._repo.tags
             self._stash_list = self._repo.stash_list
+            from src.core.operations import list_remotes
+
+            self._remotes = list_remotes(self._repo)
             self._current_branch_name = self._head_shorthand()
         except GitError as exc:
             self.error_occurred.emit(str(exc))
@@ -106,8 +116,30 @@ class BranchPanelViewModel(QObject):
             self._remote_branches = []
             self._tags = []
             self._stash_list = []
+            self._remotes = []
             self._current_branch_name = None
         self.references_changed.emit()
+
+    # ----- helpers -----------------------------------------------------
+
+    def get_remote_for_branch(self, branch_name: str) -> str | None:
+        """Return the remote name for a remote-tracking ``branch_name``.
+
+        A branch like ``origin/main`` resolves to ``"origin"``. Branches
+        without a ``/`` (e.g. local branches) and remote-tracking
+        branches whose prefix is not a configured remote return
+        ``None`` — the caller should treat this as "not a remote branch
+        in any of our remotes".
+        """
+        if "/" not in branch_name:
+            return None
+        prefix = branch_name.split("/", 1)[0]
+        for remote in self._remotes:
+            if remote.name == prefix:
+                return prefix
+        # Fall back: return the prefix anyway. Callers that need strict
+        # matching can use ``in {r.name for r in remotes()}``.
+        return prefix
 
     # ----- internals ---------------------------------------------------
 

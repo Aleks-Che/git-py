@@ -89,3 +89,19 @@ class FileChange:
 
     path: str
     status: FileStatus
+
+
+@dataclass
+class RemoteInfo:
+    """A single Git remote (``origin``, ``upstream``, ...).
+
+    Returned by :func:`src.core.operations.list_remotes` and surfaced
+    to the UI through :class:`src.viewmodels.branch_panel_viewmodel.BranchPanelViewModel`.
+    ``fetch_refspec`` and ``push_refspec`` default to ``"+" + name + "/*"``
+    (the libgit2 default) when the remote has no explicit refspecs.
+    """
+
+    name: str
+    url: str
+    fetch_refspec: str = ""
+    push_refspec: str = ""

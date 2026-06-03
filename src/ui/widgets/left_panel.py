@@ -228,6 +228,15 @@ class LeftPanel(QTreeWidget):
             create_from = QAction(f"Create Branch from {name}…", self)
             create_from.triggered.connect(lambda: self._prompt_create_branch(from_name=name))
             actions.append(create_from)
+            # ``name`` is like ``origin/main`` — the leading segment is
+            # the remote. The fetch is per-remote, not per-branch.
+            remote_name = self._vm.get_remote_for_branch(name)
+            if remote_name:
+                fetch_action = QAction(f"Fetch from {remote_name}", self)
+                fetch_action.triggered.connect(
+                    lambda: self._main_vm.fetch_changes(remote_name),
+                )
+                actions.append(fetch_action)
         elif kind == _KIND_TAG:
             create_from = QAction(f"Create Branch from {name}…", self)
             create_from.triggered.connect(lambda: self._prompt_create_branch(from_name=name))

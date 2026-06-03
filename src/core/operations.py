@@ -39,7 +39,7 @@ from src.core.exceptions import (
     NetworkError,
     RebaseConflictError,
 )
-from src.core.models import CommitInfo
+from src.core.models import CommitInfo, RemoteInfo
 from src.core.repository import RepositoryManager, unwrap
 
 if TYPE_CHECKING:
@@ -742,6 +742,93 @@ def _wrap_remote_error(url: str, exc: pygit2.GitError) -> GitError:
     return GitError(f"Remote operation against {url} failed: {exc}")
 
 
+def add_remote(
+    repo: RepositoryManager | pygit2.Repository,
+    name: str,
+    url: str,
+) -> str:
+    """Create a new remote called ``name`` pointing at ``url``.
+
+    Returns the remote name. Translates :class:`pygit2.AlreadyExistsError`
+    to :class:`GitError` and any other :class:`pygit2.GitError` to
+    :class:`GitError` as well — the ViewModel does not need to
+    distinguish "name taken" from "bad URL" because both are surfaced
+    the same way to the user.
+    """
+    if not name or not name.strip():
+        raise GitError("Remote name must not be empty.")
+    if not url or not url.strip():
+        raise GitError("Remote URL must not be empty.")
+    with unwrap(repo) as r:
+        try:
+            remote = r.remotes.create(name, url)
+        except (pygit2.AlreadyExistsError, ValueError) as exc:
+            # libgit2 raises ``AlreadyExistsError`` in newer versions
+            # and a bare ``ValueError`` (with error code GIT_EEXISTS)
+            # in older ones — both signal "remote with this name exists".
+            raise GitError(f"Remote {name!r} already exists.") from exc
+        except pygit2.GitError as exc:
+            raise GitError(f"Failed to add remote {name!r}: {exc}") from exc
+    return remote.name
+
+
+def remove_remote(
+    repo: RepositoryManager | pygit2.Repository,
+    name: str,
+) -> None:
+    """Delete the remote called ``name``.
+
+    ``pygit2`` raises :class:`KeyError` when the remote does not exist;
+    we re-raise as :class:`InvalidRefError` (the closest domain
+    exception — a missing remote is conceptually a missing ref-like
+    entry in the config). Other libgit2 errors become :class:`GitError`.
+    """
+    with unwrap(repo) as r:
+        try:
+            r.remotes.delete(name)
+        except KeyError as exc:
+            raise InvalidRefError(f"Unknown remote: {name!r}") from exc
+        except pygit2.GitError as exc:
+            raise GitError(f"Failed to remove remote {name!r}: {exc}") from exc
+
+
+def list_remotes(repo: RepositoryManager | pygit2.Repository) -> list[RemoteInfo]:
+    """Return a snapshot of every remote configured in ``repo``."""
+    with unwrap(repo) as r:
+        # ``list(r.remotes)`` yields ``Remote`` *objects*, not names.
+        # Use ``.names()`` to get the string names so the snapshot is
+        # independent of the underlying state.
+        names = list(r.remotes.names())
+        result: list[RemoteInfo] = []
+        for remote_name in names:
+            remote = r.remotes[remote_name]
+            fetch_spec = ""
+            push_spec = ""
+            try:
+                specs = list(remote.fetch_refspecs or ())
+                if specs:
+                    fetch_spec = "\n".join(specs)
+            except (AttributeError, pygit2.GitError):
+                fetch_spec = ""
+            try:
+                # ``push_refspecs`` is a newer libgit2 addition; treat
+                # ``AttributeError`` as "unsupported" and fall back.
+                push_specs = list(getattr(remote, "push_refspecs", None) or ())
+                if push_specs:
+                    push_spec = "\n".join(push_specs)
+            except (AttributeError, pygit2.GitError):
+                push_spec = ""
+            result.append(
+                RemoteInfo(
+                    name=remote.name,
+                    url=remote.url or "",
+                    fetch_refspec=fetch_spec,
+                    push_refspec=push_spec,
+                ),
+            )
+    return result
+
+
 def push(
     repo: RepositoryManager | pygit2.Repository,
     remote_name: str = "origin",
@@ -804,6 +891,7 @@ def pull(
 __all__ = [
     "abort_merge",
     "abort_rebase",
+    "add_remote",
     "cherry_pick",
     "checkout_branch",
     "commit_changes",
@@ -814,10 +902,12 @@ __all__ = [
     "fetch",
     "is_merge_in_progress",
     "is_rebase_in_progress",
+    "list_remotes",
     "merge_branch",
     "pull",
     "push",
     "rebase_branch",
+    "remove_remote",
     "rename_branch",
     "reset",
     "revert",

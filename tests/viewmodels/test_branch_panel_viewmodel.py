@@ -226,3 +226,48 @@ def test_set_repository_with_closed_manager_keeps_lists_empty(qtbot) -> None:
     assert vm.tags() == []
     assert vm.stash_list() == []
     assert vm.current_branch_name() is None
+
+
+# ----- remotes / get_remote_for_branch -----------------------------------
+
+
+def test_remotes_empty_on_no_repo(qtbot) -> None:
+    _ensure_app()
+    vm = BranchPanelViewModel()
+    vm.set_repository(None)
+    assert vm.remotes() == []
+
+
+def test_remotes_populated(qtbot, committed_repo: RepositoryManager) -> None:
+    _ensure_app()
+    from src.core.operations import add_remote
+
+    add_remote(committed_repo, "origin", "https://example.com/origin.git")
+    vm = BranchPanelViewModel()
+    vm.set_repository(committed_repo)
+    remotes = vm.remotes()
+    assert {r.name for r in remotes} == {"origin"}
+    assert remotes[0].url == "https://example.com/origin.git"
+
+
+def test_get_remote_for_branch_local_returns_none(qtbot) -> None:
+    """A local branch name has no ``/`` separator, so the lookup returns ``None``."""
+    _ensure_app()
+    vm = BranchPanelViewModel()
+    assert vm.get_remote_for_branch("main") is None
+
+
+def test_get_remote_for_branch_resolves_known_remote(qtbot) -> None:
+    _ensure_app()
+    vm = BranchPanelViewModel()
+    # No remotes configured — the prefix is still returned as a
+    # best-effort guess (callers can use ``in {r.name for r in remotes()}``
+    # for strict matching).
+    assert vm.get_remote_for_branch("origin/main") == "origin"
+
+
+def test_get_remote_for_branch_unrelated_prefix(qtbot) -> None:
+    _ensure_app()
+    vm = BranchPanelViewModel()
+    # No remotes configured; ``fork`` is not a known remote.
+    assert vm.get_remote_for_branch("fork/feature") == "fork"

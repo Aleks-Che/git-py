@@ -23,15 +23,16 @@ conflict_state_changed(dict)
     and operation-specific context (``source``, ``target``, ``upstream``,
     ``sha``).
 busy_changed(bool)
-    Emitted when a long-running operation (rebase, large merge) starts
-    or finishes. UI uses this to show a spinner and disable buttons.
+    Emitted when a long-running operation (rebase, large merge, push,
+    pull, fetch, clone) starts or finishes. UI uses this to show a
+    spinner and disable buttons.
 error_occurred(str)
     Emitted instead of raising; payload is a human-readable error
     message (always already wrapped by :mod:`src.core.exceptions`).
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, QThreadPool, Signal
+from PySide6.QtCore import QObject, QThreadPool, QTimer, Signal
 
 from src.core.exceptions import (
     GitError,
@@ -39,6 +40,7 @@ from src.core.exceptions import (
     RebaseConflictError,
     RepositoryNotFoundError,
 )
+from src.core.models import RemoteInfo
 from src.core.repository import RepositoryManager
 from src.utils.async_worker import AsyncWorker
 from src.viewmodels.branch_panel_viewmodel import BranchPanelViewModel
@@ -61,6 +63,8 @@ class MainViewModel(QObject):
         *,
         async_enabled: bool = False,
         merge_async_threshold: int = 50,
+        auto_fetch_enabled: bool = False,
+        auto_fetch_interval_ms: int = 60_000,
     ) -> None:
         super().__init__(parent)
         self._repo_manager: RepositoryManager | None = None
@@ -80,6 +84,16 @@ class MainViewModel(QObject):
         # section 3.
         self._async_enabled: bool = async_enabled
         self._merge_async_threshold: int = merge_async_threshold
+
+        # Auto-fetch timer. Default off so tests do not see surprise
+        # network calls. ``MainWindow`` flips this on when the user
+        # enables it in the config (Stage 9).
+        self._auto_fetch_enabled: bool = auto_fetch_enabled
+        self._auto_fetch_interval_ms: int = auto_fetch_interval_ms
+        self._auto_fetch_timer = QTimer(self)
+        self._auto_fetch_timer.setInterval(auto_fetch_interval_ms)
+        self._auto_fetch_timer.setSingleShot(False)
+        self._auto_fetch_timer.timeout.connect(self._on_auto_fetch_tick)
 
         # Forward errors from child VMs so the UI has a single place
         # to listen (e.g. the status bar).
@@ -135,6 +149,10 @@ class MainViewModel(QObject):
         ``RepositoryManager`` reference and could corrupt the new repo
         if undone. Any in-progress conflict state is also cleared — it
         would otherwise refer to the old repo's paths.
+
+        The auto-fetch timer is started when a repository is opened
+        (and the user has auto-fetch enabled in the config) and
+        stopped when the repository is closed.
         """
         self._repo_manager = manager
         self._command_processor.clear()
@@ -142,6 +160,7 @@ class MainViewModel(QObject):
         self._graph_view_model.set_repository(manager)
         self._commit_panel_view_model.set_repository(manager)
         self._branch_panel_view_model.set_repository(manager)
+        self._update_auto_fetch_timer()
         self.repository_changed.emit(manager.path if manager is not None else None)
 
     # ----- verb commands ----------------------------------------------
@@ -350,6 +369,66 @@ class MainViewModel(QObject):
             return
         self._refresh_all_views()
 
+    def _execute_push_sync(self, command: object) -> None:
+        try:
+            self._command_processor.execute(command)  # type: ignore[arg-type]
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            return
+        self._refresh_all_views()
+
+    def _execute_pull_sync(
+        self,
+        command: object,
+        remote_name: str,
+        refspec: str | None,
+    ) -> None:
+        try:
+            self._command_processor.execute(command)  # type: ignore[arg-type]
+        except MergeConflictError as exc:
+            self._set_conflict_state(
+                "merge",
+                conflicting_paths=exc.conflicting_paths,
+                source=(
+                    f"{remote_name}/{refspec}"
+                    if refspec
+                    else f"{remote_name}/{self._current_branch_shorthand()}"
+                ),
+                target=None,
+            )
+            return
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            return
+        self._refresh_all_views()
+
+    def _execute_fetch_sync(self, command: object, silent: bool) -> None:
+        try:
+            self._command_processor.execute(command)  # type: ignore[arg-type]
+        except GitError as exc:
+            if not silent:
+                self.error_occurred.emit(str(exc))
+            return
+        self._refresh_all_views()
+
+    def _execute_clone_sync(self, url: str, path: str) -> None:
+        try:
+            manager = RepositoryManager()
+            manager.clone(url, path)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            return
+        self.set_repository(manager)
+
+    def _current_branch_shorthand(self) -> str:
+        """Return the current branch shorthand, or ``""`` if unborn / no repo."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            return ""
+        repo = self._repo_manager.repo
+        if repo.head_is_unborn:
+            return ""
+        return repo.head.shorthand
+
     def _execute_rebase_sync(
         self,
         command: object,
@@ -458,6 +537,225 @@ class MainViewModel(QObject):
             return
         self._clear_conflict_state()
         self._refresh_all_views()
+
+    # ----- remotes: push / pull / fetch / add / remove / clone ---------
+
+    def push_changes(
+        self,
+        remote_name: str = "origin",
+        refspec: str | None = None,
+    ) -> None:
+        """Push ``refspec`` to ``remote_name`` via :class:`PushCommand`.
+
+        Always routed through :class:`AsyncWorker` when
+        ``async_enabled`` is true (per DEVELOPMENT_RULES.md §3 — push
+        is a network op and must not block the UI thread). On success
+        the views are refreshed; on failure the error is surfaced via
+        :attr:`error_occurred` and the command is not pushed.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        if self._is_busy:
+            self.error_occurred.emit("Another operation is already in progress.")
+            return
+        from src.viewmodels.commands import PushCommand
+
+        command = PushCommand(self._repo_manager, remote_name, refspec)
+        if self._async_enabled:
+            self._run_async(
+                command,
+                on_success=lambda: self._refresh_all_views(),
+            )
+            return
+        self._execute_push_sync(command)
+
+    def pull_changes(
+        self,
+        remote_name: str = "origin",
+        refspec: str | None = None,
+    ) -> None:
+        """Pull ``refspec`` from ``remote_name`` via :class:`PullCommand`.
+
+        Always routed through :class:`AsyncWorker` when
+        ``async_enabled`` is true. A conflict leaves the VM in the
+        conflict state and the command is not pushed onto the undo
+        stack.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        if self._is_busy:
+            self.error_occurred.emit("Another operation is already in progress.")
+            return
+        from src.viewmodels.commands import PullCommand
+
+        command = PullCommand(self._repo_manager, remote_name, refspec)
+        if self._async_enabled:
+            self._run_async(
+                command,
+                on_success=lambda: self._refresh_all_views(),
+            )
+            return
+        self._execute_pull_sync(command, remote_name, refspec)
+
+    def fetch_changes(
+        self,
+        remote_name: str = "origin",
+        refspec: str | None = None,
+        *,
+        silent: bool = False,
+    ) -> None:
+        """Fetch ``refspec`` from ``remote_name`` via :class:`FetchCommand`.
+
+        Always routed through :class:`AsyncWorker` when
+        ``async_enabled`` is true. ``silent=True`` (used by the auto-
+        fetch timer) suppresses the error signal — a background fetch
+        failure is logged, not flashed in front of the user.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            if not silent:
+                self.error_occurred.emit("No repository open.")
+            return
+        if self._is_busy:
+            # Auto-fetch must never block on user-driven work; the next
+            # tick will retry.
+            return
+        from src.viewmodels.commands import FetchCommand
+
+        command = FetchCommand(self._repo_manager, remote_name, refspec)
+        if self._async_enabled:
+            self._run_async(
+                command,
+                on_success=lambda: self._refresh_all_views(),
+                silent_on_failure=silent,
+            )
+            return
+        self._execute_fetch_sync(command, silent)
+
+    def add_remote(self, name: str, url: str) -> None:
+        """Add a remote via :class:`AddRemoteCommand` (sync — fast op)."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        from src.viewmodels.commands import AddRemoteCommand
+
+        command = AddRemoteCommand(self._repo_manager, name, url)
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            return
+        self._branch_panel_view_model.refresh()
+
+    def remove_remote(self, name: str) -> None:
+        """Remove a remote via :class:`RemoveRemoteCommand` (sync)."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        from src.viewmodels.commands import RemoveRemoteCommand
+
+        command = RemoveRemoteCommand(self._repo_manager, name)
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            return
+        self._branch_panel_view_model.refresh()
+
+    def list_remotes(self) -> list[RemoteInfo]:
+        """Return a snapshot of the configured remotes, or ``[]`` if none."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            return []
+        from src.core.operations import list_remotes
+
+        try:
+            return list_remotes(self._repo_manager)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            return []
+
+    def clone_repository(self, url: str, path: str) -> None:
+        """Clone ``url`` to ``path`` via :class:`RepositoryManager.clone`.
+
+        Routed through :class:`AsyncWorker` so a slow clone does not
+        freeze the UI. On success the new repository is opened
+        automatically; on failure the error is surfaced via
+        :attr:`error_occurred` and no repository is bound.
+        """
+        if self._is_busy:
+            self.error_occurred.emit("Another operation is already in progress.")
+            return
+        if not self._async_enabled:
+            self._execute_clone_sync(url, path)
+            return
+        self._is_busy = True
+        self.busy_changed.emit(True)
+
+        def _work() -> None:
+            manager = RepositoryManager()
+            manager.clone(url, path)
+
+        def _on_success(_: object) -> None:
+            self._is_busy = False
+            self.busy_changed.emit(False)
+            try:
+                manager = RepositoryManager(path)
+            except (RepositoryNotFoundError, GitError) as exc:
+                self.error_occurred.emit(str(exc))
+                return
+            self.set_repository(manager)
+
+        def _on_failure(message: str) -> None:
+            self._is_busy = False
+            self.busy_changed.emit(False)
+            self.error_occurred.emit(message)
+
+        worker = AsyncWorker(_work)
+        worker.signals.result.connect(_on_success)
+        worker.signals.failed.connect(_on_failure)
+        worker.signals.finished.connect(self._on_async_finished)
+        QThreadPool.globalInstance().start(worker)
+
+    # ----- auto-fetch timer --------------------------------------------
+
+    def set_auto_fetch_enabled(self, enabled: bool) -> None:
+        """Enable / disable the auto-fetch timer at runtime."""
+        self._auto_fetch_enabled = enabled
+        self._update_auto_fetch_timer()
+
+    def is_auto_fetch_enabled(self) -> bool:
+        return self._auto_fetch_enabled
+
+    def set_auto_fetch_interval_ms(self, interval_ms: int) -> None:
+        """Update the auto-fetch interval and restart the timer if active."""
+        if interval_ms <= 0:
+            # Treat as "disabled" — guard against config corruption.
+            self._auto_fetch_enabled = False
+            self._auto_fetch_interval_ms = 60_000
+        else:
+            self._auto_fetch_interval_ms = interval_ms
+        self._auto_fetch_timer.setInterval(self._auto_fetch_interval_ms)
+        self._update_auto_fetch_timer()
+
+    def _update_auto_fetch_timer(self) -> None:
+        """Start the timer iff a repository is open and the user opted in."""
+        if (
+            self._auto_fetch_enabled
+            and self._repo_manager is not None
+            and self._repo_manager.is_open
+            and self._auto_fetch_interval_ms > 0
+        ):
+            if not self._auto_fetch_timer.isActive():
+                self._auto_fetch_timer.start()
+        elif self._auto_fetch_timer.isActive():
+            self._auto_fetch_timer.stop()
+
+    def _on_auto_fetch_tick(self) -> None:
+        """Auto-fetch callback: silent fetch of ``origin`` (errors logged)."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            return
+        self.fetch_changes("origin", silent=True)
 
     def resolve_conflict(self, path: str, resolution: str) -> None:
         """Write ``resolution`` to ``path``, stage it, and check for more conflicts.
@@ -603,6 +901,8 @@ class MainViewModel(QObject):
         self,
         command: object,
         on_success: object,
+        *,
+        silent_on_failure: bool = False,
     ) -> None:
         """Run ``command.execute()`` on a worker thread.
 
@@ -610,6 +910,12 @@ class MainViewModel(QObject):
         signal triggers ``on_success`` on the UI thread, the failed
         signal routes the exception through the normal VM error /
         conflict paths, and the finished signal clears the busy flag.
+
+        ``silent_on_failure=True`` suppresses the ``error_occurred``
+        signal for generic :class:`GitError` failures. Conflict state
+        is still surfaced because the user must resolve it. The
+        auto-fetch timer uses silent mode so a dropped connection
+        does not flash a status-bar error every minute.
         """
         if self._is_busy:
             return
@@ -623,22 +929,31 @@ class MainViewModel(QObject):
             # guard has disabled every UI button that could race.
             self._command_processor.execute(command)  # type: ignore[arg-type]
 
+        def _on_result(_: object) -> None:
+            on_success()  # type: ignore[operator]
+
         worker = AsyncWorker(_work)
-        worker.signals.result.connect(lambda _: on_success())  # type: ignore[operator]
+        worker.signals.result.connect(_on_result)
         worker.signals.failed.connect(
-            lambda message: self._on_async_failed(command, message),
+            lambda message: self._on_async_failed(command, message, silent_on_failure),
         )
         worker.signals.finished.connect(self._on_async_finished)
         QThreadPool.globalInstance().start(worker)
 
-    def _on_async_failed(self, command: object, message: str) -> None:
+    def _on_async_failed(
+        self,
+        command: object,
+        message: str,
+        silent: bool = False,
+    ) -> None:
         """Map a worker exception back into the VM's error/conflict paths."""
         # ``message`` is the stringified exception raised on the
         # worker thread. We don't have the exception instance, so we
         # re-create the state by checking the repository for in-progress
         # markers and surfacing the appropriate error.
         if self._repo_manager is None:
-            self.error_occurred.emit(message)
+            if not silent:
+                self.error_occurred.emit(message)
             return
         from src.core.operations import is_merge_in_progress, is_rebase_in_progress
 
@@ -652,9 +967,11 @@ class MainViewModel(QObject):
             return
         if is_rebase_in_progress(self._repo_manager):
             self._set_conflict_state("rebase", conflicting_paths=[], upstream=None)
-            self.error_occurred.emit(message)
+            if not silent:
+                self.error_occurred.emit(message)
             return
-        self.error_occurred.emit(message)
+        if not silent:
+            self.error_occurred.emit(message)
 
     def _on_async_finished(self) -> None:
         self._is_busy = False

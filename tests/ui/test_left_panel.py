@@ -525,3 +525,104 @@ def test_mime_data_uses_bare_branch_name(
     assert data is not None
     assert data.hasText()
     assert data.text() == "feature"
+
+
+# ----- fetch context menu on remote branches ------------------------------
+
+
+def test_remote_branch_context_menu_has_fetch_action(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    """Right-clicking a remote-tracking branch exposes a ``Fetch from <name>`` action."""
+    import shutil
+
+    import pygit2
+
+    # Build a remote-tracking branch via a local bare origin.
+    origin_path = committed_repo.path and (
+        Path(committed_repo.path).parent / "origin.git"
+    )
+    if origin_path is None:
+        return
+    # Re-init the bare repo (it might have been set up by a sibling test).
+    if origin_path.exists():
+        shutil.rmtree(origin_path)
+    pygit2.init_repository(str(origin_path), bare=True, initial_head="main")
+    # Push the existing tip to origin and fetch so a remote-tracking
+    # branch materialises.
+    head_ref = committed_repo.repo.references.get("HEAD")
+    head_name = head_ref.target if head_ref else "refs/heads/main"
+    from src.core.operations import add_remote
+    from src.core.operations import fetch as core_fetch
+    from src.core.operations import push as core_push
+
+    add_remote(committed_repo, "origin", str(origin_path))
+    core_push(committed_repo, "origin", head_name)
+    core_fetch(committed_repo, "origin")
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    branches = _top_level(panel, "Branches")
+    remote = _child(branches, "Remote")
+    assert remote is not None
+    branch_name = head_name.removeprefix("refs/heads/")
+    origin_branch = _child(remote, f"origin/{branch_name}")
+    assert origin_branch is not None
+
+    actions = panel._context_menu_actions(origin_branch)  # noqa: SLF001
+    labels = [a.text() for a in actions]
+    assert any("Create Branch from" in t for t in labels)
+    assert "Fetch from origin" in labels
+
+
+def test_remote_branch_fetch_action_invokes_vm(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    """Triggering ``Fetch from origin`` calls :meth:`MainViewModel.fetch_changes`."""
+    import shutil
+
+    import pygit2
+
+    origin_path = committed_repo.path and (
+        Path(committed_repo.path).parent / "origin.git"
+    )
+    if origin_path is None:
+        return
+    if origin_path.exists():
+        shutil.rmtree(origin_path)
+    pygit2.init_repository(str(origin_path), bare=True, initial_head="main")
+    from src.core.operations import add_remote
+    from src.core.operations import fetch as core_fetch
+    from src.core.operations import push as core_push
+
+    add_remote(committed_repo, "origin", str(origin_path))
+    head_ref = committed_repo.repo.references.get("HEAD")
+    head_name = head_ref.target if head_ref else "refs/heads/main"
+    core_push(committed_repo, "origin", head_name)
+    core_fetch(committed_repo, "origin")
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    branches = _top_level(panel, "Branches")
+    remote = _child(branches, "Remote")
+    branch_name = head_name.removeprefix("refs/heads/")
+    origin_branch = _child(remote, f"origin/{branch_name}")
+
+    captured: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        vm,
+        "fetch_changes",
+        lambda remote, refspec=None: captured.append((remote, refspec)),
+    )
+    actions = panel._context_menu_actions(origin_branch)  # noqa: SLF001
+    fetch = next(a for a in actions if a.text() == "Fetch from origin")
+    fetch.trigger()
+    assert captured == [("origin", None)]

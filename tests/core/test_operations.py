@@ -24,6 +24,7 @@ from src.core.models import FileStatus
 from src.core.operations import (
     abort_merge,
     abort_rebase,
+    add_remote,
     checkout_branch,
     cherry_pick,
     commit_changes,
@@ -34,10 +35,12 @@ from src.core.operations import (
     fetch,
     is_merge_in_progress,
     is_rebase_in_progress,
+    list_remotes,
     merge_branch,
     pull,
     push,
     rebase_branch,
+    remove_remote,
     rename_branch,
     reset,
     revert,
@@ -350,6 +353,86 @@ def test_push_to_unknown_remote_raises(committed_repo: RepositoryManager) -> Non
 def test_fetch_from_unknown_remote_raises(committed_repo: RepositoryManager) -> None:
     with pytest.raises(InvalidRefError):
         fetch(committed_repo, "no-such-remote")
+
+
+# ----- remote management (add / remove / list) ----------------------------
+
+
+def test_list_remotes_empty(tmp_git_repo: Path) -> None:
+    mgr = RepositoryManager(str(tmp_git_repo))
+    assert list_remotes(mgr) == []
+
+
+def test_add_remote_creates_remote(committed_repo: RepositoryManager) -> None:
+    name = add_remote(committed_repo, "upstream", "https://example.com/upstream.git")
+    assert name == "upstream"
+    remotes = list_remotes(committed_repo)
+    assert [r.name for r in remotes] == ["upstream"]
+    assert remotes[0].url == "https://example.com/upstream.git"
+    # ``+refs/heads/*:refs/remotes/upstream/*`` is libgit2's default
+    # fetch refspec when none was given explicitly.
+    assert "refs/heads" in remotes[0].fetch_refspec
+
+
+def test_add_remote_already_exists_raises(committed_repo: RepositoryManager) -> None:
+    add_remote(committed_repo, "origin", "https://example.com/origin.git")
+    with pytest.raises(GitError, match="already exists"):
+        add_remote(committed_repo, "origin", "https://example.com/x.git")
+
+
+def test_add_remote_rejects_empty_name(committed_repo: RepositoryManager) -> None:
+    with pytest.raises(GitError, match="name"):
+        add_remote(committed_repo, "", "https://x.git")
+
+
+def test_add_remote_rejects_empty_url(committed_repo: RepositoryManager) -> None:
+    with pytest.raises(GitError, match="URL"):
+        add_remote(committed_repo, "upstream", "   ")
+
+
+def test_remove_remote_deletes_it(committed_repo: RepositoryManager) -> None:
+    add_remote(committed_repo, "origin", "https://example.com/origin.git")
+    assert list_remotes(committed_repo)
+    remove_remote(committed_repo, "origin")
+    assert list_remotes(committed_repo) == []
+
+
+def test_remove_remote_unknown_raises(committed_repo: RepositoryManager) -> None:
+    with pytest.raises(InvalidRefError):
+        remove_remote(committed_repo, "no-such-remote")
+
+
+def test_list_remotes_returns_snapshots(committed_repo: RepositoryManager) -> None:
+    add_remote(committed_repo, "origin", "https://example.com/origin.git")
+    add_remote(committed_repo, "upstream", "git@example.com:foo.git")
+    remotes = list_remotes(committed_repo)
+    assert {r.name for r in remotes} == {"origin", "upstream"}
+    # Returned list is a fresh copy (mutating it does not affect the next call).
+    remotes.clear()
+    assert len(list_remotes(committed_repo)) == 2
+
+
+def test_push_auth_error_uses_domain_exception(
+    monkeypatch, committed_repo: RepositoryManager,
+) -> None:
+    """A simulated auth failure surfaces as :class:`AuthError`."""
+
+    class _FakeRemote:
+        url = "https://example.com/repo.git"
+
+        def push(self, *args: object, **kwargs: object) -> None:
+            msg = "authentication failed for 'https://x@example.com/repo.git'"
+            raise pygit2.GitError(msg)
+
+    class _FakeRemotes:
+        def __getitem__(self, name: str) -> _FakeRemote:
+            return _FakeRemote()
+
+    monkeypatch.setattr(committed_repo.repo, "remotes", _FakeRemotes())
+    from src.core.exceptions import AuthError
+
+    with pytest.raises(AuthError):
+        push(committed_repo, "origin", "refs/heads/main")
 
 
 # ----- merge / rebase state, abort, and finalize ---------------------------

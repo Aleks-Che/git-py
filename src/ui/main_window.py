@@ -4,12 +4,15 @@ Stage 3 wires the central :class:`MainViewModel` into the window and
 adds the WIP / commit panel to the right side. Stage 4 swaps the
 left-panel stub for the real references tree
 (:class:`LeftPanel`). Stage 5 adds a re-entrancy guard + spinner for
-long-running operations (rebase, large merge).
+long-running operations (rebase, large merge). Stage 6 adds a
+``Remote`` toolbar with Push / Pull / Fetch, a ``File > Clone…``
+dialog, and a ``Remote > Manage Remotes…`` dialog.
 
 Layout:
 
-* **Left:** :class:`LeftPanel` — branches / tags / stash tree
-* **Centre:** :class:`GraphWidget` (Stage 2)
+* **Top:** :class:`QToolBar` with Fetch / Pull / Push (Stage 6+).
+* **Left:** :class:`LeftPanel` — branches / tags / stash tree.
+* **Centre:** :class:`GraphWidget` (Stage 2).
 * **Right (vertical splitter):**
     * :class:`CommitPanel` — file list, message field, commit button
     * :class:`CommitDetailPanel` — details of the selected graph commit
@@ -23,10 +26,10 @@ bind to :meth:`MainViewModel.undo` / :meth:`MainViewModel.redo` and
 their enabled state tracks the processor's ``stack_changed`` signal.
 
 Per ``docs/DEVELOPMENT_RULES.md`` section 3, long-running operations
-(rebase, large merges) are routed through :class:`AsyncWorker`. While
-such an operation is in flight :attr:`MainViewModel.busy_changed`
-fires; the window disables mutating toolbar actions and shows a
-spinner in the status bar.
+(rebase, large merges, push, pull, fetch, clone) are routed through
+:class:`AsyncWorker`. While such an operation is in flight
+:attr:`MainViewModel.busy_changed` fires; the window disables mutating
+toolbar actions and shows a spinner in the status bar.
 """
 from __future__ import annotations
 
@@ -39,10 +42,13 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QSplitter,
     QStatusBar,
+    QToolBar,
 )
 
 from src.core.exceptions import GitError, RepositoryNotFoundError
 from src.core.repository import RepositoryManager
+from src.ui.dialogs.clone_dialog import CloneDialog
+from src.ui.dialogs.remote_manage_dialog import RemoteManageDialog
 from src.ui.widgets.commit_detail_panel import CommitDetailPanel
 from src.ui.widgets.commit_panel import CommitPanel
 from src.ui.widgets.graph_widget import GraphWidget
@@ -65,6 +71,7 @@ class MainWindow(QMainWindow):
         self._repo_manager: RepositoryManager | None = None
 
         self._build_menu()
+        self._build_toolbar()
         self._build_central()
         self._build_status_bar()
         self._main_vm.busy_changed.connect(self._on_busy_changed)
@@ -110,11 +117,11 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self._action_close)
 
         self._action_clone = QAction("&Clone…", self)
-        self._action_clone.triggered.connect(lambda: self._stub("Clone"))
+        self._action_clone.triggered.connect(self._open_clone_dialog)
         file_menu.addAction(self._action_clone)
 
         self._action_init = QAction("&Init New Repository…", self)
-        self._action_init.triggered.connect(lambda: self._stub("Init"))
+        self._action_init.triggered.connect(self._open_init_dialog)
         file_menu.addAction(self._action_init)
 
         file_menu.addSeparator()
@@ -136,6 +143,31 @@ class MainWindow(QMainWindow):
         self._action_redo.triggered.connect(self._main_vm.redo)
         edit_menu.addAction(self._action_redo)
 
+        remote_menu = bar.addMenu("&Remote")
+        self._action_fetch = QAction("&Fetch from origin", self)
+        self._action_fetch.setShortcut("Ctrl+Shift+F")
+        self._action_fetch.setEnabled(False)
+        self._action_fetch.triggered.connect(lambda: self._main_vm.fetch_changes("origin"))
+        remote_menu.addAction(self._action_fetch)
+
+        self._action_pull = QAction("&Pull from origin", self)
+        self._action_pull.setShortcut("Ctrl+Shift+P")
+        self._action_pull.setEnabled(False)
+        self._action_pull.triggered.connect(lambda: self._main_vm.pull_changes("origin"))
+        remote_menu.addAction(self._action_pull)
+
+        self._action_push = QAction("&Push to origin", self)
+        self._action_push.setShortcut("Ctrl+Shift+U")
+        self._action_push.setEnabled(False)
+        self._action_push.triggered.connect(lambda: self._main_vm.push_changes("origin"))
+        remote_menu.addAction(self._action_push)
+
+        remote_menu.addSeparator()
+        self._action_manage_remotes = QAction("&Manage Remotes…", self)
+        self._action_manage_remotes.setEnabled(False)
+        self._action_manage_remotes.triggered.connect(self._open_remote_manage_dialog)
+        remote_menu.addAction(self._action_manage_remotes)
+
         view_menu = bar.addMenu("&View")
         for label in ("Left Panel", "Commit Detail Panel", "Terminal"):
             view_menu.addAction(QAction(label, self, checkable=True, checked=True))
@@ -151,6 +183,19 @@ class MainWindow(QMainWindow):
         self._main_vm.command_processor().stack_changed.connect(
             self._update_undo_redo_actions,
         )
+
+    def _build_toolbar(self) -> None:
+        """Add the Push / Pull / Fetch toolbar (Stage 6)."""
+        toolbar = QToolBar("Remote", self)
+        toolbar.setObjectName("remote-toolbar")
+        toolbar.setMovable(False)
+        # Use the same actions as the Remote menu so the enabled
+        # state stays in sync (one source of truth).
+        toolbar.addAction(self._action_fetch)
+        toolbar.addAction(self._action_pull)
+        toolbar.addAction(self._action_push)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
+        self._remote_toolbar = toolbar
 
     def _update_undo_redo_actions(self) -> None:
         proc = self._main_vm.command_processor()
@@ -217,8 +262,23 @@ class MainWindow(QMainWindow):
         if busy:
             self._status.showMessage("Working…")
         # Disable the toolbar buttons that could race with the worker.
-        for action in (self._action_undo, self._action_redo, self._action_close):
+        remote_actions = (
+            self._action_fetch,
+            self._action_pull,
+            self._action_push,
+            self._action_manage_remotes,
+        )
+        for action in (
+            self._action_undo,
+            self._action_redo,
+            self._action_close,
+            *remote_actions,
+        ):
             action.setEnabled(action.isEnabled() and not busy)
+        # When a busy operation ends, the actions' enabled state must
+        # be re-evaluated against the new repository state.
+        if not busy:
+            self._update_remote_actions()
 
     def _on_error(self, message: str) -> None:
         self._status.showMessage(f"Error: {message}", 8000)
@@ -230,6 +290,21 @@ class MainWindow(QMainWindow):
         else:
             self._status.showMessage(f"Repository: {path}")
             self._action_close.setEnabled(True)
+        self._update_remote_actions()
+
+    def _update_remote_actions(self) -> None:
+        """Enable Push / Pull / Fetch only when a repository is open."""
+        repo_open = (
+            self._main_vm.repository_manager() is not None
+            and self._main_vm.repository_manager().is_open
+        )
+        for action in (
+            self._action_fetch,
+            self._action_pull,
+            self._action_push,
+            self._action_manage_remotes,
+        ):
+            action.setEnabled(repo_open and not self._main_vm.is_busy())
 
     # ----- actions -----------------------------------------------------
 
@@ -245,12 +320,48 @@ class MainWindow(QMainWindow):
             return
         self.set_repository(manager)
 
-    def _stub(self, name: str) -> None:
-        QMessageBox.information(
-            self,
-            f"{name} (stub)",
-            f"'{name}' is not implemented yet. Coming in a later stage.",
+    def _open_clone_dialog(self) -> None:
+        """Show the :class:`CloneDialog`; on accept, fire the VM clone."""
+        # Default destination: the open repository's path, or ``None``.
+        repo = self._main_vm.repository_manager()
+        default_path = str(repo.path) if repo and repo.path else None
+        dialog = CloneDialog(default_path=default_path, parent=self)
+        dialog.accepted.connect(
+            lambda url, path: self._main_vm.clone_repository(url, path),
         )
+        dialog.exec()
+
+    def _open_init_dialog(self) -> None:
+        """Pick a directory and initialise a fresh repository there."""
+        path = QFileDialog.getExistingDirectory(self, "Init New Repository In…")
+        if not path:
+            return
+        manager = RepositoryManager()
+        try:
+            manager.init(path)
+        except GitError as exc:
+            QMessageBox.warning(self, "Init Repository", str(exc))
+            return
+        self.set_repository(manager)
+
+    def _open_remote_manage_dialog(self) -> None:
+        """Show the :class:`RemoteManageDialog`; reflect changes via the VM."""
+        repo = self._main_vm.repository_manager()
+        if repo is None or not repo.is_open:
+            return
+        dialog = RemoteManageDialog(self)
+        dialog.set_remotes(self._main_vm.list_remotes())
+        dialog.add_requested.connect(
+            lambda name, url: self._main_vm.add_remote(name, url),
+        )
+        dialog.remove_requested.connect(
+            lambda name: self._main_vm.remove_remote(name),
+        )
+        # Refresh the table after a successful add / remove.
+        self._main_vm.command_processor().stack_changed.connect(
+            lambda: dialog.set_remotes(self._main_vm.list_remotes()),
+        )
+        dialog.exec()
 
     def _show_about(self) -> None:
         QMessageBox.about(

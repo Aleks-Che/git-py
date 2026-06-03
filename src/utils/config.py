@@ -20,10 +20,16 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     # through :class:`AsyncWorker` so the UI stays responsive.
     # Rebase is always async regardless of size.
     "merge_async_threshold": 50,
+    # Auto-fetch every N milliseconds when a repository is open. Set
+    # to 0 (or any non-positive value) to disable. Default is 60 s.
+    "auto_fetch_interval_ms": 60_000,
+    # Whether the auto-fetch timer is enabled. Default off; the UI
+    # toggle (Stage 9) will flip this on first launch.
+    "auto_fetch_enabled": False,
 }
 
 # Keys that must be ints (validation on load; bad values fall back).
-_INT_KEYS = frozenset({"merge_async_threshold"})
+_INT_KEYS = frozenset({"merge_async_threshold", "auto_fetch_interval_ms"})
 
 
 def get_int(config: dict[str, Any], key: str, default: int) -> int:

@@ -21,14 +21,20 @@ from PySide6.QtCore import QObject, Signal
 
 from src.core.operations import (
     abort_rebase,
+    add_remote,
     checkout_branch,
     cherry_pick,
     commit_changes,
     create_branch,
     delete_branch,
+    fetch,
     is_rebase_in_progress,
+    list_remotes,
     merge_branch,
+    pull,
+    push,
     rebase_branch,
+    remove_remote,
     rename_branch,
     reset,
     revert,
@@ -485,16 +491,219 @@ class RevertCommand(GitCommand):
         return f"revert {short}"
 
 
+# ----- remotes: push / pull / fetch / add / remove -------------------------
+
+
+class PushCommand(GitCommand):
+    """Push ``refspec`` to ``remote_name``.
+
+    Push is one-way: the command is a no-op for undo, because the
+    canonical rewind would require talking to the server again (force-
+    push the previous SHA). We accept that the user cannot undo a push
+    with the toolbar — if they need to roll back, they do it manually
+    on the server.
+
+    The command is still pushed onto the undo stack so the history
+    panel shows what happened, and so Redo (which calls ``execute``
+    again) replays the same push. Redo is only useful when the first
+    push was rejected (e.g. rejected fast-forward → fix → redo).
+    """
+
+    def __init__(
+        self,
+        repo: RepositoryManager,
+        remote_name: str = "origin",
+        refspec: str | None = None,
+        callbacks: pygit2.RemoteCallbacks | None = None,
+    ) -> None:
+        self._repo = repo
+        self._remote_name = remote_name
+        self._refspec = refspec
+        self._callbacks = callbacks
+
+    def execute(self) -> None:
+        push(self._repo, self._remote_name, self._refspec, callbacks=self._callbacks)
+
+    def undo(self) -> None:
+        return  # no-op: see docstring
+
+    @property
+    def name(self) -> str:
+        spec = self._refspec or "HEAD"
+        return f"push {self._remote_name}/{spec}"
+
+
+class PullCommand(GitCommand):
+    """Fetch + merge ``refspec`` from ``remote_name`` into HEAD.
+
+    Undo captures the pre-pull HEAD SHA on :meth:`execute` and
+    rewinds via ``reset --hard``. If the pull was up-to-date (no
+    SHA change) the undo is a no-op so we do not accidentally nuke
+    the worktree.
+
+    Conflicts surface as :class:`MergeConflictError` from the core
+    layer — the processor does not push the command in that case.
+    """
+
+    def __init__(
+        self,
+        repo: RepositoryManager,
+        remote_name: str = "origin",
+        refspec: str | None = None,
+        callbacks: pygit2.RemoteCallbacks | None = None,
+    ) -> None:
+        self._repo = repo
+        self._remote_name = remote_name
+        self._refspec = refspec
+        self._callbacks = callbacks
+        self._previous_head: str | None = None
+        self._head_moved = False
+
+    def execute(self) -> None:
+        pygit2_repo = self._repo.repo
+        if not pygit2_repo.head_is_unborn:
+            self._previous_head = str(pygit2_repo.head.target)
+        else:
+            self._previous_head = None
+        pull(self._repo, self._remote_name, self._refspec, callbacks=self._callbacks)
+        if self._previous_head is None:
+            self._head_moved = False
+        else:
+            try:
+                self._head_moved = str(pygit2_repo.head.target) != self._previous_head
+            except pygit2.GitError:
+                self._head_moved = False
+
+    def undo(self) -> None:
+        if self._previous_head is None or not self._head_moved:
+            return
+        reset(self._repo, self._previous_head, mode="hard")
+
+    @property
+    def name(self) -> str:
+        spec = self._refspec or "HEAD"
+        return f"pull {self._remote_name}/{spec}"
+
+
+class FetchCommand(GitCommand):
+    """Fetch ``refspec`` from ``remote_name``; undo is a no-op.
+
+    Fetch only updates remote-tracking branches under
+    ``refs/remotes/<name>/*``; it does not touch the working tree, the
+    index, or any local ref. There is nothing to roll back, so undo
+    is intentionally a no-op. The command is still pushed onto the
+    undo stack so the user can see the fetch history.
+    """
+
+    def __init__(
+        self,
+        repo: RepositoryManager,
+        remote_name: str = "origin",
+        refspec: str | None = None,
+        callbacks: pygit2.RemoteCallbacks | None = None,
+    ) -> None:
+        self._repo = repo
+        self._remote_name = remote_name
+        self._refspec = refspec
+        self._callbacks = callbacks
+
+    def execute(self) -> None:
+        fetch(
+            self._repo,
+            self._remote_name,
+            [self._refspec] if self._refspec else None,
+            callbacks=self._callbacks,
+        )
+
+    def undo(self) -> None:
+        return  # no-op: see docstring
+
+    @property
+    def name(self) -> str:
+        spec = self._refspec or "all"
+        return f"fetch {self._remote_name}/{spec}"
+
+
+class AddRemoteCommand(GitCommand):
+    """Add a remote; undo by removing it.
+
+    The command records whether the remote already existed *before*
+    ``execute`` ran. If it did, undo is a no-op — we would otherwise
+    destroy a remote the user did not create through this command.
+    """
+
+    def __init__(self, repo: RepositoryManager, name: str, url: str) -> None:
+        self._repo = repo
+        self._name = name
+        self._url = url
+        self._existed_before = False
+
+    def execute(self) -> None:
+        existing = {r.name for r in list_remotes(self._repo)}
+        self._existed_before = self._name in existing
+        add_remote(self._repo, self._name, self._url)
+
+    def undo(self) -> None:
+        if self._existed_before:
+            return
+        remove_remote(self._repo, self._name)
+
+    @property
+    def name(self) -> str:
+        return f"add remote {self._name}"
+
+
+class RemoveRemoteCommand(GitCommand):
+    """Remove a remote; undo by re-adding it with the original URL.
+
+    The URL (and fetch refspec, which we cannot recover from pygit2
+    after deletion) is captured on :meth:`execute`. On undo we
+    re-create the remote with the same name and URL; the fetch
+    refspec reverts to libgit2's default (``+refs/heads/*:refs/remotes/<name>/*``),
+    which matches what libgit2 would have produced originally.
+    """
+
+    def __init__(self, repo: RepositoryManager, name: str) -> None:
+        self._repo = repo
+        self._name = name
+        self._saved_url: str | None = None
+        self._existed_before = False
+
+    def execute(self) -> None:
+        existing = {r.name for r in list_remotes(self._repo)}
+        self._existed_before = self._name in existing
+        if self._existed_before:
+            for r in list_remotes(self._repo):
+                if r.name == self._name:
+                    self._saved_url = r.url
+                    break
+        remove_remote(self._repo, self._name)
+
+    def undo(self) -> None:
+        if not self._existed_before or not self._saved_url:
+            return
+        add_remote(self._repo, self._name, self._saved_url)
+
+    @property
+    def name(self) -> str:
+        return f"remove remote {self._name}"
+
+
 __all__ = [
+    "AddRemoteCommand",
     "CheckoutCommand",
     "CherryPickCommand",
     "CommandProcessor",
     "CommitCommand",
     "CreateBranchCommand",
     "DeleteBranchCommand",
+    "FetchCommand",
     "GitCommand",
     "MergeCommand",
+    "PullCommand",
+    "PushCommand",
     "RebaseCommand",
+    "RemoveRemoteCommand",
     "RenameBranchCommand",
     "RevertCommand",
 ]
