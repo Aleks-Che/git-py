@@ -340,6 +340,12 @@ class GraphWidget(QGraphicsView):
         checkmark (if active), branch name, monitor (if local), and
         an identicon avatar for the commit author — all in the same
         contrasting colour as the label text.
+
+        When a local branch and one or more remote-tracking refs
+        share the same display name (e.g. ``main`` + ``origin/main``
+        both pointing at the same commit), the remote refs are
+        suppressed so the name appears only once. The monitor icon
+        on the local chip already conveys the "local" information.
         """
         items: list[QGraphicsItem] = []
         branch_refs = row.get("branch_refs", [])
@@ -347,19 +353,12 @@ class GraphWidget(QGraphicsView):
         if not branch_refs:
             return items
 
-        # Dedup: suppress remote ``origin/X`` when local ``X`` exists.
+        # Collect the set of local-branch names so we can skip
+        # remote-tracking refs whose display name would be a
+        # duplicate of a local one already drawn.
         local_names: set[str] = {
             b["name"] for b in branch_refs if not b.get("is_remote")
         }
-        visible = [
-            b for b in branch_refs
-            if not (
-                b.get("is_remote")
-                and b["name"].split("/", 1)[-1] in local_names
-            )
-        ]
-        if not visible:
-            return items
 
         icon_size = 10
         pad = 5
@@ -376,7 +375,7 @@ class GraphWidget(QGraphicsView):
         column_margin = 6
         cursor_x = column_margin
 
-        for branch in visible:
+        for branch in branch_refs:
             is_head = branch.get("is_head")
             is_remote = branch.get("is_remote")
             display = branch["name"]
@@ -384,6 +383,8 @@ class GraphWidget(QGraphicsView):
                 parts = display.split("/", 1)
                 if len(parts) == 2:
                     display = parts[1]
+                if display in local_names:
+                    continue  # suppress — local variant already covers this name
 
             # Elide if needed.
             reserved = pad * 2 + (icon_size + gap if is_head else 0) + \

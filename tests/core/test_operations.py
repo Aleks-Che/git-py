@@ -22,6 +22,9 @@ from src.core.exceptions import (
 )
 from src.core.models import FileStatus
 from src.core.operations import (
+    _url_needs_cli_fallback as url_needs_cli_fallback,
+)
+from src.core.operations import (
     abort_merge,
     abort_rebase,
     add_remote,
@@ -662,3 +665,60 @@ def test_revert_clean_returns_commit_info(
     # change but does not commit. The returned CommitInfo is HEAD,
     # which has not moved.
     assert info.sha == target_sha
+
+
+# ----- SSH URL fallback detection ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        # SCP-style (common GitHub / GitLab SSH)
+        ("git@github.com:user/repo.git", True),
+        ("git@gitlab.com:group/project.git", True),
+        ("git@codeberg.org:user/repo.git", True),
+        # ssh:// URL-style
+        ("ssh://git@github.com/user/repo.git", True),
+        ("ssh://git@github.com:22/user/repo.git", True),
+        ("ssh://user@host.xz:path/to/repo.git", True),
+        # git+ssh:// variant
+        ("git+ssh://git@github.com/user/repo.git", True),
+        # HTTPS / other — handled by pygit2
+        ("https://github.com/user/repo.git", False),
+        ("http://example.com/repo.git", False),
+        ("https://gitlab.com/user/project.git", False),
+        ("file:///path/to/repo", False),
+        ("git://git.kernel.org/xxx.git", False),
+        # Empty / None / weird
+        ("", False),
+        ("user@host:path", True),  # SCP-style without explicit "git" user
+    ],
+)
+def test_url_needs_cli_fallback(url: str, expected: bool) -> None:
+    """SSH URLs are detected so fetch can route them through the git CLI."""
+    assert url_needs_cli_fallback(url) is expected
+
+
+def test_fetch_from_local_origin_still_works(
+    origin_and_clone,
+) -> None:
+    """Regression: file://-backed ``origin`` still goes through pygit2."""
+    _origin, clone, _ = origin_and_clone
+    assert clone.path is not None
+    clone_root = Path(clone.path)
+    branch = next(b.name for b in clone.branches if b.is_head)
+
+    (clone_root / "h.txt").write_text("h\n")
+    commit_changes(clone, "add h")
+    push(clone, "origin", f"refs/heads/{branch}")
+
+    second = clone_root.parent / "fetch_clone"
+    if second.exists():
+        shutil.rmtree(second)
+    pygit2.clone_repository(str(clone_root.parent / "origin.git"), str(second))
+    second_mgr = RepositoryManager(str(second))
+
+    # This must succeed — the origin URL is file://, detected as
+    # **not** needing the CLI fallback, so pygit2 handles it.
+    fetch(second_mgr, "origin")
+    second_mgr.repo.lookup_reference(f"refs/remotes/origin/{branch}").resolve()

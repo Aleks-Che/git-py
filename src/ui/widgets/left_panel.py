@@ -109,6 +109,7 @@ class LeftPanel(QTreeWidget):
 
         self._vm.references_changed.connect(self._rebuild)
         self.itemDoubleClicked.connect(self._on_double_clicked)
+        self.itemClicked.connect(self._on_item_clicked)
         self.customContextMenuRequested.connect(self._on_context_menu)
 
     # ----- build / rebuild --------------------------------------------
@@ -187,15 +188,42 @@ class LeftPanel(QTreeWidget):
     # ----- user actions ------------------------------------------------
 
     def _on_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
-        """Double-click: local branch → checkout; remote → checkout remote; tag → create branch."""
+        """Double-click: local branch → checkout; remote → fetch + checkout; tag → create branch."""
         kind = item.data(0, _ROLE_KIND)
         name = item.data(0, _ROLE_NAME)
+        if kind is None:
+            # Group header (Branches / Local / Remote / Tags / Stash):
+            # double-click toggles the expanded state. We can't rely on
+            # Qt's default expand-on-double-click because it is disabled
+            # in ``__init__`` (so the row text click below is the
+            # checkout trigger for leaves).
+            item.setExpanded(not item.isExpanded())
+            return
         if kind == _KIND_LOCAL_BRANCH and name:
             self._main_vm.checkout_branch(name)
         elif kind == _KIND_REMOTE_BRANCH and name:
-            self._main_vm.checkout_remote_branch(name)
+            self._main_vm.fetch_and_checkout_remote_branch(name)
         elif kind == _KIND_TAG and name:
             self._main_vm.create_branch(name)
+
+    def _on_item_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        """Single-click on a group header toggles its expanded state.
+
+        Leaves (branches / tags / stash entries) carry a ``_ROLE_KIND``
+        value; group headers do not — that is the discriminator. With
+        ``setExpandsOnDoubleClick(False)`` Qt will not expand a row on
+        double-click, and the tiny triangle indicator on the left is
+        not a discoverable affordance. This makes the whole row
+        clickable to toggle, matching GitKraken's behaviour.
+
+        Note: a double-click fires ``itemClicked`` twice (once per
+        click) before ``itemDoubleClicked`` fires. Two single-click
+        toggles cancel out, so a double-click on a group header ends
+        up as a single toggle via the ``itemDoubleClicked`` handler
+        above — net effect: the state flips once, as expected.
+        """
+        if item.data(0, _ROLE_KIND) is None:
+            item.setExpanded(not item.isExpanded())
 
     def _on_context_menu(self, position) -> None:  # noqa: ANN001 - QPoint
         item = self.itemAt(position)

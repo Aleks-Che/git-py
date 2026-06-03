@@ -411,14 +411,6 @@ class GraphTableWidget(QWidget):
         if not branch_refs:
             return
 
-        local_names: set[str] = {b["name"] for b in branch_refs if not b.get("is_remote")}
-        visible = [
-            b for b in branch_refs
-            if not (b.get("is_remote") and b["name"].split("/", 1)[-1] in local_names)
-        ]
-        if not visible:
-            return
-
         icon_size = self._cfg.branch_icon_size
         pad = 5
         gap = 3
@@ -432,7 +424,7 @@ class GraphTableWidget(QWidget):
         chip_text_color = QColor("#FFFFFF")
         cursor_x = col_left + 6
 
-        for branch in visible:
+        for branch in branch_refs:
             is_head = branch.get("is_head")
             is_remote = branch.get("is_remote")
             display = branch["name"]

@@ -335,7 +335,9 @@ def test_widget_renders_checkmark_for_head_branch(
 def test_widget_renders_no_monitor_for_remote_branch(
     qtbot, tmp_git_repo: Path,
 ) -> None:
-    """A remote-tracking ref collides with local — only the local is shown."""
+    """When both local ``main`` and remote ``origin/main`` point at the
+    same commit, the remote chip is suppressed — the monitor icon on
+    the local chip already conveys the "local" information."""
     mgr = _make_committed_repo(tmp_git_repo)
     mgr.repo.references.create(
         "refs/remotes/origin/main", mgr.repo.head.target, force=True,
@@ -349,13 +351,12 @@ def test_widget_renders_no_monitor_for_remote_branch(
         vm.refresh_graph()
 
     head_sha = mgr.head_commit.sha
-    # Both local "main" and remote "origin/main" resolve to "main"
-    # after prefix stripping, so the remote one is suppressed.
+    # Only the local "main" — the remote duplicate is suppressed.
     texts = _branch_label_texts(widget, head_sha)
     assert texts == ["main"]
-    # One chip (local main) + checkmark + monitor.
+    # One chip (local) with checkmark + monitor.
     assert len(_branch_label_chips(widget, head_sha)) == 1
-    assert len(_branch_label_icons(widget, head_sha)) == 2
+    assert len(_branch_label_icons(widget, head_sha)) == 2  # checkmark + monitor
 
 
 def test_widget_remote_branch_strips_origin_prefix(

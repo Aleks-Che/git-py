@@ -322,6 +322,178 @@ class MainViewModel(QObject):
 
         return self.checkout_branch(local_name)
 
+    def fetch_and_checkout_remote_branch(self, remote_branch_name: str) -> None:
+        """Fetch ``remote_branch_name`` from its remote, then switch to a local tracking branch.
+
+        This is the "double-click on a remote-tracking branch" verb:
+        download the latest state of the remote first, then create a
+        local branch (if one does not already exist) and switch HEAD to
+        it.
+
+        The fetch runs **synchronously** on the UI thread. The other
+        network ops in this VM (``push_changes`` / ``fetch_changes`` /
+        ``pull_changes``) route through :class:`AsyncWorker`, but for
+        this specific verb the async path is unsafe: ``pygit2``'s
+        :class:`Repository` is not thread-safe when shared with the
+        main thread, and a fetch kicked off from a worker has been
+        observed to silently hang / never propagate its result to the
+        UI (the ``result`` signal is queued back, but the underlying
+        network call may have died). For a one-shot user action where
+        the user is already waiting on the result, the safest thing
+        is to block the UI for the duration of the fetch and surface
+        the outcome immediately.
+
+        The busy flag is set so the re-entrancy guard and the
+        status-bar spinner still work. On error the issue is surfaced
+        via :attr:`error_occurred` and no checkout is attempted.
+
+        If a local branch with the same name already exists but is
+        behind the remote tracking tip, the local branch is
+        fast-forwarded so the user lands on the freshly downloaded
+        commit. If the local branch has diverged from the remote, it
+        is left alone and a warning is logged — the user must merge,
+        rebase, or reset manually.
+
+        ``remote_branch_name`` is in the form ``origin/feature``.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            self._log(
+                "checkout",
+                f"Fetch+checkout {remote_branch_name!r} failed: no repo",
+                level="error",
+            )
+            return
+        if self._is_busy:
+            self.error_occurred.emit("Another operation is already in progress.")
+            return
+        if "/" not in remote_branch_name:
+            self.error_occurred.emit(f"Not a remote branch: {remote_branch_name!r}")
+            return
+
+        remote_name, branch_name = remote_branch_name.split("/", 1)
+        self._log(
+            "checkout",
+            f"Fetch {remote_name}/{branch_name} before checkout of "
+            f"{remote_branch_name!r}",
+        )
+
+        from src.viewmodels.commands import FetchCommand
+
+        command = FetchCommand(self._repo_manager, remote_name, branch_name)
+        self._is_busy = True
+        self.busy_changed.emit(True)
+        try:
+            self._command_processor.execute(command)  # type: ignore[arg-type]
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("fetch", f"Fetch failed: {exc}", level="error")
+            return
+        finally:
+            self._is_busy = False
+            self.busy_changed.emit(False)
+
+        self._log("fetch", "Fetch succeeded")
+        self._refresh_all_views()
+
+        # Look up the (now-updated) remote tracking ref.
+        remote_info = next(
+            (b for b in self._repo_manager.branches
+             if b.name == remote_branch_name and b.is_remote),
+            None,
+        )
+        if remote_info is None:
+            self.error_occurred.emit(f"Unknown remote branch: {remote_branch_name!r}")
+            self._log(
+                "checkout",
+                f"Cannot find {remote_branch_name!r} after fetch",
+                level="error",
+            )
+            return
+
+        target_sha = remote_info.target_sha
+        local_name = branch_name
+        local_info = next(
+            (b for b in self._repo_manager.branches
+             if b.name == local_name and not b.is_remote),
+            None,
+        )
+
+        if local_info is None:
+            self._log(
+                "checkout",
+                f"Creating local branch {local_name!r} at {target_sha[:7]}",
+            )
+            if not self._create_branch_internal(local_name, target_sha):
+                return
+        elif local_info.target_sha != target_sha:
+            if self._is_fast_forward(local_info.target_sha, target_sha):
+                self._log(
+                    "checkout",
+                    f"Fast-forwarding {local_name!r} from "
+                    f"{local_info.target_sha[:7]} to {target_sha[:7]}",
+                )
+                if not self._move_branch_ref(local_name, target_sha):
+                    return
+            else:
+                self._log(
+                    "checkout",
+                    f"Local {local_name!r} has diverged from "
+                    f"{remote_branch_name!r}; leaving local ref as-is",
+                    level="warn",
+                )
+        else:
+            self._log(
+                "checkout",
+                f"Local {local_name!r} is already at {target_sha[:7]}",
+            )
+
+        self.checkout_branch(local_name)
+
+    def _is_fast_forward(self, old_sha: str, new_sha: str) -> bool:
+        """Return ``True`` if ``new_sha`` is a descendant of ``old_sha``.
+
+        Used to decide whether a remote tracking tip can be applied to
+        a local branch as a fast-forward. ``False`` on any error
+        (missing commit, repo closed, …) so the caller falls back to
+        the safe "leave the local ref alone" path.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            return False
+        try:
+            return bool(
+                self._repo_manager.repo.descendant_of(new_sha, old_sha),
+            )
+        except (KeyError, ValueError, GitError):
+            return False
+
+    def _move_branch_ref(self, name: str, target_sha: str) -> bool:
+        """Move ``refs/heads/<name>`` to ``target_sha``.
+
+        Pure ref rewrite — no working-tree update. The subsequent
+        :meth:`checkout_branch` call updates the worktree. On failure
+        the error is surfaced via :attr:`error_occurred`.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            return False
+        try:
+            ref = self._repo_manager.repo.lookup_reference(f"refs/heads/{name}")
+        except KeyError as exc:
+            self.error_occurred.emit(f"Unknown local branch: {name!r}")
+            self._log("branch", f"Cannot fast-forward {name!r}: {exc}", level="error")
+            return False
+        try:
+            ref.set_target(target_sha)
+        except GitError as exc:
+            self.error_occurred.emit(f"Cannot fast-forward {name!r}: {exc}")
+            self._log(
+                "branch",
+                f"Fast-forward of {name!r} to {target_sha[:7]} failed: {exc}",
+                level="error",
+            )
+            return False
+        return True
+
     def create_branch(self, name: str, target_sha: str | None = None) -> None:
         """Create a local branch via :class:`CreateBranchCommand`."""
         if self._repo_manager is None or not self._repo_manager.is_open:

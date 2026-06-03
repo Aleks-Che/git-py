@@ -282,6 +282,171 @@ def test_fetch_changes_verbose_emits_error(committed_repo: RepositoryManager) ->
     assert errors
 
 
+# ----- fetch_and_checkout_remote_branch ----------------------------------
+
+
+def test_fetch_and_checkout_remote_branch_sync_brings_local_branch(
+    origin_and_clone,
+) -> None:
+    """Double-clicking a remote branch: fetch first, then create+checkout local.
+
+    We push a *new* branch (``feature``) from the working clone to
+    ``origin`` so the subject clone doesn't have a local tracking
+    branch for it. Calling
+    ``fetch_and_checkout_remote_branch("origin/feature")`` on the
+    subject should (1) fetch the new branch from origin, (2) create a
+    local ``feature`` branch at the remote-tracking tip, and (3)
+    switch HEAD to it.
+    """
+    _ensure_app()
+    _origin, clone = origin_and_clone
+    assert clone.path is not None
+    clone_root = Path(clone.path)
+
+    # Create and push a new branch from the working clone to origin.
+    from src.core.operations import checkout_branch as core_checkout
+    from src.core.operations import commit_changes
+    from src.core.operations import create_branch as core_create_branch
+    from src.core.operations import push as core_push
+
+    core_create_branch(clone, "feature", target_sha=clone.head_commit.sha)
+    core_checkout(clone, "feature")
+    (clone_root / "f.txt").write_text("from feature\n")
+    commit_changes(clone, "feature: init")
+    core_push(clone, "origin", "refs/heads/feature")
+
+    # Subject clone — has no local "feature" branch yet.
+    subject = clone_root.parent / "subject_clone"
+    if subject.exists():
+        import shutil
+        shutil.rmtree(subject)
+    pygit2.clone_repository(str(clone_root.parent / "origin.git"), str(subject))
+    subject_mgr = RepositoryManager(str(subject))
+    assert "feature" not in {b.name for b in subject_mgr.branches if not b.is_remote}
+    assert not subject_mgr.repo.head_is_unborn
+
+    vm = MainViewModel(async_enabled=False)
+    vm.set_repository(subject_mgr)
+    vm.fetch_and_checkout_remote_branch("origin/feature")
+
+    # Local "feature" was created and HEAD is on it.
+    local_names = {b.name for b in subject_mgr.branches if not b.is_remote}
+    assert "feature" in local_names
+    assert not subject_mgr.repo.head_is_unborn
+    assert subject_mgr.repo.head.shorthand == "feature"
+    assert subject_mgr.head_commit.message.strip() == "feature: init"
+
+
+def test_fetch_and_checkout_remote_branch_fast_forwards_existing_local(
+    origin_and_clone,
+) -> None:
+    """If the local branch exists but is behind, fast-forward to the remote tip.
+
+    Regression test for the "I double-clicked origin/main and nothing
+    happened" case: the user already has a local ``main`` at an old
+    commit, fetch updates ``origin/main`` to a new tip, the local
+    branch must move with it so HEAD ends up on the freshly
+    downloaded commit.
+    """
+    _ensure_app()
+    _origin, clone = origin_and_clone
+    assert clone.path is not None
+    clone_root = Path(clone.path)
+    branch = next(b.name for b in clone.branches if b.is_head)
+
+    # Subject clone is made first, so it starts at the "init" commit only.
+    subject = clone_root.parent / "subject_clone"
+    if subject.exists():
+        import shutil
+        shutil.rmtree(subject)
+    pygit2.clone_repository(str(clone_root.parent / "origin.git"), str(subject))
+    subject_mgr = RepositoryManager(str(subject))
+    local_master = next(
+        b for b in subject_mgr.branches if b.name == branch and not b.is_remote
+    )
+    assert local_master.target_sha == clone.head_commit.sha
+
+    # Now push a new commit to origin from the working clone.
+    (clone_root / "g.txt").write_text("g\n")
+    from src.core.operations import commit_changes
+    from src.core.operations import push as core_push
+
+    commit_changes(clone, "add g")
+    core_push(clone, "origin", f"refs/heads/{branch}")
+    new_origin_sha = clone.head_commit.sha
+
+    vm = MainViewModel(async_enabled=False)
+    vm.set_repository(subject_mgr)
+    vm.fetch_and_checkout_remote_branch(f"origin/{branch}")
+
+    # Local branch has been fast-forwarded and HEAD is on the new tip.
+    local_after = next(
+        b for b in subject_mgr.branches if b.name == branch and not b.is_remote
+    )
+    assert local_after.target_sha == new_origin_sha
+    assert subject_mgr.repo.head.shorthand == branch
+    assert subject_mgr.head_commit.message.strip() == "add g"
+
+
+def test_fetch_and_checkout_remote_branch_without_repo_emits_error() -> None:
+    _ensure_app()
+    vm = MainViewModel()
+    errors: list[str] = []
+    vm.error_occurred.connect(errors.append)
+    vm.fetch_and_checkout_remote_branch("origin/main")
+    assert errors
+
+
+def test_fetch_and_checkout_remote_branch_bad_name_emits_error(
+    committed_repo: RepositoryManager,
+) -> None:
+    _ensure_app()
+    vm = MainViewModel()
+    vm.set_repository(committed_repo)
+    errors: list[str] = []
+    vm.error_occurred.connect(errors.append)
+    vm.fetch_and_checkout_remote_branch("not-a-remote-name")
+    assert errors
+    assert any("Not a remote branch" in e for e in errors)
+
+
+def test_fetch_and_checkout_remote_branch_when_busy_emits_error(
+    committed_repo: RepositoryManager,
+) -> None:
+    _ensure_app()
+    vm = MainViewModel()
+    vm.set_repository(committed_repo)
+    # Force the busy flag without dispatching a real op.
+    vm._is_busy = True  # noqa: SLF001
+    errors: list[str] = []
+    vm.error_occurred.connect(errors.append)
+    vm.fetch_and_checkout_remote_branch("origin/main")
+    assert any("in progress" in e for e in errors)
+    vm._is_busy = False  # noqa: SLF001
+
+
+def test_fetch_and_checkout_remote_branch_toggles_busy_during_fetch(
+    origin_and_clone,
+) -> None:
+    """The method is sync, but the re-entrancy guard and spinner are honoured.
+
+    busy_changed must go True then False, regardless of whether
+    ``async_enabled`` is True — the fetch is executed inline to avoid
+    the pygit2 thread-safety issue documented on the method.
+    """
+    _ensure_app()
+    _origin, clone = origin_and_clone
+    assert clone.path is not None
+    branch = next(b.name for b in clone.branches if b.is_head)
+
+    vm = MainViewModel(async_enabled=True)
+    vm.set_repository(clone)
+    busy: list[bool] = []
+    vm.busy_changed.connect(busy.append)
+    vm.fetch_and_checkout_remote_branch(f"origin/{branch}")
+    assert busy == [True, False]
+
+
 def test_pull_changes_brings_remote(origin_and_clone) -> None:
     _ensure_app()
     _origin, clone = origin_and_clone

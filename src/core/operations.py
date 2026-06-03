@@ -21,6 +21,7 @@ in ``PATH``.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -802,6 +803,78 @@ def _wrap_remote_error(url: str, exc: pygit2.GitError) -> GitError:
     return GitError(f"Remote operation against {url} failed: {exc}")
 
 
+# SCP-style ``user@host:path`` URLs (the common GitHub / GitLab SSH
+# form, e.g. ``git@github.com:foo/bar.git``). We use this regex rather
+# than ``urlsplit`` because the colon is not a port separator here.
+_SCP_URL_RE = re.compile(r"^[\w.-]+@[\w.-]+:")
+# ``ssh://...`` and ``git+ssh://...`` are the URL-style forms.
+_SSH_SCHEME_RE = re.compile(r"^(ssh|git\+ssh)://", re.IGNORECASE)
+
+
+def _url_needs_cli_fallback(url: str) -> bool:
+    """Return ``True`` if ``url`` is an SSH URL pygit2 may not handle.
+
+    pygit2 is built on libgit2; the prebuilt Windows wheel ships
+    **without libssh2 support**, so any SSH URL surfaces as
+    ``unsupported URL protocol``. The system ``git`` CLI uses the
+    user's own SSH client (OpenSSH on PATH, ``~/.ssh/config``,
+    ``SSH_AUTH_SOCK``) which works out of the box. We detect the
+    common SSH forms and route those through the CLI; HTTPS URLs
+    still go through pygit2 and benefit from its in-process transport.
+    """
+    if not url:
+        return False
+    return bool(_SCP_URL_RE.match(url) or _SSH_SCHEME_RE.match(url))
+
+
+def _fetch_via_cli(
+    repo: pygit2.Repository,
+    remote_name: str,
+    refspec: Sequence[str] | None,
+) -> None:
+    """Run ``git fetch <remote> [refspec...]`` in ``repo``'s workdir.
+
+    Used as a fallback for SSH remotes when pygit2 cannot handle the
+    transport. Translates non-zero exit codes into the same domain
+    errors :func:`_wrap_remote_error` would have produced for a
+    pygit2 failure so callers handle one error surface.
+    """
+    args: list[str] = ["fetch", remote_name]
+    if refspec:
+        if isinstance(refspec, str):
+            args.append(refspec)
+        else:
+            args.extend(refspec)
+    try:
+        completed = _run_git_in_workdir(repo, args)
+    except GitNotInstalledError:
+        raise
+    if completed.returncode != 0:
+        stderr = (completed.stderr or completed.stdout or "").strip()
+        # We don't have a pygit2.GitError to feed into _wrap_remote_error,
+        # so the error-class detection is done on the CLI's stderr text.
+        # ``git fetch`` reports auth failures as "Permission denied
+        # (publickey)" and network problems as "Could not resolve
+        # hostname" / "Connection refused" / "Connection timed out".
+        low = stderr.lower()
+        url = remote_name
+        if "permission denied" in low or "publickey" in low or "authentication" in low:
+            raise AuthError(
+                f"Authentication failed for {url}: {stderr}",
+            ) from None
+        if (
+            "could not resolve" in low
+            or "connection refused" in low
+            or "connection timed out" in low
+            or "network" in low
+            or "no route" in low
+        ):
+            raise NetworkError(
+                f"Network error contacting {url}: {stderr}",
+            ) from None
+        raise GitError(f"git fetch {url} failed: {stderr}") from None
+
+
 def add_remote(
     repo: RepositoryManager | pygit2.Repository,
     name: str,
@@ -914,16 +987,26 @@ def fetch(
     refspec: Sequence[str] | None = None,
     callbacks: pygit2.RemoteCallbacks | None = None,
 ) -> None:
-    """Fetch ``refspec`` from ``remote_name`` (default: fetch all configured refspecs)."""
+    """Fetch ``refspec`` from ``remote_name`` (default: fetch all configured refspecs).
+
+    SSH remotes (``git@host:path`` / ``ssh://...``) are routed through
+    the system ``git`` CLI because prebuilt pygit2 wheels on Windows
+    are built without libssh2 support. HTTPS / ``file://`` / ``git://``
+    URLs go through :meth:`pygit2.Remote.fetch` as before.
+    """
     with unwrap(repo) as r:
         try:
             remote = r.remotes[remote_name]
         except KeyError as exc:
             raise InvalidRefError(f"Unknown remote: {remote_name!r}") from exc
+        url = remote.url or ""
+        if _url_needs_cli_fallback(url):
+            _fetch_via_cli(r, remote_name, refspec)
+            return
         try:
             remote.fetch(refspec, callbacks=callbacks)
         except pygit2.GitError as exc:
-            raise _wrap_remote_error(remote.url or remote_name, exc) from exc
+            raise _wrap_remote_error(url, exc) from exc
 
 
 def pull(

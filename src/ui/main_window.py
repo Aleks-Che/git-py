@@ -49,6 +49,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
+    QLabel,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -465,7 +466,71 @@ class MainWindow(QMainWindow):
             self._update_remote_actions()
 
     def _on_error(self, message: str) -> None:
+        """Show error in the status bar and as a toast popup."""
         self._status.showMessage(f"Error: {message}", 8000)
+        self._show_toast(message)
+
+    def _show_toast(self, message: str) -> None:
+        """Display a short-lived notification in the bottom-right corner.
+
+        Dismisses any currently visible toast, then shows a new
+        red-background label that hides itself after 12 seconds or
+        on click. If the mouse is over the toast the auto-hide timer
+        is paused so the user can read the message at their own pace.
+        The toast is positioned above the status bar.
+        """
+        from PySide6.QtCore import QEvent, QObject, QTimer
+
+        if hasattr(self, "_toast_label") and self._toast_label is not None:
+            try:
+                self._toast_label.hide()
+                self._toast_label.deleteLater()
+            except RuntimeError:
+                pass
+            self._toast_label = None
+
+        toast_timeout_ms = 12_000
+
+        label = QLabel(message, self)
+        label.setStyleSheet(
+            "background-color: #c0392b; color: white; padding: 10px 14px; "
+            "border-radius: 6px; font-size: 13px;"
+        )
+        label.setWordWrap(True)
+        label.setMaximumWidth(420)
+        label.adjustSize()
+        label.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+        # Click to dismiss
+        label.mousePressEvent = lambda _e: label.hide()  # type: ignore[assignment]
+
+        # Event filter: pause / resume auto-hide on hover
+        timer = QTimer(label)
+        timer.setSingleShot(True)
+        timer.timeout.connect(label.hide)
+        timer.setInterval(toast_timeout_ms)
+
+        class _HoverFilter(QObject):
+            def eventFilter(self, _obj, event):  # noqa: N802, N805 - Qt override
+                if event.type() == QEvent.Type.HoverEnter:
+                    timer.stop()
+                elif event.type() == QEvent.Type.HoverLeave:
+                    timer.start(toast_timeout_ms)
+                return False
+
+        toast_filter = _HoverFilter(label)
+        label.installEventFilter(toast_filter)
+
+        y_offset = 40  # above the status bar
+        label.move(
+            self.width() - label.width() - 16,
+            self.height() - label.height() - y_offset,
+        )
+        label.show()
+        label.raise_()
+        self._toast_label = label
+
+        timer.start()
 
     def _on_repository_changed(self, path: str | None) -> None:
         if path is None:

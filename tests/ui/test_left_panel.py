@@ -124,13 +124,49 @@ def test_double_click_on_local_branch_checks_it_out(
     panel.show()
     vm.set_repository(committed_repo)
 
-    branches = _find_top_level(panel, "Branches")
-    local = _find_child(branches, "Local")
-    feature = _find_child(local, "feature")
+    branches = _top_level(panel, "Branches")
+    local = _child(branches, "Local")
+    feature = _child(local, "feature")
     assert feature is not None
 
     panel.itemDoubleClicked.emit(feature, 0)
     assert committed_repo.repo.head.shorthand == "feature"
+
+
+def test_double_click_on_remote_branch_fetches_and_checks_it_out(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    """Double-click on a remote-tracking branch should trigger the new
+    fetch+checkout verb (not the bare :meth:`checkout_remote_branch`).
+    """
+    _set_up_repo_with_remotes(committed_repo)
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    branches = _top_level(panel, "Branches")
+    remote = _child(branches, "Remote")
+    origin_main = _child(remote, "origin/main")
+    assert origin_main is not None
+
+    captured: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        vm,
+        "fetch_and_checkout_remote_branch",
+        lambda name: captured.append((name,)),
+    )
+    # Ensure the old verb is NOT called.
+    monkeypatch.setattr(
+        vm,
+        "checkout_remote_branch",
+        lambda name: captured.append(("OLD", name)) or True,
+    )
+
+    panel.itemDoubleClicked.emit(origin_main, 0)
+    assert captured == [("origin/main",)]
 
 
 def test_double_click_on_tag_creates_branch_from_it(
@@ -629,3 +665,183 @@ def test_remote_branch_fetch_action_invokes_vm(
     fetch = next(a for a in actions if a.text() == "Fetch from origin")
     fetch.trigger()
     assert captured == [("origin", None)]
+
+
+# ----- group-header expand/collapse on click -----------------------------
+
+
+def _set_up_repo_with_remotes(
+    committed_repo: RepositoryManager,
+) -> str:
+    """Create a bare origin and push so the Remote group has children.
+
+    Returns the pushed branch name (e.g. ``"main"``).
+    """
+    import shutil
+
+    import pygit2
+
+    origin_path = Path(committed_repo.path).parent / "origin.git"
+    if origin_path.exists():
+        shutil.rmtree(origin_path)
+    pygit2.init_repository(str(origin_path), bare=True, initial_head="main")
+    from src.core.operations import add_remote
+    from src.core.operations import fetch as core_fetch
+    from src.core.operations import push as core_push
+
+    add_remote(committed_repo, "origin", str(origin_path))
+    head_ref = committed_repo.repo.references.get("HEAD")
+    head_name = head_ref.target if head_ref else "refs/heads/main"
+    core_push(committed_repo, "origin", head_name)
+    core_fetch(committed_repo, "origin")
+    return head_name.removeprefix("refs/heads/")
+
+
+def test_single_click_on_remote_group_expands_it(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """Single-click on the ``Remote`` group toggles its expansion.
+
+    Regression test: with ``setExpandsOnDoubleClick(False)`` and a
+    custom ``itemDoubleClicked`` handler that only handles leaves, the
+    ``Remote`` group could not be expanded at all — making any
+    remote-tracking branch invisible to the user.
+    """
+    branch_name = _set_up_repo_with_remotes(committed_repo)
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    branches = _top_level(panel, "Branches")
+    remote = _child(branches, "Remote")
+    assert remote is not None
+    assert remote.isExpanded() is False
+
+    panel.itemClicked.emit(remote, 0)
+
+    assert remote.isExpanded() is True
+    assert _child(remote, f"origin/{branch_name}") is not None
+
+
+def test_second_click_on_remote_group_collapses_it(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """A second single-click on the ``Remote`` group collapses it."""
+    _set_up_repo_with_remotes(committed_repo)
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    branches = _top_level(panel, "Branches")
+    remote = _child(branches, "Remote")
+
+    panel.itemClicked.emit(remote, 0)
+    assert remote.isExpanded() is True
+
+    panel.itemClicked.emit(remote, 0)
+    assert remote.isExpanded() is False
+
+
+def test_single_click_on_local_group_collapses_it(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """The ``Local`` group is expanded by default; clicking should collapse it."""
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    branches = _top_level(panel, "Branches")
+    local = _child(branches, "Local")
+    assert local.isExpanded() is True  # expanded by default in _rebuild
+
+    panel.itemClicked.emit(local, 0)
+    assert local.isExpanded() is False
+
+    panel.itemClicked.emit(local, 0)
+    assert local.isExpanded() is True
+
+
+def test_single_click_on_tags_group_expands_it(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """A single click on the ``Tags`` top-level group toggles expansion."""
+    import time
+
+    import pygit2
+
+    sig = pygit2.Signature("t", "t@x", int(time.time()), 0)
+    obj = committed_repo.repo.revparse_single("HEAD").peel(pygit2.Commit)
+    committed_repo.repo.create_tag("v1", obj.id, pygit2.GIT_OBJECT_COMMIT, sig, "v1")
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    tags = _top_level(panel, "Tags")
+    assert tags.isExpanded() is False
+
+    panel.itemClicked.emit(tags, 0)
+    assert tags.isExpanded() is True
+    assert _child(tags, "v1") is not None
+
+
+def test_click_on_leaf_does_not_toggle_parent_group(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """Clicking a branch leaf must not collapse the group that contains it."""
+    from src.core.operations import create_branch
+
+    create_branch(committed_repo, "feature", target_sha=committed_repo.head_commit.sha)
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    branches = _top_level(panel, "Branches")
+    local = _child(branches, "Local")
+    feature = _child(local, "feature")
+    assert feature is not None
+    assert local.isExpanded() is True
+
+    panel.itemClicked.emit(feature, 0)
+    # The leaf has _ROLE_KIND set, so the group-toggle handler must skip it.
+    assert local.isExpanded() is True
+
+
+def test_double_click_on_group_header_toggles_once(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """A double-click on a group header ends up toggled exactly once.
+
+    Qt fires ``itemClicked`` twice (one per click) before
+    ``itemDoubleClicked`` for a double-click. Two toggles cancel
+    out, then ``itemDoubleClicked`` toggles again — net effect: the
+    state flips once.
+    """
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    branches = _top_level(panel, "Branches")
+    local = _child(branches, "Local")
+    assert local.isExpanded() is True
+
+    # Simulate the two itemClicked + one itemDoubleClicked sequence
+    # that Qt produces for a real double-click.
+    panel.itemClicked.emit(local, 0)
+    panel.itemClicked.emit(local, 0)
+    panel.itemDoubleClicked.emit(local, 0)
+    assert local.isExpanded() is False
