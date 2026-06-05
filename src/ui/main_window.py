@@ -325,6 +325,14 @@ class MainWindow(QMainWindow):
         # MainViewModel.select_commit.
         self._graph_table.commit_selected.connect(self._main_vm.select_commit)
 
+        # When the VM clears the selection (toggle-off) the graph
+        # widget must also remove its highlight ring.  The reverse
+        # direction (VM → graph) for a *new* selection is redundant
+        # (the graph already set it on click) but harmless.
+        self._main_vm.selection_changed.connect(
+            self._graph_table.set_selected_sha,
+        )
+
         # Diff view shown in place of the graph when the user clicks
         # an unstaged file in the commit panel.
         self._diff_view = QPlainTextEdit(self)

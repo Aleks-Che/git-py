@@ -62,8 +62,8 @@ def test_dark_theme_preserves_graph_widget_history() -> None:
     assert DARK_THEME.text == "#D4D4D4"
     assert DARK_THEME.text_dim == "#8B8B8B"
     assert DARK_THEME.graph_selection == "#FFFFFF"
-    assert DARK_THEME.graph_edge == "#5A5A5A"
-    assert DARK_THEME.graph_wip == "#8B8B8B"
+    assert DARK_THEME.graph_edge == "#343434"
+    assert DARK_THEME.graph_wip == "#505050"
 
 
 def test_theme_is_immutable() -> None:

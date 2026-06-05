@@ -51,6 +51,20 @@ _STATUS_BADGE: dict[FileStatus, tuple[str, str]] = {
     FileStatus.IGNORED: ("I", "#8B8B8B"),
 }
 
+# Per-status tooltip — matches the WIP panel so the vocabulary
+# is consistent between the two right-panel views.
+_STATUS_TOOLTIP: dict[FileStatus, str] = {
+    FileStatus.NEW: "Added (new file)",
+    FileStatus.MODIFIED: "Modified",
+    FileStatus.DELETED: "Deleted",
+    FileStatus.RENAMED: "Renamed",
+    FileStatus.COPIED: "Copied",
+    FileStatus.UNTRACKED: "Untracked",
+    FileStatus.TYPE_CHANGED: "Type changed",
+    FileStatus.CONFLICTED: "Conflicted",
+    FileStatus.IGNORED: "Ignored",
+}
+
 # Selection background colour for the chosen file — matches the WIP
 # panel so the visual language is identical on both sides.
 _SELECTION_BG = "#264F78"
@@ -260,6 +274,9 @@ class CommitDetailPanel(QWidget):
         item = QListWidgetItem(f"[{badge}]  {change.path}", self._files)
         item.setForeground(QBrush(QColor(color_hex)))
         item.setData(Qt.ItemDataRole.UserRole, change.path)
+        tip = _STATUS_TOOLTIP.get(change.status, "")
+        if tip:
+            item.setToolTip(tip)
 
     # ----- file selection (click to show diff in place) ---------------
 
