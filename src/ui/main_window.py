@@ -367,7 +367,10 @@ class MainWindow(QMainWindow):
         top.addWidget(self._left_panel)
         top.addWidget(self._graph_stack)
         top.addWidget(self._right_panel)
-        top.setStretchFactor(0, 1)
+        # Left panel stretch = 0 so it never grows/shrinks when the
+        # right panel is hidden/shown — only the graph absorbs the
+        # space change, keeping the left divider stable.
+        top.setStretchFactor(0, 0)
         top.setStretchFactor(1, 5)
         top.setStretchFactor(2, 3)
         self._top_splitter = top

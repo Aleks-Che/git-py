@@ -384,8 +384,11 @@ def test_main_window_splitter_drag_persists_after_close(
         p_second = _proportions(actual)
         for p1, p2 in zip(p_first, p_second, strict=False):
             assert abs(p1 - p2) < 0.02, f"proportion drifted: {p_first} -> {p_second}"
-        # And the qualitative invariant the user cares about: the
-        # left panel is the widest, the right panel is the narrowest.
-        assert actual[0] > actual[1] > actual[2]
+        # The left panel keeps its saved width (stretch=0) so it is
+        # narrower than the graph (which absorbs all the free space
+        # when the right panel is hidden).  The right panel is 0
+        # because it starts hidden.
+        assert actual[2] == 0
+        assert 0 < actual[0] < actual[1]
     finally:
         second.close()
