@@ -40,7 +40,7 @@ class RenderConfig:
     edge_width: int = 2
     selection_ring_width: int = 1
     subject_max_chars: int = 80
-    wip_node_radius: int = 4
+    wip_node_radius: int = 11
     branch_icon_size: int = 10
     ref_chip_height: int = 11
     ref_chip_padding: int = 5

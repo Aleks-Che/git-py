@@ -84,7 +84,7 @@ class RenderConfig:
     selection_ring_width: int = 2
     subject_max_chars: int = 60
     wip_color: str = DARK_THEME.graph_wip
-    wip_node_radius: int = 6
+    wip_node_radius: int = 12
     branch_icon_size: int = 12
 
 
