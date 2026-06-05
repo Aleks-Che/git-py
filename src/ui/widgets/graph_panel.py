@@ -42,7 +42,7 @@ class RenderConfig:
     subject_max_chars: int = 80
     wip_node_radius: int = 11
     branch_icon_size: int = 10
-    ref_chip_height: int = 11
+    ref_chip_height: int = 13
     ref_chip_padding: int = 5
     ref_chip_gap: int = 3
     header_height: int = 28
@@ -559,7 +559,7 @@ class GraphTableWidget(QWidget):
                 int(cx - av_size / 2), int(y_center - av_size / 2), av_pix,
             )
 
-        chip_y = y_center - self._cfg.ref_chip_height / 2 - 2
+        chip_y = y_center - self._cfg.ref_chip_height / 2 - 1
         label_x = cx + radius + 4
         has_head_branch = any(b.get("is_head") for b in row_data.get("branch_refs", []))
         for ref_label in row_data.get("refs", []):
@@ -578,9 +578,9 @@ class GraphTableWidget(QWidget):
         chip_path = QPainterPath()
         chip_path.addRoundedRect(x, y, w, h, 3, 3)
         painter.fillPath(chip_path, QBrush(color))
-        painter.setPen(QPen(QColor(self._cfg.background_color)))
+        painter.setPen(QPen(QColor(self._cfg.text_color)))
         painter.setFont(self.font())
-        painter.drawText(int(x + pad), int(y + h - 4), label)
+        painter.drawText(int(x + pad), int(y + h - 2), label)
         return w, h
 
     def _draw_commit_text(

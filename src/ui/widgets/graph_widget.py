@@ -71,7 +71,7 @@ class RenderConfig:
     row_height: int = 43
     node_radius: int = 12
     label_offset: int = 18
-    ref_chip_height: int = 12
+    ref_chip_height: int = 14
     ref_chip_padding: int = 6
     ref_chip_gap: int = 4
     background_color: str = DARK_THEME.bg
@@ -304,7 +304,7 @@ class GraphWidget(QGraphicsView):
         # branch ref is already shown — the checkmark next to the
         # branch name conveys the same information.
         label_x = x + self._cfg.label_offset
-        chip_y = y - self._cfg.ref_chip_height / 2 - 2
+        chip_y = y - self._cfg.ref_chip_height / 2 - 1
         has_head_branch = any(b.get("is_head") for b in row.get("branch_refs", []))
         for ref_label in row["refs"]:
             if ref_label == "HEAD" and has_head_branch:
@@ -575,7 +575,7 @@ class GraphWidget(QGraphicsView):
         self, label: str, x: float, y: float, color: QColor,
     ) -> QGraphicsRectItem:
         text = QGraphicsSimpleTextItem(label)
-        text.setBrush(QColor(self._cfg.background_color))
+        text.setBrush(QColor(self._cfg.text_color))
         text.setFont(self.font())
         # First lay out the text to measure it, then place the chip.
         chip_padding = self._cfg.ref_chip_padding
@@ -588,7 +588,7 @@ class GraphWidget(QGraphicsView):
         text.setParentItem(chip)
         text.setPos(
             (width - text.boundingRect().width()) / 2,
-            (chip_height - text.boundingRect().height()) / 2,
+            (chip_height - text.boundingRect().height()) / 2 + 2,
         )
         return chip
 
