@@ -1,9 +1,9 @@
-"""Stage 3 UI tests for the :class:`CommitPanel` widget.
+"""UI tests for the redesigned :class:`CommitPanel` (right-panel commit-input view).
 
-End-to-end flow under ``pytest-qt``: drive the panel via real signal
-delivery and a real :class:`MainViewModel` bound to a real
-:class:`RepositoryManager`. We mock at the ViewModel level only — the
-panel itself is the system under test.
+The panel now has a two-list layout (Unstaged + Staged) and a sticky
+commit block at the bottom. Tests run under ``pytest-qt`` and drive
+the widget through real signal delivery against a real
+:class:`MainViewModel` bound to a real :class:`RepositoryManager`.
 """
 from __future__ import annotations
 
@@ -11,14 +11,14 @@ import time
 from pathlib import Path
 
 import pygit2
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QListWidgetItem
 from src.core.repository import RepositoryManager
-from src.ui.widgets.commit_panel import CommitPanel
+from src.ui.widgets.commit_panel import CommitPanel, FileListWidget
 from src.viewmodels.main_viewmodel import MainViewModel
 
 
 def _make_repo_with_change(path: Path) -> RepositoryManager:
+    """Open a repo with one commit, then leave ``f.txt`` modified
+    and ``untracked.txt`` as an untracked file."""
     mgr = RepositoryManager(str(path))
     sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
     (path / "f.txt").write_text("v1\n")
@@ -31,10 +31,28 @@ def _make_repo_with_change(path: Path) -> RepositoryManager:
     return mgr
 
 
-# ----- list rendering --------------------------------------------------
+def _panel_paths(list_widget: FileListWidget) -> list[str]:
+    """Return the path stored on every visible row in ``list_widget``."""
+    result: list[str] = []
+    for i in range(list_widget.count()):
+        # Each row carries a custom QWidget via ``setItemWidget``; we
+        # pulled the path out of that widget's child ``QLabel``.
+        row_widget = list_widget.itemWidget(list_widget.item(i))
+        if row_widget is None:
+            continue
+        # The row's path label is the second ``QLabel`` after the
+        # status badge — but it's also accessible via the public
+        # ``_change`` attribute. We use the latter for stability.
+        result.append(row_widget._change.path)
+    return result
 
 
-def test_panel_lists_modified_and_untracked_files(qtbot, tmp_git_repo: Path) -> None:
+# ----- Unstaged / Staged list rendering --------------------------------
+
+
+def test_panel_lists_unstaged_modified_and_untracked(
+    qtbot, tmp_git_repo: Path,
+) -> None:
     mgr = _make_repo_with_change(tmp_git_repo)
     vm = MainViewModel()
     vm.set_repository(mgr)
@@ -42,63 +60,227 @@ def test_panel_lists_modified_and_untracked_files(qtbot, tmp_git_repo: Path) -> 
     qtbot.addWidget(panel)
     panel.show()
 
-    paths = [
-        panel._files.item(i).data(Qt.ItemDataRole.UserRole)  # noqa: SLF001
-        for i in range(panel._files.count())
-    ]
-    assert set(paths) == {"f.txt", "untracked.txt"}
-    # Status badges: M for modified, U for untracked.
-    labels = [
-        panel._files.item(i).text()  # noqa: SLF001
-        for i in range(panel._files.count())
-    ]
-    assert any(lbl.startswith("[M]") for lbl in labels)
-    assert any(lbl.startswith("[U]") for lbl in labels)
+    paths = set(_panel_paths(panel._unstaged_list))
+    assert paths == {"f.txt", "untracked.txt"}
 
 
-def test_panel_file_count_in_header(qtbot, tmp_git_repo: Path) -> None:
+def test_panel_staged_list_is_empty_before_any_action(
+    qtbot, tmp_git_repo: Path,
+) -> None:
     mgr = _make_repo_with_change(tmp_git_repo)
     vm = MainViewModel()
     vm.set_repository(mgr)
     panel = CommitPanel(vm)
     qtbot.addWidget(panel)
     panel.show()
-    assert panel._files_header.text().startswith("Files (2)")
+
+    assert _panel_paths(panel._staged_list) == []
 
 
-# ----- commit button ---------------------------------------------------
-
-
-def test_commit_button_disabled_without_message_or_staged(qtbot, tmp_git_repo: Path) -> None:
+def test_panel_headers_show_counts(qtbot, tmp_git_repo: Path) -> None:
     mgr = _make_repo_with_change(tmp_git_repo)
     vm = MainViewModel()
     vm.set_repository(mgr)
     panel = CommitPanel(vm)
     qtbot.addWidget(panel)
     panel.show()
+
+    assert panel._unstaged_expander.text().strip() == "Unstaged Files (2)"
+    assert panel._staged_expander.text().strip() == "Staged Files (0)"
+
+
+def test_panel_headers_update_after_staging(qtbot, tmp_git_repo: Path) -> None:
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    vm.stage_file("f.txt")
+    assert panel._unstaged_expander.text().strip() == "Unstaged Files (1)"
+    assert panel._staged_expander.text().strip() == "Staged Files (1)"
+
+
+# ----- Stage All Changes -----------------------------------------------
+
+
+def test_stage_all_button_disabled_when_nothing_unstaged(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    # Stage every file before constructing the panel.
+    vm.stage_file("f.txt")
+    vm.stage_file("untracked.txt")
+
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    assert not panel._stage_all_button.isEnabled()
+
+
+def test_stage_all_button_moves_every_file_to_staged(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    assert panel._stage_all_button.isEnabled()
+    panel._stage_all_button.click()
+
+    paths = set(_panel_paths(panel._staged_list))
+    assert paths == {"f.txt", "untracked.txt"}
+    assert _panel_paths(panel._unstaged_list) == []
+
+
+# ----- Per-row Stage File button ---------------------------------------
+
+
+def test_clicking_stage_file_button_stages_one_file(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    # Locate the row for f.txt and click its stage button.
+    for i in range(panel._unstaged_list.count()):
+        row_widget = panel._unstaged_list.itemWidget(panel._unstaged_list.item(i))
+        if row_widget._change.path == "f.txt":
+            row_widget._stage_button.click()
+            break
+
+    assert "f.txt" in vm.commit_panel_view_model().staged_files()
+    assert "f.txt" not in _panel_paths(panel._unstaged_list)
+    assert "f.txt" in _panel_paths(panel._staged_list)
+
+
+# ----- Click on row = stage / unstage (accessibility shortcut) --------
+
+
+def test_clicking_unstaged_row_selects_file(qtbot, tmp_git_repo: Path) -> None:
+    """Clicking an unstaged file row selects it for diff preview (does NOT stage)."""
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    cp_vm = vm.commit_panel_view_model()
+    assert cp_vm.selected_file() is None
+
+    panel._unstaged_list.item(0).setSelected(True)
+    panel._on_unstaged_item_clicked(panel._unstaged_list.item(0))
+
+    # The file is selected (not staged).
+    assert cp_vm.selected_file() == "f.txt"
+    assert cp_vm.staged_files() == []
+
+
+def test_clicking_same_unstaged_row_again_deselects(qtbot, tmp_git_repo: Path) -> None:
+    """Clicking the same unstaged row again deselects the file."""
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    cp_vm = vm.commit_panel_view_model()
+    item = panel._unstaged_list.item(0)
+
+    panel._on_unstaged_item_clicked(item)
+    assert cp_vm.selected_file() == "f.txt"
+
+    panel._on_unstaged_item_clicked(item)
+    assert cp_vm.selected_file() is None
+
+
+def test_clicking_staged_row_selects_file(qtbot, tmp_git_repo: Path) -> None:
+    """Clicking a staged row selects the file for diff view."""
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    vm.stage_file("f.txt")
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    cp_vm = vm.commit_panel_view_model()
+    assert cp_vm.selected_file() is None
+
+    panel._staged_list.item(0).setSelected(True)
+    panel._on_staged_item_clicked(panel._staged_list.item(0))
+
+    assert cp_vm.selected_file() == "f.txt"
+    assert cp_vm._selected_file_staged is True
+
+
+def test_clicking_same_staged_row_again_deselects(qtbot, tmp_git_repo: Path) -> None:
+    """Clicking the same staged row a second time deselects the file."""
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    vm.stage_file("f.txt")
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    cp_vm = vm.commit_panel_view_model()
+    item = panel._staged_list.item(0)
+
+    panel._on_staged_item_clicked(item)
+    assert cp_vm.selected_file() == "f.txt"
+
+    panel._on_staged_item_clicked(item)
+    assert cp_vm.selected_file() is None
+
+
+# ----- Commit block (Summary / Description / button) ------------------
+
+
+def test_commit_button_disabled_without_input_or_staged(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
     assert not panel._commit_button.isEnabled()
 
 
-def test_commit_button_enables_with_message_and_staged(qtbot, tmp_git_repo: Path) -> None:
+def test_commit_button_enabled_with_input_and_staged(
+    qtbot, tmp_git_repo: Path,
+) -> None:
     mgr = _make_repo_with_change(tmp_git_repo)
     vm = MainViewModel()
     vm.set_repository(mgr)
+    vm.stage_file("f.txt")
     panel = CommitPanel(vm)
     qtbot.addWidget(panel)
     panel.show()
 
-    # Stage f.txt
-    for i in range(panel._files.count()):
-        item = panel._files.item(i)
-        if item.data(Qt.ItemDataRole.UserRole) == "f.txt":
-            item.setCheckState(Qt.CheckState.Checked)
-    # Type a message
-    panel._message.setPlainText("hello")
-
+    panel._summary.setText("hello")
     assert panel._commit_button.isEnabled()
 
 
-def test_commit_button_creates_a_commit(qtbot, tmp_git_repo: Path) -> None:
+def test_commit_button_label_singular_and_plural(
+    qtbot, tmp_git_repo: Path,
+) -> None:
     mgr = _make_repo_with_change(tmp_git_repo)
     vm = MainViewModel()
     vm.set_repository(mgr)
@@ -106,24 +288,64 @@ def test_commit_button_creates_a_commit(qtbot, tmp_git_repo: Path) -> None:
     qtbot.addWidget(panel)
     panel.show()
 
-    # Stage and type.
-    for i in range(panel._files.count()):
-        item = panel._files.item(i)
-        if item.data(Qt.ItemDataRole.UserRole) == "f.txt":
-            item.setCheckState(Qt.CheckState.Checked)
-    panel._message.setPlainText("commit from ui")
+    # 0 staged → plural (no files).
+    assert panel._commit_button.text() == "Commit Changes to 0 Files"
+    panel._summary.setText("hi")
+    # Still 0 staged → button stays disabled.
+    assert not panel._commit_button.isEnabled()
 
+    # 1 staged → singular.
+    vm.stage_file("f.txt")
+    assert "1 File" in panel._commit_button.text()
+    assert "1 Files" not in panel._commit_button.text()
+
+    # 2 staged → plural again.
+    vm.stage_file("untracked.txt")
+    assert "2 Files" in panel._commit_button.text()
+
+
+def test_commit_button_creates_a_real_commit(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    vm.stage_file("f.txt")
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    panel._summary.setText("subject")
+    panel._description.setPlainText("body line one\nbody line two")
     head_before = str(mgr.repo.head.target)
     panel._commit_button.click()
     head_after = str(mgr.repo.head.target)
+
     assert head_after != head_before
-    assert mgr.repo[head_after].message.strip() == "commit from ui"
+    # The message should be "summary\n\ndescription" per the design.
+    assert mgr.repo[head_after].message.strip() == "subject\n\nbody line one\nbody line two"
 
 
-# ----- staging via checkbox -------------------------------------------
+def test_commit_button_enabled_by_description_alone(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """At least one of summary / description is sufficient."""
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    vm.stage_file("f.txt")
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    assert not panel._commit_button.isEnabled()
+    panel._description.setPlainText("just a body")
+    assert panel._commit_button.isEnabled()
 
 
-def test_toggling_checkbox_stages_file(qtbot, tmp_git_repo: Path) -> None:
+def test_summary_routes_through_viewmodel(
+    qtbot, tmp_git_repo: Path,
+) -> None:
     mgr = _make_repo_with_change(tmp_git_repo)
     vm = MainViewModel()
     vm.set_repository(mgr)
@@ -131,21 +353,13 @@ def test_toggling_checkbox_stages_file(qtbot, tmp_git_repo: Path) -> None:
     qtbot.addWidget(panel)
     panel.show()
 
-    # Locate the f.txt row and check it.
-    target: QListWidgetItem | None = None
-    for i in range(panel._files.count()):
-        item = panel._files.item(i)
-        if item.data(Qt.ItemDataRole.UserRole) == "f.txt":
-            target = item
-            break
-    assert target is not None
-    target.setCheckState(Qt.CheckState.Checked)
-
-    # The VM's staged_files set should now include "f.txt".
-    assert "f.txt" in vm.commit_panel_view_model().staged_files()
+    panel._summary.setText("a new subject")
+    assert vm.commit_panel_view_model().commit_summary() == "a new subject"
 
 
-def test_unchecking_staged_file_unstages(qtbot, tmp_git_repo: Path) -> None:
+def test_description_routes_through_viewmodel(
+    qtbot, tmp_git_repo: Path,
+) -> None:
     mgr = _make_repo_with_change(tmp_git_repo)
     vm = MainViewModel()
     vm.set_repository(mgr)
@@ -153,72 +367,44 @@ def test_unchecking_staged_file_unstages(qtbot, tmp_git_repo: Path) -> None:
     qtbot.addWidget(panel)
     panel.show()
 
-    # Find the f.txt row, then check it. After the check, the panel
-    # rebuilds the list (refresh_status); refetch by path before
-    # unchecking.
-    def find_f_item() -> QListWidgetItem | None:
-        for i in range(panel._files.count()):
-            it = panel._files.item(i)
-            if it.data(Qt.ItemDataRole.UserRole) == "f.txt":
-                return it
-        return None
-
-    first = find_f_item()
-    assert first is not None
-    first.setCheckState(Qt.CheckState.Checked)
-    assert "f.txt" in vm.commit_panel_view_model().staged_files()
-
-    second = find_f_item()
-    assert second is not None
-    second.setCheckState(Qt.CheckState.Unchecked)
-    assert "f.txt" not in vm.commit_panel_view_model().staged_files()
+    panel._description.setPlainText("multi\nline\nbody")
+    assert vm.commit_panel_view_model().commit_description() == "multi\nline\nbody"
 
 
-# ----- diff preview ----------------------------------------------------
-
-
-def test_selecting_file_shows_diff(qtbot, tmp_git_repo: Path) -> None:
+def test_inputs_clear_after_commit(qtbot, tmp_git_repo: Path) -> None:
     mgr = _make_repo_with_change(tmp_git_repo)
     vm = MainViewModel()
     vm.set_repository(mgr)
+    vm.stage_file("f.txt")
     panel = CommitPanel(vm)
     qtbot.addWidget(panel)
     panel.show()
 
-    with qtbot.waitSignal(vm.commit_panel_view_model().diff_ready, timeout=2000) as blocker:
-        panel._files.setCurrentRow(0)  # noqa: SLF001
-    assert "v1" in blocker.args[0] or "v2" in blocker.args[0]
-
-
-# ----- message binding -------------------------------------------------
-
-
-def test_message_field_routes_through_viewmodel(qtbot, tmp_git_repo: Path) -> None:
-    mgr = _make_repo_with_change(tmp_git_repo)
-    vm = MainViewModel()
-    vm.set_repository(mgr)
-    panel = CommitPanel(vm)
-    qtbot.addWidget(panel)
-    panel.show()
-
-    panel._message.setPlainText("a new subject")  # noqa: SLF001
-    assert vm.commit_panel_view_model().commit_message() == "a new subject"
-
-
-def test_message_clears_after_commit(qtbot, tmp_git_repo: Path) -> None:
-    mgr = _make_repo_with_change(tmp_git_repo)
-    vm = MainViewModel()
-    vm.set_repository(mgr)
-    panel = CommitPanel(vm)
-    qtbot.addWidget(panel)
-    panel.show()
-
-    for i in range(panel._files.count()):
-        item = panel._files.item(i)
-        if item.data(Qt.ItemDataRole.UserRole) == "f.txt":
-            item.setCheckState(Qt.CheckState.Checked)
-    panel._message.setPlainText("subject")
+    panel._summary.setText("subject")
+    panel._description.setPlainText("body")
     panel._commit_button.click()
 
-    assert panel._message.toPlainText() == ""
-    assert vm.commit_panel_view_model().commit_message() == ""
+    assert panel._summary.text() == ""
+    assert panel._description.toPlainText() == ""
+    assert vm.commit_panel_view_model().commit_summary() == ""
+    assert vm.commit_panel_view_model().commit_description() == ""
+
+
+# ----- Collapsible expanders ------------------------------------------
+
+
+def test_unstaged_expander_toggles_list_visibility(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    assert panel._unstaged_list.isVisible()
+    panel._unstaged_expander.toggle()
+    assert not panel._unstaged_list.isVisible()
+    panel._unstaged_expander.toggle()
+    assert panel._unstaged_list.isVisible()

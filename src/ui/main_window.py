@@ -14,9 +14,10 @@ Layout:
 * **Top:** :class:`QToolBar` with Fetch / Pull / Push (Stage 6+).
 * **Left:** :class:`LeftPanel` — branches / tags / stash tree.
 * **Centre:** :class:`GraphWidget` (Stage 2).
-* **Right (vertical splitter):**
-    * :class:`CommitPanel` — file list, message field, commit button
-    * :class:`CommitDetailPanel` — details of the selected graph commit
+* **Right:** :class:`RightPanel` — hidden until the user picks a
+  commit or the WIP node in the graph. When shown it shows one of
+  two views (commit-input or commit-detail) selected by
+  :attr:`MainViewModel.selection_changed`.
 * **Bottom:** :class:`TerminalWidget` (Stage 0 stub; real shell in Stage 7)
 
 The :class:`MainViewModel` owns the :class:`RepositoryManager` and the
@@ -52,8 +53,10 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QSplitter,
+    QStackedWidget,
     QStatusBar,
     QTabWidget,
     QToolBar,
@@ -64,16 +67,14 @@ from src.core.repository import RepositoryManager
 from src.ui.dialogs.clone_dialog import CloneDialog
 from src.ui.dialogs.open_or_clone_dialog import OpenOrCloneDialog
 from src.ui.dialogs.remote_manage_dialog import RemoteManageDialog
-from src.ui.widgets.commit_detail_panel import CommitDetailPanel
-from src.ui.widgets.commit_panel import CommitPanel
 from src.ui.widgets.graph_panel import GraphTableWidget
 from src.ui.widgets.left_panel import LeftPanel
 from src.ui.widgets.log_widget import LogWidget
 from src.ui.widgets.repo_bar_widget import RepoBarWidget
+from src.ui.widgets.right_panel import RightPanel
 from src.ui.widgets.terminal_widget import TerminalWidget
 from src.utils.config import (
     SPLITTER_KEY_HORIZONTAL,
-    SPLITTER_KEY_RIGHT_VERTICAL,
     load_config,
     load_graph_column_widths,
     load_splitter_sizes,
@@ -86,7 +87,7 @@ from src.viewmodels.repo_tabs_viewmodel import RepoTabViewModel
 
 
 class MainWindow(QMainWindow):
-    """Top-level window: graph + (commit panel / commit detail) over a terminal stub."""
+    """Top-level window: graph + right panel over a terminal stub."""
 
     def __init__(self, config_path: Path | str | None = None) -> None:
         super().__init__()
@@ -109,12 +110,20 @@ class MainWindow(QMainWindow):
             Path(config_path) if config_path is not None else None
         )
 
-        # Splitter references are kept on ``self`` so the persistence
-        # layer can read / write their sizes in :meth:`_restore_state`
-        # and :meth:`closeEvent`. They are populated by
-        # :meth:`_build_central`.
+        # The top horizontal splitter (left | graph | right) is kept
+        # on ``self`` so the persistence layer can read / write its
+        # sizes in :meth:`_restore_state` and :meth:`closeEvent`. It
+        # is populated by :meth:`_build_central`.
+        #
+        # Note: the right_vertical splitter that lived in this
+        # position through Stage 5 is gone — the right panel is now
+        # a single :class:`RightPanel` whose sub-views are stacked
+        # internally; the user no longer resizes between them. The
+        # persisted config key ``SPLITTER_KEY_RIGHT_VERTICAL`` is
+        # therefore ignored (it is no longer written), so older
+        # configs simply fall back to whatever Qt gives the new
+        # layout by default.
         self._top_splitter: QSplitter | None = None
-        self._right_splitter: QSplitter | None = None
 
         self._build_menu()
         self._build_repo_bar()
@@ -305,22 +314,43 @@ class MainWindow(QMainWindow):
             self._main_vm,
         )
         self._graph_table = GraphTableWidget(self._main_vm.graph_view_model())
-        self._commit_panel = CommitPanel(self._main_vm)
-        self._detail_panel = CommitDetailPanel(self._main_vm.graph_view_model())
+        self._right_panel = RightPanel(self._main_vm)
 
-        # Right side: commit panel (top) + commit detail (bottom).
-        right_splitter = QSplitter(Qt.Orientation.Vertical)
-        right_splitter.addWidget(self._commit_panel)
-        right_splitter.addWidget(self._detail_panel)
-        right_splitter.setStretchFactor(0, 1)
-        right_splitter.setStretchFactor(1, 1)
-        right_splitter.setSizes([320, 320])
-        self._right_splitter = right_splitter
+        # Wire the graph's commit_selected signal to the central
+        # VM's select_commit verb. The graph widget already updates
+        # its own selection (the highlighted node) and the graph
+        # view-model; we just need to make sure the VM tracks the
+        # same SHA so the right panel can show it. The toggle-off
+        # behaviour (click-same-commit-toggles-off) lives in
+        # MainViewModel.select_commit.
+        self._graph_table.commit_selected.connect(self._main_vm.select_commit)
+
+        # Diff view shown in place of the graph when the user clicks
+        # an unstaged file in the commit panel.
+        self._diff_view = QPlainTextEdit(self)
+        self._diff_view.setReadOnly(True)
+        self._diff_view.setStyleSheet(
+            "font-family: Consolas, monospace; font-size: 10pt; "
+            "background-color: #1E1E1E; color: #D4D4D4; "
+            "border: none;",
+        )
+        # Hide diff view by default; shown when a file is selected.
+        self._diff_view.setVisible(False)
+
+        self._graph_stack = QStackedWidget(self)
+        self._graph_stack.addWidget(self._graph_table)  # index 0
+        self._graph_stack.addWidget(self._diff_view)     # index 1
+
+        # Wire the commit panel VM's file selection signals to
+        # switch between graph and diff view.
+        cp_vm = self._main_vm.commit_panel_view_model()
+        cp_vm.selected_file_changed.connect(self._on_selected_file_changed)
+        cp_vm.diff_ready.connect(self._on_diff_ready)
 
         top = QSplitter(self)
         top.addWidget(self._left_panel)
-        top.addWidget(self._graph_table)
-        top.addWidget(right_splitter)
+        top.addWidget(self._graph_stack)
+        top.addWidget(self._right_panel)
         top.setStretchFactor(0, 1)
         top.setStretchFactor(1, 5)
         top.setStretchFactor(2, 3)
@@ -365,6 +395,21 @@ class MainWindow(QMainWindow):
         self._main_vm.log_message.connect(self._log_widget.append_log)
         self._main_vm.error_occurred.connect(self._log_widget.append_log)
 
+    # ----- diff view (replaces graph on file selection) ---------------
+
+    def _on_selected_file_changed(self, path: str | None) -> None:
+        """Switch between graph and diff view when a file is selected."""
+        if path is not None:
+            self._graph_stack.setCurrentIndex(1)
+            self._diff_view.setVisible(True)
+        else:
+            self._graph_stack.setCurrentIndex(0)
+            self._diff_view.setVisible(False)
+
+    def _on_diff_ready(self, text: str) -> None:
+        """Display the computed diff text in the diff view."""
+        self._diff_view.setPlainText(text)
+
     # ----- state persistence (Stage 9) ---------------------------------
 
     def _restore_state(self) -> None:
@@ -385,13 +430,6 @@ class MainWindow(QMainWindow):
         horizontal = splitter_sizes.get(SPLITTER_KEY_HORIZONTAL)
         if horizontal is not None and self._top_splitter is not None and len(horizontal) == 3:
             self._top_splitter.setSizes(horizontal)
-        right_vertical = splitter_sizes.get(SPLITTER_KEY_RIGHT_VERTICAL)
-        if (
-            right_vertical is not None
-            and self._right_splitter is not None
-            and len(right_vertical) == 2
-        ):
-            self._right_splitter.setSizes(right_vertical)
         # Restore repository tabs.
         recent_repos = config.get("recent_repos", [])
         active_repo = config.get("active_repo")
@@ -421,10 +459,6 @@ class MainWindow(QMainWindow):
             splitter_sizes: dict[str, list[int]] = {}
             if self._top_splitter is not None:
                 splitter_sizes[SPLITTER_KEY_HORIZONTAL] = self._top_splitter.sizes()
-            if self._right_splitter is not None:
-                splitter_sizes[SPLITTER_KEY_RIGHT_VERTICAL] = (
-                    self._right_splitter.sizes()
-                )
             config["splitter_sizes"] = splitter_sizes
             # Persist repo tabs.
             tab_state = self._repo_tabs_vm.save_to_state()

@@ -23,7 +23,6 @@ from src.utils.config import (
     DEFAULT_WINDOW_HEIGHT,
     DEFAULT_WINDOW_WIDTH,
     SPLITTER_KEY_HORIZONTAL,
-    SPLITTER_KEY_RIGHT_VERTICAL,
     default_config_path,
     load_config,
     load_splitter_sizes,
@@ -121,7 +120,6 @@ def test_save_and_load_roundtrip(tmp_path: Path) -> None:
         "window_size": [1500, 900],
         "splitter_sizes": {
             SPLITTER_KEY_HORIZONTAL: [200, 700, 300],
-            SPLITTER_KEY_RIGHT_VERTICAL: [350, 350],
         },
     }
     save_config(path, data)
@@ -129,7 +127,6 @@ def test_save_and_load_roundtrip(tmp_path: Path) -> None:
     assert load_window_size(loaded) == (1500, 900)
     assert load_splitter_sizes(loaded) == {
         SPLITTER_KEY_HORIZONTAL: [200, 700, 300],
-        SPLITTER_KEY_RIGHT_VERTICAL: [350, 350],
     }
 
 
@@ -185,41 +182,38 @@ def test_main_window_persists_size_on_close(qtbot, tmp_path: Path) -> None:
 
 
 def test_main_window_persists_splitter_sizes_on_close(qtbot, tmp_path: Path) -> None:
-    """After close, the config file holds the two persisted splitters' sizes.
+    """After close, the config file holds the persisted splitter's sizes.
 
     ``QSplitter.setSizes`` rescales the values to fit the widget's
     current size — it accepts *hints*, not absolute pixels. The
     persistence layer must save whatever Qt reports, so the test
     reads the actual sizes back from the splitter after the resize
     and compares the saved file to those reported values.
+
+    The right-vertical splitter that Stage 3–5 maintained between
+    the commit panel and the commit detail is gone (the new
+    :class:`RightPanel` swaps its sub-views internally); only the
+    horizontal splitter is persisted now.
     """
     config_path = tmp_path / "config.json"
     window = _make_window(qtbot, config_path=config_path)
     # Pump events until the splitter is laid out (its sizes are
     # non-zero, which means Qt has computed a real geometry for it).
     assert window._top_splitter is not None  # noqa: SLF001 - test wiring
-    assert window._right_splitter is not None  # noqa: SLF001 - test wiring
     qtbot.waitUntil(
         lambda: any(s > 0 for s in window._top_splitter.sizes()),  # noqa: SLF001
         timeout=2000,
     )
-    qtbot.waitUntil(
-        lambda: any(s > 0 for s in window._right_splitter.sizes()),  # noqa: SLF001
-        timeout=2000,
-    )
     # A recognisable, asymmetric layout: left panel wider than the
-    # default ~equal split, commit panel smaller than commit detail.
+    # default ~equal split, graph wider than the right panel.
     # Qt may rescale the absolute values to fit the current window
     # size; we read the actual sizes after the call.
     window._top_splitter.setSizes([300, 600, 200])  # noqa: SLF001
-    window._right_splitter.setSizes([400, 500])  # noqa: SLF001
     top_actual = window._top_splitter.sizes()  # noqa: SLF001
-    right_actual = window._right_splitter.sizes()  # noqa: SLF001
     window.close()
 
     saved = load_splitter_sizes(load_config(config_path))
     assert saved[SPLITTER_KEY_HORIZONTAL] == top_actual
-    assert saved[SPLITTER_KEY_RIGHT_VERTICAL] == right_actual
 
 
 def test_main_window_restores_size_on_next_launch(qtbot, tmp_path: Path) -> None:
@@ -259,36 +253,23 @@ def test_main_window_restores_splitter_sizes_on_next_launch(
     config_path = tmp_path / "config.json"
 
     first = _make_window(qtbot, config_path=config_path)
-    assert first._top_splitter is not None  # noqa: SLF001
-    assert first._right_splitter is not None  # noqa: SLF001
+    assert first._top_splitter is not None  # noqa: SLF001 - test wiring
     qtbot.waitUntil(
         lambda: any(s > 0 for s in first._top_splitter.sizes()),  # noqa: SLF001
         timeout=2000,
     )
-    qtbot.waitUntil(
-        lambda: any(s > 0 for s in first._right_splitter.sizes()),  # noqa: SLF001
-        timeout=2000,
-    )
     first._top_splitter.setSizes([300, 600, 200])  # noqa: SLF001
-    first._right_splitter.setSizes([400, 500])  # noqa: SLF001
     expected_top = first._top_splitter.sizes()  # noqa: SLF001
-    expected_right = first._right_splitter.sizes()  # noqa: SLF001
     first.close()
 
     second = _make_window(qtbot, config_path=config_path)
     try:
-        assert second._top_splitter is not None  # noqa: SLF001
-        assert second._right_splitter is not None  # noqa: SLF001
+        assert second._top_splitter is not None  # noqa: SLF001 - test wiring
         qtbot.waitUntil(
             lambda: second._top_splitter.sizes() == expected_top,  # noqa: SLF001
             timeout=2000,
         )
-        qtbot.waitUntil(
-            lambda: second._right_splitter.sizes() == expected_right,  # noqa: SLF001
-            timeout=2000,
-        )
         assert second._top_splitter.sizes() == expected_top  # noqa: SLF001
-        assert second._right_splitter.sizes() == expected_right  # noqa: SLF001
     finally:
         second.close()
 

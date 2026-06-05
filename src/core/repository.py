@@ -40,6 +40,35 @@ def unwrap(repo_or_manager: RepositoryManager | pygit2.Repository) -> Iterator[p
         yield repo_or_manager
 
 
+def _delta_status(delta: pygit2.DiffDelta, parent_tree: pygit2.Tree | None) -> FileStatus:
+    """Translate a single ``pygit2`` delta into a :class:`FileStatus`.
+
+    The decision tree follows what ``git status`` / ``git diff`` show
+    to the user; rename/copy live in their own branches and a
+    "first-parent path" change is reported as a modify.
+    """
+    raw = delta.status
+    if raw == pygit2.GIT_DELTA_DELETED:
+        return FileStatus.DELETED
+    if raw == pygit2.GIT_DELTA_RENAMED:
+        return FileStatus.RENAMED
+    if raw == pygit2.GIT_DELTA_COPIED:
+        return FileStatus.COPIED
+    if raw == pygit2.GIT_DELTA_TYPECHANGE:
+        return FileStatus.TYPE_CHANGED
+    if raw == pygit2.GIT_DELTA_ADDED:
+        return FileStatus.NEW
+    if raw == pygit2.GIT_DELTA_MODIFIED:
+        return FileStatus.MODIFIED
+    # ``GIT_DELTA_UNMODIFIED`` / ``GIT_DELTA_IGNORED`` / ``GIT_DELTA_UNTRACKED``
+    # are not produced by ``Repository.diff`` for committed changes, but
+    # treat them defensively. ``UNTRACKED`` becomes NEW so the user sees
+    # the file in the file list (matches what ``get_status`` does).
+    if raw == pygit2.GIT_DELTA_UNTRACKED:
+        return FileStatus.NEW
+    return FileStatus.MODIFIED
+
+
 class RepositoryManager:
     """Facade over :class:`pygit2.Repository` with typed, exception-safe APIs."""
 
@@ -340,6 +369,47 @@ class RepositoryManager:
         except (KeyError, pygit2.GitError, ValueError) as exc:
             raise InvalidRefError(f"Unknown revision: {sha!r}") from exc
         return self._to_commit_info(obj)
+
+    def get_commit_changes(self, sha: str) -> list[FileChange]:
+        """Return the list of files changed by ``sha`` (vs its first parent).
+
+        The result is a list of :class:`FileChange` — one per delta in
+        the commit. ``status`` follows :class:`FileStatus` semantics
+        (added, modified, deleted, renamed, type-changed, copied). The
+        initial commit (``parents == []``) is diffed against the empty
+        tree, so every file it introduces is reported as
+        :attr:`FileStatus.NEW`.
+
+        Used by the right panel's commit-detail view: clicking a
+        commit in the graph shows a list of files the commit touched
+        without computing or rendering a full unified diff.
+        """
+        try:
+            obj = self.repo.revparse_single(sha).peel(pygit2.Commit)
+        except (KeyError, pygit2.GitError, ValueError) as exc:
+            raise InvalidRefError(f"Unknown revision: {sha!r}") from exc
+        if obj.parent_ids:
+            try:
+                parent_tree = obj.parents[0].tree
+            except (KeyError, ValueError):
+                parent_tree = self.repo.TreeBuilder().write()
+        else:
+            parent_tree = self.repo.TreeBuilder().write()
+        try:
+            diff = self.repo.diff(parent_tree, obj.tree)
+        except (pygit2.GitError, KeyError, ValueError) as exc:
+            raise GitError(f"Failed to diff {sha!r}: {exc}") from exc
+        result: list[FileChange] = []
+        for patch in diff:
+            delta = patch.delta
+            new_path = delta.new_file.path
+            old_path = delta.old_file.path
+            path = new_path or old_path
+            if path is None:
+                continue
+            status = _delta_status(delta, parent_tree)
+            result.append(FileChange(path=path, status=status))
+        return result
 
     # ----- internals ---------------------------------------------------
 

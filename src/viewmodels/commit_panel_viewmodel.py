@@ -10,9 +10,14 @@ Holds:
   :class:`FileStatus`, because that enum conflates staged and
   worktree-only variants for ``MODIFIED`` / ``DELETED`` / ``RENAMED`` /
   ``TYPE_CHANGED``.
-* ``commit_message`` — the text the user is typing.
-* ``selected_file`` / ``current_diff`` — what the diff preview is
-  showing.
+* ``commit_summary`` / ``commit_description`` — the two text fields
+  the user fills in for the next commit. The commit message sent to
+  Git is built by :meth:`combined_commit_message` as
+  ``"<summary>\\n\\n<description>"`` (or just ``<summary>`` when the
+  description is empty).
+* ``selected_file`` / ``current_diff`` — kept for the Stage-3 diff
+  preview contract; the new right-panel UI no longer reads them but
+  they remain so old tests and any future diff widget still work.
 
 The ViewModel never commits on its own: it only stages / unstages
 files and prepares data. The actual commit is created by
@@ -55,8 +60,16 @@ class CommitPanelViewModel(QObject):
     diff_ready = Signal(str)
     """Emitted with the unified-diff text for the selected file."""
 
+    commit_summary_changed = Signal(str)
+    """Emitted when ``commit_summary`` changes."""
+
+    commit_description_changed = Signal(str)
+    """Emitted when ``commit_description`` changes."""
+
     commit_message_changed = Signal(str)
-    """Emitted when ``commit_message`` changes."""
+    """Emitted with the *combined* commit message
+    (``summary + \\n\\n + description``) so legacy listeners that only
+    care about the final string still work."""
 
     error_occurred = Signal(str)
 
@@ -66,8 +79,10 @@ class CommitPanelViewModel(QObject):
         self._file_changes: list[FileChange] = []
         self._staged_files: set[str] = set()
         self._selected_file: str | None = None
+        self._selected_file_staged: bool = False
         self._current_diff: str | None = None
-        self._commit_message: str = ""
+        self._commit_summary: str = ""
+        self._commit_description: str = ""
 
     # ----- read-only state (properties) --------------------------------
 
@@ -79,30 +94,85 @@ class CommitPanelViewModel(QObject):
         """Return the sorted list of currently staged paths."""
         return sorted(self._staged_files)
 
+    def staged_paths_set(self) -> set[str]:
+        """Return the staged paths as a set (fast ``in`` lookups)."""
+        return set(self._staged_files)
+
+    def unstaged_paths(self) -> list[str]:
+        """Return the sorted list of paths that are in the working tree
+        but **not** currently recorded in the index.
+
+        Used by the right panel's *Stage All Changes* button. Files
+        that are already staged are filtered out.
+        """
+        staged = self._staged_files
+        return sorted(c.path for c in self._file_changes if c.path not in staged)
+
+    def unstaged_files(self) -> list[FileChange]:
+        """Return the :class:`FileChange` records that are not yet staged."""
+        staged = self._staged_files
+        return [c for c in self._file_changes if c.path not in staged]
+
+    def staged_files_detailed(self) -> list[FileChange]:
+        """Return the :class:`FileChange` records for staged paths.
+
+        The result keeps the original :class:`FileStatus` from
+        ``file_changes``; callers that need a per-file ``M`` / ``A``
+        / ``D`` badge read this directly.
+        """
+        staged = self._staged_files
+        return [c for c in self._file_changes if c.path in staged]
+
     def selected_file(self) -> str | None:
         return self._selected_file
 
     def current_diff(self) -> str | None:
         return self._current_diff
 
+    def commit_summary(self) -> str:
+        return self._commit_summary
+
+    def commit_description(self) -> str:
+        return self._commit_description
+
     def commit_message(self) -> str:
-        return self._commit_message
+        """Return the combined message (``summary + \\n\\n + description``)."""
+        return self.combined_commit_message()
+
+    def combined_commit_message(self) -> str:
+        """Return the message to send to ``git commit``.
+
+        Concatenates ``summary`` and ``description`` with a single
+        blank line between them (the conventional git layout). When
+        the description is empty only the summary is returned.
+        """
+        if self._commit_description.strip():
+            return f"{self._commit_summary}\n\n{self._commit_description}"
+        return self._commit_summary
+
+    def has_commit_input(self) -> bool:
+        """Return ``True`` if either field has user input."""
+        return bool(self._commit_summary.strip() or self._commit_description.strip())
 
     # ----- repository binding -----------------------------------------
 
     def set_repository(self, manager: RepositoryManager | None) -> None:
         """Bind (or unbind) the repository the panel reads from.
 
-        On every bind the message field and the file selection are
+        On every bind the message fields and the file selection are
         cleared and the status is refreshed. ``manager=None`` is the
         close path: the panel becomes empty.
         """
         self._repo = manager
         self._selected_file = None
+        self._selected_file_staged = False
         self._current_diff = None
-        self._commit_message = ""
+        self._commit_summary = ""
+        self._commit_description = ""
         self.selected_file_changed.emit(None)
         self.diff_ready.emit("")
+        self.commit_summary_changed.emit("")
+        self.commit_description_changed.emit("")
         self.commit_message_changed.emit("")
         self.refresh_status()
 
@@ -168,18 +238,63 @@ class CommitPanelViewModel(QObject):
             return
         self.refresh_status()
 
-    def select_file(self, path: str | None) -> None:
-        """Set the file whose diff is shown in the preview pane."""
+    def select_file(self, path: str | None, staged: bool = False) -> None:
+        """Set the file whose diff is shown in the preview pane.
+
+        ``staged=True`` computes the diff between the index and HEAD
+        (i.e. what *is* staged), rather than the working tree vs HEAD.
+        """
         self._selected_file = path
+        self._selected_file_staged = staged if path is not None else False
         self.selected_file_changed.emit(path)
         self._compute_and_emit_diff(path)
 
-    def set_commit_message(self, text: str) -> None:
-        """Update the commit message; emits :attr:`commit_message_changed`."""
-        if text == self._commit_message:
+    def set_commit_summary(self, text: str) -> None:
+        """Update the commit summary; emits :attr:`commit_summary_changed`
+        and the combined :attr:`commit_message_changed`."""
+        if text == self._commit_summary:
             return
-        self._commit_message = text
-        self.commit_message_changed.emit(text)
+        self._commit_summary = text
+        self.commit_summary_changed.emit(text)
+        self.commit_message_changed.emit(self.combined_commit_message())
+
+    def set_commit_description(self, text: str) -> None:
+        """Update the commit description; emits
+        :attr:`commit_description_changed` and the combined
+        :attr:`commit_message_changed`."""
+        if text == self._commit_description:
+            return
+        self._commit_description = text
+        self.commit_description_changed.emit(text)
+        self.commit_message_changed.emit(self.combined_commit_message())
+
+    def set_commit_message(self, text: str) -> None:
+        """Backwards-compat alias — set the *summary* from a full message.
+
+        Older callers (and the test suite) feed a single string; we
+        keep that working by treating the input as the summary and
+        clearing the description. New code should prefer
+        :meth:`set_commit_summary` / :meth:`set_commit_description`.
+        """
+        if text == self._commit_summary and self._commit_description == "":
+            return
+        self._commit_summary = text
+        self._commit_description = ""
+        self.commit_summary_changed.emit(text)
+        self.commit_description_changed.emit("")
+        self.commit_message_changed.emit(self.combined_commit_message())
+
+    def clear_commit_input(self) -> None:
+        """Reset both fields to empty in a single, signal-coherent step.
+
+        Used by :meth:`MainViewModel.commit_changes` after a successful
+        commit so the next commit starts from a clean slate.
+        """
+        self._commit_summary = ""
+        self._commit_description = ""
+        self.commit_summary_changed.emit("")
+        self.commit_description_changed.emit("")
+        self.commit_message_changed.emit("")
 
     # ----- internals ---------------------------------------------------
 
@@ -198,13 +313,13 @@ class CommitPanelViewModel(QObject):
         return result
 
     def _compute_and_emit_diff(self, path: str | None) -> None:
-        """Compute the worktree-vs-HEAD diff for ``path`` and emit :attr:`diff_ready`."""
+        """Compute the diff for ``path`` and emit :attr:`diff_ready`."""
         if self._repo is None or not self._repo.is_open or path is None:
             self._current_diff = ""
             self.diff_ready.emit("")
             return
         try:
-            text = self._build_diff_text(path)
+            text = self._build_diff_text(path, staged=self._selected_file_staged)
         except GitError as exc:
             self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
             self._current_diff = ""
@@ -213,26 +328,24 @@ class CommitPanelViewModel(QObject):
         self._current_diff = text
         self.diff_ready.emit(text)
 
-    def _build_diff_text(self, path: str) -> str:
-        """Return the unified diff for ``path`` (HEAD vs worktree).
+    def _build_diff_text(self, path: str, staged: bool = False) -> str:
+        """Return the unified diff for ``path``.
 
-        pygit2 1.x's :meth:`Repository.diff` doesn't accept a
-        ``pathspec`` argument, so we build the full workdir-vs-HEAD
-        diff (with ``INCLUDE_UNTRACKED``) and then walk the patches
-        to find the entry for ``path``.
-
-        Untracked files are synthesised as a unified-diff header
-        followed by ``+`` lines for every line of the file. Binary
-        files produce a one-line placeholder.
+        When ``staged=False`` (default) shows the working-tree diff
+        (worktree vs HEAD).  When ``staged=True`` shows the index diff
+        (index vs HEAD) — what would be committed if you ran ``git
+        commit`` right now.
         """
         repo = self._repo.repo
-        if self._is_untracked(path):
+        if not staged and self._is_untracked(path):
             return self._untracked_diff_text(path)
         if self._is_binary(path):
-            return f"Binary file {path} differs from HEAD.\n"
+            label = "staged" if staged else "HEAD"
+            return f"Binary file {path} differs from {label}.\n"
         try:
             diff = repo.diff(
                 "HEAD",
+                cached=staged,
                 context_lines=3,
                 flags=pygit2.enums.DiffOption.INCLUDE_UNTRACKED
                 | pygit2.enums.DiffOption.RECURSE_UNTRACKED_DIRS,

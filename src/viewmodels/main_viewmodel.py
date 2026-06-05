@@ -57,6 +57,7 @@ class MainViewModel(QObject):
     conflict_state_changed = Signal(object)  # dict
     busy_changed = Signal(bool)
     log_message = Signal(str)  # human-readable timestamped log line
+    selection_changed = Signal(object)  # str | None — currently selected SHA, or WIP_SHA, or None
 
     def __init__(
         self,
@@ -101,6 +102,11 @@ class MainViewModel(QObject):
         self._graph_view_model.error_occurred.connect(self.error_occurred)
         self._commit_panel_view_model.error_occurred.connect(self.error_occurred)
         self._branch_panel_view_model.error_occurred.connect(self.error_occurred)
+
+        # ``selected_commit_sha`` drives the right panel. ``None`` means
+        # the panel is hidden; ``WIP_SHA`` means the WIP / commit-input
+        # view; any other value means the commit-detail view.
+        self._selected_commit_sha: str | None = None
 
     # ----- child ViewModels / processor (read-only accessors) ---------
 
@@ -155,6 +161,11 @@ class MainViewModel(QObject):
         if undone. Any in-progress conflict state is also cleared — it
         would otherwise refer to the old repo's paths.
 
+        The right-panel selection is also cleared: the previously
+        selected SHA refers to a commit that may not exist in the new
+        repo, and ``WIP_SHA`` no longer makes sense once the WIP
+        changes.
+
         The auto-fetch timer is started when a repository is opened
         (and the user has auto-fetch enabled in the config) and
         stopped when the repository is closed.
@@ -166,6 +177,9 @@ class MainViewModel(QObject):
         self._commit_panel_view_model.set_repository(manager)
         self._branch_panel_view_model.set_repository(manager)
         self._update_auto_fetch_timer()
+        if self._selected_commit_sha is not None:
+            self._selected_commit_sha = None
+            self.selection_changed.emit(None)
         self.repository_changed.emit(manager.path if manager is not None else None)
 
     # ----- verb commands ----------------------------------------------
@@ -173,10 +187,14 @@ class MainViewModel(QObject):
     def commit_changes(self, message: str) -> None:
         """Create a new commit on ``HEAD`` via :class:`CommitCommand`.
 
-        On success the graph and commit panel are refreshed and the
-        commit message is cleared. On failure the error is surfaced
-        via :attr:`error_occurred` and the undo stack is unchanged
-        (the failed command is never pushed).
+        On success the graph and commit panel are refreshed, the
+        commit message is cleared, and the new commit is auto-selected
+        so the right panel switches from the commit-input view to the
+        commit-detail view of the freshly-created commit.
+
+        On failure the error is surfaced via :attr:`error_occurred` and
+        the undo stack is unchanged (the failed command is never
+        pushed). The selection is left untouched.
         """
         if self._repo_manager is None or not self._repo_manager.is_open:
             self.error_occurred.emit("No repository open.")
@@ -195,7 +213,10 @@ class MainViewModel(QObject):
         # Refresh downstream views; clear the message field for the next commit.
         self._graph_view_model.refresh_graph()
         self._commit_panel_view_model.refresh_status()
-        self._commit_panel_view_model.set_commit_message("")
+        self._commit_panel_view_model.set_commit_summary("")
+        self._commit_panel_view_model.set_commit_description("")
+        new_sha = str(self._repo_manager.repo.head.target)
+        self.set_selected_commit(new_sha)
         self._log("commit", "Commit succeeded")
 
     def stage_file(self, path: str) -> None:
@@ -205,6 +226,63 @@ class MainViewModel(QObject):
     def unstage_file(self, path: str) -> None:
         """Delegate to :meth:`CommitPanelViewModel.unstage_file`."""
         self._commit_panel_view_model.unstage_file(path)
+
+    def stage_all_unstaged(self) -> None:
+        """Stage every currently-unstaged file in one call.
+
+        Used by the right panel's *Stage All Changes* button. Errors
+        from individual ``stage_file`` calls are routed through
+        :attr:`error_occurred` (the VM's normal error path) so a
+        single bad file does not abort the rest of the batch.
+        """
+        unstaged = self._commit_panel_view_model.unstaged_paths()
+        for path in unstaged:
+            self._commit_panel_view_model.stage_file(path)
+
+    def unstage_all_staged(self) -> None:
+        """Unstage every currently-staged file in one call.
+
+        Used by the right panel's red *Unstage All Changes* button.
+        Each file is reset via :meth:`CommitPanelViewModel.unstage_file`;
+        individual errors are surfaced through :attr:`error_occurred`
+        but do not abort the batch.
+        """
+        staged = self._commit_panel_view_model.staged_files()
+        for path in staged:
+            self._commit_panel_view_model.unstage_file(path)
+
+    # ----- commit-graph selection (drives the right panel) ------------
+
+    def select_commit(self, sha: str) -> None:
+        """Toggle selection of ``sha`` in the commit graph.
+
+        Re-selecting the currently-selected SHA clears the selection
+        (right panel hides). Selecting a different SHA replaces the
+        previous one. ``WIP_SHA`` is a valid value — it switches the
+        right panel to the commit-input view.
+
+        Emits :attr:`selection_changed` with the new selection (or
+        ``None`` when toggled off).
+        """
+        if self._selected_commit_sha == sha:
+            self.set_selected_commit(None)
+            return
+        self.set_selected_commit(sha)
+
+    def set_selected_commit(self, sha: str | None) -> None:
+        """Force-set the selected commit (bypasses toggle behaviour).
+
+        Used internally after a fresh commit is created so the new
+        commit becomes the selected node without first clearing it.
+        """
+        if sha == self._selected_commit_sha:
+            return
+        self._selected_commit_sha = sha
+        self.selection_changed.emit(sha)
+
+    def selected_commit_sha(self) -> str | None:
+        """Return the currently selected commit SHA, ``WIP_SHA``, or ``None``."""
+        return self._selected_commit_sha
 
     def undo(self) -> None:
         """Undo the most recent command; refreshes views on success."""
