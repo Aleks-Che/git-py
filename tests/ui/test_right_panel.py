@@ -259,6 +259,50 @@ def test_commit_detail_panel_renders_message_and_files(
     assert any("[A]" in p for p in paths)
 
 
+def test_commit_detail_panel_file_click_toggles_selection(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Clicking the same file row twice toggles the selection off."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = RightPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    vm.select_commit(head_sha)
+    detail = panel._commit_detail
+
+    item = detail._files.item(0)
+    detail._on_files_item_clicked(item)
+    assert detail.selected_file() == "f.txt"
+
+    detail._on_files_item_clicked(item)
+    assert detail.selected_file() is None
+
+
+def test_commit_detail_panel_showing_new_commit_clears_selection(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Loading a new commit clears the previously selected file."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = RightPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    vm.select_commit(head_sha)
+    detail = panel._commit_detail
+    detail._on_files_item_clicked(detail._files.item(0))
+    assert detail.selected_file() is not None
+
+    detail.show_commit(head_sha)
+    assert detail.selected_file() is None
+
+
 # ----- stage_all_unstaged verb ----------------------------------------
 
 
@@ -368,6 +412,95 @@ def test_deselecting_staged_file_returns_graph(qtbot, tmp_git_repo: Path) -> Non
     cp_vm.select_file(None)
     assert window._graph_stack.currentIndex() == 0
     assert not window._diff_view.isVisible()
+
+
+def test_clicking_file_in_commit_detail_shows_diff(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Clicking a file row in the commit-detail panel shows the diff
+    in place of the graph (same behaviour as the WIP panel)."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(head_sha)
+
+    detail = window._right_panel._commit_detail
+    detail._on_files_item_clicked(detail._files.item(0))
+
+    assert window._graph_stack.currentIndex() == 1
+    assert window._diff_view.isVisible()
+    assert len(window._diff_view.toPlainText()) > 0
+
+
+def test_clicking_same_file_in_commit_detail_toggles_off(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Clicking the same file again in the commit-detail panel hides
+    the diff and returns the graph."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(head_sha)
+
+    detail = window._right_panel._commit_detail
+    item = detail._files.item(0)
+
+    detail._on_files_item_clicked(item)
+    assert window._graph_stack.currentIndex() == 1
+
+    detail._on_files_item_clicked(item)
+    assert window._graph_stack.currentIndex() == 0
+    assert not window._diff_view.isVisible()
+
+
+def test_switching_commits_clears_file_selection(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """When the user clicks a different commit, the file selection
+    in the previous commit is cleared and the graph returns."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(head_sha)
+
+    detail = window._right_panel._commit_detail
+    detail._on_files_item_clicked(detail._files.item(0))
+    assert window._graph_stack.currentIndex() == 1
+
+    # Re-selecting the same commit (toggle-off → toggle-on) clears.
+    window._main_vm.select_commit(head_sha)
+    assert window._graph_stack.currentIndex() == 0
+    assert detail.selected_file() is None
+
+
+def test_commit_detail_panel_clears_selection_on_hide(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Going back to WIP from a commit-detail view with a file selected
+    hides the diff and clears the panel's selection."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(head_sha)
+
+    detail = window._right_panel._commit_detail
+    detail._on_files_item_clicked(detail._files.item(0))
+    assert window._graph_stack.currentIndex() == 1
+
+    window._main_vm.select_commit(WIP_SHA)
+    assert window._graph_stack.currentIndex() == 0
 
 
 # ----- integration with MainWindow ------------------------------------

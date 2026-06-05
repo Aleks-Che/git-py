@@ -347,6 +347,14 @@ class MainWindow(QMainWindow):
         cp_vm.selected_file_changed.connect(self._on_selected_file_changed)
         cp_vm.diff_ready.connect(self._on_diff_ready)
 
+        # The commit-detail panel emits the same signal pair so a
+        # file click in either right-panel view swaps the graph for
+        # a diff in this same stack.
+        self._right_panel._commit_detail.selected_file_changed.connect(
+            self._on_selected_file_changed,
+        )
+        self._right_panel._commit_detail.diff_ready.connect(self._on_diff_ready)
+
         top = QSplitter(self)
         top.addWidget(self._left_panel)
         top.addWidget(self._graph_stack)

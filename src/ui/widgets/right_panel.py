@@ -77,14 +77,20 @@ class RightPanel(QWidget):
 
         When leaving the WIP / commit-input view the file selection
         in the commit panel VM is cleared so the diff view (which
-        replaces the graph) is hidden.
+        replaces the graph) is hidden. The commit-detail panel
+        clears its own selection inside :meth:`show_commit`; we
+        also clear it explicitly when switching back to WIP or
+        hiding the panel, since ``show_commit`` is not on that
+        path.
         """
         if sha is None:
             self._main_vm.commit_panel_view_model().select_file(None)
+            self._commit_detail.select_file(None)
             self.setVisible(False)
             return
         self.setVisible(True)
         if sha == WIP_SHA:
+            self._commit_detail.select_file(None)
             self._stack.setCurrentIndex(0)
             self._commit_input._refresh_all()
         else:

@@ -9,20 +9,20 @@ Structure (top-to-bottom):
 * **Changed files** — one row per file the commit touched, with the
   usual ``M`` / ``A`` / ``D`` / ``R`` / ``C`` / ``T`` badge.
 
+Clicking a file in the **Changed Files** list emits
+:attr:`selected_file_changed` and :attr:`diff_ready` so the
+:class:`MainWindow` can swap the graph for a diff view in place.
+Clicking the same file again deselects it (toggle behaviour, mirroring
+the WIP panel).
+
 The widget is bound to :class:`MainViewModel` for the commit's
 ``CommitInfo`` and to :class:`RepositoryManager` (through the VM) for
-the list of changed files. It does not render a unified diff — Stage 3
-kept a diff preview here, but the new layout surfaces file lists in
-both the commit view and the WIP view, so a side-by-side diff is
-redundant.
-
-The widget is read-only: there are no editing controls and no
-verb-method calls. The user returns to the WIP / commit-input view by
-clicking the WIP node in the graph.
+the list of changed files and the per-file diff.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+import pygit2
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QLabel,
@@ -51,13 +51,27 @@ _STATUS_BADGE: dict[FileStatus, tuple[str, str]] = {
     FileStatus.IGNORED: ("I", "#8B8B8B"),
 }
 
+# Selection background colour for the chosen file — matches the WIP
+# panel so the visual language is identical on both sides.
+_SELECTION_BG = "#264F78"
+
 
 class CommitDetailPanel(QWidget):
     """Read-only view of a single commit, bound to :class:`MainViewModel`."""
 
+    selected_file_changed = Signal(object)
+    """Emitted with the new selected path (or ``None``)."""
+
+    diff_ready = Signal(str)
+    """Emitted with the unified-diff text for the selected file."""
+
+    error_occurred = Signal(str)
+
     def __init__(self, main_view_model: MainViewModel, parent=None) -> None:
         super().__init__(parent)
         self._main_vm = main_view_model
+        self._selected_file: str | None = None
+        self._current_sha: str | None = None
 
         self._build_ui()
         self._render_empty()
@@ -107,9 +121,16 @@ class CommitDetailPanel(QWidget):
         )
 
         self._files = QListWidget(self)
-        self._files.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        self._files.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self._files.setUniformItemSizes(True)
         self._files.setAlternatingRowColors(True)
+        # Use the native ``:selected`` state (priority over ``:hover``)
+        # instead of ``setBackground``, matching the WIP panel's
+        # approach so hover never overrides the selection highlight.
+        self._files.setStyleSheet(
+            f"QListWidget::item:selected {{ background: {_SELECTION_BG}; }}",
+        )
+        self._files.itemClicked.connect(self._on_files_item_clicked)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -124,13 +145,40 @@ class CommitDetailPanel(QWidget):
 
     # ----- public API --------------------------------------------------
 
+    def selected_file(self) -> str | None:
+        """Return the path of the currently selected file, or ``None``."""
+        return self._selected_file
+
+    def select_file(self, path: str | None) -> None:
+        """Set (or clear) the file whose diff should be displayed.
+
+        Emits :attr:`selected_file_changed` and
+        :attr:`diff_ready`. ``path=None`` clears both signals so the
+        MainWindow switches back to the graph.
+        """
+        self._selected_file = path
+        self._highlight_selected_file()
+        if path is None:
+            self._files.clearSelection()
+        self.selected_file_changed.emit(path)
+        if path is None or self._current_sha is None:
+            self.diff_ready.emit("")
+            return
+        self._compute_and_emit_diff(self._current_sha, path)
+
     def show_commit(self, sha: str) -> None:
         """Populate the panel for the commit at ``sha``.
 
-        Errors are swallowed — the user already clicked a valid graph
-        node; if the repo state has drifted (race with a background
-        op) we just leave the panel empty rather than pop a dialog.
+        Any previously selected file is cleared: each commit has its
+        own file list, and carrying the selection across would
+        highlight a path that no longer exists in the new commit.
         """
+        self._current_sha = sha
+        self._selected_file = None
+        self._highlight_selected_file()
+        self.selected_file_changed.emit(None)
+        self.diff_ready.emit("")
+
         repo = self._main_vm.repository_manager()
         if repo is None or not repo.is_open:
             self._render_empty()
@@ -151,6 +199,11 @@ class CommitDetailPanel(QWidget):
 
     def clear(self) -> None:
         """Reset the panel to the empty state."""
+        self._current_sha = None
+        self._selected_file = None
+        self._highlight_selected_file()
+        self.selected_file_changed.emit(None)
+        self.diff_ready.emit("")
         self._render_empty()
 
     # ----- rendering ---------------------------------------------------
@@ -205,8 +258,100 @@ class CommitDetailPanel(QWidget):
     def _append_change_item(self, change: FileChange) -> None:
         badge, color_hex = _STATUS_BADGE.get(change.status, ("?", "#8B8B8B"))
         item = QListWidgetItem(f"[{badge}]  {change.path}", self._files)
-        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
         item.setForeground(QBrush(QColor(color_hex)))
+        item.setData(Qt.ItemDataRole.UserRole, change.path)
+
+    # ----- file selection (click to show diff in place) ---------------
+
+    def _on_files_item_clicked(self, item: QListWidgetItem) -> None:
+        """Toggle the file selection for diff view.
+
+        Clicking the same file again deselects it. The diff view is
+        driven by :attr:`selected_file_changed` and
+        :attr:`diff_ready` — same contract as the WIP panel.
+        """
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if not path:
+            return
+        if self._selected_file == path:
+            self.select_file(None)
+            self._files.clearSelection()
+        else:
+            self.select_file(path)
+
+    def _highlight_selected_file(self) -> None:
+        """Apply the ``:selected`` state to the chosen file row.
+
+        Uses the native ``QListWidget`` selection mechanism (subject
+        to the ``QListWidget::item:selected`` stylesheet above) so
+        the platform's hover indicator never paints over the
+        selected-file highlight.
+        """
+        selected = self._selected_file
+        for i in range(self._files.count()):
+            item = self._files.item(i)
+            if item is None:
+                continue
+            is_match = (
+                selected is not None
+                and item.data(Qt.ItemDataRole.UserRole) == selected
+            )
+            item.setSelected(is_match)
+
+    # ----- diff computation -------------------------------------------
+
+    def _compute_and_emit_diff(self, sha: str, path: str) -> None:
+        """Compute the commit-vs-parent diff for ``path`` and emit
+        :attr:`diff_ready`."""
+        repo = self._main_vm.repository_manager()
+        if repo is None or not repo.is_open:
+            self.diff_ready.emit("")
+            return
+        try:
+            text = self._build_commit_diff_text(repo, sha, path)
+        except GitError as exc:
+            self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
+            self.diff_ready.emit("")
+            return
+        self.diff_ready.emit(text)
+
+    def _build_commit_diff_text(
+        self, repo, sha: str, path: str,  # noqa: ANN001 - RepositoryManager
+    ) -> str:
+        """Return the unified diff for ``path`` (commit tree vs its
+        first parent's tree).
+
+        For a root commit (no parents) the diff is against the empty
+        tree, so every file it introduces is reported as
+        ``new file``. We pick the patch for ``path`` out of a
+        multi-file diff via :meth:`_extract_patch_for`.
+        """
+        try:
+            obj = repo.repo.revparse_single(sha).peel(pygit2.Commit)
+        except (KeyError, pygit2.GitError, ValueError) as exc:
+            raise GitError(f"Unknown revision: {sha!r}") from exc
+        if obj.parent_ids:
+            try:
+                parent_tree = obj.parents[0].tree
+            except (KeyError, ValueError):
+                parent_tree = repo.repo.TreeBuilder().write()
+        else:
+            parent_tree = repo.repo.TreeBuilder().write()
+        try:
+            diff = repo.repo.diff(parent_tree, obj.tree, context_lines=3)
+        except (pygit2.GitError, KeyError, ValueError) as exc:
+            raise GitError(f"Failed to diff {sha!r}: {exc}") from exc
+        return self._extract_patch_for(diff, path)
+
+    @staticmethod
+    def _extract_patch_for(diff, path: str) -> str:  # noqa: ANN001 - pygit2.Diff
+        """Return the patch text for ``path`` from a multi-file ``pygit2.Diff``."""
+        pieces: list[str] = []
+        for patch in diff:
+            delta = patch.delta
+            if (delta.new_file.path == path) or (delta.old_file.path == path):
+                pieces.append(patch.text or "")
+        return "".join(pieces)
 
 
 __all__ = ["CommitDetailPanel"]
