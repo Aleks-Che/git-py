@@ -15,6 +15,14 @@ Layout: a single :class:`QTreeWidget` with three top-level groups:
 * **Tags** — all tags.
 * **Stash** — stash entries (``stash@{0}`` … ``stash@{N}``).
 
+Every group row carries an explicit chevron icon
+(``QStyle.SP_ArrowRight`` when collapsed, ``QStyle.SP_ArrowDown``
+when expanded) so the expand/collapse state is visible at a glance
+even when the platform's default branch indicator is hard to see
+on a dark surface. The chevron is updated by the
+``itemExpanded`` / ``itemCollapsed`` signals; leaf rows (branches,
+tags, stash entries) keep no icon.
+
 Context menu (right-click):
 
 * On a local branch: **Checkout**, **Merge into current…**,
@@ -40,25 +48,41 @@ the ViewModel forwards them to its ``error_occurred`` signal.
 from __future__ import annotations
 
 from PySide6.QtCore import QMimeData, Qt
-from PySide6.QtGui import QAction, QDragEnterEvent, QDragMoveEvent, QDropEvent, QFont
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QDragEnterEvent,
+    QDragMoveEvent,
+    QDropEvent,
+    QFont,
+    QIcon,
+    QImage,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QInputDialog,
     QLineEdit,
     QMenu,
     QMessageBox,
+    QStyle,
     QTreeWidget,
     QTreeWidgetItem,
 )
 
 from src.core.exceptions import GitError
+from src.utils.theme import DARK_THEME
 from src.viewmodels.branch_panel_viewmodel import BranchPanelViewModel
 from src.viewmodels.main_viewmodel import MainViewModel
 
 # Item data roles. ``UserRole`` is the canonical Qt role for app data;
 # we pick ``UserRole + 1`` for the kind discriminator so ``UserRole``
-# itself can hold the name.
+# itself can hold the name. ``UserRole + 2`` marks a group row
+# (Branches / Local / Remote / Tags / Stash) so the chevron icon
+# logic can tell a group from a leaf and from the placeholder even
+# when the group happens to be empty.
 _ROLE_KIND = Qt.ItemDataRole.UserRole + 1
 _ROLE_NAME = Qt.ItemDataRole.UserRole
+_ROLE_IS_GROUP = Qt.ItemDataRole.UserRole + 2
 
 # Discriminator values for ``_ROLE_KIND``.
 _KIND_LOCAL_BRANCH = "local_branch"
@@ -111,6 +135,8 @@ class LeftPanel(QTreeWidget):
         self.itemDoubleClicked.connect(self._on_double_clicked)
         self.itemClicked.connect(self._on_item_clicked)
         self.customContextMenuRequested.connect(self._on_context_menu)
+        self.itemExpanded.connect(self._on_group_toggled)
+        self.itemCollapsed.connect(self._on_group_toggled)
 
     # ----- build / rebuild --------------------------------------------
 
@@ -126,11 +152,11 @@ class LeftPanel(QTreeWidget):
         self._group_branches = QTreeWidgetItem([_GROUP_BRANCHES])
         self._group_local = QTreeWidgetItem([_GROUP_LOCAL])
         self._group_remote = QTreeWidgetItem([_GROUP_REMOTE])
+        for group in (self._group_branches, self._group_local, self._group_remote):
+            group.setData(0, _ROLE_IS_GROUP, True)
         self._group_branches.addChild(self._group_local)
         self._group_branches.addChild(self._group_remote)
         self.addTopLevelItem(self._group_branches)
-        self._group_branches.setExpanded(True)
-        self._group_local.setExpanded(True)
 
         current = self._vm.current_branch_name()
         bold = QFont()
@@ -150,8 +176,8 @@ class LeftPanel(QTreeWidget):
             self._group_remote.addChild(item)
 
         self._group_tags = QTreeWidgetItem([_GROUP_TAGS])
+        self._group_tags.setData(0, _ROLE_IS_GROUP, True)
         self.addTopLevelItem(self._group_tags)
-        self._group_tags.setExpanded(False)
         for tag in self._vm.tags():
             item = QTreeWidgetItem([tag.name])
             item.setData(0, _ROLE_KIND, _KIND_TAG)
@@ -161,8 +187,8 @@ class LeftPanel(QTreeWidget):
             self._group_tags.setDisabled(True)
 
         self._group_stash = QTreeWidgetItem([_GROUP_STASH])
+        self._group_stash.setData(0, _ROLE_IS_GROUP, True)
         self.addTopLevelItem(self._group_stash)
-        self._group_stash.setExpanded(False)
         for entry in self._vm.stash_list():
             label = f"stash@{{{entry.index}}}: {entry.message}"
             item = QTreeWidgetItem([label])
@@ -171,6 +197,21 @@ class LeftPanel(QTreeWidget):
             self._group_stash.addChild(item)
         if not self._group_stash.childCount():
             self._group_stash.setDisabled(True)
+
+        # Set expansion state and chevron icons. Order matters: each
+        # group must already have its children attached, otherwise
+        # ``_set_expand_icon`` would treat the row as a leaf and
+        # clear the icon. ``setExpanded`` also fires ``itemExpanded``,
+        # which keeps the chevron in sync for the groups that actually
+        # expand; the explicit calls below cover the groups that stay
+        # collapsed (``Remote`` / ``Tags`` / ``Stash``).
+        self._group_branches.setExpanded(True)
+        self._group_local.setExpanded(True)
+        self._set_expand_icon(self._group_branches)
+        self._set_expand_icon(self._group_local)
+        self._set_expand_icon(self._group_remote)
+        self._set_expand_icon(self._group_tags)
+        self._set_expand_icon(self._group_stash)
 
         self._update_drag_state()
 
@@ -184,6 +225,64 @@ class LeftPanel(QTreeWidget):
         for i in range(self._group_local.childCount()):
             leaf = self._group_local.child(i)
             leaf.setFlags(leaf.flags() | Qt.ItemFlag.ItemIsDragEnabled)
+
+    def _set_expand_icon(self, item: QTreeWidgetItem) -> None:
+        """Set the chevron icon on a group item from its expansion state.
+
+        Only rows that carry the ``_ROLE_IS_GROUP`` marker are touched
+        — leaves and the placeholder are left alone, even if the group
+        is currently empty. The chevron uses the platform's standard
+        arrow pixmaps so it follows the OS look and reads well on the
+        dark surface even when Qt's default branch indicator is barely
+        visible. The pixmap is then tinted with the theme's text color
+        so the chevron blends in with the row label.
+        """
+        if item.data(0, _ROLE_IS_GROUP) is not True:
+            return
+        item.setIcon(0, self._tint_chevron(item.isExpanded()))
+
+    def _tint_chevron(self, expanded: bool) -> QIcon:
+        """Return a chevron icon tinted with the theme's text color.
+
+        The standard pixmap (SP_ArrowRight / SP_ArrowDown) is drawn in
+        the platform's icon color, which on Windows stays near-black
+        even when a dark QSS is applied. We walk the source's alpha
+        channel and replace every non-transparent pixel with the
+        theme's text color, so the chevron reads like the row label
+        next to it. A direct pixel walk is more reliable than a
+        ``QPainter`` composition pass on the offscreen Qt platform
+        used by the test suite.
+        """
+        standard = (
+            QStyle.StandardPixmap.SP_ArrowDown
+            if expanded
+            else QStyle.StandardPixmap.SP_ArrowRight
+        )
+        source = self.style().standardPixmap(standard)
+        if source.isNull():
+            return QIcon(source)
+
+        image = source.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+        text_color = QColor(DARK_THEME.text)
+        r, g, b = text_color.red(), text_color.green(), text_color.blue()
+
+        for y in range(image.height()):
+            for x in range(image.width()):
+                alpha = (image.pixel(x, y) >> 24) & 0xFF
+                if alpha:
+                    image.setPixel(x, y, (alpha << 24) | (r << 16) | (g << 8) | b)
+
+        return QIcon(QPixmap.fromImage(image))
+
+    def _on_group_toggled(self, item: QTreeWidgetItem) -> None:
+        """Refresh the chevron when a group row is expanded or collapsed.
+
+        Only group rows carry the ``_ROLE_IS_GROUP`` marker; leaves
+        and the placeholder do not, so the icon update runs only on
+        the rows that actually need it.
+        """
+        if item.data(0, _ROLE_IS_GROUP) is True:
+            self._set_expand_icon(item)
 
     # ----- user actions ------------------------------------------------
 

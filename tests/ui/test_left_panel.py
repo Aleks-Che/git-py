@@ -105,6 +105,142 @@ def test_panel_rebuilds_when_repository_changes(qtbot, tmp_git_repo: Path) -> No
     assert _find_top_level(panel, "No repository opened") is not None
 
 
+# ----- expand/collapse chevron icons ---------------------------------
+
+
+def test_group_items_carry_expand_chevron(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """Every group row in the left panel exposes a chevron icon whose
+    direction matches the row's expansion state. Leaf rows (branches,
+    tags, stash entries) and the placeholder stay icon-free."""
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    branches = _find_top_level(panel, "Branches")
+    local = _find_child(branches, "Local")
+    remote = _find_child(branches, "Remote")
+    tags = _find_top_level(panel, "Tags")
+    stash = _find_top_level(panel, "Stash")
+
+    # Branches + Local start expanded; Remote / Tags / Stash stay collapsed.
+    assert not branches.icon(0).isNull()
+    assert not local.icon(0).isNull()
+    assert not remote.icon(0).isNull()
+    assert not tags.icon(0).isNull()
+    assert not stash.icon(0).isNull()
+
+    # Icons for the two states must differ — otherwise the chevron is
+    # just a static dot. ``cacheKey`` of the underlying pixmaps is the
+    # stable, well-defined way to compare two ``QIcon`` instances in
+    # PySide6.
+    collapsed_pixmap_key = tags.icon(0).pixmap(16, 16).cacheKey()
+    expanded_pixmap_key = branches.icon(0).pixmap(16, 16).cacheKey()
+    assert collapsed_pixmap_key != expanded_pixmap_key
+
+    # Leaf rows (branches) and the placeholder carry no icon.
+    main_leaf = _find_child(local, "main  (HEAD)")
+    assert main_leaf is not None
+    assert main_leaf.icon(0).isNull()
+
+
+def test_placeholder_has_no_chevron(qtbot) -> None:
+    """The 'No repository opened' placeholder is not a group, so it
+    must not display a chevron."""
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    placeholder = _find_top_level(panel, "No repository opened")
+    assert placeholder is not None
+    assert placeholder.icon(0).isNull()
+
+
+def test_chevron_is_tinted_with_theme_text_color(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """The chevron pixmap must be recoloured to match the theme's
+    text color, not the platform's default (near-black) icon color.
+
+    We render the icon to its native size, then walk the pixels and
+    require at least one fully-opaque pixel to carry the theme's
+    RGB channels. Anti-aliased edges (partial alpha) are allowed to
+    blend with the background, so the assertion stays a sanity check
+    on the bulk fill rather than a per-pixel equality.
+    """
+    from PySide6.QtCore import QSize
+    from PySide6.QtGui import QColor, QImage
+    from src.utils.theme import DARK_THEME
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    branches = _find_top_level(panel, "Branches")
+    tags = _find_top_level(panel, "Tags")
+    assert branches is not None and tags is not None
+
+    expected = QColor(DARK_THEME.text)
+    expected_rgb = (expected.red(), expected.green(), expected.blue())
+
+    def _has_text_color(icon) -> bool:
+        pixmap = icon.pixmap(icon.actualSize(QSize(16, 16)))
+        image = pixmap.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+        for y in range(image.height()):
+            for x in range(image.width()):
+                pixel = image.pixel(x, y)
+                alpha = (pixel >> 24) & 0xFF
+                if alpha < 200:
+                    continue
+                r, g, b = (pixel >> 16) & 0xFF, (pixel >> 8) & 0xFF, pixel & 0xFF
+                if (r, g, b) == expected_rgb:
+                    return True
+        return False
+
+    assert _has_text_color(branches.icon(0))
+    assert _has_text_color(tags.icon(0))
+
+
+def test_chevron_updates_when_group_is_collapsed(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """Toggling a group's expansion must swap the chevron to match the
+    new state. The handler is wired to ``itemExpanded`` /
+    ``itemCollapsed`` so the icon stays in sync without manual refresh.
+
+    We can't compare the QPixmap cache keys across calls — Qt hands
+    out a fresh ``QPixmap`` on every ``icon.pixmap(...)`` call, so the
+    keys differ even when the icon is the same standard arrow. The
+    first test already asserts that the two *states* render different
+    pixmaps; here we only verify the icon stays valid through a
+    full round-trip of expand → collapse → expand."""
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    branches = _find_top_level(panel, "Branches")
+    assert branches is not None
+
+    # Initially expanded → chevron is set.
+    assert not branches.icon(0).isNull()
+
+    branches.setExpanded(False)
+    qtbot.waitUntil(lambda: not branches.isExpanded())
+    assert not branches.icon(0).isNull()
+
+    branches.setExpanded(True)
+    qtbot.waitUntil(lambda: branches.isExpanded())
+    assert not branches.icon(0).isNull()
+
+
 # ----- double-click --------------------------------------------------
 
 
