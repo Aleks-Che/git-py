@@ -151,6 +151,7 @@ class GraphWidget(QGraphicsView):
         self._node_items: dict[str, QGraphicsEllipseItem] = {}
         self._branch_label_items: dict[str, list[QGraphicsItem]] = {}
         self._selected_sha: str | None = None
+        self._highlighted_shas: set[str] = set()
         self._placeholder: QGraphicsSimpleTextItem | None = None
         self._rows: list[dict] = []
         self._avatar_cache: dict[str, QPixmap] = {}
@@ -179,6 +180,22 @@ class GraphWidget(QGraphicsView):
         """
         self._selected_sha = sha
         self._refresh_selection_rings()
+
+    def set_highlighted_shas(self, shas: set[str]) -> None:
+        """Highlight the nodes with the given SHAs (search results).
+
+        The highlight is a soft lime border around the node ellipse.
+        When a node is both selected and highlighted, the selection
+        ring wins (selection is the dominant visual state).
+        """
+        self._highlighted_shas = set(shas)
+        self._refresh_selection_rings()
+        # Auto-scroll to the first highlighted node.
+        if self._highlighted_shas:
+            for sha, node in self._node_items.items():
+                if sha in self._highlighted_shas:
+                    self.centerOn(node)
+                    break
 
     # ----- signal handlers ---------------------------------------------
 
@@ -691,6 +708,8 @@ class GraphWidget(QGraphicsView):
                 node.setPen(
                     QPen(QColor(self._cfg.selection_color), self._cfg.selection_ring_width),
                 )
+            elif sha in self._highlighted_shas:
+                node.setPen(QPen(QColor("#A3BE8C"), 2))
             else:
                 node.setPen(QPen(QColor(self._cfg.background_color), 1))
 

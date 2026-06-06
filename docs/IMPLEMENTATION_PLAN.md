@@ -77,7 +77,7 @@
 
 ## Прогресс разработки
 
-**Общий прогресс:** `[██████████████░░░░░░░░░░░░]` 6 / 11 этапов (55%)
+**Общий прогресс:** `[███████████████░░░░░░░░░░]` 7 / 11 этапов (64%)
 
 Легенда:
 - `[ ]` — не начато
@@ -121,10 +121,10 @@
   - Дата завершения: `2026-06-03`
   - Комментарий: `core/models.py` — новый `RemoteInfo(name, url, fetch_refspec, push_refspec)`. `core/operations.py` — `add_remote(name, url)` (ловит `pygit2.AlreadyExistsError`/`ValueError` → `GitError`), `remove_remote(name)` (KeyError → `InvalidRefError`), `list_remotes(repo)` (читает `r.remotes.names()` + `fetch_refspecs`/`push_refspecs`, корректно обрабатывает `AttributeError` для старых pygit2). `commands.py` — 5 новых `GitCommand`: `PushCommand` (undo no-op, push нельзя откатить локально), `PullCommand` (undo через `reset(_previous_head, hard)`, no-op при up-to-date), `FetchCommand` (undo no-op, fetch только обновляет remote-tracking refs), `AddRemoteCommand` (undo через `remove_remote`, защита от destroy pre-existing), `RemoveRemoteCommand` (запоминает url до удаления, undo через `add_remote` с восстановленным url). `MainViewModel` — 6 verb-методов: `push_changes`/`pull_changes`/`fetch_changes` (всегда async при `async_enabled=True`, синхронный fallback), `add_remote`/`remove_remote` (синхронные, быстрые), `list_remotes()` (читает core), `clone_repository(url, path)` (async с `AsyncWorker`, на success автопривязывает новый репо). Авто-fetch таймер — `QTimer` в конструкторе (`auto_fetch_enabled=False` по умолчанию, `auto_fetch_interval_ms=60_000`), запускается в `set_repository` если опция включена, останавливается при close. Метод `_run_async` принимает `silent_on_failure=True` (использует таймер — падающий fetch не светит ошибку каждую минуту). `BranchPanelViewModel` — `remotes()` property + `references_changed` сигнал + `get_remote_for_branch(name)` (по `origin/main` → `origin`). `config.py` — добавлены `auto_fetch_enabled`/`auto_fetch_interval_ms`. `MainWindow` — новый `QToolBar` с Push/Pull/Fetch (`Ctrl+Shift+U`/`P`/`F`), Remote menu с этими же действиями + `Manage Remotes…`. Действия enabled только когда репо открыто + не busy (через `_update_remote_actions()` на `busy_changed`/`repository_changed`). `CloneDialog` (`ui/dialogs/clone_dialog.py`) — провайдеры (GitHub/GitLab/Bitbucket/Custom URL) с префилом URL, file browse, `Generate SSH Key…` (sub-dialog `SshKeyDialog` с реальным `ssh-keygen -t ed25519` через subprocess + мок в тестах). `RemoteManageDialog` (`ui/dialogs/remote_manage_dialog.py`) — `QTableWidget` с Name/URL/Fetch, Add/Remove кнопки, сигналы `add_requested(name, url)`/`remove_requested(name)`. `LeftPanel` — context menu на remote-ветке получил `Fetch from {remote}` action (через `get_remote_for_branch`). `File > Init New Repository…` теперь реально инициализирует репо. **92 новых теста** (10 core/operations + 20 commands + 24 MainViewModel remote + 5 BranchPanelViewModel + 2 LeftPanel fetch + 14 CloneDialog + 9 RemoteManageDialog + 8 toolbar wiring), итого **405/405 проходят**, `ruff check` чисто. Замечания: pygit2 `remotes.names()` — generator, нужно обернуть в `list()`; `remotes.create()` бросает `ValueError` (а не `AlreadyExistsError`) на дубликат — ловим оба; fetch context-menu не показывается если remote-tracking ветка указывает на несуществующий remote (graceful — ничего не добавляется в actions).
 
-- [ ] **Этап 7: Stash и дополнительные инструменты** — _не начато_
-  - Дата начала: `—`
-  - Дата завершения: `—`
-  - Комментарий: `—`
+- [x] **Этап 7: Stash и дополнительные инструменты** — _завершён_
+  - Дата начала: `2026-06-06`
+  - Дата завершения: `2026-06-06`
+  - Комментарий: **Stash-команды** (StashPushCommand, StashPopCommand, StashApplyCommand, StashDropCommand, StashPushStagedCommand) реализованы в `viewmodels/commands.py` с undo/redo через CommandProcessor. **Core-операции** дополнены: `stash_apply`, `stash_drop`, `stash_oid_at`, `restore_stash` (через `git stash store`), `stash_push_staged` (через `git stash push -- <paths>`, т.к. pygit2 `paths=` ревертит все изменения). **MainViewModel** — verb-методы `stash_push/pop/apply/drop/stash_push_staged`. **LeftPanel** — контекстное меню stash с Apply/Pop/Drop (с confirm-диалогом для Drop). **Stash на графе** — синтетические узлы с `kind="stash"`, реальный OID, золотой пунктирный ромб + крест; клик — детали в CommitDetailPanel, правый клик — Apply/Pop/Drop через graph. **Порядок узлов** — WIP (Uncommitted) сверху, затем stash, затем HEAD. **Тулбар** — кнопки Stash (Ctrl+Shift+S) и Pop (Ctrl+Shift+O) с авто-обновлением enabled (Pop disabled при пустом stash-листе). **Терминал** — `TerminalWidget` с `QProcess` (cmd.exe/bash), ANSI SGR-парсер в HTML, запуск в корне репо, старт/стоп по `repository_changed`, отложенный старт через `QTimer.singleShot`. **Поиск по коммитам** — `SearchBar` с debounce 300ms, `GraphViewModel.search_commits` (по SHA/сообщению/автору), скролл к первому совпадению через `GraphTableWidget.scroll_to_commit`. **Прочее:** убран дубликат `_execute_rebase_sync` в `main_viewmodel.py`; фикс стартапа — `_restore_state()` через `QTimer.singleShot(0)` c disconnect/reconnect `active_tab_changed`. Итого **643 теста, ruff clean**.
 
 - [ ] **Этап 8: Undo/Redo и история действий** — _не начато_
   - Дата начала: `—`
@@ -143,5 +143,5 @@
 
 ### Текущий статус
 - **Активный этап:** `Этап 9: Конфигурация и темизация` (под-этапы: темизация ✓, персистентность окна ✓, редизайн правой панели ✓)
-- **Последнее обновление:** `2026-06-05`
-- **Следующий шаг:** `Запустить Settings-диалог с переключателем тёмная/светлая (LIGHT_THEME реальная палитра), сохранение выбора темы в config.json, импорт/экспорт настроек. Stage 7/8 (stash UI, undo UI) — по-прежнему не начаты, ставятся в очередь после Этапа 9.`
+- **Последнее обновление:** `2026-06-06`
+- **Следующий шаг:** `Завершить Settings-диалог (переключатель dark/light), импорт/экспорт настроек. Stage 8 (интеграция undo/redo в тулбар + история действий).`

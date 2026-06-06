@@ -390,6 +390,7 @@ def test_graphnode_to_dict_round_trip() -> None:
         display_column=1,
         color="#ff0000",
         row=5,
+        kind="commit",
     )
     d = node.to_dict()
     assert d == {
@@ -406,6 +407,7 @@ def test_graphnode_to_dict_round_trip() -> None:
         "display_column": 1,
         "color": "#ff0000",
         "row": 5,
+        "kind": "commit",
     }
 
 

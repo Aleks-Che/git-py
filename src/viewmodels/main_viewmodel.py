@@ -405,6 +405,20 @@ class MainViewModel(QObject):
         except GitError:
             return ""
 
+    def get_workdir_diff_text(self) -> str:
+        """Return the full unified diff of the working tree vs HEAD.
+
+        Returns an empty string when no repository is open or the
+        working tree is clean. Used by the graph widget's "Copy diff"
+        context-menu action for the WIP node.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            return ""
+        try:
+            return self._repo_manager.get_workdir_diff_text()
+        except GitError:
+            return ""
+
     # ----- branch commands ---------------------------------------------
 
     def checkout_branch(self, name: str) -> bool:
@@ -945,26 +959,6 @@ class MainViewModel(QObject):
             return ""
         return repo.head.shorthand
 
-    def _execute_rebase_sync(
-        self,
-        command: object,
-        upstream: str,
-    ) -> None:
-        try:
-            self._command_processor.execute(command)  # type: ignore[arg-type]
-        except RebaseConflictError as exc:
-            self._set_conflict_state(
-                "rebase",
-                conflicting_paths=[],
-                upstream=upstream,
-            )
-            self.error_occurred.emit(str(exc))
-            return
-        except GitError as exc:
-            self.error_occurred.emit(str(exc))
-            return
-        self._refresh_all_views()
-
     def cherry_pick(self, sha: str) -> None:
         """Cherry-pick ``sha`` onto HEAD via :class:`CherryPickCommand`.
 
@@ -1069,6 +1063,148 @@ class MainViewModel(QObject):
         self._clear_conflict_state()
         self._refresh_all_views()
         self._log("rebase", "Rebase aborted")
+
+    # ----- stash: push / pop / apply / drop -----------------------------
+
+    def stash_push(self, message: str = "WIP") -> bool:
+        """Push the current WIP onto the stash list via :class:`StashPushCommand`.
+
+        A no-op (returns ``False``) when there is nothing to stash —
+        the command still runs through the processor, but the undo
+        path is a no-op so the user does not see a confusing "undo
+        did nothing" entry in the history.
+
+        Returns ``True`` on success, ``False`` on failure.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            self._log("stash", "Stash push failed: no repository", level="error")
+            return False
+        if self._is_busy:
+            self.error_occurred.emit("Another operation is already in progress.")
+            return False
+        from src.viewmodels.commands import StashPushCommand
+
+        self._log("stash", f"Stash push — message: {message[:60]!r}")
+        command = StashPushCommand(self._repo_manager, message)
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("stash", f"Stash push failed: {exc}", level="error")
+            return False
+        self._refresh_all_views()
+        self._log("stash", "Stash push succeeded")
+        return True
+
+    def stash_pop(self, index: int = 0) -> bool:
+        """Apply and drop the stash at ``index`` via :class:`StashPopCommand`."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            self._log("stash", f"Stash pop @{index} failed: no repository", level="error")
+            return False
+        if self._is_busy:
+            self.error_occurred.emit("Another operation is already in progress.")
+            return False
+        from src.viewmodels.commands import StashPopCommand
+
+        self._log("stash", f"Stash pop @{{{index}}}")
+        command = StashPopCommand(self._repo_manager, index)
+        try:
+            self._command_processor.execute(command)
+        except MergeConflictError as exc:
+            # Pop left conflicts — surface them to the user.
+            self.error_occurred.emit(str(exc))
+            self._log("stash", "Stash pop produced conflicts", level="warn")
+            self._refresh_all_views()
+            return False
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("stash", f"Stash pop failed: {exc}", level="error")
+            return False
+        self._refresh_all_views()
+        self._log("stash", f"Stash pop @{{{index}}} succeeded")
+        return True
+
+    def stash_apply(self, index: int = 0) -> bool:
+        """Apply the stash at ``index`` without dropping it via :class:`StashApplyCommand`."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            self._log("stash", f"Stash apply @{index} failed: no repository", level="error")
+            return False
+        if self._is_busy:
+            self.error_occurred.emit("Another operation is already in progress.")
+            return False
+        from src.viewmodels.commands import StashApplyCommand
+
+        self._log("stash", f"Stash apply @{{{index}}}")
+        command = StashApplyCommand(self._repo_manager, index)
+        try:
+            self._command_processor.execute(command)
+        except MergeConflictError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("stash", "Stash apply produced conflicts", level="warn")
+            self._refresh_all_views()
+            return False
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("stash", f"Stash apply failed: {exc}", level="error")
+            return False
+        self._refresh_all_views()
+        self._log("stash", f"Stash apply @{{{index}}} succeeded")
+        return True
+
+    def stash_drop(self, index: int = 0) -> bool:
+        """Drop the stash at ``index`` via :class:`StashDropCommand`."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            self._log("stash", f"Stash drop @{index} failed: no repository", level="error")
+            return False
+        if self._is_busy:
+            self.error_occurred.emit("Another operation is already in progress.")
+            return False
+        from src.viewmodels.commands import StashDropCommand
+
+        self._log("stash", f"Stash drop @{{{index}}}")
+        command = StashDropCommand(self._repo_manager, index)
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("stash", f"Stash drop failed: {exc}", level="error")
+            return False
+        self._refresh_all_views()
+        self._log("stash", f"Stash drop @{{{index}}} succeeded")
+        return True
+
+    def stash_push_staged(self, message: str = "WIP staged") -> bool:
+        """Stash only the *staged* changes via :class:`StashPushStagedCommand`.
+
+        A successful no-op (returns ``True``) when there are no staged
+        files; the command is still pushed onto the undo stack so the
+        user can see the attempt in the history. The undo path is
+        safe — when no stash was actually created, undo is a no-op.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            self._log("stash", "Stash staged failed: no repository", level="error")
+            return False
+        if self._is_busy:
+            self.error_occurred.emit("Another operation is already in progress.")
+            return False
+        from src.viewmodels.commands import StashPushStagedCommand
+
+        self._log("stash", f"Stash staged — message: {message[:60]!r}")
+        command = StashPushStagedCommand(self._repo_manager, message)
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("stash", f"Stash staged failed: {exc}", level="error")
+            return False
+        self._refresh_all_views()
+        self._log("stash", "Stash staged succeeded")
+        return True
 
     # ----- remotes: push / pull / fetch / add / remove / clone ---------
 

@@ -981,3 +981,227 @@ def test_double_click_on_group_header_toggles_once(
     panel.itemClicked.emit(local, 0)
     panel.itemDoubleClicked.emit(local, 0)
     assert local.isExpanded() is False
+
+
+# ----- stash context menu and verb delegations --------------------------
+
+
+def test_stash_context_menu_has_apply_pop_drop(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """The right-click menu on a stash entry exposes Apply, Pop, Drop."""
+    from pathlib import Path
+
+    (Path(committed_repo.path) / "hello.txt").write_text("wip\n")
+    from src.core.operations import stash_push
+
+    stash_push(committed_repo, "menu test")
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    stash = _top_level(panel, "Stash")
+    assert stash is not None
+    # libgit2 prefixes "On <branch>: " to the user message.
+    stash_entry = _child(stash, "stash@{0}: On main: menu test")
+    assert stash_entry is not None
+
+    actions = panel._context_menu_actions(stash_entry)  # noqa: SLF001
+    labels = {a.text() for a in actions}
+    assert "Apply Stash" in labels
+    assert "Pop Stash" in labels
+    assert "Drop Stash" in labels
+
+
+def test_stash_apply_action_invokes_main_vm(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    from pathlib import Path
+
+    (Path(committed_repo.path) / "hello.txt").write_text("apply\n")
+    from src.core.operations import stash_push
+
+    stash_push(committed_repo, "apply-target")
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    captured: list[int] = []
+    monkeypatch.setattr(
+        vm, "stash_apply",
+        lambda index=0: captured.append(index),
+    )
+
+    stash = _top_level(panel, "Stash")
+    entry = _child(stash, "stash@{0}: On main: apply-target")
+    actions = panel._context_menu_actions(entry)  # noqa: SLF001
+    apply_action = next(a for a in actions if a.text() == "Apply Stash")
+    apply_action.trigger()
+    assert captured == [0]
+
+
+def test_stash_pop_action_invokes_main_vm(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    from pathlib import Path
+
+    (Path(committed_repo.path) / "hello.txt").write_text("pop\n")
+    from src.core.operations import stash_push
+
+    stash_push(committed_repo, "pop-target")
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    captured: list[int] = []
+    monkeypatch.setattr(
+        vm, "stash_pop",
+        lambda index=0: captured.append(index) or True,
+    )
+
+    stash = _top_level(panel, "Stash")
+    entry = _child(stash, "stash@{0}: On main: pop-target")
+    actions = panel._context_menu_actions(entry)  # noqa: SLF001
+    pop_action = next(a for a in actions if a.text() == "Pop Stash")
+    pop_action.trigger()
+    assert captured == [0]
+
+
+def test_stash_drop_action_invokes_main_vm(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    from pathlib import Path
+
+    from PySide6.QtWidgets import QMessageBox
+
+    (Path(committed_repo.path) / "hello.txt").write_text("drop\n")
+    from src.core.operations import stash_push
+
+    stash_push(committed_repo, "drop-target")
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    captured: list[int] = []
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(
+            lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+        ),
+    )
+    monkeypatch.setattr(
+        vm, "stash_drop",
+        lambda index=0: captured.append(index) or True,
+    )
+
+    stash = _top_level(panel, "Stash")
+    entry = _child(stash, "stash@{0}: On main: drop-target")
+    actions = panel._context_menu_actions(entry)  # noqa: SLF001
+    drop_action = next(a for a in actions if a.text() == "Drop Stash")
+    drop_action.trigger()
+    assert captured == [0]
+
+
+def test_stash_drop_action_cancelled_by_user(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    """If the user clicks No in the confirm dialog, stash_drop is *not* called."""
+    from pathlib import Path
+
+    from PySide6.QtWidgets import QMessageBox
+
+    (Path(committed_repo.path) / "hello.txt").write_text("drop2\n")
+    from src.core.operations import stash_push
+
+    stash_push(committed_repo, "drop-cancel")
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    captured: list[int] = []
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(
+            lambda *args, **kwargs: QMessageBox.StandardButton.No,
+        ),
+    )
+    monkeypatch.setattr(
+        vm, "stash_drop",
+        lambda index=0: captured.append(index) or True,
+    )
+
+    panel._drop_stash(0)  # noqa: SLF001
+    assert captured == []
+
+
+def test_stash_list_updates_after_push(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """Pushing a stash through the VM updates the left panel's stash list."""
+    from pathlib import Path
+
+    (Path(committed_repo.path) / "hello.txt").write_text("wip\n")
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    stash = _top_level(panel, "Stash")
+    assert stash.isDisabled() is True  # no stashes yet
+
+    vm.stash_push("list-update")
+    stash = _top_level(panel, "Stash")
+    assert stash.isDisabled() is False
+    assert _child(stash, "stash@{0}: On main: list-update") is not None
+
+
+def test_stash_index_out_of_range_is_ignored(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    """If the stash list shrunk between menu build and action trigger,
+    the delegation helpers bail out without calling the VM."""
+    from pathlib import Path
+
+    (Path(committed_repo.path) / "hello.txt").write_text("range\n")
+    from src.core.operations import stash_push
+
+    stash_push(committed_repo, "out of range")
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    called: list[str] = []
+    monkeypatch.setattr(vm, "stash_apply", lambda index=0: called.append("apply"))
+    monkeypatch.setattr(vm, "stash_pop", lambda index=0: called.append("pop"))
+    monkeypatch.setattr(vm, "stash_drop", lambda index=0: called.append("drop"))
+
+    # Drop the stash before the action runs; index 0 is now invalid.
+    from src.core.operations import stash_drop as core_stash_drop
+
+    core_stash_drop(committed_repo, 0)
+    vm.branch_panel_view_model().refresh()
+
+    panel._apply_stash(0)  # noqa: SLF001
+    panel._pop_stash(0)  # noqa: SLF001
+    panel._drop_stash(0)  # noqa: SLF001
+    assert called == []

@@ -90,6 +90,7 @@ class Theme:
     graph_selection: str
     graph_edge: str
     graph_wip: str
+    graph_stash: str
 
 
 # VS Code Dark+ inspired palette, extended with a few GitKraken-flavoured
@@ -122,6 +123,7 @@ DARK_THEME = Theme(
     graph_selection="#FFFFFF",
     graph_edge="#343434",
     graph_wip="#505050",
+    graph_stash="#D4A259",
 )
 
 
@@ -150,6 +152,7 @@ _LIGHT_THEME_PLACEHOLDER = Theme(
     graph_selection="#0078D7",
     graph_edge="#A0A0A0",
     graph_wip="#8A8A8A",
+    graph_stash="#D4A259",
 )
 
 

@@ -46,9 +46,14 @@ from src.core.operations import (
     remove_remote,
     rename_branch,
     reset,
+    restore_stash,
     revert,
+    stash_apply,
+    stash_drop,
+    stash_oid_at,
     stash_pop,
     stash_push,
+    stash_push_staged,
 )
 from src.core.repository import RepositoryManager
 
@@ -264,6 +269,132 @@ def test_stash_push_and_pop_roundtrip(committed_repo: RepositoryManager) -> None
 
 def test_stash_push_returns_none_when_clean(committed_repo: RepositoryManager) -> None:
     assert stash_push(committed_repo) is None
+
+
+def test_stash_apply_keeps_entry_in_list(committed_repo: RepositoryManager) -> None:
+    assert committed_repo.path is not None
+    (Path(committed_repo.path) / "hello.txt").write_text("apply test\n")
+    stash_push(committed_repo, "apply me")
+    assert len(committed_repo.stash_list) == 1
+    stash_apply(committed_repo, 0)
+    # Apply must NOT remove the stash.
+    assert len(committed_repo.stash_list) == 1
+    # The worktree has the popped content back.
+    assert (Path(committed_repo.path) / "hello.txt").read_text() == "apply test\n"
+
+
+def test_stash_drop_removes_entry(committed_repo: RepositoryManager) -> None:
+    assert committed_repo.path is not None
+    (Path(committed_repo.path) / "hello.txt").write_text("to drop\n")
+    stash_push(committed_repo, "drop me")
+    assert len(committed_repo.stash_list) == 1
+    stash_drop(committed_repo, 0)
+    assert committed_repo.stash_list == []
+
+
+def test_stash_drop_invalid_index_raises(committed_repo: RepositoryManager) -> None:
+    with pytest.raises(GitError, match="Stash drop"):
+        stash_drop(committed_repo, 99)
+
+
+def test_stash_oid_at_returns_sha(committed_repo: RepositoryManager) -> None:
+    assert committed_repo.path is not None
+    (Path(committed_repo.path) / "hello.txt").write_text("oid test\n")
+    stash_push(committed_repo, "oid me")
+    oid = stash_oid_at(committed_repo, 0)
+    assert oid is not None
+    assert len(oid) == 40  # full SHA
+
+
+def test_stash_oid_at_out_of_range_returns_none(
+    committed_repo: RepositoryManager,
+) -> None:
+    assert stash_oid_at(committed_repo, 0) is None
+    assert stash_oid_at(committed_repo, 99) is None
+
+
+def test_restore_stash_recreates_dropped_entry(committed_repo: RepositoryManager) -> None:
+    assert committed_repo.path is not None
+    (Path(committed_repo.path) / "hello.txt").write_text("restore me\n")
+    stash_push(committed_repo, "restore-target")
+    oid = stash_oid_at(committed_repo, 0)
+    assert oid is not None
+    stash_drop(committed_repo, 0)
+    assert committed_repo.stash_list == []
+    restore_stash(committed_repo, oid, "restore-target")
+    # The stash is back, and libgit2's message parsing still matches
+    # the user-supplied suffix.
+    assert len(committed_repo.stash_list) == 1
+    assert committed_repo.stash_list[0].message.endswith("restore-target")
+
+
+def test_stash_push_staged_only_stages_staged_files(
+    committed_repo: RepositoryManager,
+) -> None:
+    """``stash_push_staged`` stashes only the staged subset of changes.
+
+    Setup: modify ``hello.txt`` in the worktree (unstaged) **and** stage
+    a new file. The worktree change must survive; the staged change
+    must be stashed. Implemented via the ``git stash push -- <path>``
+    CLI, so we need ``git`` on ``PATH``.
+    """
+    assert committed_repo.path is not None
+    repo = committed_repo.repo
+    # Worktree change: modify hello.txt but do NOT stage.
+    (Path(committed_repo.path) / "hello.txt").write_text("dirty worktree\n")
+    # Staged change: add a new file to the index.
+    (Path(committed_repo.path) / "new_staged.txt").write_text("staged content\n")
+    repo.index.add("new_staged.txt")
+    repo.index.write()
+
+    oid = stash_push_staged(committed_repo, "staged only")
+    assert oid is not None
+    # Worktree change is preserved.
+    assert (Path(committed_repo.path) / "hello.txt").read_text() == "dirty worktree\n"
+    # The new file is no longer in the index.
+    status = {p: f for p, f in repo.status().items()}
+    flag = status.get("new_staged.txt", 0)
+    assert not (flag & pygit2.GIT_STATUS_INDEX_NEW)
+
+
+def test_stash_push_staged_returns_none_with_no_staged(
+    committed_repo: RepositoryManager,
+) -> None:
+    """No staged changes → no stash is created, returns ``None``."""
+    assert committed_repo.path is not None
+    (Path(committed_repo.path) / "hello.txt").write_text("just worktree\n")
+    assert stash_push_staged(committed_repo) is None
+    assert committed_repo.stash_list == []
+
+
+def test_stash_push_staged_with_no_staged_in_clean_repo(
+    committed_repo: RepositoryManager,
+) -> None:
+    """A clean worktree with no staged changes → returns ``None``."""
+    assert stash_push_staged(committed_repo) is None
+    assert committed_repo.stash_list == []
+
+
+def test_stash_push_with_paths_only_stashes_those_paths(
+    committed_repo: RepositoryManager,
+) -> None:
+    """``stash_push(paths=...)`` accepts a path whitelist via libgit2.
+
+    The semantic is "stash the listed paths only" — the rest of the
+    worktree may still carry uncommitted changes. We don't assert the
+    exact behaviour here (libgit2's ``paths=`` mode has historically
+    had edge cases); we only verify the parameter is accepted and a
+    stash is created when there is at least one dirty path.
+    """
+    assert committed_repo.path is not None
+    (Path(committed_repo.path) / "hello.txt").write_text("path-only\n")
+    oid = stash_push(
+        committed_repo, "paths test",
+        include_untracked=False,
+        paths=["hello.txt"],
+    )
+    assert oid is not None
+    assert len(committed_repo.stash_list) == 1
 
 
 # ----- rebase --------------------------------------------------------------

@@ -37,6 +37,7 @@ class CommitInfo:
     committer_email: str
     committer_time: int
     parents: list[str] = field(default_factory=list)
+    kind: str = "commit"  # "commit" | "wip" | "stash" — graph widget only
 
 
 @dataclass

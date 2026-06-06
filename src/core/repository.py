@@ -435,6 +435,24 @@ class RepositoryManager:
             raise GitError(f"Failed to diff {sha!r}: {exc}") from exc
         return diff.patch or ""
 
+    def get_workdir_diff_text(self, context_lines: int = 3) -> str:
+        """Return the full unified diff of the working tree vs HEAD.
+
+        Includes both staged and unstaged changes. Returns an empty
+        string when the working tree is clean or the repository has
+        no commits yet.
+        """
+        if self.repo.head_is_unborn:
+            return ""
+        try:
+            head_tree = self.repo.head.peel(pygit2.Commit).tree
+        except (KeyError, pygit2.GitError, ValueError) as exc:
+            raise GitError(f"Failed to resolve HEAD tree: {exc}") from exc
+        staged = self.repo.diff(head_tree, context_lines=context_lines)
+        unstaged = self.repo.diff(context_lines=context_lines)
+        staged.merge(unstaged)
+        return staged.patch or ""
+
     # ----- internals ---------------------------------------------------
 
     @staticmethod

@@ -264,3 +264,55 @@ def test_select_commit_emits_whatever_it_is_given(qtbot, bad) -> None:
     with qtbot.waitSignal(vm.commit_selected, timeout=1000) as blocker:
         vm.select_commit(bad)
     assert blocker.args[0] == bad
+
+
+# ----- stash nodes (Stage 7) -----------------------------------------
+
+
+def test_stash_nodes_appear_in_graph(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """Stash entries appear as synthetic nodes above WIP in the graph."""
+    _ensure_app()
+    from pathlib import Path
+
+    (Path(committed_repo.path) / "hello.txt").write_text("stashed\n")
+    from src.core.operations import stash_push
+
+    stash_push(committed_repo, "graph-stash")
+
+    vm = GraphViewModel(committed_repo)
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000) as blocker:
+        vm.refresh_graph()
+    rows = blocker.args[0]
+    stash_nodes = [r for r in rows if r.get("kind") == "stash"]
+    assert len(stash_nodes) == 1
+    assert "Stash @{0}" in stash_nodes[0]["subject"]
+    # The stash node carries the real commit OID, not a synthetic SHA.
+    assert stash_nodes[0]["short_sha"] is not None
+    assert stash_nodes[0]["short_sha"] != "stash@0"
+
+
+def test_multiple_stash_nodes_appear_in_order(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """Two stash entries → two synthetic nodes, STASH_1 before STASH_0."""
+    _ensure_app()
+    from pathlib import Path
+
+    from src.core.operations import stash_push
+
+    (Path(committed_repo.path) / "hello.txt").write_text("first\n")
+    stash_push(committed_repo, "first stash")
+    (Path(committed_repo.path) / "hello.txt").write_text("second\n")
+    stash_push(committed_repo, "second stash")
+
+    vm = GraphViewModel(committed_repo)
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000) as blocker:
+        vm.refresh_graph()
+    rows = blocker.args[0]
+    stash_nodes = [r for r in rows if r.get("kind") == "stash"]
+    assert len(stash_nodes) == 2
+    # Most recent stash (index 0, created second) is at row 0 (top).
+    assert "Stash @{0}" in stash_nodes[0]["subject"]
+    assert "Stash @{1}" in stash_nodes[1]["subject"]

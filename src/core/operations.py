@@ -811,6 +811,7 @@ def stash_push(
     repo: RepositoryManager | pygit2.Repository,
     message: str = "WIP",
     include_untracked: bool = True,
+    paths: list[str] | None = None,
 ) -> str | None:
     """Stash uncommitted changes; returns the stash OID, or ``None`` if there was nothing to stash.
 
@@ -818,16 +819,90 @@ def stash_push(
     "stash everything I'm working on" expectation); pass ``False`` to
     only stash tracked-file changes, like ``git stash --keep-index``
     vs. plain ``git stash``.
+
+    ``paths`` is an optional whitelist of working-tree paths to stash.
+    When non-empty only the listed paths participate in the stash
+    (matching ``git stash -- <path>`` semantics). The implementation
+    passes the list straight to :meth:`pygit2.Repository.stash` which
+    accepts a ``paths=`` keyword.
     """
     with unwrap(repo) as r:
         try:
-            oid = r.stash(_now_signature(), message, include_untracked=include_untracked)
+            oid = r.stash(
+                _now_signature(),
+                message,
+                include_untracked=include_untracked,
+                paths=paths,
+            )
         except (pygit2.GitError, KeyError) as exc:
             msg = str(exc).lower()
             if "nothing to stash" in msg:
                 return None
             raise GitError(f"Stash failed: {exc}") from exc
     return str(oid) if oid else None
+
+
+def stash_push_staged(
+    repo: RepositoryManager | pygit2.Repository,
+    message: str = "WIP staged",
+) -> str | None:
+    """Stash only the *staged* (index) changes, leaving the worktree alone.
+
+    Implemented via the ``git stash push -- <path>`` CLI because
+    :meth:`pygit2.Repository.stash` with ``paths=`` reverts *all*
+    worktree changes (not just the listed paths) — it does not match
+    the modern ``git stash push`` semantics, which only touches the
+    listed paths and leaves the rest of the worktree intact.
+
+    Returns ``None`` when there are no staged changes to stash (the
+    CLI prints a "No local changes to save" message, which we
+    detect). The CLI's stderr is surfaced as a :class:`GitError` on
+    any other failure.
+    """
+    with unwrap(repo) as r:
+        staged_paths: list[str] = []
+        for path, flag in r.status().items():
+            if flag & _STAGED_FLAGS:
+                staged_paths.append(path)
+        if not staged_paths:
+            return None
+        workdir = r.workdir
+        if workdir is None:
+            raise GitError("Cannot stash in a bare repository.")
+    git = shutil.which("git")
+    if git is None:
+        raise GitNotInstalledError("`git` CLI is not in PATH; partial stash requires it.")
+    args = ["stash", "push", "-m", message, "--"] + staged_paths
+    try:
+        completed = subprocess.run(
+            [git, *args],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise GitError(f"Failed to spawn git: {exc}") from exc
+    if completed.returncode != 0:
+        stderr = (completed.stderr or completed.stdout or "").strip()
+        if "no local changes to save" in stderr.lower():
+            return None
+        raise GitError(f"git stash push failed: {stderr}")
+    return stash_oid_at(repo, 0)
+
+
+# Bitmask of pygit2 status flags that mean "the change is already
+# recorded in the index" (i.e. would be picked up by the next commit).
+# Kept module-private — callers that need a similar set should use
+# :class:`src.viewmodels.commit_panel_viewmodel.CommitPanelViewModel`'s
+# staged-files view instead of duplicating the bitmask.
+_STAGED_FLAGS = (
+    pygit2.GIT_STATUS_INDEX_NEW
+    | pygit2.GIT_STATUS_INDEX_MODIFIED
+    | pygit2.GIT_STATUS_INDEX_DELETED
+    | pygit2.GIT_STATUS_INDEX_RENAMED
+    | pygit2.GIT_STATUS_INDEX_TYPECHANGE
+)
 
 
 def stash_pop(
@@ -838,7 +913,7 @@ def stash_pop(
     with unwrap(repo) as r:
         try:
             r.stash_pop(index)
-        except pygit2.GitError as exc:
+        except (pygit2.GitError, KeyError) as exc:
             conflicts = _collect_conflicts(r)
             if conflicts:
                 raise MergeConflictError(
@@ -846,6 +921,101 @@ def stash_pop(
                     conflicting_paths=conflicts,
                 ) from exc
             raise GitError(f"Stash pop failed: {exc}") from exc
+
+
+def stash_apply(
+    repo: RepositoryManager | pygit2.Repository,
+    index: int = 0,
+) -> None:
+    """Apply the stash at ``index`` without removing it from the stash list.
+
+    Mirrors :func:`stash_pop` for the conflict path — :class:`MergeConflictError`
+    is raised when the application left conflicts in the index.
+    """
+    with unwrap(repo) as r:
+        try:
+            r.stash_apply(index)
+        except (pygit2.GitError, KeyError) as exc:
+            conflicts = _collect_conflicts(r)
+            if conflicts:
+                raise MergeConflictError(
+                    "Stash apply produced conflicts.",
+                    conflicting_paths=conflicts,
+                ) from exc
+            raise GitError(f"Stash apply failed: {exc}") from exc
+
+
+def stash_drop(
+    repo: RepositoryManager | pygit2.Repository,
+    index: int = 0,
+) -> None:
+    """Remove the stash at ``index`` from the stash list (commit object is kept)."""
+    with unwrap(repo) as r:
+        try:
+            r.stash_drop(index)
+        except (pygit2.GitError, KeyError) as exc:
+            raise GitError(f"Stash drop failed: {exc}") from exc
+
+
+def stash_oid_at(
+    repo: RepositoryManager | pygit2.Repository,
+    index: int,
+) -> str | None:
+    """Return the OID of the stash commit at ``index`` (0 is most recent).
+
+    Returns ``None`` if the index is out of range. The OID is needed by
+    :func:`restore_stash` to put a dropped stash back: ``git stash store``
+    requires the original commit SHA, not just the message.
+    """
+    with unwrap(repo) as r:
+        try:
+            for idx, entry in enumerate(r.listall_stashes()):
+                if idx == index:
+                    sha = entry.commit_id if hasattr(entry, "commit_id") else entry
+                    return str(sha)
+        except (pygit2.GitError, KeyError) as exc:
+            raise GitError(f"Stash lookup failed: {exc}") from exc
+    return None
+
+
+def restore_stash(
+    repo: RepositoryManager | pygit2.Repository,
+    sha: str,
+    message: str,
+) -> None:
+    """Restore a previously-dropped stash via ``git stash store``.
+
+    pygit2 has no public API to recreate a stash entry from an existing
+    commit — ``git stash`` only ever creates a *new* entry from the
+    current worktree. The portable escape hatch is the low-level
+    ``git stash store`` plumbing command, which writes a stash ref
+    pointing at an existing commit object. We shell out to the
+    ``git`` CLI for this, matching the pattern in
+    :func:`_fetch_via_cli` / :func:`_push_via_cli`.
+
+    The command raises :class:`GitNotInstalledError` when ``git`` is
+    missing and :class:`GitError` on any other failure.
+    """
+    with unwrap(repo) as r:
+        workdir = r.workdir
+    if workdir is None:
+        raise GitError("Cannot restore stash in a bare repository.")
+    git = shutil.which("git")
+    if git is None:
+        raise GitNotInstalledError("`git` CLI is not in PATH; stash restore requires it.")
+    try:
+        completed = subprocess.run(
+            [git, "stash", "store", "-m", message, sha],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise GitError(f"Failed to spawn git: {exc}") from exc
+    if completed.returncode != 0:
+        stderr = (completed.stderr or completed.stdout or "").strip()
+        raise GitError(f"git stash store failed: {stderr}")
 
 
 # ----- remotes: push / pull / fetch ----------------------------------------
@@ -1153,7 +1323,12 @@ __all__ = [
     "rename_branch",
     "reset",
     "revert",
+    "restore_stash",
+    "stash_apply",
+    "stash_drop",
+    "stash_oid_at",
     "stash_pop",
     "stash_push",
+    "stash_push_staged",
     "unstage_changes",
 ]

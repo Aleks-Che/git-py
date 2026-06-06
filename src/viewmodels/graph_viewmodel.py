@@ -22,7 +22,7 @@ from PySide6.QtCore import QObject, Signal
 
 from src.core.exceptions import GitError
 from src.core.graph import compute_layout, nodes_to_rows
-from src.core.models import CommitInfo
+from src.core.models import CommitInfo, StashInfo
 from src.core.repository import RepositoryManager
 
 WIP_SHA = "WIP"
@@ -50,6 +50,7 @@ class GraphViewModel(QObject):
     graph_updated = Signal(list)
     commit_selected = Signal(str)
     error_occurred = Signal(str)
+    search_results_changed = Signal(list)  # list[str] of matching SHA values
 
     def __init__(self, repo_manager: RepositoryManager | None = None, parent=None) -> None:
         super().__init__(parent)
@@ -96,6 +97,13 @@ class GraphViewModel(QObject):
         except GitError as exc:
             self.error_occurred.emit(str(exc))
             return
+        # Prepend stash entries below the eventual WIP row. We iterate
+        # reversed so the most recent stash (index 0) ends up closest
+        # to HEAD; the WIP node (if any) is prepended last and sits
+        # on top of all stash nodes.
+        stash_entries = self._repo.stash_list
+        for entry in reversed(stash_entries):
+            history = [self._stash_commit(entry, head_target)] + history
         if status:
             history = [self._wip_commit(head_target)] + history
         try:
@@ -125,6 +133,37 @@ class GraphViewModel(QObject):
         except GitError:
             return None
 
+    def search_commits(self, query: str) -> list[str]:
+        """Search the history for commits matching ``query``.
+
+        Matches are case-insensitive against SHA prefix, commit
+        message substring, and author name. Emits
+        :attr:`search_results_changed` with the matching SHA list
+        and returns the same list for synchronous consumers.
+
+        An empty ``query`` clears the filter (emits an empty list).
+        """
+        if not query:
+            self.search_results_changed.emit([])
+            return []
+        if self._repo is None or not self._repo.is_open:
+            self.search_results_changed.emit([])
+            return []
+        try:
+            history = self._repo.get_all_history(max_count=500)
+        except GitError:
+            self.search_results_changed.emit([])
+            return []
+        query_lower = query.lower()
+        results: list[str] = []
+        for commit in history:
+            if (query_lower in commit.sha.lower()
+                    or query_lower in commit.message.lower()
+                    or query_lower in commit.author_name.lower()):
+                results.append(commit.sha)
+        self.search_results_changed.emit(results)
+        return results
+
     # ----- internals ----------------------------------------------------
 
     def _head_info(self) -> tuple[str | None, str | None]:
@@ -141,12 +180,7 @@ class GraphViewModel(QObject):
 
     @staticmethod
     def _wip_commit(head_target: str | None) -> CommitInfo:
-        """Build the synthetic WIP :class:`CommitInfo` shown above ``HEAD``.
-
-        ``parents`` is the real HEAD SHA when HEAD exists, otherwise
-        an empty list (an unborn-HEAD WIP node is the only node in
-        the graph; this is the "stage the first commit" state).
-        """
+        """Build the synthetic WIP :class:`CommitInfo` shown above ``HEAD``."""
         return CommitInfo(
             sha=WIP_SHA,
             short_sha="WIP",
@@ -158,4 +192,34 @@ class GraphViewModel(QObject):
             committer_email="",
             committer_time=int(time.time()),
             parents=[head_target] if head_target else [],
+            kind="wip",
+        )
+
+    @staticmethod
+    def _stash_commit(entry: StashInfo, head_target: str | None) -> CommitInfo:
+        """Build a synthetic :class:`CommitInfo` for a stash entry.
+
+        Uses the *real* stash commit OID as the SHA so the right
+        panel can resolve it via :meth:`RepositoryManager.get_commit`
+        and show the stash commit's message, author, and changed
+        files. The ``kind="stash"`` flag tells the graph widget
+        to render the golden dashed icon.
+        """
+        raw = entry.message
+        if ": " in raw:
+            raw = raw.split(": ", 1)[1]
+        label = f"Stash @{{{entry.index}}}: {raw}"
+
+        return CommitInfo(
+            sha=entry.sha,
+            short_sha=entry.sha[:7],
+            message=label,
+            author_name="",
+            author_email="",
+            author_time=int(time.time()),
+            committer_name="",
+            committer_email="",
+            committer_time=int(time.time()),
+            parents=[head_target] if head_target else [],
+            kind="stash",
         )

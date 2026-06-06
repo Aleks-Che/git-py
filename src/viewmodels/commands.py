@@ -38,7 +38,14 @@ from src.core.operations import (
     remove_remote,
     rename_branch,
     reset,
+    restore_stash,
     revert,
+    stash_apply,
+    stash_drop,
+    stash_oid_at,
+    stash_pop,
+    stash_push,
+    stash_push_staged,
 )
 from src.core.repository import RepositoryManager
 
@@ -771,6 +778,228 @@ class RemoveRemoteCommand(GitCommand):
         return f"remove remote {self._name}"
 
 
+# ----- stash: push / pop / apply / drop -----------------------------------
+
+
+class StashPushCommand(GitCommand):
+    """Push the current worktree changes onto the stash list.
+
+    The stash we just pushed is *always* at index 0 right after
+    :func:`src.core.operations.stash_push` returns (libgit2 prepends
+    to the stash list). :meth:`undo` therefore drops index 0 — no
+    need to capture the OID.
+    """
+
+    def __init__(
+        self,
+        repo: RepositoryManager,
+        message: str = "WIP",
+        include_untracked: bool = True,
+    ) -> None:
+        self._repo = repo
+        self._message = message
+        self._include_untracked = include_untracked
+        self._pushed_oid: str | None = None
+
+    def execute(self) -> None:
+        self._pushed_oid = stash_push(
+            self._repo,
+            self._message,
+            include_untracked=self._include_untracked,
+        )
+
+    def undo(self) -> None:
+        if self._pushed_oid is None:
+            return
+        # The stash we just pushed is at index 0; popping it restores
+        # the worktree (which is the user's expectation when they hit
+        # "undo" on a stash push) and removes the entry. If the worktree
+        # was modified in the meantime, pop may conflict — that is
+        # better than silently dropping the user's stashed work.
+        try:
+            stash_pop(self._repo, 0)
+        except Exception:
+            pass  # best-effort: stash may already be gone
+
+    @property
+    def name(self) -> str:
+        label = (self._message or "WIP").splitlines()[0]
+        if len(label) > 40:
+            label = label[:39] + "…"
+        return f"stash push: {label}"
+
+
+class StashPopCommand(GitCommand):
+    """Apply the stash at ``index`` and remove it from the list.
+
+    :meth:`undo` restores the stash entry via
+    :func:`src.core.operations.restore_stash` (``git stash store``).
+    The worktree and index are *not* rolled back — the user can
+    re-apply the restored stash if they need to.
+    """
+
+    def __init__(self, repo: RepositoryManager, index: int = 0) -> None:
+        self._repo = repo
+        self._index = index
+        self._captured_oid: str | None = None
+        self._captured_message: str | None = None
+
+    def execute(self) -> None:
+        # Snapshot the OID and message *before* popping so the entry
+        # is still in the list and we can use it on undo.
+        self._captured_oid = stash_oid_at(self._repo, self._index)
+        # The user-facing message (without the "On <branch>: " prefix
+        # that libgit2 prepends) — we take the raw listall_stashes
+        # message and split on the conventional ": " separator.
+        if self._captured_oid is not None:
+            try:
+                for idx, entry in enumerate(self._repo.repo.listall_stashes()):
+                    if idx == self._index:
+                        raw = entry.message.strip()
+                        # Strip "On <branch>: " prefix added by libgit2.
+                        if ": " in raw:
+                            self._captured_message = raw.split(": ", 1)[1]
+                        else:
+                            self._captured_message = raw
+                        break
+            except (pygit2.GitError, KeyError):
+                self._captured_message = None
+        stash_pop(self._repo, self._index)
+
+    def undo(self) -> None:
+        if self._captured_oid is None:
+            return
+        if not self._captured_message:
+            self._captured_message = "WIP (restored)"
+        try:
+            restore_stash(self._repo, self._captured_oid, self._captured_message)
+        except Exception:
+            pass  # best-effort
+
+    @property
+    def name(self) -> str:
+        return f"stash pop @{{{self._index}}}"
+
+
+class StashApplyCommand(GitCommand):
+    """Apply the stash at ``index`` without removing it from the list.
+
+    :meth:`undo` resets the worktree to ``HEAD``. :class:`pygit2.Repository.stash_apply`
+    only touches the worktree (the index is preserved), so resetting
+    the worktree is enough to put the tree back in its pre-apply state.
+    The user's pre-existing index is not affected.
+    """
+
+    def __init__(self, repo: RepositoryManager, index: int = 0) -> None:
+        self._repo = repo
+        self._index = index
+
+    def execute(self) -> None:
+        stash_apply(self._repo, self._index)
+
+    def undo(self) -> None:
+        # Reset the worktree to HEAD. ``git checkout HEAD -- .`` reverts
+        # every tracked file to its HEAD version. Untracked files added
+        # by the apply are left in place — the user explicitly chose to
+        # apply the stash, so we don't silently clean up new files.
+        from src.core.operations import _run_git_in_workdir
+        from src.core.repository import unwrap
+
+        with unwrap(self._repo) as r:
+            if r.is_bare or r.head_is_unborn:
+                return
+            completed = _run_git_in_workdir(r, ["checkout", "HEAD", "--", "."])
+        if completed.returncode != 0:
+            # Fall back to git reset --hard HEAD if checkout refuses
+            # (e.g. on a detached HEAD with no worktree).
+            from src.core.operations import _run_git_in_workdir
+            from src.core.repository import unwrap
+
+            with unwrap(self._repo) as r:
+                _run_git_in_workdir(r, ["reset", "--hard", "HEAD"])
+
+    @property
+    def name(self) -> str:
+        return f"stash apply @{{{self._index}}}"
+
+
+class StashDropCommand(GitCommand):
+    """Drop the stash at ``index``; undo by restoring the stash via ``git stash store``.
+
+    The dropped commit object survives in the object database (only
+    the ref is removed), so we can use :func:`src.core.operations.restore_stash`
+    to put the entry back on undo. The message is also captured
+    because libgit2 prefixes the raw commit message with
+    ``"On <branch>: "`` and ``git stash store`` requires the bare
+    user message.
+    """
+
+    def __init__(self, repo: RepositoryManager, index: int = 0) -> None:
+        self._repo = repo
+        self._index = index
+        self._captured_oid: str | None = None
+        self._captured_message: str | None = None
+
+    def execute(self) -> None:
+        self._captured_oid = stash_oid_at(self._repo, self._index)
+        if self._captured_oid is not None:
+            try:
+                for idx, entry in enumerate(self._repo.repo.listall_stashes()):
+                    if idx == self._index:
+                        raw = entry.message.strip()
+                        if ": " in raw:
+                            self._captured_message = raw.split(": ", 1)[1]
+                        else:
+                            self._captured_message = raw
+                        break
+            except (pygit2.GitError, KeyError):
+                self._captured_message = None
+        stash_drop(self._repo, self._index)
+
+    def undo(self) -> None:
+        if self._captured_oid is None:
+            return
+        if not self._captured_message:
+            self._captured_message = "WIP (restored)"
+        try:
+            restore_stash(self._repo, self._captured_oid, self._captured_message)
+        except Exception:
+            pass  # best-effort
+
+    @property
+    def name(self) -> str:
+        return f"stash drop @{{{self._index}}}"
+
+
+class StashPushStagedCommand(GitCommand):
+    """Stash only the staged (index) changes via :func:`src.core.operations.stash_push_staged`.
+
+    The undo path pops the stash we just pushed (the staged files
+    return to the index, the worktree is left alone). This mirrors
+    :class:`StashPushCommand`'s undo strategy.
+    """
+
+    def __init__(self, repo: RepositoryManager, message: str = "WIP staged") -> None:
+        self._repo = repo
+        self._message = message
+        self._pushed_oid: str | None = None
+
+    def execute(self) -> None:
+        self._pushed_oid = stash_push_staged(self._repo, self._message)
+
+    def undo(self) -> None:
+        if self._pushed_oid is None:
+            return
+        try:
+            stash_pop(self._repo, 0)
+        except Exception:
+            pass  # best-effort
+
+    @property
+    def name(self) -> str:
+        return "stash push (staged only)"
+
+
 __all__ = [
     "AddRemoteCommand",
     "CheckoutCommand",
@@ -789,4 +1018,9 @@ __all__ = [
     "RemoveRemoteCommand",
     "RenameBranchCommand",
     "RevertCommand",
+    "StashApplyCommand",
+    "StashDropCommand",
+    "StashPopCommand",
+    "StashPushCommand",
+    "StashPushStagedCommand",
 ]

@@ -370,9 +370,21 @@ class LeftPanel(QTreeWidget):
             actions.append(create_from)
             actions.extend(self._tag_cherry_pick_actions(name))
         elif kind == _KIND_STASH:
-            apply = QAction("Apply (Stage 7)", self)
-            apply.setEnabled(False)
+            apply = QAction("Apply Stash", self)
+            apply.triggered.connect(
+                lambda checked=False, i=int(name): self._apply_stash(i),
+            )
             actions.append(apply)
+            pop = QAction("Pop Stash", self)
+            pop.triggered.connect(
+                lambda checked=False, i=int(name): self._pop_stash(i),
+            )
+            actions.append(pop)
+            drop = QAction("Drop Stash", self)
+            drop.triggered.connect(
+                lambda checked=False, i=int(name): self._drop_stash(i),
+            )
+            actions.append(drop)
         return actions
 
     def _local_branch_actions(self, name: str) -> list[QAction]:
@@ -613,6 +625,58 @@ class LeftPanel(QTreeWidget):
             self._main_vm.delete_branch(name)
         except GitError as exc:
             QMessageBox.warning(self, "Delete Branch", str(exc))
+
+    # ----- stash verb delegations --------------------------------------
+
+    def _apply_stash(self, index: int) -> None:
+        """Apply the stash at *index* without dropping it.
+
+        Defers to :meth:`MainViewModel.stash_apply` so the operation
+        runs through the ``CommandProcessor`` (Undo / Redo work) and
+        the error path goes through the normal VM error signal.
+        """
+        if not self._has_stash(index):
+            return
+        self._main_vm.stash_apply(index)
+
+    def _pop_stash(self, index: int) -> None:
+        """Apply and drop the stash at *index*."""
+        if not self._has_stash(index):
+            return
+        self._main_vm.stash_pop(index)
+
+    def _drop_stash(self, index: int) -> None:
+        """Drop the stash at *index* after a confirm dialog."""
+        if not self._has_stash(index):
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Drop Stash",
+            f"Drop stash@{{{index}}}? This cannot be easily undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._main_vm.stash_drop(index)
+
+    def _has_stash(self, index: int) -> bool:
+        """Return ``True`` if a stash entry at *index* still exists.
+
+        The stash list is rebuilt on every :attr:`references_changed`
+        emission; between the context menu opening and the action
+        firing the user could have triggered another stash op (a
+        remote-side push trigger, a script, ...) that renumbers the
+        entries. We re-read the live list instead of trusting the
+        index captured when the menu was built.
+        """
+        if self._main_vm.repository_manager() is None:
+            return False
+        try:
+            stash_list = self._main_vm.repository_manager().stash_list
+        except GitError:
+            return False
+        return 0 <= index < len(stash_list)
 
 
 __all__ = ["LeftPanel"]

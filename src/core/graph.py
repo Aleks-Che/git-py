@@ -103,6 +103,7 @@ class GraphNode:
     display_column: int = 0
     color: str = BRANCH_PALETTE[0]
     row: int = 0
+    kind: str = "commit"  # "commit" | "wip" | "stash"
 
     def to_dict(self) -> dict:
         """Serialise to a plain dict (safe for Qt signal payload)."""
@@ -120,6 +121,7 @@ class GraphNode:
             "display_column": self.display_column,
             "color": self.color,
             "row": self.row,
+            "kind": self.kind,
         }
 
 
@@ -185,6 +187,7 @@ def compute_layout(
                 display_column=column_of_lane.get(lanes[sha], 0),
                 color=colors[sha],
                 row=row,
+                kind=getattr(commit, "kind", "commit"),
             ),
         )
     return nodes

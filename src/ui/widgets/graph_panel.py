@@ -56,6 +56,7 @@ class RenderConfig:
     selection_color: str = DARK_THEME.graph_selection
     edge_color: str = DARK_THEME.graph_edge
     wip_color: str = DARK_THEME.graph_wip
+    stash_color: str = DARK_THEME.graph_stash
     divider_color: str = "#444"
     hover_bg_color: str = "#1a2744"
     selected_bg_color: str = "#2a4370"
@@ -72,6 +73,7 @@ def _config_for_theme(theme: Theme | None) -> RenderConfig:
         selection_color=theme.graph_selection,
         edge_color=theme.graph_edge,
         wip_color=theme.graph_wip,
+        stash_color=theme.graph_stash,
     )
 
 
@@ -95,6 +97,9 @@ class GraphTableWidget(QWidget):
     commit_selected = Signal(str)
     checkout_commit_requested = Signal(str)
     copy_diff_requested = Signal(str)
+    stash_apply_requested = Signal(str)     # sha of the stash commit
+    stash_pop_requested = Signal(str)
+    stash_drop_requested = Signal(str)
 
     _AVATAR_COLORS: tuple[str, ...] = (
         "#C44A2B", "#B85C8C", "#9A6E3A", "#5B7FA5",
@@ -165,6 +170,26 @@ class GraphTableWidget(QWidget):
     def scrollbar(self) -> QScrollBar:
         return self._scrollbar
 
+    def scroll_to_commit(self, sha: str) -> None:
+        """Scroll the view so the commit with ``sha`` is visible.
+
+        The scroll position is set so the row is centred vertically
+        in the viewport when possible. A no-op if ``sha`` is not found
+        in the current rows.
+        """
+        for idx, row in enumerate(self._rows):
+            if row.get("sha") == sha:
+                row_center_y = (
+                    self._cfg.header_height
+                    + idx * self._cfg.row_height
+                    + self._cfg.row_height // 2
+                )
+                viewport_center = self.height() // 2
+                target = max(0, row_center_y - viewport_center)
+                self._scrollbar.setValue(target)
+                self.update()
+                return
+
     # ----- signal handlers ---------------------------------------------
 
     def _on_graph_updated(self, rows: list[dict]) -> None:
@@ -211,19 +236,41 @@ class GraphTableWidget(QWidget):
 
     def _on_context_menu(self, position) -> None:
         sha = self._hit_test_commit(position.x(), position.y())
-        if sha is None or sha == "WIP":
+        if sha is None:
             return
 
-        menu = QMenu(self)
-        checkout_action = menu.addAction("Checkout this commit")
-        checkout_action.triggered.connect(
-            lambda checked=False, s=sha: self.checkout_commit_requested.emit(s),
-        )
+        row_data = self._row_by_sha(sha)
+        kind = row_data.get("kind", "commit") if row_data else "commit"
 
-        copy_diff_action = menu.addAction("Copy diff")
-        copy_diff_action.triggered.connect(
-            lambda checked=False, s=sha: self.copy_diff_requested.emit(s),
-        )
+        menu = QMenu(self)
+        if kind == "stash":
+            apply_action = menu.addAction("Apply Stash")
+            apply_action.triggered.connect(
+                lambda: self.stash_apply_requested.emit(sha),
+            )
+            pop_action = menu.addAction("Pop Stash")
+            pop_action.triggered.connect(
+                lambda: self.stash_pop_requested.emit(sha),
+            )
+            menu.addSeparator()
+            drop_action = menu.addAction("Delete Stash")
+            drop_action.triggered.connect(
+                lambda: self.stash_drop_requested.emit(sha),
+            )
+        elif kind == "wip":
+            copy_diff_action = menu.addAction("Copy diff")
+            copy_diff_action.triggered.connect(
+                lambda checked=False, s=sha: self.copy_diff_requested.emit(s),
+            )
+        else:
+            checkout_action = menu.addAction("Checkout this commit")
+            checkout_action.triggered.connect(
+                lambda checked=False, s=sha: self.checkout_commit_requested.emit(s),
+            )
+            copy_diff_action = menu.addAction("Copy diff")
+            copy_diff_action.triggered.connect(
+                lambda checked=False, s=sha: self.copy_diff_requested.emit(s),
+            )
 
         menu.exec(self.mapToGlobal(position))
 
@@ -540,8 +587,11 @@ class GraphTableWidget(QWidget):
         painter.save()
         column = row_data.get("display_column", row_data.get("lane", 0))
         cx = self._lane_x(column, col_cx, lane_w)
-        is_wip = row_data["sha"] == "WIP"
-        is_selected = row_data["sha"] == self._selected_sha
+        kind = row_data.get("kind", "commit")
+        sha = row_data["sha"]
+        is_wip = kind == "wip"
+        is_stash = kind == "stash"
+        is_selected = sha == self._selected_sha
 
         if is_wip:
             color = QColor(self._cfg.wip_color)
@@ -551,6 +601,28 @@ class GraphTableWidget(QWidget):
             painter.drawEllipse(
                 int(cx - radius), int(y_center - radius),
                 int(radius * 2), int(radius * 2),
+            )
+        elif is_stash:
+            # Stash node: golden dashed circle (hollow, like WIP).
+            color = QColor(self._cfg.stash_color)
+            radius = self._cfg.wip_node_radius
+            painter.setPen(QPen(color, 1.5, Qt.PenStyle.DashLine))
+            painter.setBrush(QColor(self._cfg.background_color))
+            painter.drawEllipse(
+                int(cx - radius), int(y_center - radius),
+                int(radius * 2), int(radius * 2),
+            )
+            # Draw a small diagonal cross inside the circle to make
+            # the stash icon distinctive (like a "box" symbol).
+            inset = int(radius * 0.5)
+            painter.setPen(QPen(color, 1))
+            painter.drawLine(
+                int(cx - inset), int(y_center - inset),
+                int(cx + inset), int(y_center + inset),
+            )
+            painter.drawLine(
+                int(cx - inset), int(y_center + inset),
+                int(cx + inset), int(y_center - inset),
             )
         elif is_selected:
             color = QColor(row_data["color"])
@@ -575,7 +647,7 @@ class GraphTableWidget(QWidget):
 
         painter.restore()
 
-        if not is_wip:
+        if not is_wip and not is_stash:
             av_size = max(6, int(radius * 2.6 - 8))
             av_pix = self._avatar_for(
                 row_data.get("author_email") or row_data.get("author_name", ""),
@@ -619,13 +691,13 @@ class GraphTableWidget(QWidget):
         if avail_w < 20:
             return
 
-        is_wip = row_data["sha"] == "WIP"
+        kind = row_data.get("kind", "commit")
         subject = row_data["subject"]
         if fm.horizontalAdvance(subject) > avail_w:
             subject = fm.elidedText(subject, Qt.TextElideMode.ElideRight, avail_w)
 
         text_color = (
-            QColor(self._cfg.dim_text_color) if is_wip
+            QColor(self._cfg.dim_text_color) if kind in ("wip", "stash")
             else QColor(self._cfg.text_color)
         )
         subject_x = col_left + pad_x
@@ -781,6 +853,13 @@ class GraphTableWidget(QWidget):
             row_top = dh * row
             if row_top <= scroll_y < row_top + dh:
                 return row_data["sha"]
+        return None
+
+    def _row_by_sha(self, sha: str) -> dict | None:
+        """Return the row dict for *sha*, or ``None``."""
+        for row_data in self._rows:
+            if row_data["sha"] == sha:
+                return row_data
         return None
 
 
