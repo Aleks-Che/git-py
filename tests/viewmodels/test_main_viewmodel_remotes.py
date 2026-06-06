@@ -444,7 +444,10 @@ def test_fetch_and_checkout_remote_branch_toggles_busy_during_fetch(
     busy: list[bool] = []
     vm.busy_changed.connect(busy.append)
     vm.fetch_and_checkout_remote_branch(f"origin/{branch}")
-    assert busy == [True, False]
+    # busy toggles twice: once for the fetch (inside
+    # fetch_and_checkout_remote_branch) and once for the checkout
+    # (inside checkout_branch).
+    assert busy == [True, False, True, False]
 
 
 def test_pull_changes_brings_remote(origin_and_clone) -> None:

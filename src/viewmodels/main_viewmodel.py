@@ -362,6 +362,9 @@ class MainViewModel(QObject):
             self.error_occurred.emit("No repository open.")
             self._log("checkout", f"Checkout commit {sha[:7]!r} failed: no repo", level="error")
             return False
+        if self._is_busy:
+            self.error_occurred.emit("Another operation is already in progress.")
+            return False
         if sha == "WIP":
             self.error_occurred.emit("Cannot checkout the WIP node.")
             self._log("checkout", "Checkout WIP node rejected", level="warn")
@@ -369,6 +372,8 @@ class MainViewModel(QObject):
         from src.viewmodels.commands import CheckoutCommitCommand  # local import: avoids cycle
 
         self._log("checkout", f"Checkout commit {sha[:7]!r} — detached HEAD")
+        self._is_busy = True
+        self.busy_changed.emit(True)
         command = CheckoutCommitCommand(self._repo_manager, sha)
         try:
             self._command_processor.execute(command)
@@ -376,6 +381,9 @@ class MainViewModel(QObject):
             self.error_occurred.emit(str(exc))
             self._log("checkout", f"Checkout commit {sha[:7]!r} failed: {exc}", level="error")
             return False
+        finally:
+            self._is_busy = False
+            self.busy_changed.emit(False)
         self._refresh_all_views()
         self._log("checkout", f"Checkout commit {sha[:7]!r} succeeded — detached HEAD")
         return True
@@ -412,6 +420,9 @@ class MainViewModel(QObject):
             self.error_occurred.emit("No repository open.")
             self._log("checkout", f"Checkout {name!r} failed: no repository open", level="error")
             return False
+        if self._is_busy:
+            self.error_occurred.emit("Another operation is already in progress.")
+            return False
         from src.viewmodels.commands import CheckoutCommand  # local import: avoids cycle
 
         self._log("checkout", f"Checkout {name!r} — switching HEAD to refs/heads/{name}")
@@ -430,6 +441,8 @@ class MainViewModel(QObject):
                 self._log("checkout", "Working tree clean before checkout")
         except Exception:
             pass  # diagnostic only — never block the actual operation
+        self._is_busy = True
+        self.busy_changed.emit(True)
         command = CheckoutCommand(self._repo_manager, name)
         try:
             self._command_processor.execute(command)
@@ -437,6 +450,9 @@ class MainViewModel(QObject):
             self.error_occurred.emit(str(exc))
             self._log("checkout", f"Checkout {name!r} failed: {exc}", level="error")
             return False
+        finally:
+            self._is_busy = False
+            self.busy_changed.emit(False)
         self._refresh_all_views()
         self._log("checkout", f"Checkout {name!r} succeeded — HEAD is now {name}")
         return True
