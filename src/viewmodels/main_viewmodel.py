@@ -1241,7 +1241,10 @@ class MainViewModel(QObject):
         worker = AsyncWorker(_work)
         worker.signals.result.connect(_on_success)
         worker.signals.failed.connect(_on_failure)
-        worker.signals.finished.connect(self._on_async_finished)
+        self._active_workers.add(worker)
+        worker.signals.finished.connect(
+            lambda: self._on_async_finished(worker),
+        )
         QThreadPool.globalInstance().start(worker)
 
     # ----- auto-fetch timer --------------------------------------------

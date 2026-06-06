@@ -634,6 +634,7 @@ class MainWindow(QMainWindow):
         # When a busy operation ends, the actions' enabled state must
         # be re-evaluated against the new repository state.
         if not busy:
+            self._status.clearMessage()
             self._update_remote_actions()
 
     def _on_error(self, message: str) -> None:
