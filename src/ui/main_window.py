@@ -49,6 +49,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QLabel,
     QMainWindow,
@@ -140,6 +141,18 @@ class MainWindow(QMainWindow):
         self._build_central()
         self._build_status_bar()
         self._main_vm.busy_changed.connect(self._on_busy_changed)
+        # Refresh the repository from disk when the application
+        # becomes active (window restored from minimised, switched
+        # back from another app, etc.) so commits / branch changes
+        # made in another Git client show up immediately. We listen
+        # at the ``QApplication`` level rather than per-window so a
+        # future secondary window (Settings, Clone…) does not
+        # double-trigger the refresh. The hook is a no-op when no
+        # repository is open or an async op is running — see
+        # :meth:`MainViewModel.refresh_state`.
+        app = QApplication.instance()
+        if app is not None:
+            app.applicationStateChanged.connect(self._on_app_state_changed)
         # ``_restore_state`` runs *after* the central widget is built
         # because :meth:`setSizes` needs the children to be parented
         # and laid out once.
@@ -566,6 +579,23 @@ class MainWindow(QMainWindow):
                 )
             save_config(self._config_path, config)
         super().closeEvent(event)
+
+    def _on_app_state_changed(self, state: Qt.ApplicationState) -> None:
+        """Refresh the repository whenever the application becomes active.
+
+        ``QApplication.applicationStateChanged`` fires once per
+        transition: ``Qt.ApplicationActive`` when the user switches
+        back to this app (Alt-Tab, click on the taskbar, un-minimise),
+        ``Qt.ApplicationInactive`` / ``Qt.ApplicationSuspended``
+        otherwise. We only act on the active transition; the inactive
+        one is the user's "I'm done" signal and there is no work to
+        do when they leave.
+
+        The VM swallows the no-op cases (no repo / busy), so this
+        slot stays a one-liner.
+        """
+        if state == Qt.ApplicationState.ApplicationActive:
+            self._main_vm.refresh_state()
 
     def _on_busy_changed(self, busy: bool) -> None:
         """Show / hide the spinner and toggle the re-entrancy guard."""

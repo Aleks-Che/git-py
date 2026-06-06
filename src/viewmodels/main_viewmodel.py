@@ -284,6 +284,40 @@ class MainViewModel(QObject):
         """Return the currently selected commit SHA, ``WIP_SHA``, or ``None``."""
         return self._selected_commit_sha
 
+    def refresh_state(self) -> None:
+        """Re-read the repository state from disk and refresh every panel.
+
+        Used by the main window when the application becomes active
+        so changes made in another Git client (CLI, IDE, GitKraken…)
+        show up in this UI without the user having to switch tabs.
+        Also a useful escape hatch for manual refresh — the toolbar
+        or a keyboard shortcut can be wired to it later.
+
+        No-op when no repository is open (the panels already reflect
+        the empty state) and when a long-running async operation is
+        in flight (refreshing during a rebase / merge would race
+        with the worker thread). The latter is the same re-entrancy
+        guard the toolbar buttons rely on via :attr:`busy_changed`.
+
+        :class:`GitError` from any of the child ViewModels is already
+        routed through :attr:`error_occurred` by the children
+        themselves, so it never reaches this method. A non-``GitError``
+        (e.g. an :class:`OSError` when ``.git/`` was removed while
+        the window was inactive) is caught here and surfaced the same
+        way; the VM state is left unchanged so a subsequent valid
+        refresh can still succeed.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            return
+        if self._is_busy:
+            return
+        self._log("refresh", "Refreshing repository state from disk")
+        try:
+            self._refresh_all_views()
+        except GitError as exc:
+            self.error_occurred.emit(f"Failed to refresh: {exc}")
+            self._log("refresh", f"Refresh failed: {exc}", level="error")
+
     def undo(self) -> None:
         """Undo the most recent command; refreshes views on success."""
         if not self._command_processor.can_undo:
