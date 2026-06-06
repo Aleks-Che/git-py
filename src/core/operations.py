@@ -953,9 +953,6 @@ def add_remote(
         try:
             remote = r.remotes.create(name, url)
         except (pygit2.AlreadyExistsError, ValueError) as exc:
-            # libgit2 raises ``AlreadyExistsError`` in newer versions
-            # and a bare ``ValueError`` (with error code GIT_EEXISTS)
-            # in older ones — both signal "remote with this name exists".
             raise GitError(f"Remote {name!r} already exists.") from exc
         except pygit2.GitError as exc:
             raise GitError(f"Failed to add remote {name!r}: {exc}") from exc
@@ -985,9 +982,6 @@ def remove_remote(
 def list_remotes(repo: RepositoryManager | pygit2.Repository) -> list[RemoteInfo]:
     """Return a snapshot of every remote configured in ``repo``."""
     with unwrap(repo) as r:
-        # ``list(r.remotes)`` yields ``Remote`` *objects*, not names.
-        # Use ``.names()`` to get the string names so the snapshot is
-        # independent of the underlying state.
         names = list(r.remotes.names())
         result: list[RemoteInfo] = []
         for remote_name in names:
@@ -1001,8 +995,6 @@ def list_remotes(repo: RepositoryManager | pygit2.Repository) -> list[RemoteInfo
             except (AttributeError, pygit2.GitError):
                 fetch_spec = ""
             try:
-                # ``push_refspecs`` is a newer libgit2 addition; treat
-                # ``AttributeError`` as "unsupported" and fall back.
                 push_specs = list(getattr(remote, "push_refspecs", None) or ())
                 if push_specs:
                     push_spec = "\n".join(push_specs)
@@ -1025,17 +1017,27 @@ def push(
     refspec: str | None = None,
     callbacks: pygit2.RemoteCallbacks | None = None,
 ) -> None:
-    """Push ``refspec`` to ``remote_name`` (default: push ``HEAD``)."""
+    """Push ``refspec`` to ``remote_name`` (default: push ``HEAD``).
+
+    SSH remotes (``git@host:path`` / ``ssh://...``) are routed through
+    the system ``git`` CLI because prebuilt pygit2 wheels on Windows
+    are built without libssh2 support. HTTPS / ``file://`` / ``git://``
+    URLs go through :meth:`pygit2.Remote.push` as before.
+    """
     spec = refspec or "HEAD"
     with unwrap(repo) as r:
         try:
             remote = r.remotes[remote_name]
         except KeyError as exc:
             raise InvalidRefError(f"Unknown remote: {remote_name!r}") from exc
+        url = remote.url or ""
+        if _url_needs_cli_fallback(url):
+            _push_via_cli(r, remote_name, refspec)
+            return
         try:
             remote.push([spec], callbacks=callbacks)
         except pygit2.GitError as exc:
-            raise _wrap_remote_error(remote.url or remote_name, exc) from exc
+            raise _wrap_remote_error(url, exc) from exc
 
 
 def fetch(
@@ -1064,6 +1066,45 @@ def fetch(
             remote.fetch(refspec, callbacks=callbacks)
         except pygit2.GitError as exc:
             raise _wrap_remote_error(url, exc) from exc
+
+
+def _push_via_cli(
+    repo: pygit2.Repository,
+    remote_name: str,
+    refspec: str | None,
+) -> None:
+    """Run ``git push <remote> [refspec]`` in ``repo``'s workdir.
+
+    Used as a fallback for SSH remotes when pygit2 cannot handle the
+    transport, following the same pattern as :func:`_fetch_via_cli`.
+    """
+    spec = refspec or "HEAD"
+    args: list[str] = ["push", remote_name, spec]
+    try:
+        completed = _run_git_in_workdir(repo, args)
+    except GitNotInstalledError:
+        raise
+    if completed.returncode != 0:
+        stderr = (completed.stderr or completed.stdout or "").strip()
+        low = stderr.lower()
+        url = remote_name
+        if "permission denied" in low or "publickey" in low or "authentication" in low:
+            raise AuthError(
+                f"Authentication failed for {url}: {stderr}",
+            ) from None
+        if "rejected" in low or "non-fast-forward" in low:
+            raise GitError(f"Push to {url} rejected: {stderr}") from None
+        if (
+            "could not resolve" in low
+            or "connection refused" in low
+            or "connection timed out" in low
+            or "network" in low
+            or "no route" in low
+        ):
+            raise NetworkError(
+                f"Network error contacting {url}: {stderr}",
+            ) from None
+        raise GitError(f"git push {url} failed: {stderr}") from None
 
 
 def pull(
