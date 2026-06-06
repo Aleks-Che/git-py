@@ -25,10 +25,13 @@ import pygit2
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
+    QFrame,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QScrollArea,
     QSizePolicy,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -93,7 +96,7 @@ class CommitDetailPanel(QWidget):
     # ----- construction -----------------------------------------------
 
     def _build_ui(self) -> None:
-        # --- message block ---
+        # --- message (subject) — always visible ---
         self._message = QLabel(self)
         self._message.setWordWrap(True)
         self._message.setTextInteractionFlags(
@@ -104,8 +107,10 @@ class CommitDetailPanel(QWidget):
             "font-size: 14px; font-weight: 600; padding: 4px 0;",
         )
 
+        # --- body (description) — scrollable when too long ---
         self._body = QLabel(self)
         self._body.setWordWrap(True)
+        self._body.setAlignment(Qt.AlignmentFlag.AlignTop)
         self._body.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
             | Qt.TextInteractionFlag.TextSelectableByKeyboard,
@@ -116,9 +121,29 @@ class CommitDetailPanel(QWidget):
             "padding: 6px;",
         )
         self._body.setVisible(False)
-        self._body.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
-        # --- info block ---
+        body_container = QWidget()
+        body_layout = QVBoxLayout(body_container)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.addWidget(self._body)
+
+        self._body_scroll = QScrollArea(self)
+        self._body_scroll.setWidgetResizable(True)
+        self._body_scroll.setWidget(body_container)
+        self._body_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
+        self._body_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._body_scroll.setVisible(False)
+        self._body_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; } "
+            "QScrollArea > QWidget > QWidget { background: transparent; } "
+            "QScrollBar:vertical { background: #2A2A2A; width: 10px; } "
+            "QScrollBar::handle:vertical { background: #555; border-radius: 4px; } "
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }",
+        )
+
+        # --- info block — always visible ---
         self._info = QLabel(self)
         self._info.setWordWrap(True)
         self._info.setTextInteractionFlags(
@@ -138,24 +163,49 @@ class CommitDetailPanel(QWidget):
         self._files.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self._files.setUniformItemSizes(True)
         self._files.setAlternatingRowColors(True)
-        # Use the native ``:selected`` state (priority over ``:hover``)
-        # instead of ``setBackground``, matching the WIP panel's
-        # approach so hover never overrides the selection highlight.
         self._files.setStyleSheet(
             f"QListWidget::item:selected {{ background: {_SELECTION_BG}; }}",
         )
         self._files.itemClicked.connect(self._on_files_item_clicked)
 
+        # --- splitter: 60% message+info / 40% files ---
+        top_container = QWidget()
+        top_container.setObjectName("commit-detail-top")
+        top_layout = QVBoxLayout(top_container)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(4)
+        top_layout.addWidget(self._message)
+        top_layout.addWidget(self._body_scroll, stretch=1)
+        top_layout.addSpacing(6)
+        top_layout.addWidget(self._info)
+        top_layout.addStretch()
+
+        files_container = QWidget()
+        files_container.setObjectName("commit-detail-files")
+        files_layout = QVBoxLayout(files_container)
+        files_layout.setContentsMargins(0, 0, 0, 0)
+        files_layout.setSpacing(2)
+        files_layout.addWidget(self._files_header)
+        files_layout.addWidget(self._files, stretch=1)
+
+        self._splitter = QSplitter(Qt.Orientation.Vertical)
+        self._splitter.addWidget(top_container)
+        self._splitter.addWidget(files_container)
+        self._splitter.setStretchFactor(0, 3)
+        self._splitter.setStretchFactor(1, 2)
+        self._splitter.setChildrenCollapsible(False)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(4)
-        layout.addWidget(self._message)
-        layout.addWidget(self._body)
-        layout.addSpacing(6)
-        layout.addWidget(self._info)
-        layout.addSpacing(6)
-        layout.addWidget(self._files_header)
-        layout.addWidget(self._files, stretch=1)
+        layout.setSpacing(0)
+        layout.addWidget(self._splitter, stretch=1)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        """Enforce 60/40 split on first resize."""
+        super().resizeEvent(event)
+        h = self._splitter.height()
+        if h > 0 and self._splitter.sizes()[0] == 0:
+            self._splitter.setSizes([int(h * 0.6), int(h * 0.4)])
 
     # ----- public API --------------------------------------------------
 
@@ -229,6 +279,8 @@ class CommitDetailPanel(QWidget):
         )
         self._body.setVisible(False)
         self._body.clear()
+        self._body_scroll.verticalScrollBar().setValue(0)
+        self._body_scroll.setVisible(False)
         self._info.clear()
         self._files_header.setText("Changed Files (0)")
         self._files.clear()
@@ -253,9 +305,13 @@ class CommitDetailPanel(QWidget):
         if body:
             self._body.setText(body)
             self._body.setVisible(True)
+            self._body_scroll.verticalScrollBar().setValue(0)
+            self._body_scroll.setVisible(True)
         else:
             self._body.clear()
             self._body.setVisible(False)
+            self._body_scroll.verticalScrollBar().setValue(0)
+            self._body_scroll.setVisible(False)
 
         self._info.setText(_format_info(info))
 

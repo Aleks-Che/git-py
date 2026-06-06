@@ -75,6 +75,8 @@ class StashInfo:
     index: int
     message: str
     sha: str
+    parent_sha: str | None = None
+    author_time: int = 0
     branch: str | None = None
 
 

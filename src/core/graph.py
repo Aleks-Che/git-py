@@ -169,9 +169,94 @@ def compute_layout(
     colors = _assign_colors(history, branch_tips)
     column_of_lane = _compact_lanes(history, lanes, max_columns)
 
+    # Build per-row "rightmost non-stash column".  Unlike a single
+    # global rightmost, this lets stashes that are far away from a
+    # branch use its column when it no longer interferes visually.
+    #
+    # A proximity zone (+-ZONE rows) is added around each non-stash
+    # lane so stashes sitting just above or below the branch (where
+    # they would appear connected by a vertical edge) still avoid
+    # that column.  Stashes far outside the zone get no extra shift.
+    _zone = 3
+
+    stash_groups: list[list[int]] = []
+    current: list[int] = []
+    for row, commit in enumerate(history):
+        if getattr(commit, "kind", "commit") == "stash":
+            current.append(row)
+        else:
+            if current:
+                stash_groups.append(current)
+                current = []
+    if current:
+        stash_groups.append(current)
+
+    row_rightmost = [-1] * len(history)
+    for lane, col in column_of_lane.items():
+        has_non_stash = any(
+            lanes[commit.sha] == lane
+            and getattr(commit, "kind", "commit") != "stash"
+            for commit in history
+        )
+        if not has_non_stash:
+            continue
+
+        lane_min = len(history)
+        lane_max = -1
+        for row, commit in enumerate(history):
+            if (
+                lanes[commit.sha] == lane
+                and getattr(commit, "kind", "commit") != "stash"
+            ):
+                lane_min = min(lane_min, row)
+                lane_max = max(lane_max, row)
+        if lane_max < 0:
+            continue
+        lo = max(0, lane_min - _zone)
+        hi = min(len(history) - 1, lane_max + _zone)
+        for row in range(lo, hi + 1):
+            if col > row_rightmost[row]:
+                row_rightmost[row] = col
+
+    # Assign per-stash display_column without touching column_of_lane,
+    # so real-branch commits that share a lane with a stash keep their
+    # own column.
+    stash_col: dict[str, int] = {}
+    for group in stash_groups:
+        # Stash at the very top of the graph (row 0, no commits or
+        # WIP above it) sits on the parent's own line — no offset.
+        if group[0] == 0:
+            first = history[0]
+            if first.parents:
+                p_lane = lanes.get(first.parents[0])
+                col = column_of_lane.get(p_lane, 0) if p_lane is not None else 0
+            else:
+                col = 0
+            sha = history[0].sha
+            stash_col[sha] = col
+            col += 1
+            for row in group[1:]:
+                while col <= row_rightmost[row]:
+                    col += 1
+                sha = history[row].sha
+                stash_col[sha] = col
+                col += 1
+        else:
+            col = max(row_rightmost[row] for row in group) + 1
+            for row in group:
+                while col <= row_rightmost[row]:
+                    col += 1
+                sha = history[row].sha
+                stash_col[sha] = col
+                col += 1
+
     nodes: list[GraphNode] = []
     for row, commit in enumerate(history):
         sha = commit.sha
+        if sha in stash_col:
+            display_column = stash_col[sha]
+        else:
+            display_column = column_of_lane.get(lanes[sha], 0)
         nodes.append(
             GraphNode(
                 sha=sha,
@@ -184,7 +269,7 @@ def compute_layout(
                 refs=refs_by_sha.get(sha, []),
                 branch_refs=branch_refs_by_sha.get(sha, []),
                 lane=lanes[sha],
-                display_column=column_of_lane.get(lanes[sha], 0),
+                display_column=display_column,
                 color=colors[sha],
                 row=row,
                 kind=getattr(commit, "kind", "commit"),
@@ -343,6 +428,8 @@ def _assign_lanes(
 
     # Phase 2: orphan walk (commits no branch reached). Process
     # oldest-first and use the "first available lane" rule.
+    # Stash entries always get their own lane so they render as
+    # dead-end branches forking off their parent commit.
     lane_last_commit: list[str | None] = []
     for commit in reversed(history):
         if commit.sha in lane_of:
@@ -351,18 +438,22 @@ def _assign_lanes(
                 lane_last_commit.append(None)
             lane_last_commit[lane] = commit.sha
             continue
-        parent = commit.parents[0] if commit.parents else None
-        if parent is not None and parent in lane_of:
-            parent_lane = lane_of[parent]
-            if (
-                parent_lane < len(lane_last_commit)
-                and lane_last_commit[parent_lane] == parent
-            ):
-                my_lane = parent_lane
+        kind = getattr(commit, "kind", "commit")
+        if kind == "stash":
+            my_lane = _first_free_lane(lane_last_commit)
+        else:
+            parent = commit.parents[0] if commit.parents else None
+            if parent is not None and parent in lane_of:
+                parent_lane = lane_of[parent]
+                if (
+                    parent_lane < len(lane_last_commit)
+                    and lane_last_commit[parent_lane] == parent
+                ):
+                    my_lane = parent_lane
+                else:
+                    my_lane = _first_free_lane(lane_last_commit)
             else:
                 my_lane = _first_free_lane(lane_last_commit)
-        else:
-            my_lane = _first_free_lane(lane_last_commit)
         while len(lane_last_commit) <= my_lane:
             lane_last_commit.append(None)
         lane_last_commit[my_lane] = commit.sha

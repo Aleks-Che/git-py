@@ -97,13 +97,20 @@ class GraphViewModel(QObject):
         except GitError as exc:
             self.error_occurred.emit(str(exc))
             return
-        # Prepend stash entries below the eventual WIP row. We iterate
-        # reversed so the most recent stash (index 0) ends up closest
-        # to HEAD; the WIP node (if any) is prepended last and sits
-        # on top of all stash nodes.
+        # Insert stash entries chronologically among real commits.
+        # We iterate newest-first so each stash is placed at the
+        # correct time position. If the timestamp matches an existing
+        # commit, the stash goes right after the last same-time commit.
         stash_entries = self._repo.stash_list
-        for entry in reversed(stash_entries):
-            history = [self._stash_commit(entry, head_target)] + history
+        for entry in stash_entries:
+            stash_ci = self._stash_commit(entry, head_target)
+            t = stash_ci.author_time
+            idx = 0
+            while idx < len(history) and history[idx].author_time > t:
+                idx += 1
+            while idx < len(history) and history[idx].author_time == t:
+                idx += 1
+            history.insert(idx, stash_ci)
         if status:
             history = [self._wip_commit(head_target)] + history
         try:
@@ -204,22 +211,27 @@ class GraphViewModel(QObject):
         and show the stash commit's message, author, and changed
         files. The ``kind="stash"`` flag tells the graph widget
         to render the golden dashed icon.
+
+        The parent is set to the stash's actual parent commit (the
+        HEAD at the time the stash was created) so the graph draws
+        the stash as a branch forking off that commit.
         """
         raw = entry.message
         if ": " in raw:
             raw = raw.split(": ", 1)[1]
         label = f"Stash @{{{entry.index}}}: {raw}"
 
+        parent = entry.parent_sha or head_target
         return CommitInfo(
             sha=entry.sha,
             short_sha=entry.sha[:7],
             message=label,
             author_name="",
             author_email="",
-            author_time=int(time.time()),
+            author_time=entry.author_time if entry.author_time else int(time.time()),
             committer_name="",
             committer_email="",
-            committer_time=int(time.time()),
-            parents=[head_target] if head_target else [],
+            committer_time=entry.author_time if entry.author_time else int(time.time()),
+            parents=[parent] if parent else [],
             kind="stash",
         )

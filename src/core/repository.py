@@ -266,7 +266,24 @@ class RepositoryManager:
         result: list[StashInfo] = []
         for idx, entry in enumerate(self.repo.listall_stashes()):
             sha = entry.commit_id if hasattr(entry, "commit_id") else entry
-            result.append(StashInfo(index=idx, message=entry.message.strip(), sha=str(sha)))
+            parent_sha = None
+            author_time = 0
+            try:
+                oid = pygit2.Oid(hex=str(sha))
+                commit = self.repo.get(oid)
+                if commit is not None:
+                    author_time = int(commit.author.time)
+                    if commit.parents:
+                        parent_sha = str(commit.parents[0].id)
+            except Exception:
+                pass
+            result.append(StashInfo(
+                index=idx,
+                message=entry.message.strip(),
+                sha=str(sha),
+                parent_sha=parent_sha,
+                author_time=author_time,
+            ))
         return result
 
     # ----- queries (methods) -------------------------------------------
