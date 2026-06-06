@@ -53,7 +53,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
-    QPlainTextEdit,
     QProgressBar,
     QSplitter,
     QStackedWidget,
@@ -67,6 +66,7 @@ from src.core.repository import RepositoryManager
 from src.ui.dialogs.clone_dialog import CloneDialog
 from src.ui.dialogs.open_or_clone_dialog import OpenOrCloneDialog
 from src.ui.dialogs.remote_manage_dialog import RemoteManageDialog
+from src.ui.widgets.diff_view_widget import DiffViewWidget
 from src.ui.widgets.graph_panel import GraphTableWidget
 from src.ui.widgets.left_panel import LeftPanel
 from src.ui.widgets.log_widget import LogWidget
@@ -335,13 +335,7 @@ class MainWindow(QMainWindow):
 
         # Diff view shown in place of the graph when the user clicks
         # an unstaged file in the commit panel.
-        self._diff_view = QPlainTextEdit(self)
-        self._diff_view.setReadOnly(True)
-        self._diff_view.setStyleSheet(
-            "font-family: Consolas, monospace; font-size: 10pt; "
-            "background-color: #1E1E1E; color: #D4D4D4; "
-            "border: none;",
-        )
+        self._diff_view = DiffViewWidget(self)
         # Hide diff view by default; shown when a file is selected.
         self._diff_view.setVisible(False)
 
@@ -427,7 +421,7 @@ class MainWindow(QMainWindow):
 
     def _on_diff_ready(self, text: str) -> None:
         """Display the computed diff text in the diff view."""
-        self._diff_view.setPlainText(text)
+        self._diff_view.set_diff(text)
 
     # ----- state persistence (Stage 9) ---------------------------------
 

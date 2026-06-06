@@ -4,13 +4,30 @@ The functions here intentionally return plain dataclasses with optional
 ``raw_patch`` strings — never ``pygit2`` objects — so the ViewModel and
 UI layers can hand them across thread boundaries and Qt models without
 worrying about libgit2 object lifetime.
+
+For the UI diff view, :func:`parse_diff_lines` breaks unified diff text
+into typed lines (header, hunk, addition, deletion, …) so the widget can
+apply per-line colour coding without re-parsing ``pygit2`` objects.
 """
 from __future__ import annotations
+
+from enum import Enum, auto
 
 import pygit2
 
 from src.core.exceptions import GitError
 from src.core.models import DiffEntry, FileStatus
+
+
+class DiffLineType(Enum):
+    """Semantic type of a single line in a unified diff."""
+
+    HEADER = auto()
+    HUNK = auto()
+    ADDITION = auto()
+    DELETION = auto()
+    CONTEXT = auto()
+    EMPTY = auto()
 
 # Map ``pygit2`` delta status to our :class:`FileStatus` enum.
 _DELTA_TO_STATUS: dict[int, FileStatus] = {
@@ -90,4 +107,67 @@ def diff_to_text(diff: pygit2.Diff) -> str:
     return diff.patch
 
 
-__all__ = ["diff_to_text", "parse_diff"]
+def parse_diff_lines(text: str) -> list[tuple[DiffLineType, str]]:
+    """Break unified diff *text* into ``(type, line)`` pairs.
+
+    The caller receives every line (including empty ones) tagged with its
+    semantic role so a UI widget can apply per-line colour coding without
+    re-parsing the raw ``pygit2`` objects.
+
+    Classification rules::
+
+        * ``diff --git``, ``index``, ``---``, ``+++``, ``old mode``,
+          ``new mode``, ``deleted file mode``, ``new file mode``,
+          ``rename from``, ``rename to``, ``similarity index``,
+          ``copy from``, ``copy to``, ``Binary files`` → HEADER
+        * ``@@ … @@`` → HUNK
+        * ``+…`` (but not ``+++``) → ADDITION
+        * ``-…`` (but not ``---``) → DELETION
+        * `` …`` (leading space) → CONTEXT
+        * ``\\ No newline at end of file`` → EMPTY (treated like
+          a marker, not a real line)
+        * Everything else (including truly blank lines inside hunks) → EMPTY
+    """
+    result: list[tuple[DiffLineType, str]] = []
+    for line in text.splitlines(keepends=False):
+        stripped = line.rstrip("\n\r")
+        if stripped.startswith("@@") and "@@" in stripped[3:]:
+            result.append((DiffLineType.HUNK, stripped))
+        elif stripped.startswith("+") and not stripped.startswith("+++"):
+            result.append((DiffLineType.ADDITION, stripped))
+        elif stripped.startswith("-") and not stripped.startswith("---"):
+            result.append((DiffLineType.DELETION, stripped))
+        elif stripped.startswith(" ") and len(stripped) >= 1:
+            # Context lines inside hunks start with a single space.
+            result.append((DiffLineType.CONTEXT, stripped))
+        elif _is_header_line(stripped):
+            result.append((DiffLineType.HEADER, stripped))
+        else:
+            result.append((DiffLineType.EMPTY, stripped))
+    return result
+
+
+def _is_header_line(line: str) -> bool:
+    """Return ``True`` if *line* is a file-level or extended-header
+    line in a unified diff."""
+    if not line:
+        return False
+    return (
+        line.startswith("diff --git")
+        or line.startswith("index ")
+        or line.startswith("--- ")
+        or line.startswith("+++ ")
+        or line.startswith("old mode ")
+        or line.startswith("new mode ")
+        or line.startswith("deleted file mode ")
+        or line.startswith("new file mode ")
+        or line.startswith("rename from ")
+        or line.startswith("rename to ")
+        or line.startswith("similarity index ")
+        or line.startswith("copy from ")
+        or line.startswith("copy to ")
+        or line.startswith("Binary files ")
+    )
+
+
+__all__ = ["DiffLineType", "diff_to_text", "parse_diff", "parse_diff_lines"]
