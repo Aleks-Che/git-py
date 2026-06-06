@@ -78,6 +78,10 @@ class MainViewModel(QObject):
         # present it carries the operation context (see class docstring).
         self._conflict_state: dict | None = None
         self._is_busy: bool = False
+        # Keep strong references to active :class:`AsyncWorker` objects so
+        # they are not garbage collected while the worker thread is running.
+        # Removed in :meth:`_on_async_finished`.
+        self._active_workers: set[object] = set()
         # ``async_enabled`` lets tests run the VM in pure-sync mode by
         # passing ``async_enabled=False`` in the constructor. In
         # production ``MainWindow`` constructs the VM with the default
@@ -1474,7 +1478,10 @@ class MainViewModel(QObject):
                 command, message, silent_on_failure, log_tag=log_tag,
             ),
         )
-        worker.signals.finished.connect(self._on_async_finished)
+        self._active_workers.add(worker)
+        worker.signals.finished.connect(
+            lambda: self._on_async_finished(worker),
+        )
         QThreadPool.globalInstance().start(worker)
 
     def _on_async_failed(
@@ -1510,7 +1517,8 @@ class MainViewModel(QObject):
         if not silent:
             self.error_occurred.emit(message)
 
-    def _on_async_finished(self) -> None:
+    def _on_async_finished(self, worker: object) -> None:
+        self._active_workers.discard(worker)
         self._is_busy = False
         self.busy_changed.emit(False)
 
