@@ -257,6 +257,63 @@ def _dirty_paths(repo: pygit2.Repository) -> list[str]:
     return [p for p, _ in repo.status().items()]
 
 
+def checkout_commit(
+    repo: RepositoryManager | pygit2.Repository,
+    sha: str,
+    strategy: int = pygit2.GIT_CHECKOUT_SAFE,
+) -> dict | None:
+    """Switch ``HEAD`` to a specific commit (detached HEAD mode).
+
+    Resolves ``sha`` to a commit and switches ``HEAD`` to it directly,
+    leaving the repository in detached-HEAD state. ``strategy`` defaults
+    to ``GIT_CHECKOUT_SAFE`` which refuses to overwrite local changes;
+    pass ``GIT_CHECKOUT_FORCE`` to override.
+
+    Returns ``None`` on success. When ``GIT_CHECKOUT_SAFE`` is used and
+    the working tree has uncommitted changes, returns a dict
+    ``{"dirty_files": [str, ...]}`` so the caller can surface the exact
+    file list to the user.
+    """
+    with unwrap(repo) as r:
+        try:
+            commit = r.revparse_single(sha).peel(pygit2.Commit)
+        except (KeyError, pygit2.GitError, ValueError) as exc:
+            raise InvalidRefError(f"Unknown revision: {sha!r}") from exc
+
+        if strategy == pygit2.GIT_CHECKOUT_SAFE:
+            dirty = _dirty_paths(r)
+            if dirty:
+                return {"dirty_files": dirty}
+            strategy = pygit2.GIT_CHECKOUT_FORCE
+
+        previous_head = r.head.name if not r.head_is_unborn else None
+
+        try:
+            r.create_reference_direct('HEAD', commit.id, force=True)
+        except pygit2.GitError as exc:
+            raise GitError(f"Cannot switch HEAD to {sha[:7]!r}: {exc}") from exc
+
+        try:
+            r.checkout_head(strategy=strategy)
+        except pygit2.GitError as exc:
+            _rollback_head(r, previous_head)
+            raise DirtyWorkTreeError(
+                f"Cannot update working tree for {sha[:7]!r}: {exc}",
+            ) from exc
+
+        remaining = _dirty_paths(r)
+        if remaining:
+            _rollback_head(r, previous_head)
+            n = len(remaining)
+            preview = ", ".join(remaining[:10])
+            suffix = f" and {n - 10} more" if n > 10 else ""
+            raise DirtyWorkTreeError(
+                f"Checkout to {sha[:7]!r} did not fully update the working tree "
+                f"({n} file(s) still differ): {preview}{suffix}",
+            )
+    return None
+
+
 def rename_branch(
     repo: RepositoryManager | pygit2.Repository,
     old_name: str,
@@ -1037,6 +1094,7 @@ __all__ = [
     "add_remote",
     "cherry_pick",
     "checkout_branch",
+    "checkout_commit",
     "commit_changes",
     "complete_merge",
     "complete_rebase_continue",

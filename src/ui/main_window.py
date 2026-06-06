@@ -345,6 +345,12 @@ class MainWindow(QMainWindow):
         # MainViewModel.select_commit.
         self._graph_table.commit_selected.connect(self._main_vm.select_commit)
 
+        # Wire context-menu actions from the graph table.
+        self._graph_table.checkout_commit_requested.connect(
+            self._main_vm.checkout_commit,
+        )
+        self._graph_table.copy_diff_requested.connect(self._on_copy_diff)
+
         # When the VM clears the selection (toggle-off) the graph
         # widget must also remove its highlight ring.  The reverse
         # direction (VM → graph) for a *new* selection is redundant
@@ -486,6 +492,15 @@ class MainWindow(QMainWindow):
     def _on_diff_ready(self, text: str) -> None:
         """Display the computed diff text in the diff view."""
         self._diff_view.set_diff(text)
+
+    def _on_copy_diff(self, sha: str) -> None:
+        """Copy the full unified diff of ``sha`` to the system clipboard."""
+        text = self._main_vm.get_commit_diff_text(sha)
+        if not text:
+            self._on_error(f"No diff available for {sha[:7]}")
+            return
+        QApplication.clipboard().setText(text)
+        self._status.showMessage(f"Diff of {sha[:7]} copied to clipboard", 3000)
 
     def _on_top_splitter_moved(self, _pos: int, _index: int) -> None:
         """Cache the current splitter sizes when the left panel is visible.

@@ -344,6 +344,52 @@ class MainViewModel(QObject):
         self._refresh_all_views()
         self._log("redo", "Redo succeeded")
 
+    # ----- commit checkout (detached HEAD) ----------------------------
+
+    def checkout_commit(self, sha: str) -> bool:
+        """Switch ``HEAD`` to a specific commit (detached HEAD) via :class:`CheckoutCommitCommand`.
+
+        Refreshes every view on success. :class:`DirtyWorkTreeError` is
+        surfaced through :attr:`error_occurred`.
+
+        Returns ``True`` on success, ``False`` on failure.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            self._log("checkout", f"Checkout commit {sha[:7]!r} failed: no repo", level="error")
+            return False
+        if sha == "WIP":
+            self.error_occurred.emit("Cannot checkout the WIP node.")
+            self._log("checkout", "Checkout WIP node rejected", level="warn")
+            return False
+        from src.viewmodels.commands import CheckoutCommitCommand  # local import: avoids cycle
+
+        self._log("checkout", f"Checkout commit {sha[:7]!r} — detached HEAD")
+        command = CheckoutCommitCommand(self._repo_manager, sha)
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("checkout", f"Checkout commit {sha[:7]!r} failed: {exc}", level="error")
+            return False
+        self._refresh_all_views()
+        self._log("checkout", f"Checkout commit {sha[:7]!r} succeeded — detached HEAD")
+        return True
+
+    def get_commit_diff_text(self, sha: str) -> str:
+        """Return the full unified diff for ``sha`` vs its first parent.
+
+        Returns an empty string when no repository is open or the SHA
+        cannot be resolved. Used by the graph widget's "Copy diff"
+        context-menu action.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            return ""
+        try:
+            return self._repo_manager.get_commit_diff_text(sha)
+        except GitError:
+            return ""
+
     # ----- branch commands ---------------------------------------------
 
     def checkout_branch(self, name: str) -> bool:

@@ -23,6 +23,7 @@ from PySide6.QtGui import (
     QPixmap,
 )
 from PySide6.QtWidgets import (
+    QMenu,
     QScrollBar,
     QWidget,
 )
@@ -92,6 +93,8 @@ class GraphTableWidget(QWidget):
     """
 
     commit_selected = Signal(str)
+    checkout_commit_requested = Signal(str)
+    copy_diff_requested = Signal(str)
 
     _AVATAR_COLORS: tuple[str, ...] = (
         "#C44A2B", "#B85C8C", "#9A6E3A", "#5B7FA5",
@@ -131,6 +134,9 @@ class GraphTableWidget(QWidget):
         self.setMouseTracking(True)
         self.setMinimumHeight(100)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_context_menu)
 
         self._view_model.graph_updated.connect(self._on_graph_updated)
         self._view_model.commit_selected.connect(self._on_external_select)
@@ -200,6 +206,26 @@ class GraphTableWidget(QWidget):
             if abs(x - dx) <= zone:
                 return i
         return -1
+
+    # ----- context menu ------------------------------------------------
+
+    def _on_context_menu(self, position) -> None:
+        sha = self._hit_test_commit(position.x(), position.y())
+        if sha is None or sha == "WIP":
+            return
+
+        menu = QMenu(self)
+        checkout_action = menu.addAction("Checkout this commit")
+        checkout_action.triggered.connect(
+            lambda checked=False, s=sha: self.checkout_commit_requested.emit(s),
+        )
+
+        copy_diff_action = menu.addAction("Copy diff")
+        copy_diff_action.triggered.connect(
+            lambda checked=False, s=sha: self.copy_diff_requested.emit(s),
+        )
+
+        menu.exec(self.mapToGlobal(position))
 
     # ----- painting ----------------------------------------------------
 

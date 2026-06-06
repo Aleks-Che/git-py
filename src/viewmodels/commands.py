@@ -23,6 +23,7 @@ from src.core.operations import (
     abort_rebase,
     add_remote,
     checkout_branch,
+    checkout_commit,
     cherry_pick,
     commit_changes,
     create_branch,
@@ -228,6 +229,76 @@ class CheckoutCommand(GitCommand):
         if repo.head_is_unborn:
             return None
         return repo.head.shorthand
+
+
+class CheckoutCommitCommand(GitCommand):
+    """Switch ``HEAD`` to a specific commit (detached HEAD); undo by switching back.
+
+    On :meth:`execute` the repository enters a detached-HEAD state
+    pointing at the given commit SHA. :meth:`undo` restores the
+    previous HEAD — either by checking out the original branch (if
+    HEAD was on a named branch before) or by checking out the
+    previous commit SHA directly (if already detached).
+
+    :class:`DirtyWorkTreeError` propagates out of :meth:`execute` when
+    the working tree has uncommitted changes and ``GIT_CHECKOUT_SAFE``
+    is used (always true for the initial execute; undo uses FORCE).
+    """
+
+    def __init__(self, repo: RepositoryManager, sha: str) -> None:
+        self._repo = repo
+        self._sha = sha
+        self._previous_head: str | None = None
+        self._previous_branch: str | None = None
+
+    def execute(self) -> None:
+        from src.core.exceptions import DirtyWorkTreeError, GitError
+
+        r = self._repo.repo
+        try:
+            if not r.head_is_unborn:
+                self._previous_head = str(r.head.peel(pygit2.Commit).id)
+                self._previous_branch = r.head.shorthand
+        except Exception as exc:
+            raise GitError(
+                f"Failed to save pre-checkout HEAD state: {exc}",
+            ) from exc
+        try:
+            result = checkout_commit(self._repo, self._sha)
+        except GitError:
+            raise
+        except Exception as exc:
+            raise GitError(f"Checkout commit failed: {exc}") from exc
+        if result is not None:
+            dirty = result.get("dirty_files", [])
+            n = len(dirty)
+            preview = ", ".join(dirty[:5])
+            suffix = f" and {n - 5} more" if n > 5 else ""
+
+            raise DirtyWorkTreeError(
+                f"Cannot check out {self._sha[:7]!r}: "
+                f"working tree has {n} uncommitted change(s) "
+                f"({preview}{suffix}).",
+            )
+
+    def undo(self) -> None:
+        if self._previous_head is None:
+            return
+        if self._previous_branch is not None:
+            try:
+                checkout_branch(
+                    self._repo, self._previous_branch,
+                    strategy=pygit2.GIT_CHECKOUT_FORCE,
+                )
+                return
+            except Exception:
+                pass
+        checkout_commit(self._repo, self._previous_head, strategy=pygit2.GIT_CHECKOUT_FORCE)
+
+    @property
+    def name(self) -> str:
+        short = self._sha[:7] if len(self._sha) >= 7 else self._sha
+        return f"checkout {short}"
 
 
 class CreateBranchCommand(GitCommand):
@@ -703,6 +774,7 @@ class RemoveRemoteCommand(GitCommand):
 __all__ = [
     "AddRemoteCommand",
     "CheckoutCommand",
+    "CheckoutCommitCommand",
     "CherryPickCommand",
     "CommandProcessor",
     "CommitCommand",
