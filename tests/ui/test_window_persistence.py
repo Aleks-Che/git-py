@@ -15,9 +15,12 @@ in are the values that come back out.
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
+import pygit2
 import pytest
+from src.core.repository import RepositoryManager
 from src.ui.main_window import MainWindow
 from src.utils.config import (
     DEFAULT_WINDOW_HEIGHT,
@@ -29,6 +32,7 @@ from src.utils.config import (
     load_window_size,
     save_config,
 )
+from src.viewmodels.graph_viewmodel import WIP_SHA
 
 # ----- config helpers -------------------------------------------------
 
@@ -390,5 +394,67 @@ def test_main_window_splitter_drag_persists_after_close(
         # because it starts hidden.
         assert actual[2] == 0
         assert 0 < actual[0] < actual[1]
+    finally:
+        second.close()
+
+
+def test_main_window_closing_with_diff_open_preserves_layout(
+    qtbot, tmp_path: Path,
+) -> None:
+    """Closing the window while the diff view is open must not
+    overwrite the saved layout with sizes where the (hidden) left
+    panel has zero width. The cached "last normal" sizes are written
+    instead, so the next launch restores the user's real layout.
+
+    This is the regression case for the hide-left-panel-on-diff
+    behaviour — without the cache, the user would have to drag the
+    splitter back to its previous position on every launch.
+    """
+    config_path = tmp_path / "config.json"
+
+    # Build a tiny dirty repo so we can pick a file to view a diff for.
+    repo_path = tmp_path / "diff-repo"
+    repo_path.mkdir()
+    pygit2.init_repository(str(repo_path), initial_head="main")
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    (repo_path / "f.txt").write_text("v1\n")
+    repo = pygit2.Repository(str(repo_path))
+    repo.index.add("f.txt")
+    repo.index.write()
+    tree = repo.index.write_tree()
+    repo.create_commit("refs/heads/main", sig, sig, "init", tree, [])
+    (repo_path / "f.txt").write_text("v2\n")
+    mgr = RepositoryManager(str(repo_path))
+
+    first = _make_window(qtbot, config_path=config_path)
+    first.set_repository(mgr)
+    first._main_vm.select_commit(WIP_SHA)
+    qtbot.waitUntil(
+        lambda: any(s > 0 for s in first._top_splitter.sizes()),  # noqa: SLF001
+        timeout=2000,
+    )
+    first._top_splitter.setSizes([400, 700, 300])  # noqa: SLF001
+    normal_sizes = first._top_splitter.sizes()  # noqa: SLF001
+
+    # Open a diff: the left panel hides and ``closeEvent`` must
+    # fall back to the cached normal sizes.
+    cp_vm = first._main_vm.commit_panel_view_model()
+    cp_vm.select_file("f.txt")
+    assert not first._left_panel.isVisible()  # noqa: SLF001
+    first.close()
+
+    saved = load_splitter_sizes(load_config(config_path))
+    assert saved[SPLITTER_KEY_HORIZONTAL] == normal_sizes
+
+    second = _make_window(qtbot, config_path=config_path)
+    try:
+        qtbot.waitUntil(
+            lambda: any(s > 0 for s in second._top_splitter.sizes()),  # noqa: SLF001
+            timeout=2000,
+        )
+        # The left panel comes back at its real width — not zeroed
+        # out from the close-while-diff-open state.
+        assert second._left_panel.isVisible()  # noqa: SLF001
+        assert second._top_splitter.sizes()[0] > 0  # noqa: SLF001
     finally:
         second.close()

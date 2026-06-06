@@ -124,6 +124,13 @@ class MainWindow(QMainWindow):
         # configs simply fall back to whatever Qt gives the new
         # layout by default.
         self._top_splitter: QSplitter | None = None
+        # Cache of the last splitter sizes recorded while the left
+        # panel was visible. While the diff view is open the left
+        # panel is hidden, which collapses its column to zero — if
+        # we wrote those zeroed-out sizes to the config the user's
+        # normal layout would be lost. ``closeEvent`` consults this
+        # cache when the left panel is hidden at close time.
+        self._last_normal_splitter_sizes: list[int] | None = None
 
         self._build_menu()
         self._build_repo_bar()
@@ -368,6 +375,11 @@ class MainWindow(QMainWindow):
         top.setStretchFactor(1, 5)
         top.setStretchFactor(2, 3)
         self._top_splitter = top
+        # Track splitter drags while the left panel is in its normal
+        # (visible) state so we can restore the user's layout if the
+        # window is closed with the diff view open. See ``closeEvent``
+        # for the consumer side.
+        top.splitterMoved.connect(self._on_top_splitter_moved)
 
         self._terminal = TerminalWidget(self)
         self._terminal.setMaximumHeight(180)
@@ -411,17 +423,71 @@ class MainWindow(QMainWindow):
     # ----- diff view (replaces graph on file selection) ---------------
 
     def _on_selected_file_changed(self, path: str | None) -> None:
-        """Switch between graph and diff view when a file is selected."""
+        """Switch between graph and diff view when a file is selected.
+
+        The left panel (branches / tags / stash tree) is hidden while
+        the diff is open so the diff gets the full width of the
+        centre column, matching GitKraken. It reappears when the
+        file is deselected.
+
+        Before hiding we cache the current splitter sizes so that
+        closing the window with the diff open does not overwrite
+        the user's normal layout with sizes where the left panel
+        has zero width.
+
+        Hiding the left panel frees its column; without intervention
+        the splitter would redistribute the freed space between the
+        graph and the right panel in proportion to their stretch
+        factors (5 : 3), so the right panel would visibly grow. To
+        keep the right panel pinned at its previous width we
+        redistribute all of the freed space to the graph via
+        :meth:`QSplitter.setSizes`. The same widths are restored
+        when the file is deselected.
+        """
         if path is not None:
+            if self._top_splitter is not None and self._left_panel.isVisible():
+                self._last_normal_splitter_sizes = self._top_splitter.sizes()
             self._graph_stack.setCurrentIndex(1)
             self._diff_view.setVisible(True)
+            self._left_panel.setVisible(False)
+            if (
+                self._top_splitter is not None
+                and self._last_normal_splitter_sizes is not None
+            ):
+                saved = self._last_normal_splitter_sizes
+                # Pin the right panel at its cached width; let the
+                # graph absorb the left panel's old width.
+                self._top_splitter.setSizes(
+                    [0, saved[1] + saved[0], saved[2]],
+                )
         else:
             self._graph_stack.setCurrentIndex(0)
             self._diff_view.setVisible(False)
+            self._left_panel.setVisible(True)
+            if (
+                self._top_splitter is not None
+                and self._last_normal_splitter_sizes is not None
+            ):
+                self._top_splitter.setSizes(self._last_normal_splitter_sizes)
 
     def _on_diff_ready(self, text: str) -> None:
         """Display the computed diff text in the diff view."""
         self._diff_view.set_diff(text)
+
+    def _on_top_splitter_moved(self, _pos: int, _index: int) -> None:
+        """Cache the current splitter sizes when the left panel is visible.
+
+        The cache is used by :meth:`closeEvent` to avoid overwriting
+        the saved layout with the zeroed-out sizes that the splitter
+        reports while the left panel is hidden (i.e. while the diff
+        view is open). We deliberately do nothing while the left
+        panel is hidden — the cache must reflect a "normal" state.
+        """
+        if (
+            self._top_splitter is not None
+            and self._left_panel.isVisible()
+        ):
+            self._last_normal_splitter_sizes = self._top_splitter.sizes()
 
     # ----- state persistence (Stage 9) ---------------------------------
 
@@ -465,13 +531,26 @@ class MainWindow(QMainWindow):
         on-disk state one resize behind. When :attr:`_config_path` is
         ``None`` this method is effectively a pass-through — the
         configuration file is left untouched.
+
+        When the diff view is open at close time the left panel is
+        hidden, which collapses its column to zero in the live
+        splitter sizes. We refuse to overwrite the saved layout with
+        those zeroed-out values and instead fall back to the last
+        sizes we observed while the panel was visible.
         """
         if self._config_path is not None:
             config = load_config(self._config_path)
             config["window_size"] = [self.width(), self.height()]
             splitter_sizes: dict[str, list[int]] = {}
             if self._top_splitter is not None:
-                splitter_sizes[SPLITTER_KEY_HORIZONTAL] = self._top_splitter.sizes()
+                if self._left_panel.isVisible():
+                    splitter_sizes[SPLITTER_KEY_HORIZONTAL] = (
+                        self._top_splitter.sizes()
+                    )
+                elif self._last_normal_splitter_sizes is not None:
+                    splitter_sizes[SPLITTER_KEY_HORIZONTAL] = (
+                        self._last_normal_splitter_sizes
+                    )
             config["splitter_sizes"] = splitter_sizes
             # Persist repo tabs.
             tab_state = self._repo_tabs_vm.save_to_state()

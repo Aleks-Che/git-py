@@ -503,6 +503,231 @@ def test_commit_detail_panel_clears_selection_on_hide(
     assert window._graph_stack.currentIndex() == 0
 
 
+# ----- left panel hide / show on diff ---------------------------------
+
+
+def test_left_panel_visible_by_default(qtbot, tmp_git_repo: Path) -> None:
+    """The left panel (branches / tags / stash) is visible when no
+    file is selected — that's the normal working state."""
+    mgr = _make_dirty_repo(tmp_git_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(WIP_SHA)
+
+    assert window._left_panel.isVisible()
+
+
+def test_selecting_file_hides_left_panel(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Selecting an unstaged file shows the diff view *and* hides the
+    left panel so the diff gets the full width of the centre column,
+    matching GitKraken."""
+    mgr = _make_dirty_repo(tmp_git_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(WIP_SHA)
+
+    cp_vm = window._main_vm.commit_panel_view_model()
+    assert window._left_panel.isVisible()
+
+    cp_vm.select_file("f.txt")
+    assert window._diff_view.isVisible()
+    assert not window._left_panel.isVisible()
+
+
+def test_deselecting_file_restores_left_panel(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Deselecting a file returns both the graph and the left panel."""
+    mgr = _make_dirty_repo(tmp_git_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(WIP_SHA)
+
+    cp_vm = window._main_vm.commit_panel_view_model()
+    cp_vm.select_file("f.txt")
+    assert not window._left_panel.isVisible()
+
+    cp_vm.select_file(None)
+    assert window._left_panel.isVisible()
+    assert not window._diff_view.isVisible()
+
+
+def test_selecting_staged_file_hides_left_panel(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Selecting a staged file hides the left panel (same as unstaged)."""
+    mgr = _make_dirty_repo(tmp_git_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(WIP_SHA)
+    window._main_vm.stage_file("f.txt")
+
+    cp_vm = window._main_vm.commit_panel_view_model()
+    assert window._left_panel.isVisible()
+
+    cp_vm.select_file("f.txt", staged=True)
+    assert not window._left_panel.isVisible()
+
+
+def test_clicking_file_in_commit_detail_hides_left_panel(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Clicking a file in the commit-detail panel hides the left panel
+    (same contract as the WIP panel)."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(head_sha)
+
+    assert window._left_panel.isVisible()
+    detail = window._right_panel._commit_detail
+    detail._on_files_item_clicked(detail._files.item(0))
+    assert not window._left_panel.isVisible()
+
+
+def test_switching_commits_with_file_selected_restores_left_panel(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """When a file is selected (diff open, left panel hidden) and the
+    user switches to a different commit, the file selection is cleared
+    and the left panel reappears."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(head_sha)
+
+    detail = window._right_panel._commit_detail
+    detail._on_files_item_clicked(detail._files.item(0))
+    assert not window._left_panel.isVisible()
+
+    window._main_vm.select_commit(WIP_SHA)
+    assert window._left_panel.isVisible()
+
+
+def test_left_panel_sizes_cached_when_hiding_for_diff(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Opening a diff caches the current splitter sizes so closing the
+    window with the diff open does not overwrite the saved layout
+    with zeroed-out values for the hidden left panel."""
+    mgr = _make_dirty_repo(tmp_git_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(WIP_SHA)
+
+    assert window._top_splitter is not None
+    qtbot.waitUntil(
+        lambda: any(s > 0 for s in window._top_splitter.sizes()),
+        timeout=2000,
+    )
+    window._top_splitter.setSizes([300, 600, 200])
+    normal_sizes = window._top_splitter.sizes()
+
+    cp_vm = window._main_vm.commit_panel_view_model()
+    cp_vm.select_file("f.txt")
+
+    # The cache holds the sizes that were current just before the
+    # left panel was hidden.
+    assert window._last_normal_splitter_sizes == normal_sizes
+
+
+def test_right_panel_width_unchanged_when_diff_opens(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Opening a diff hides the left panel and would normally let the
+    freed space bleed into the right panel (via the splitter's
+    stretch factors 5 : 3). The right panel must keep its width
+    while the diff is open — the graph absorbs the freed space."""
+    mgr = _make_dirty_repo(tmp_git_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(WIP_SHA)
+
+    assert window._top_splitter is not None
+    qtbot.waitUntil(
+        lambda: any(s > 0 for s in window._top_splitter.sizes()),
+        timeout=2000,
+    )
+    # Asymmetric layout so the right panel has a recognisable
+    # width different from the default ~equal split.
+    window._top_splitter.setSizes([300, 600, 200])
+    qtbot.waitUntil(
+        lambda: window._top_splitter.sizes()[0] > 0,
+        timeout=2000,
+    )
+    right_width_before = window._top_splitter.sizes()[2]
+
+    cp_vm = window._main_vm.commit_panel_view_model()
+    cp_vm.select_file("f.txt")
+    qtbot.waitUntil(
+        lambda: not window._left_panel.isVisible(),
+        timeout=2000,
+    )
+    right_width_during = window._top_splitter.sizes()[2]
+
+    # The right panel must be at the same width as before.
+    assert right_width_during == right_width_before
+    # And the left panel must really be hidden (zero width).
+    assert window._top_splitter.sizes()[0] == 0
+
+
+def test_right_panel_width_restored_when_diff_closes(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Deselecting a file restores the splitter to its normal sizes
+    — left panel reappears, right panel keeps its width, graph
+    shrinks back to its normal column."""
+    mgr = _make_dirty_repo(tmp_git_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(WIP_SHA)
+
+    assert window._top_splitter is not None
+    qtbot.waitUntil(
+        lambda: any(s > 0 for s in window._top_splitter.sizes()),
+        timeout=2000,
+    )
+    window._top_splitter.setSizes([300, 600, 200])
+    qtbot.waitUntil(
+        lambda: window._top_splitter.sizes()[0] > 0,
+        timeout=2000,
+    )
+    expected = window._top_splitter.sizes()
+
+    cp_vm = window._main_vm.commit_panel_view_model()
+    cp_vm.select_file("f.txt")
+    cp_vm.select_file(None)
+
+    qtbot.waitUntil(
+        lambda: window._top_splitter.sizes() == expected,
+        timeout=2000,
+    )
+    assert window._top_splitter.sizes() == expected
+    assert window._left_panel.isVisible()
+
+
 # ----- integration with MainWindow ------------------------------------
 
 
