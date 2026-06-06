@@ -374,6 +374,9 @@ class MainViewModel(QObject):
         self._log("checkout", f"Checkout commit {sha[:7]!r} — detached HEAD")
         self._is_busy = True
         self.busy_changed.emit(True)
+        from PySide6.QtCore import QEventLoop
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
         command = CheckoutCommitCommand(self._repo_manager, sha)
         try:
             self._command_processor.execute(command)
@@ -443,6 +446,9 @@ class MainViewModel(QObject):
             pass  # diagnostic only — never block the actual operation
         self._is_busy = True
         self.busy_changed.emit(True)
+        from PySide6.QtCore import QEventLoop
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
         command = CheckoutCommand(self._repo_manager, name)
         try:
             self._command_processor.execute(command)
@@ -561,6 +567,9 @@ class MainViewModel(QObject):
         command = FetchCommand(self._repo_manager, remote_name, branch_name)
         self._is_busy = True
         self.busy_changed.emit(True)
+        from PySide6.QtCore import QEventLoop
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
         try:
             self._command_processor.execute(command)  # type: ignore[arg-type]
         except GitError as exc:
