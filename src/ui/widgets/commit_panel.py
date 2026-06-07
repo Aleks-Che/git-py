@@ -26,14 +26,14 @@ never holds Git state and never calls ``pygit2`` directly.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor
+from PySide6.QtCore import QItemSelectionModel, QModelIndex, QRect, Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
+    QListView,
     QPlainTextEdit,
     QPushButton,
     QToolButton,
@@ -41,44 +41,24 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.core.models import FileChange, FileStatus
+from src.core.models import FileChange
+from src.ui.widgets.file_list_model import (
+    FileChangeRole,
+    FileListDelegate,
+    FileListModel,
+)
 from src.viewmodels.commit_panel_viewmodel import CommitPanelViewModel
 from src.viewmodels.main_viewmodel import MainViewModel
 
 # Short status letter + colour shared with :class:`CommitDetailPanel`
 # so the visual vocabulary is consistent across the two right-panel
 # views.
-_STATUS_BADGE: dict[FileStatus, tuple[str, str]] = {
-    FileStatus.NEW: ("A", "#43BCCD"),
-    FileStatus.MODIFIED: ("M", "#F5B947"),
-    FileStatus.DELETED: ("D", "#E8685A"),
-    FileStatus.RENAMED: ("R", "#5B8FF9"),
-    FileStatus.COPIED: ("C", "#A371F7"),
-    FileStatus.UNTRACKED: ("U", "#3FB950"),
-    FileStatus.TYPE_CHANGED: ("T", "#F0883E"),
-    FileStatus.CONFLICTED: ("!", "#FF6B6B"),
-    FileStatus.IGNORED: ("I", "#8B8B8B"),
-}
-
-_STATUS_TOOLTIP: dict[FileStatus, str] = {
-    FileStatus.NEW: "Added (new file)",
-    FileStatus.MODIFIED: "Modified",
-    FileStatus.DELETED: "Deleted",
-    FileStatus.RENAMED: "Renamed",
-    FileStatus.COPIED: "Copied",
-    FileStatus.UNTRACKED: "Untracked",
-    FileStatus.TYPE_CHANGED: "Type changed",
-    FileStatus.CONFLICTED: "Conflicted",
-    FileStatus.IGNORED: "Ignored",
-}
-
 _GREEN = "#3FB950"
 _GREEN_HOVER = "#46C75A"
 _GREEN_PRESSED = "#2F8B3B"
 _RED = "#E8685A"
 _RED_HOVER = "#ED7A6E"
 _RED_PRESSED = "#C04D40"
-_SELECTION_BG = "#264F78"
 
 
 class CommitPanel(QWidget):
@@ -147,8 +127,8 @@ class CommitPanel(QWidget):
         unstaged_header_row.addWidget(self._unstaged_expander, stretch=1)
         unstaged_header_row.addWidget(self._stage_all_button)
 
-        self._unstaged_list = FileListWidget(staged=False, parent=self)
-        self._unstaged_list.itemClicked.connect(self._on_unstaged_item_clicked)
+        self._unstaged_list = FileListView(staged=False, parent=self)
+        self._unstaged_list.clicked.connect(self._on_unstaged_index_clicked)
         self._unstaged_list.stage_file_requested.connect(self._on_stage_file)
 
         # --- Staged Files block ---
@@ -185,8 +165,8 @@ class CommitPanel(QWidget):
         staged_header_row.addWidget(self._staged_expander, stretch=1)
         staged_header_row.addWidget(self._unstage_all_button)
 
-        self._staged_list = FileListWidget(staged=True, parent=self)
-        self._staged_list.itemClicked.connect(self._on_staged_item_clicked)
+        self._staged_list = FileListView(staged=True, parent=self)
+        self._staged_list.clicked.connect(self._on_staged_index_clicked)
         self._staged_list.stage_file_requested.connect(self._on_unstage_file)
 
         # --- Commit block (sticky at the bottom) ---
@@ -267,16 +247,8 @@ class CommitPanel(QWidget):
         unstaged = self._vm.unstaged_files()
         staged = self._vm.staged_files_detailed()
 
-        # Block signals during the rebuild so itemChanged feedback
-        # doesn't trigger stray stage/unstage calls.
-        self._unstaged_list.blockSignals(True)
-        self._staged_list.blockSignals(True)
-        try:
-            self._unstaged_list.populate(unstaged)
-            self._staged_list.populate(staged)
-        finally:
-            self._unstaged_list.blockSignals(False)
-            self._staged_list.blockSignals(False)
+        self._unstaged_list.populate(unstaged)
+        self._staged_list.populate(staged)
 
         n_unstaged = len(unstaged)
         n_staged = len(staged)
@@ -339,16 +311,17 @@ class CommitPanel(QWidget):
         self._main_vm.unstage_file(path)
         self._vm.select_file(None)
 
-    def _on_unstaged_item_clicked(self, item: QListWidgetItem) -> None:
+    def _on_unstaged_index_clicked(self, index: QModelIndex) -> None:
         """Click on a row in the Unstaged list = show diff for that file.
 
         Clicking the same file again deselects it and returns the
         graph view. The *Stage File* hover button is the dedicated
-        way to stage — this click only previews the diff.
+        way to stage -- this click only previews the diff.
         """
-        path = item.data(Qt.ItemDataRole.UserRole)
-        if not path:
+        change = index.data(FileChangeRole) if index.isValid() else None
+        if change is None:
             return
+        path = change.path
         current = self._vm.selected_file()
         if current == path:
             self._vm.select_file(None)
@@ -357,16 +330,17 @@ class CommitPanel(QWidget):
         else:
             self._vm.select_file(path)
 
-    def _on_staged_item_clicked(self, item: QListWidgetItem) -> None:
+    def _on_staged_index_clicked(self, index: QModelIndex) -> None:
         """Click on a row in the Staged list = show diff for that file.
 
         Clicking the same file again deselects it and returns the
         graph view. The *Unstage File* hover button is the dedicated
-        way to unstage — this click only previews the diff.
+        way to unstage -- this click only previews the diff.
         """
-        path = item.data(Qt.ItemDataRole.UserRole)
-        if not path:
+        change = index.data(FileChangeRole) if index.isValid() else None
+        if change is None:
             return
+        path = change.path
         current = self._vm.selected_file()
         if current == path:
             self._vm.select_file(None)
@@ -383,15 +357,22 @@ class CommitPanel(QWidget):
 
     def _highlight_selected_file(self) -> None:
         selected = self._vm.selected_file()
-        for list_widget in (self._unstaged_list, self._staged_list):
-            for i in range(list_widget.count()):
-                item = list_widget.item(i)
-                if item is None:
-                    continue
-                if selected is not None and item.data(Qt.ItemDataRole.UserRole) == selected:
-                    item.setBackground(QBrush(QColor(_SELECTION_BG)))
-                else:
-                    item.setBackground(QBrush())
+        for list_view in (self._unstaged_list, self._staged_list):
+            sel_model = list_view.selectionModel()
+            if sel_model is None:
+                continue
+            sel_model.clearSelection()
+            if selected is not None:
+                model = list_view.model()
+                for row in range(model.rowCount()):
+                    change = model.change_at(row)
+                    if change is not None and change.path == selected:
+                        idx = model.index(row, 0)
+                        sel_model.select(
+                            idx,
+                            QItemSelectionModel.SelectionFlag.Select,
+                        )
+                        return
 
     def _on_commit_clicked(self) -> None:
         message = self._vm.combined_commit_message()
@@ -414,196 +395,86 @@ class CommitPanel(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# File list widget with hover-to-reveal action button
+# File list view — thin QListView wrapper
 # ---------------------------------------------------------------------------
 
 
-class FileListWidget(QListWidget):
-    """A ``QListWidget`` that supports per-item widgets.
+class FileListView(QListView):
+    """Thin wrapper around ``QListView`` that owns the model and delegate.
 
-    For ``staged=False`` (the Unstaged list) each row widget manages
-    its own *Stage File* button via native ``enterEvent`` / ``leaveEvent``
-    — no signal forwarding, no coordinate tracking.  For ``staged=True``
-    the button is never created.
-
-    When the file list exceeds ``MAX_ITEMS`` rows, population is limited
-    to the first ``MAX_ITEMS`` entries and a placeholder item is
-    appended.  For very large lists (e.g. 20 000+ files) the items are
-    added in batches of ``CHUNK`` via :meth:`_populate_chunk` so the
-    event loop stays responsive.
+    Replaces the old ``FileListWidget`` (``QListWidget`` + per-row
+    ``QWidget``) with a pure data model and ``QPainter``-based delegate.
+    Only visible rows are rendered, making it fast even with 28 000 files.
     """
 
-    MAX_ITEMS = 1000
-    CHUNK = 400
-
     stage_file_requested = Signal(str)
-    """Emitted when the user clicks the *Stage File* hover button on a row."""
-
-    populate_finished = Signal()
-    """Emitted after the last chunk of :meth:`populate` has been added."""
+    """Forwarded from :class:`FileListDelegate`."""
 
     def __init__(self, *, staged: bool, parent=None) -> None:
         super().__init__(parent)
         self._staged = staged
+        self._model = FileListModel(self)
+        self._delegate = FileListDelegate(staged, self)
+        self.setModel(self._model)
+        self.setItemDelegate(self._delegate)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setMouseTracking(True)
-        self.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setUniformItemSizes(True)
-        self.setAlternatingRowColors(True)
-        self.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
-        # Internal state for chunked population.
-        self._pending_changes: list[FileChange] = []
-        self._pending_index: int = 0
-        self._populate_generation: int = 0
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setFrameShape(QListView.Shape.NoFrame)
+        p = self.palette()
+        p.setColor(self.backgroundRole(), QColor("#1E1E1E"))
+        self.setPalette(p)
+        self.viewport().setAutoFillBackground(False)
+        self.entered.connect(self._on_entered)
+        self._delegate.stage_file_requested.connect(self.stage_file_requested)
+        self.viewport().setMouseTracking(True)
+
+    # -- public API -------------------------------------------------------
 
     def populate(self, changes: list[FileChange]) -> None:
-        """Rebuild the list to match the supplied *changes*.
+        """Replace all rows with the supplied *changes*."""
+        self._model.set_changes(changes)
 
-        For very large change sets the items are created in batches
-        of :attr:`CHUNK` so the Qt event loop can process paint and
-        input events between chunks.
-        """
-        self.clear()
-        self._populate_generation += 1  # invalidate any pending chunk timer
-        self._pending_changes = []
-        if not changes:
-            return
-        self._pending_changes = changes
-        self._pending_index = 0
-        gen = self._populate_generation
-        QTimer.singleShot(0, lambda g=gen: self._populate_chunk(g))
+    def count(self) -> int:
+        return self._model.count()
 
-    def _populate_chunk(self, generation: int) -> None:
-        if self._populate_generation != generation:
-            return  # another populate() call invalidated this run
-        # Guard against the C++ object being deleted between timer ticks.
-        import shiboken6
-        if not shiboken6.isValid(self):
-            return
-        changes = self._pending_changes
-        start = self._pending_index
-        end = min(start + self.CHUNK, len(changes), self.MAX_ITEMS)
-        for i in range(start, end):
-            change = changes[i]
-            item = QListWidgetItem(self)
-            item.setData(Qt.ItemDataRole.UserRole, change.path)
-            self.addItem(item)
-            row_widget = _RowWidget(change, staged=self._staged, parent=self)
-            row_widget.stage_file_requested.connect(self.stage_file_requested)
-            item.setSizeHint(row_widget.sizeHint())
-            self.setItemWidget(item, row_widget)
-        self._pending_index = end
-        remaining = len(changes)
-        if self.MAX_ITEMS < remaining:
-            if end >= self.MAX_ITEMS:
-                self._append_truncation_item(remaining)
-                self._pending_changes = []
-                self.populate_finished.emit()
-                return
-        if end < remaining:
-            QTimer.singleShot(0, lambda g=generation: self._populate_chunk(g))
+    def model(self) -> FileListModel:
+        return self._model
+
+    # -- hover forwarding to delegate -------------------------------------
+
+    def _on_entered(self, index: QModelIndex) -> None:
+        self._delegate.set_hovered_index(index)
+        self.viewport().update()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        super().mouseMoveEvent(event)
+        index = self.indexAt(event.pos())
+        if index.isValid():
+            item_rect = self.visualRect(index)
+            btn_rect = self._button_rect(item_rect)
+            over = btn_rect.contains(event.pos())
+            self._delegate.set_button_row(index.row() if over else None)
         else:
-            self._pending_changes = []
-            self.populate_finished.emit()
+            self._delegate.set_button_row(None)
+        self.viewport().update()
 
-    def _append_truncation_item(self, total: int) -> None:
-        shown = self.MAX_ITEMS
-        item = QListWidgetItem(self)
-        item.setText(f"  … showing {shown} of {total} files.  "
-                      "Commit or stash to shrink the list.")
-        item.setFlags(Qt.ItemFlag.NoItemFlags)
-        item.setForeground(QColor("#8B8B8B"))
-        self.addItem(item)
-
-
-class _RowWidget(QWidget):
-    """Single-row widget inside :class:`FileListWidget`.
-
-    Renders the status badge + path; for the unstaged variant a
-    green *Stage File* button is positioned on the right and is
-    always visible (it's small and the row is short, so the visual
-    noise is minimal). Clicking the button emits
-    :attr:`stage_file_requested` with the file path.
-    """
-
-    stage_file_requested = Signal(str)
-
-    def __init__(self, change: FileChange, *, staged: bool, parent=None) -> None:
-        super().__init__(parent)
-        self._change = change
-        self._staged = staged
-        self._build_ui()
-
-    def _build_ui(self) -> None:
-        badge, color_hex = _STATUS_BADGE.get(self._change.status, ("?", "#8B8B8B"))
-
-        self._badge = QLabel(f"[{badge}]", self)
-        self._badge.setStyleSheet(
-            f"color: {color_hex}; font-weight: bold; padding: 0 6px 0 2px;",
-        )
-        self._badge.setFixedWidth(28)
-        tip = _STATUS_TOOLTIP.get(self._change.status, "")
-        if tip:
-            self._badge.setToolTip(tip)
-
-        self._path = QLabel(self._change.path, self)
-        self._path.setStyleSheet("color: #D4D4D4;")
-        self._path.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(2, 1, 2, 1)
-        layout.setSpacing(4)
-        layout.addWidget(self._badge)
-        layout.addWidget(self._path, stretch=1)
-
-        if not self._staged:
-            self._stage_button = QPushButton("Stage File", self)
-            self._stage_button.setCursor(Qt.CursorShape.PointingHandCursor)
-            self._stage_button.setFixedHeight(16)
-            self._stage_button.setStyleSheet(
-                f"QPushButton {{ background-color: { _GREEN }; color: white; "
-                f"border: none; border-radius: 3px; padding: 0px 8px 0px 8px; "
-                f"font-size: 10px; font-weight: 600; }} "
-                f"QPushButton:hover {{ background-color: { _GREEN_HOVER }; }} "
-                f"QPushButton:pressed {{ background-color: { _GREEN_PRESSED }; }}",
-            )
-            self._stage_button.clicked.connect(
-                lambda: self.stage_file_requested.emit(self._change.path),
-            )
-            self._stage_button.setVisible(False)
-            layout.addWidget(self._stage_button, alignment=Qt.AlignmentFlag.AlignRight)
-        else:
-            self._stage_button = QPushButton("Unstage File", self)
-            self._stage_button.setCursor(Qt.CursorShape.PointingHandCursor)
-            self._stage_button.setFixedHeight(16)
-            self._stage_button.setStyleSheet(
-                f"QPushButton {{ background-color: { _RED }; color: white; "
-                f"border: none; border-radius: 3px; padding: 0px 8px 0px 8px; "
-                f"font-size: 10px; font-weight: 600; }} "
-                f"QPushButton:hover {{ background-color: { _RED_HOVER }; }} "
-                f"QPushButton:pressed {{ background-color: { _RED_PRESSED }; }}",
-            )
-            self._stage_button.clicked.connect(
-                lambda: self.stage_file_requested.emit(self._change.path),
-            )
-            self._stage_button.setVisible(False)
-            layout.addWidget(self._stage_button, alignment=Qt.AlignmentFlag.AlignRight)
-
-    def enterEvent(self, event) -> None:  # noqa: N802 - Qt override
-        """Show the Stage File button when the mouse enters the row."""
-        if hasattr(self, "_stage_button"):
-            self._stage_button.setVisible(True)
-        super().enterEvent(event)
-
-    def leaveEvent(self, event) -> None:  # noqa: N802 - Qt override
-        """Hide the Stage File button when the mouse leaves the row."""
-        if hasattr(self, "_stage_button"):
-            self._stage_button.setVisible(False)
+    def leaveEvent(self, event) -> None:  # noqa: N802
         super().leaveEvent(event)
+        self._delegate.set_hovered_index(QModelIndex())
+        self._delegate.set_button_row(None)
+        self.viewport().update()
 
-    def set_stage_button_visible(self, visible: bool) -> None:
-        """Show or hide the Stage File button on this row."""
-        if hasattr(self, "_stage_button"):
-            self._stage_button.setVisible(visible)
+    @staticmethod
+    def _button_rect(item_rect):
+        m = FileListDelegate.MARGIN
+        bs = FileListDelegate.BUTTON_SIZE
+        rh = FileListDelegate.ROW_HEIGHT
+        btn_x = item_rect.right() - m - bs
+        btn_y = item_rect.top() + (rh - bs) // 2
+        return QRect(btn_x, btn_y, bs, bs)
 
 
-__all__ = ["CommitPanel"]
+__all__ = ["CommitPanel", "FileListView"]

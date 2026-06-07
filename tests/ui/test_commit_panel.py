@@ -11,8 +11,11 @@ import time
 from pathlib import Path
 
 import pygit2
+from PySide6.QtCore import QItemSelectionModel, QPoint, Qt
+from PySide6.QtTest import QTest
 from src.core.repository import RepositoryManager
-from src.ui.widgets.commit_panel import CommitPanel, FileListWidget
+from src.ui.widgets.commit_panel import CommitPanel, FileListView
+from src.ui.widgets.file_list_model import FileListDelegate
 from src.viewmodels.main_viewmodel import MainViewModel
 
 
@@ -31,23 +34,27 @@ def _make_repo_with_change(path: Path) -> RepositoryManager:
     return mgr
 
 
-def _panel_paths(list_widget: FileListWidget) -> list[str]:
-    """Return the path stored on every visible row in ``list_widget``."""
+def _panel_paths(list_view: FileListView) -> list[str]:
+    """Return the path stored on every row in ``list_view``."""
     result: list[str] = []
-    for i in range(list_widget.count()):
-        row_widget = list_widget.itemWidget(list_widget.item(i))
-        if row_widget is None:
-            continue
-        result.append(row_widget._change.path)
+    model = list_view.model()
+    for i in range(model.count()):
+        change = model.change_at(i)
+        if change is not None:
+            result.append(change.path)
     return result
 
 
-def _wait_populate(qtbot, *lists: FileListWidget) -> None:
-    """Wait for chunked population to finish on every list."""
-    for lst in lists:
-        if lst._pending_changes:
-            with qtbot.waitSignal(lst.populate_finished, timeout=2000):
-                pass
+def _click_stage_button(view: FileListView, row: int) -> None:
+    """Click the painted stage/unstage button on the given *row*."""
+    idx = view.model().index(row, 0)
+    item_rect = view.visualRect(idx)
+    m = FileListDelegate.MARGIN
+    bs = FileListDelegate.BUTTON_SIZE
+    rh = FileListDelegate.ROW_HEIGHT
+    btn_x = item_rect.right() - m - bs + bs // 2
+    btn_y = item_rect.top() + (rh - bs) // 2 + bs // 2
+    QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=QPoint(btn_x, btn_y))
 
 
 # ----- Unstaged / Staged list rendering --------------------------------
@@ -63,8 +70,6 @@ def test_panel_lists_unstaged_modified_and_untracked(
     qtbot.addWidget(panel)
     panel.show()
 
-    with qtbot.waitSignal(panel._unstaged_list.populate_finished, timeout=2000):
-        pass
     paths = set(_panel_paths(panel._unstaged_list))
     assert paths == {"f.txt", "untracked.txt"}
 
@@ -136,11 +141,9 @@ def test_stage_all_button_moves_every_file_to_staged(
     panel = CommitPanel(vm)
     qtbot.addWidget(panel)
     panel.show()
-    _wait_populate(qtbot, panel._unstaged_list)
 
     assert panel._stage_all_button.isEnabled()
     panel._stage_all_button.click()
-    _wait_populate(qtbot, panel._unstaged_list, panel._staged_list)
 
     paths = set(_panel_paths(panel._staged_list))
     assert paths == {"f.txt", "untracked.txt"}
@@ -159,22 +162,21 @@ def test_clicking_stage_file_button_stages_one_file(
     panel = CommitPanel(vm)
     qtbot.addWidget(panel)
     panel.show()
-    _wait_populate(qtbot, panel._unstaged_list)
 
-    # Locate the row for f.txt and click its stage button.
-    for i in range(panel._unstaged_list.count()):
-        row_widget = panel._unstaged_list.itemWidget(panel._unstaged_list.item(i))
-        if row_widget._change.path == "f.txt":
-            row_widget._stage_button.click()
+    # Locate the row for f.txt and click its painted stage button.
+    model = panel._unstaged_list.model()
+    for i in range(model.count()):
+        change = model.change_at(i)
+        if change and change.path == "f.txt":
+            _click_stage_button(panel._unstaged_list, i)
             break
 
-    _wait_populate(qtbot, panel._unstaged_list, panel._staged_list)
     assert "f.txt" in vm.commit_panel_view_model().staged_files()
     assert "f.txt" not in _panel_paths(panel._unstaged_list)
     assert "f.txt" in _panel_paths(panel._staged_list)
 
 
-# ----- Click on row = stage / unstage (accessibility shortcut) --------
+# ----- Click on row = select for diff ----------------------------------
 
 
 def test_clicking_unstaged_row_selects_file(qtbot, tmp_git_repo: Path) -> None:
@@ -185,13 +187,13 @@ def test_clicking_unstaged_row_selects_file(qtbot, tmp_git_repo: Path) -> None:
     panel = CommitPanel(vm)
     qtbot.addWidget(panel)
     panel.show()
-    _wait_populate(qtbot, panel._unstaged_list)
 
     cp_vm = vm.commit_panel_view_model()
     assert cp_vm.selected_file() is None
 
-    panel._unstaged_list.item(0).setSelected(True)
-    panel._on_unstaged_item_clicked(panel._unstaged_list.item(0))
+    index = panel._unstaged_list.model().index(0, 0)
+    panel._unstaged_list.selectionModel().select(index, QItemSelectionModel.SelectionFlag.Select)
+    panel._on_unstaged_index_clicked(index)
 
     # The file is selected (not staged).
     assert cp_vm.selected_file() == "f.txt"
@@ -206,15 +208,14 @@ def test_clicking_same_unstaged_row_again_deselects(qtbot, tmp_git_repo: Path) -
     panel = CommitPanel(vm)
     qtbot.addWidget(panel)
     panel.show()
-    _wait_populate(qtbot, panel._unstaged_list)
 
     cp_vm = vm.commit_panel_view_model()
-    item = panel._unstaged_list.item(0)
+    index = panel._unstaged_list.model().index(0, 0)
 
-    panel._on_unstaged_item_clicked(item)
+    panel._on_unstaged_index_clicked(index)
     assert cp_vm.selected_file() == "f.txt"
 
-    panel._on_unstaged_item_clicked(item)
+    panel._on_unstaged_index_clicked(index)
     assert cp_vm.selected_file() is None
 
 
@@ -227,13 +228,13 @@ def test_clicking_staged_row_selects_file(qtbot, tmp_git_repo: Path) -> None:
     panel = CommitPanel(vm)
     qtbot.addWidget(panel)
     panel.show()
-    _wait_populate(qtbot, panel._staged_list)
 
     cp_vm = vm.commit_panel_view_model()
     assert cp_vm.selected_file() is None
 
-    panel._staged_list.item(0).setSelected(True)
-    panel._on_staged_item_clicked(panel._staged_list.item(0))
+    index = panel._staged_list.model().index(0, 0)
+    panel._staged_list.selectionModel().select(index, QItemSelectionModel.SelectionFlag.Select)
+    panel._on_staged_index_clicked(index)
 
     assert cp_vm.selected_file() == "f.txt"
     assert cp_vm._selected_file_staged is True
@@ -248,15 +249,14 @@ def test_clicking_same_staged_row_again_deselects(qtbot, tmp_git_repo: Path) -> 
     panel = CommitPanel(vm)
     qtbot.addWidget(panel)
     panel.show()
-    _wait_populate(qtbot, panel._staged_list)
 
     cp_vm = vm.commit_panel_view_model()
-    item = panel._staged_list.item(0)
+    index = panel._staged_list.model().index(0, 0)
 
-    panel._on_staged_item_clicked(item)
+    panel._on_staged_index_clicked(index)
     assert cp_vm.selected_file() == "f.txt"
 
-    panel._on_staged_item_clicked(item)
+    panel._on_staged_index_clicked(index)
     assert cp_vm.selected_file() is None
 
 
@@ -301,18 +301,18 @@ def test_commit_button_label_singular_and_plural(
     qtbot.addWidget(panel)
     panel.show()
 
-    # 0 staged → plural (no files).
+    # 0 staged -> plural (no files).
     assert panel._commit_button.text() == "Commit Changes to 0 Files"
     panel._summary.setText("hi")
-    # Still 0 staged → button stays disabled.
+    # Still 0 staged -> button stays disabled.
     assert not panel._commit_button.isEnabled()
 
-    # 1 staged → singular.
+    # 1 staged -> singular.
     vm.stage_file("f.txt")
     assert "1 File" in panel._commit_button.text()
     assert "1 Files" not in panel._commit_button.text()
 
-    # 2 staged → plural again.
+    # 2 staged -> plural again.
     vm.stage_file("untracked.txt")
     assert "2 Files" in panel._commit_button.text()
 
