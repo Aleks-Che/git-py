@@ -1,4 +1,4 @@
-"""Configuration loader/saver (JSON).
+"""Configuration loader/saver (JSON) and settings helpers.
 
 Per ``docs/DEVELOPMENT_RULES.md`` (section 7), paths, hotkeys, theme
 parameters, and panel layout live in JSON/YAML configs and are
@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import pygit2
 
 # Default window size used when no config exists yet or when the
 # saved value is unusable. Matches the historical hard-coded value
@@ -62,6 +65,16 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     # :data:`SPLITTER_KEY_HORIZONTAL` and
     # :data:`SPLITTER_KEY_RIGHT_VERTICAL`; values are ``[int, ...]``.
     "splitter_sizes": {},
+    # Author identity for commits (overridden by Git config when
+    # ``use_default_git_credentials`` is ``True``).
+    "author_name": "",
+    "author_email": "",
+    # SSH key paths for remotes that use SSH transport.
+    "ssh_private_key": "",
+    "ssh_public_key": "",
+    # When ``True``, read author name/email from ``git config`` instead of
+    # the ``author_name`` / ``author_email`` keys above.
+    "use_default_git_credentials": True,
     # Recent repositories shown in the tab bar (list of absolute paths).
     "recent_repos": [],
     # The active repository path (str or null).
@@ -219,6 +232,58 @@ def save_graph_column_widths(
     graph_configs[repo_path] = list(widths)
 
 
+def load_author_signature(
+    config: dict[str, Any] | None = None,
+) -> pygit2.Signature:
+    """Return a :class:`pygit2.Signature` from app config.
+
+    When ``config`` is ``None`` or the ``use_default_git_credentials``
+    flag is ``True``, the signature is read from ``git config``
+    (``user.name`` / ``user.email``).  Otherwise the ``author_name``
+    and ``author_email`` keys are used.  Falls back to ``("git-py",
+    "git-py@localhost")`` when neither source provides a value.
+    """
+    import time
+
+    import pygit2
+
+    if config is None:
+        config = {}
+
+    use_default = config.get("use_default_git_credentials", True)
+    if use_default:
+        try:
+            name = _git_config_get("user.name")
+            email = _git_config_get("user.email")
+            if name and email:
+                return pygit2.Signature(name, email, int(time.time()), 0)
+        except Exception:
+            pass
+        return pygit2.Signature("git-py", "git-py@localhost", int(time.time()), 0)
+
+    name = (config.get("author_name") or "").strip()
+    email = (config.get("author_email") or "").strip()
+    if not name or not email:
+        return pygit2.Signature("git-py", "git-py@localhost", int(time.time()), 0)
+    return pygit2.Signature(name, email, int(time.time()), 0)
+
+
+def _git_config_get(key: str) -> str:
+    """Read a single ``git config --global`` key, returning ``""`` on failure."""
+    import subprocess
+
+    try:
+        completed = subprocess.run(
+            ["git", "config", "--global", key],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return ""
+    return completed.stdout.strip() if completed.returncode == 0 else ""
+
+
 __all__ = [
     "DEFAULT_WINDOW_HEIGHT",
     "DEFAULT_WINDOW_WIDTH",
@@ -228,10 +293,10 @@ __all__ = [
     "SPLITTER_KEY_RIGHT_VERTICAL",
     "default_config_path",
     "get_int",
+    "load_author_signature",
     "load_config",
     "load_graph_column_widths",
     "load_splitter_sizes",
-    "load_window_size",
     "save_config",
     "save_graph_column_widths",
 ]

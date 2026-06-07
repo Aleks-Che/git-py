@@ -67,6 +67,7 @@ from src.core.repository import RepositoryManager
 from src.ui.dialogs.clone_dialog import CloneDialog
 from src.ui.dialogs.open_or_clone_dialog import OpenOrCloneDialog
 from src.ui.dialogs.remote_manage_dialog import RemoteManageDialog
+from src.ui.dialogs.settings_dialog import SettingsDialog
 from src.ui.widgets.diff_view_widget import DiffViewWidget
 from src.ui.widgets.graph_panel import GraphTableWidget
 from src.ui.widgets.left_panel import LeftPanel
@@ -259,6 +260,10 @@ class MainWindow(QMainWindow):
         self._action_init = QAction("&Init New Repository…", self)
         self._action_init.triggered.connect(self._open_init_dialog)
         file_menu.addAction(self._action_init)
+
+        self._action_settings = QAction("&Settings…", self)
+        self._action_settings.triggered.connect(self._open_settings_dialog)
+        file_menu.addAction(self._action_settings)
 
         file_menu.addSeparator()
         action_exit = QAction("E&xit", self)
@@ -921,6 +926,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Init Repository", str(exc))
             return
         self.set_repository(manager)
+
+    def _open_settings_dialog(self) -> None:
+        """Show the :class:`SettingsDialog` (modal)."""
+        dialog = SettingsDialog(
+            config_path=str(self._config_path) if self._config_path else None,
+            parent=self,
+        )
+        dialog.exec()
 
     def _open_remote_manage_dialog(self) -> None:
         """Show the :class:`RemoteManageDialog`; reflect changes via the VM."""

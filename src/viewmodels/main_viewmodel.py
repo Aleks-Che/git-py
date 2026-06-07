@@ -43,6 +43,7 @@ from src.core.exceptions import (
 from src.core.models import RemoteInfo
 from src.core.repository import RepositoryManager
 from src.utils.async_worker import AsyncWorker
+from src.utils.config import default_config_path, load_author_signature, load_config
 from src.viewmodels.branch_panel_viewmodel import BranchPanelViewModel
 from src.viewmodels.commands import CommandProcessor
 from src.viewmodels.commit_panel_viewmodel import CommitPanelViewModel
@@ -199,6 +200,10 @@ class MainViewModel(QObject):
         On failure the error is surfaced via :attr:`error_occurred` and
         the undo stack is unchanged (the failed command is never
         pushed). The selection is left untouched.
+
+        The author signature is taken from the app config (or from
+        ``git config --global`` when ``use_default_git_credentials`` is
+        ``True``).
         """
         if self._repo_manager is None or not self._repo_manager.is_open:
             self.error_occurred.emit("No repository open.")
@@ -207,7 +212,9 @@ class MainViewModel(QObject):
         from src.viewmodels.commands import CommitCommand  # local import: avoids cycle
 
         self._log("commit", f"Committing staged changes — message: {message[:80]}")
-        command = CommitCommand(self._repo_manager, message)
+        config = load_config(default_config_path())
+        author = load_author_signature(config)
+        command = CommitCommand(self._repo_manager, message, author=author)
         try:
             self._command_processor.execute(command)
         except GitError as exc:
