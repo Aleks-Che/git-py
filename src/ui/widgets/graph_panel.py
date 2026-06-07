@@ -594,10 +594,13 @@ class GraphTableWidget(QWidget):
         is_selected = sha == self._selected_sha
 
         if is_wip:
+            # WIP node: semi-transparent dashed circle (ghost).
             color = QColor(self._cfg.wip_color)
             radius = self._cfg.wip_node_radius
-            painter.setPen(QPen(color, 1, Qt.PenStyle.DashLine))
-            painter.setBrush(QColor(self._cfg.background_color))
+            painter.setPen(QPen(color, 1.5, Qt.PenStyle.DashLine))
+            fill = QColor(self._cfg.background_color)
+            fill.setAlpha(80)
+            painter.setBrush(fill)
             painter.drawEllipse(
                 int(cx - radius), int(y_center - radius),
                 int(radius * 2), int(radius * 2),
@@ -612,18 +615,19 @@ class GraphTableWidget(QWidget):
                 int(cx - radius), int(y_center - radius),
                 int(radius * 2), int(radius * 2),
             )
-            # Draw a small diagonal cross inside the circle to make
-            # the stash icon distinctive (like a "box" symbol).
-            inset = int(radius * 0.5)
-            painter.setPen(QPen(color, 1))
-            painter.drawLine(
-                int(cx - inset), int(y_center - inset),
-                int(cx + inset), int(y_center + inset),
-            )
-            painter.drawLine(
-                int(cx - inset), int(y_center + inset),
-                int(cx + inset), int(y_center - inset),
-            )
+            # Stack of books: three horizontal bars, centered pyramid.
+            bar_w = int(radius * 1.0)
+            bar_h = max(2, int(radius * 0.22))
+            gap = max(1, int(radius * 0.1))
+            total_h = bar_h * 3 + gap * 2
+            start_y = int(y_center - total_h / 2)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            for i in range(3):
+                w = bar_w - abs(i - 1) * int(radius * 0.14)
+                bx = int(cx - w / 2)
+                by = start_y + i * (bar_h + gap)
+                painter.drawRoundedRect(bx, by, w, bar_h, 2, 2)
         elif is_selected:
             color = QColor(row_data["color"])
             radius = self._cfg.node_radius
