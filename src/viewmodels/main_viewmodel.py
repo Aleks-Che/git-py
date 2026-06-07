@@ -157,7 +157,12 @@ class MainViewModel(QObject):
         self._log("repo", "Closing repository")
         self.set_repository(None)
 
-    def set_repository(self, manager: RepositoryManager | None) -> None:
+    def set_repository(
+        self,
+        manager: RepositoryManager | None,
+        *,
+        refresh: bool = True,
+    ) -> None:
         """Bind a new :class:`RepositoryManager` (or ``None`` to clear).
 
         The undo/redo stacks are always cleared on a repository change:
@@ -174,18 +179,172 @@ class MainViewModel(QObject):
         The auto-fetch timer is started when a repository is opened
         (and the user has auto-fetch enabled in the config) and
         stopped when the repository is closed.
+
+        Pass ``refresh=False`` to defer the heavy graph / status /
+        branch enumeration. The caller must then invoke
+        :meth:`load_repository_data` to populate the panels on a
+        background thread.  The default ``refresh=True`` preserves
+        the existing synchronous behaviour used by tests — the graph,
+        commit panel and branch panel are fully populated before the
+        method returns.
         """
         self._repo_manager = manager
         self._command_processor.clear()
         self._clear_conflict_state()
-        self._graph_view_model.set_repository(manager)
-        self._commit_panel_view_model.set_repository(manager)
-        self._branch_panel_view_model.set_repository(manager)
         self._update_auto_fetch_timer()
         if self._selected_commit_sha is not None:
             self._selected_commit_sha = None
             self.selection_changed.emit(None)
-        self.repository_changed.emit(manager.path if manager is not None else None)
+
+        if manager is None:
+            self._graph_view_model.set_repository(None)
+            self._commit_panel_view_model.set_repository(None)
+            self._branch_panel_view_model.set_repository(None)
+            self.repository_changed.emit(None)
+            return
+
+        if refresh:
+            self._graph_view_model.set_repository(manager)
+            self._commit_panel_view_model.set_repository(manager)
+            self._branch_panel_view_model.set_repository(manager)
+        else:
+            self._graph_view_model.set_repository(manager, refresh=False)
+            self._commit_panel_view_model.set_repository(manager, refresh=False)
+            self._branch_panel_view_model.set_repository(manager, refresh=False)
+
+        self.repository_changed.emit(manager.path)
+
+    def load_repository_data(self) -> None:
+        """Run heavy graph / status / branch enumeration on a background thread.
+
+        Call this after :meth:`set_repository` with ``refresh=False``
+        to populate the panels without freezing the UI. ``busy_changed``
+        is set to ``True`` while the worker runs so the status bar
+        shows a spinner and mutating toolbar actions are disabled.
+
+        The worker opens a **separate** :class:`RepositoryManager` on
+        the same path so it never shares the ``pygit2.Repository``
+        object with the main thread — libgit2 repositories are not
+        thread-safe and sharing them can deadlock.
+
+        The returned data (pure dataclasses / dicts / sets) is then
+        applied on the main thread through the ``result`` signal.
+        """
+        import time as _time
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            return
+        if not self._async_enabled:
+            print("[worker] async disabled, running sync...")
+            _t0 = _time.monotonic()
+            self._graph_view_model.refresh_graph()
+            print(f"[worker] sync refresh_graph took {_time.monotonic() - _t0:.2f}s")
+            self._commit_panel_view_model.refresh_status()
+            print(f"[worker] sync refresh_status took {_time.monotonic() - _t0:.2f}s")
+            self._branch_panel_view_model.refresh()
+            print(f"[worker] sync refresh took {_time.monotonic() - _t0:.2f}s")
+            return
+        if self._is_busy:
+            return
+
+        repo_path = self._repo_manager.path
+        if repo_path is None:
+            return
+
+        print(f"[worker] load_repository_data: starting worker for {repo_path}")
+        self._is_busy = True
+        self.busy_changed.emit(True)
+
+        def _work(repo_path: str = repo_path) -> dict | None:
+            """Open a worker-owned RepositoryManager, read all data,
+            and return a result dict.  The worker's pygit2.Repository is
+            never accessed from the main thread, avoiding libgit2's
+            thread-safety issues."""
+            import time as _wt
+            print(f"[worker::bg] _work started, opening repo: {repo_path}")
+            _t0 = _wt.monotonic()
+            worker_repo = RepositoryManager()
+            worker_repo.open(repo_path)
+            print(f"[worker::bg] open took {_wt.monotonic() - _t0:.2f}s")
+            try:
+                print("[worker::bg] _compute_graph...")
+                _t1 = _wt.monotonic()
+                rows, err = GraphViewModel._compute_graph(worker_repo)
+                _elapsed = _wt.monotonic() - _t1
+                _nrows = len(rows) if rows else 0
+                print(f"[worker::bg] _compute_graph took {_elapsed:.2f}s, rows={_nrows}")
+                if err is not None:
+                    return {"error": err}
+                print("[worker::bg] _compute_status_data...")
+                _t2 = _wt.monotonic()
+                file_changes, staged = (
+                    CommitPanelViewModel._compute_status_data(worker_repo)
+                )
+                _elapsed2 = _wt.monotonic() - _t2
+                _nchanges = len(file_changes)
+                print(
+                    f"[worker::bg] _compute_status_data took {_elapsed2:.2f}s, "
+                    f"changes={_nchanges}"
+                )
+                print("[worker::bg] _compute_branch_data...")
+                _t3 = _wt.monotonic()
+                branch_data = (
+                    BranchPanelViewModel._compute_branch_data(worker_repo)
+                )
+                _elapsed3 = _wt.monotonic() - _t3
+                _nbranches = len(branch_data.get("local_branches", []))
+                print(
+                    f"[worker::bg] _compute_branch_data took {_elapsed3:.2f}s, "
+                    f"branches={_nbranches}"
+                )
+                print(f"[worker::bg] total work time: {_wt.monotonic() - _t0:.2f}s")
+            finally:
+                worker_repo.close()
+                print(f"[worker::bg] worker_repo closed, total: {_wt.monotonic() - _t0:.2f}s")
+            return {
+                "rows": rows,
+                "file_changes": file_changes,
+                "staged": staged,
+                "branch_data": branch_data,
+            }
+
+        def _on_result(result: object) -> None:
+            print("[worker::ui] _on_result called")
+            data: dict = result  # type: ignore[assignment]
+            error = data.get("error")
+            if error is not None:
+                self._on_repo_load_failed(str(error))
+                return
+            # Apply the pre-computed data on the main thread — signal
+            # emissions happen here, not in the worker.
+            print("[worker::ui] applying data to VMs...")
+            rows: list = data["rows"]
+            file_changes: list = data["file_changes"]
+            staged: set = data["staged"]
+            branch_data: dict = data["branch_data"]
+
+            self._graph_view_model.graph_updated.emit(rows)
+            self._commit_panel_view_model._file_changes = file_changes
+            self._commit_panel_view_model._staged_files = staged
+            self._commit_panel_view_model.file_changes_changed.emit()
+            self._commit_panel_view_model.staged_files_changed.emit(
+                sorted(staged),
+            )
+            self._branch_panel_view_model._apply_branch_data(branch_data)
+            print("[worker::ui] data applied, calling _on_repo_load_finished")
+            self._on_repo_load_finished()
+
+        worker = AsyncWorker(_work)
+        worker.signals.result.connect(_on_result)
+        worker.signals.failed.connect(
+            lambda message: self._on_repo_load_failed(message),
+        )
+        self._active_workers.add(worker)
+        worker.signals.finished.connect(
+            lambda w=worker: self._on_async_finished(w),
+        )
+        print("[worker] dispatching to thread pool...")
+        QThreadPool.globalInstance().start(worker)
+        print("[worker] dispatched")
 
     # ----- verb commands ----------------------------------------------
 
@@ -1475,9 +1634,22 @@ class MainViewModel(QObject):
             self._auto_fetch_timer.stop()
 
     def _on_auto_fetch_tick(self) -> None:
-        """Auto-fetch callback: silent fetch of ``origin`` (errors logged)."""
+        """Auto-fetch callback: silent fetch of ``origin`` (errors logged).
+
+        Skipped when the working tree has uncommitted changes — a fetch
+        into a dirty tree is pointless (the user cannot see the result
+        until they commit or stash) and on large repos the status check
+        may be slow enough to cause a UI hiccup.
+        """
         if self._repo_manager is None or not self._repo_manager.is_open:
             return
+        if self._is_busy:
+            return
+        try:
+            if self._repo_manager.repo.status():
+                return  # working tree is dirty — skip auto-fetch
+        except Exception:
+            pass
         self.fetch_changes("origin", silent=True)
 
     def resolve_conflict(self, path: str, resolution: str) -> None:
@@ -1712,6 +1884,25 @@ class MainViewModel(QObject):
             return
         if not silent:
             self.error_occurred.emit(message)
+
+    def _on_repo_load_finished(self) -> None:
+        """Called on the UI thread after the background repo data load succeeds."""
+        self._is_busy = False
+        self.busy_changed.emit(False)
+        self._log("repo", "Repository data loaded")
+        # Drain any events queued by the worker's signal emissions so
+        # the graph / side panels render without waiting for the next
+        # event-loop iteration.
+        from PySide6.QtCore import QEventLoop
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+
+    def _on_repo_load_failed(self, message: str) -> None:
+        """Called on the UI thread when the background repo data load raises."""
+        self._is_busy = False
+        self.busy_changed.emit(False)
+        self.error_occurred.emit(f"Failed to load repository data: {message}")
+        self._log("repo", f"Repository data load failed: {message}", level="error")
 
     def _on_async_finished(self, worker: object) -> None:
         self._active_workers.discard(worker)

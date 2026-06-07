@@ -294,10 +294,20 @@ class RepositoryManager:
         When a file is both staged and modified in the worktree, the
         staged (index) status is reported — matching ``git status``.
         """
-        result: list[FileChange] = []
-        for path, flag in self.repo.status().items():
-            result.append(FileChange(path=path, status=self._map_status(flag)))
-        return result
+        return self.get_status_from_raw(self.repo.status())
+
+    def get_status_from_raw(
+        self,
+        raw_status: dict[str, int],
+    ) -> list[FileChange]:
+        """Same as :meth:`get_status` but takes a pre-fetched ``pygit2``
+        status dict, letting callers reuse a single ``repo.status()``
+        call for both the file-change list and the staged-files set.
+        """
+        return [
+            FileChange(path=path, status=self._map_status(flag))
+            for path, flag in raw_status.items()
+        ]
 
     def get_history(
         self,

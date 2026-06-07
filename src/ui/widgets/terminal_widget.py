@@ -197,9 +197,20 @@ class TerminalWidget(QWidget):
             return
         proc = self._process
         self._process = None
+        # Disconnect signals *before* killing so the "process
+        # crashed / finished" messages are not appended to the
+        # terminal while we tear down the old shell.
+        try:
+            proc.finished.disconnect(self._on_finished)
+            proc.errorOccurred.disconnect(self._on_error)
+        except (RuntimeError, TypeError):
+            pass
         if proc.state() != QProcess.ProcessState.NotRunning:
             proc.kill()
-            proc.waitForFinished(2000)
+        # deleteLater queues the QProcess for deferred deletion
+        # without blocking the UI thread — waitForFinished() was
+        # the culprit that froze the window for up to 2s on every
+        # repository switch.
         proc.deleteLater()
 
     def _on_input(self) -> None:

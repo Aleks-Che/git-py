@@ -462,7 +462,10 @@ def rebase_branch(
             capture_output=True,
             text=True,
             check=False,
+            timeout=300.0,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(f"git rebase {upstream} timed out after 300s") from exc
     except OSError as exc:
         raise GitError(f"Failed to spawn git: {exc}") from exc
     if completed.returncode != 0:
@@ -511,8 +514,16 @@ def is_rebase_in_progress(repo: RepositoryManager | pygit2.Repository) -> bool:
 def _run_git_in_workdir(
     repo: pygit2.Repository,
     args: list[str],
+    *,
+    timeout: float = 60.0,
 ) -> subprocess.CompletedProcess[str]:
-    """Run ``git <args>`` in ``repo.workdir``; raise domain errors on failure."""
+    """Run ``git <args>`` in ``repo.workdir``; raise domain errors on failure.
+
+    *timeout* (seconds) guards against a hung ``git`` process — the
+    :class:`subprocess.TimeoutExpired` exception is surfaced as a
+    :class:`GitError` so the UI always gets a clean domain error
+    instead of a raw stack trace.
+    """
     workdir = repo.workdir
     if workdir is None:
         raise GitError("Cannot run git in a bare repository.")
@@ -526,7 +537,12 @@ def _run_git_in_workdir(
             capture_output=True,
             text=True,
             check=False,
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(
+            f"git {' '.join(args)} timed out after {timeout:.0f}s",
+        ) from exc
     except OSError as exc:
         raise GitError(f"Failed to spawn git: {exc}") from exc
 
@@ -659,8 +675,11 @@ def complete_rebase_continue(repo: RepositoryManager | pygit2.Repository) -> boo
             capture_output=True,
             text=True,
             check=False,
+            timeout=300.0,
             env=env,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise GitError("git rebase --continue timed out after 300s") from exc
     except OSError as exc:
         raise GitError(f"Failed to spawn git: {exc}") from exc
     if completed.returncode != 0:
@@ -766,7 +785,10 @@ def unstage_changes(
             capture_output=True,
             text=True,
             check=False,
+            timeout=30.0,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise GitError("git reset timed out after 30s") from exc
     except OSError as exc:
         raise GitError(f"Failed to spawn git: {exc}") from exc
     if completed.returncode != 0:
@@ -880,7 +902,12 @@ def stash_push_staged(
             capture_output=True,
             text=True,
             check=False,
+            timeout=30.0,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(
+            "git stash push timed out after 30s",
+        ) from exc
     except OSError as exc:
         raise GitError(f"Failed to spawn git: {exc}") from exc
     if completed.returncode != 0:
@@ -1010,7 +1037,12 @@ def restore_stash(
             capture_output=True,
             text=True,
             check=False,
+            timeout=30.0,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(
+            "git stash store timed out after 30s",
+        ) from exc
     except OSError as exc:
         raise GitError(f"Failed to spawn git: {exc}") from exc
     if completed.returncode != 0:

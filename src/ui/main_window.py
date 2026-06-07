@@ -185,6 +185,26 @@ class MainWindow(QMainWindow):
             self._status.showMessage("No repository")
         self._action_close.setEnabled(manager is not None)
 
+    def _open_repository_async(self, manager: RepositoryManager) -> None:
+        """Bind *manager* and start background data loading.
+
+        Uses :meth:`MainViewModel.set_repository` with ``refresh=False``
+        to emit ``repository_changed`` and update the tab bar / status
+        bar immediately, then kicks off :meth:`MainViewModel.load_repository_data`
+        on a worker thread so the graph and side panels populate without
+        freezing the UI.
+        """
+        print("[repo] _open_repository_async start")
+        self._repo_manager = manager
+        print("[repo] calling set_repository(refresh=False)...")
+        self._main_vm.set_repository(manager, refresh=False)
+        print("[repo] set_repository done, status:", manager.path)
+        self._status.showMessage(f"Repository: {manager.path}")
+        self._action_close.setEnabled(manager is not None)
+        print("[repo] calling load_repository_data...")
+        self._main_vm.load_repository_data()
+        print("[repo] _open_repository_async done")
+
     def graph_view_model(self) -> object:
         """Expose the graph ViewModel for Stage 2 test wiring."""
         return self._main_vm.graph_view_model()
@@ -222,7 +242,33 @@ class MainWindow(QMainWindow):
             self._open_clone_dialog()
 
     def _on_tab_changed(self, index: int) -> None:
-        """Switch the active repository to the tab at *index*."""
+        """Switch the active repository to the tab at *index*.
+
+        No-ops when the current VM is busy (the previous repository
+        data is still loading on a background thread) or when the
+        requested path is already the active repository.  The busy
+        guard prevents a second tab switch from racing with the
+        :class:`AsyncWorker` that was launched by the first one.
+
+        When a tab click arrives while a worker is in flight we
+        restore the tab bar selection to the currently-open repository
+        so the tab bar does not get out of sync with the actual state.
+        To avoid a signal feedback loop the ``active_tab_changed``
+        signal is temporarily disconnected during the restoration.
+        """
+        if self._main_vm.is_busy():
+            current = self._main_vm.repository_manager()
+            if current is not None and current.path is not None:
+                # Temporarily unhook to avoid triggering
+                # _on_tab_changed again from add_tab → set_active_tab.
+                self._repo_tabs_vm.active_tab_changed.disconnect(
+                    self._on_tab_changed,
+                )
+                self._repo_tabs_vm.add_tab(current.path)
+                self._repo_tabs_vm.active_tab_changed.connect(
+                    self._on_tab_changed,
+                )
+            return
         path = self._repo_tabs_vm.active_path
         if path is None:
             self.set_repository(None)
@@ -237,7 +283,7 @@ class MainWindow(QMainWindow):
         except (RepositoryNotFoundError, GitError) as exc:
             self._on_error(str(exc))
             return
-        self.set_repository(manager)
+        self._open_repository_async(manager)
 
     def _build_menu(self) -> None:
         bar = self.menuBar()
@@ -871,7 +917,9 @@ class MainWindow(QMainWindow):
         # to be useful — disabled when the list is empty.
         self._action_stash_push.setEnabled(repo_open and not busy)
         if repo_open and not busy:
-            stash_count = len(self._main_vm.repository_manager().stash_list)
+            stash_count = len(
+                self._main_vm.branch_panel_view_model().stash_list(),
+            )
         else:
             stash_count = 0
         self._action_stash_pop.setEnabled(repo_open and not busy and stash_count > 0)
@@ -901,7 +949,7 @@ class MainWindow(QMainWindow):
         except (RepositoryNotFoundError, GitError) as exc:
             QMessageBox.warning(self, "Open Repository", str(exc))
             return
-        self.set_repository(manager)
+        self._open_repository_async(manager)
 
     def _open_clone_dialog(self) -> None:
         """Show the :class:`CloneDialog`; on accept, fire the VM clone."""
@@ -925,7 +973,7 @@ class MainWindow(QMainWindow):
         except GitError as exc:
             QMessageBox.warning(self, "Init Repository", str(exc))
             return
-        self.set_repository(manager)
+        self._open_repository_async(manager)
 
     def _open_settings_dialog(self) -> None:
         """Show the :class:`SettingsDialog` (modal)."""

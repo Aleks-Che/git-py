@@ -156,12 +156,20 @@ class CommitPanelViewModel(QObject):
 
     # ----- repository binding -----------------------------------------
 
-    def set_repository(self, manager: RepositoryManager | None) -> None:
+    def set_repository(
+        self,
+        manager: RepositoryManager | None,
+        *,
+        refresh: bool = True,
+    ) -> None:
         """Bind (or unbind) the repository the panel reads from.
 
         On every bind the message fields and the file selection are
         cleared and the status is refreshed. ``manager=None`` is the
         close path: the panel becomes empty.
+
+        Pass ``refresh=False`` to defer the status re-read so the
+        caller can batch it inside a background worker.
         """
         self._repo = manager
         self._selected_file = None
@@ -174,7 +182,8 @@ class CommitPanelViewModel(QObject):
         self.commit_summary_changed.emit("")
         self.commit_description_changed.emit("")
         self.commit_message_changed.emit("")
-        self.refresh_status()
+        if refresh:
+            self.refresh_status()
 
     # ----- verb methods ------------------------------------------------
 
@@ -184,14 +193,20 @@ class CommitPanelViewModel(QObject):
         Translates :class:`GitError` into :attr:`error_occurred` —
         never re-raises. Emits :attr:`file_changes_changed` and
         :attr:`staged_files_changed` exactly once each.
+
+        The raw ``pygit2`` status dict is fetched once and reused for
+        both the :class:`FileChange` list and the staged-files set,
+        avoiding a second ``repo.status()`` call that walks the
+        working tree a second time.
         """
         if self._repo is None or not self._repo.is_open:
             self._file_changes = []
             self._staged_files = set()
         else:
             try:
-                self._file_changes = self._repo.get_status()
-                self._staged_files = self._compute_staged_files()
+                raw_status = self._repo.repo.status()
+                self._file_changes = self._repo.get_status_from_raw(raw_status)
+                self._staged_files = self._compute_staged_files_from_raw(raw_status)
             except GitError as exc:
                 self.error_occurred.emit(str(exc))
                 self._file_changes = []
@@ -298,6 +313,28 @@ class CommitPanelViewModel(QObject):
 
     # ----- internals ---------------------------------------------------
 
+    @staticmethod
+    def _compute_staged_files_from_raw(raw_status: dict[str, int]) -> set[str]:
+        """Rebuild the staged set from a pre-fetched ``pygit2`` status dict."""
+        return {path for path, flag in raw_status.items() if flag & _STAGED_FLAGS}
+
+    @staticmethod
+    def _compute_status_data(
+        repo: RepositoryManager,
+    ) -> tuple[list[FileChange], set[str]]:
+        """Read working-tree status from *repo* and return
+        ``(file_changes, staged_files)``.
+
+        Pure data-in/data-out — no signal emissions, safe to call
+        from a background thread.
+        """
+        raw_status = repo.repo.status()
+        file_changes: list[FileChange] = []
+        for path, flag in raw_status.items():
+            file_changes.append(FileChange(path=path, status=repo._map_status(flag)))
+        staged = CommitPanelViewModel._compute_staged_files_from_raw(raw_status)
+        return file_changes, staged
+
     def _compute_staged_files(self) -> set[str]:
         """Rebuild the staged set from the raw ``pygit2`` status flags.
 
@@ -305,12 +342,12 @@ class CommitPanelViewModel(QObject):
         worktree-only variants into a single :class:`FileStatus`
         (``MODIFIED``, ``DELETED``, ...). We re-read the raw flag
         bitfield here to keep the staged-vs-not distinction.
+
+        Kept for backwards compatibility; new code should prefer
+        :meth:`_compute_staged_files_from_raw` to avoid a duplicate
+        ``repo.status()`` call.
         """
-        result: set[str] = set()
-        for path, flag in self._repo.repo.status().items():
-            if flag & _STAGED_FLAGS:
-                result.add(path)
-        return result
+        return self._compute_staged_files_from_raw(self._repo.repo.status())
 
     def _compute_and_emit_diff(self, path: str | None) -> None:
         """Compute the diff for ``path`` and emit :attr:`diff_ready`."""

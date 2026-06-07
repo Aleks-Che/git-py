@@ -58,14 +58,23 @@ class GraphViewModel(QObject):
 
     # ----- repository binding -------------------------------------------
 
-    def set_repository(self, manager: RepositoryManager | None) -> None:
+    def set_repository(
+        self,
+        manager: RepositoryManager | None,
+        *,
+        refresh: bool = True,
+    ) -> None:
         """Bind (or unbind) the repository the ViewModel reads from.
 
-        Setting a new repository automatically refreshes the graph.
-        Passing ``None`` clears the graph (emits an empty list).
+        Setting a new repository automatically refreshes the graph
+        unless ``refresh=False``, which lets the caller defer the
+        heavy ``get_all_history`` + ``compute_layout`` work to a
+        background thread. Passing ``None`` clears the graph (emits
+        an empty list) regardless of *refresh*.
         """
         self._repo = manager
-        self.refresh_graph()
+        if refresh:
+            self.refresh_graph()
 
     def repository(self) -> RepositoryManager | None:
         """Return the currently bound repository, or ``None``."""
@@ -88,22 +97,37 @@ class GraphViewModel(QObject):
         if self._repo is None or not self._repo.is_open:
             self.graph_updated.emit([])
             return
-        try:
-            history = self._repo.get_all_history()
-            branches = self._repo.branches
-            tags = self._repo.tags
-            head_target, head_shorthand = self._head_info()
-            status = self._repo.get_status()
-        except GitError as exc:
-            self.error_occurred.emit(str(exc))
+        rows, err = self._compute_graph(self._repo)
+        if err is not None:
+            self.error_occurred.emit(err)
             return
-        # Insert stash entries chronologically among real commits.
-        # We iterate newest-first so each stash is placed at the
-        # correct time position. If the timestamp matches an existing
-        # commit, the stash goes right after the last same-time commit.
-        stash_entries = self._repo.stash_list
+        self.graph_updated.emit(rows)
+
+    @staticmethod
+    def _compute_graph(
+        repo: RepositoryManager,
+    ) -> tuple[list[dict], str | None]:
+        """Read history / status / branches / tags / stashes from
+        *repo*, compute the lane layout, and return ``(rows, None)``
+        on success or ``([], error_message)`` on failure.
+
+        This method is pure data-in/data-out — it does not emit any
+        Qt signals and is safe to call from a background thread.
+        Callers that need signal delivery call :meth:`refresh_graph`
+        instead (or take the returned rows and emit ``graph_updated``
+        themselves on the main thread).
+        """
+        try:
+            history = repo.get_all_history()
+            branches = repo.branches
+            tags = repo.tags
+            head_target, head_shorthand = GraphViewModel._head_info_from(repo)
+            status = repo.get_status()
+        except GitError as exc:
+            return [], str(exc)
+        stash_entries = repo.stash_list
         for entry in stash_entries:
-            stash_ci = self._stash_commit(entry, head_target)
+            stash_ci = GraphViewModel._stash_commit(entry, head_target)
             t = stash_ci.author_time
             idx = 0
             while idx < len(history) and history[idx].author_time > t:
@@ -112,13 +136,12 @@ class GraphViewModel(QObject):
                 idx += 1
             history.insert(idx, stash_ci)
         if status:
-            history = [self._wip_commit(head_target)] + history
+            history = [GraphViewModel._wip_commit(head_target)] + history
         try:
             nodes = compute_layout(history, branches, tags, head_target, head_shorthand)
         except GitError as exc:
-            self.error_occurred.emit(str(exc))
-            return
-        self.graph_updated.emit(nodes_to_rows(nodes))
+            return [], str(exc)
+        return nodes_to_rows(nodes), None
 
     def select_commit(self, sha: str) -> None:
         """Forward a user click on a commit to :attr:`commit_selected`."""
@@ -183,6 +206,13 @@ class GraphViewModel(QObject):
         if self._repo is None or self._repo.repo.head_is_unborn:
             return None, None
         head = self._repo.repo.head
+        return str(head.target), head.shorthand
+
+    @staticmethod
+    def _head_info_from(repo: RepositoryManager) -> tuple[str | None, str | None]:
+        if repo.repo.head_is_unborn:
+            return None, None
+        head = repo.repo.head
         return str(head.target), head.shorthand
 
     @staticmethod

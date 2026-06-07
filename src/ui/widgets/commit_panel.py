@@ -26,7 +26,7 @@ never holds Git state and never calls ``pygit2`` directly.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -425,10 +425,22 @@ class FileListWidget(QListWidget):
     its own *Stage File* button via native ``enterEvent`` / ``leaveEvent``
     — no signal forwarding, no coordinate tracking.  For ``staged=True``
     the button is never created.
+
+    When the file list exceeds ``MAX_ITEMS`` rows, population is limited
+    to the first ``MAX_ITEMS`` entries and a placeholder item is
+    appended.  For very large lists (e.g. 20 000+ files) the items are
+    added in batches of ``CHUNK`` via :meth:`_populate_chunk` so the
+    event loop stays responsive.
     """
+
+    MAX_ITEMS = 1000
+    CHUNK = 400
 
     stage_file_requested = Signal(str)
     """Emitted when the user clicks the *Stage File* hover button on a row."""
+
+    populate_finished = Signal()
+    """Emitted after the last chunk of :meth:`populate` has been added."""
 
     def __init__(self, *, staged: bool, parent=None) -> None:
         super().__init__(parent)
@@ -438,11 +450,40 @@ class FileListWidget(QListWidget):
         self.setUniformItemSizes(True)
         self.setAlternatingRowColors(True)
         self.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
+        # Internal state for chunked population.
+        self._pending_changes: list[FileChange] = []
+        self._pending_index: int = 0
+        self._populate_generation: int = 0
 
     def populate(self, changes: list[FileChange]) -> None:
-        """Rebuild the list to match the supplied ``changes``."""
+        """Rebuild the list to match the supplied *changes*.
+
+        For very large change sets the items are created in batches
+        of :attr:`CHUNK` so the Qt event loop can process paint and
+        input events between chunks.
+        """
         self.clear()
-        for change in changes:
+        self._populate_generation += 1  # invalidate any pending chunk timer
+        self._pending_changes = []
+        if not changes:
+            return
+        self._pending_changes = changes
+        self._pending_index = 0
+        gen = self._populate_generation
+        QTimer.singleShot(0, lambda g=gen: self._populate_chunk(g))
+
+    def _populate_chunk(self, generation: int) -> None:
+        if self._populate_generation != generation:
+            return  # another populate() call invalidated this run
+        # Guard against the C++ object being deleted between timer ticks.
+        import shiboken6
+        if not shiboken6.isValid(self):
+            return
+        changes = self._pending_changes
+        start = self._pending_index
+        end = min(start + self.CHUNK, len(changes), self.MAX_ITEMS)
+        for i in range(start, end):
+            change = changes[i]
             item = QListWidgetItem(self)
             item.setData(Qt.ItemDataRole.UserRole, change.path)
             self.addItem(item)
@@ -450,6 +491,28 @@ class FileListWidget(QListWidget):
             row_widget.stage_file_requested.connect(self.stage_file_requested)
             item.setSizeHint(row_widget.sizeHint())
             self.setItemWidget(item, row_widget)
+        self._pending_index = end
+        remaining = len(changes)
+        if self.MAX_ITEMS < remaining:
+            if end >= self.MAX_ITEMS:
+                self._append_truncation_item(remaining)
+                self._pending_changes = []
+                self.populate_finished.emit()
+                return
+        if end < remaining:
+            QTimer.singleShot(0, lambda g=generation: self._populate_chunk(g))
+        else:
+            self._pending_changes = []
+            self.populate_finished.emit()
+
+    def _append_truncation_item(self, total: int) -> None:
+        shown = self.MAX_ITEMS
+        item = QListWidgetItem(self)
+        item.setText(f"  … showing {shown} of {total} files.  "
+                      "Commit or stash to shrink the list.")
+        item.setFlags(Qt.ItemFlag.NoItemFlags)
+        item.setForeground(QColor("#8B8B8B"))
+        self.addItem(item)
 
 
 class _RowWidget(QWidget):

@@ -78,10 +78,22 @@ class BranchPanelViewModel(QObject):
 
     # ----- repository binding -----------------------------------------
 
-    def set_repository(self, manager: RepositoryManager | None) -> None:
-        """Bind (or unbind) the repository; immediately :meth:`refresh`."""
+    def set_repository(
+        self,
+        manager: RepositoryManager | None,
+        *,
+        refresh: bool = True,
+    ) -> None:
+        """Bind (or unbind) the repository.
+
+        Pass ``refresh=False`` to defer the heavy branch/tag/stash
+        enumeration so the caller can batch it inside a background
+        worker. The default ``refresh=True`` preserves the existing
+        synchronous behaviour for tests and callers that need it.
+        """
         self._repo = manager
-        self.refresh()
+        if refresh:
+            self.refresh()
 
     def refresh(self) -> None:
         """Re-read branches / tags / stash from the bound repository.
@@ -118,6 +130,44 @@ class BranchPanelViewModel(QObject):
             self._stash_list = []
             self._remotes = []
             self._current_branch_name = None
+        self.references_changed.emit()
+
+    @staticmethod
+    def _compute_branch_data(
+        repo: RepositoryManager,
+    ) -> dict:
+        """Read branches / tags / stash / remotes from *repo* and
+        return a snapshot ``dict``.
+
+        Pure data-in/data-out — no signal emissions, safe to call
+        from a background thread. The dict has the keys expected by
+        :meth:`_apply_branch_data`.
+        """
+        from src.core.operations import list_remotes
+
+        all_branches = repo.branches
+        local = [b for b in all_branches if not b.is_remote]
+        remote = [b for b in all_branches if b.is_remote]
+        current = None
+        if not repo.repo.head_is_unborn:
+            current = repo.repo.head.shorthand
+        return {
+            "local_branches": local,
+            "remote_branches": remote,
+            "tags": repo.tags,
+            "stash_list": repo.stash_list,
+            "remotes": list_remotes(repo),
+            "current_branch_name": current,
+        }
+
+    def _apply_branch_data(self, data: dict) -> None:
+        """Populate internal lists from a pre-computed snapshot dict."""
+        self._local_branches = data["local_branches"]
+        self._remote_branches = data["remote_branches"]
+        self._tags = data["tags"]
+        self._stash_list = data["stash_list"]
+        self._remotes = data["remotes"]
+        self._current_branch_name = data["current_branch_name"]
         self.references_changed.emit()
 
     # ----- helpers -----------------------------------------------------
