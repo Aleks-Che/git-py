@@ -46,7 +46,15 @@ GRAPH_CONFIGS_KEY = "graph_configs"
 _DEFAULT_CONFIG: dict[str, Any] = {
     "theme": "dark",
     "panel_layout": {},
-    "hotkeys": {},
+    "hotkeys": {
+        "undo": "Ctrl+Z",
+        "redo": "Ctrl+Y",
+        "fetch": "Ctrl+Shift+F",
+        "pull": "Ctrl+Shift+P",
+        "push": "Ctrl+Shift+U",
+        "stash_push": "Ctrl+Shift+S",
+        "stash_pop": "Ctrl+Shift+O",
+    },
     # Merge operations touching more than this many files are routed
     # through :class:`AsyncWorker` so the UI stays responsive.
     # Rebase is always async regardless of size.
@@ -197,6 +205,24 @@ def load_splitter_sizes(config: dict[str, Any]) -> dict[str, list[int]]:
     return _coerce_splitter_sizes(config.get("splitter_sizes"))
 
 
+def load_hotkey(
+    config: dict[str, Any], action_key: str, default: str,
+) -> str:
+    """Return the hotkey for *action_key* from *config*; fall back to *default*.
+
+    Reads from the ``"hotkeys"`` sub-dict.  Returns *default* when the
+    key is missing, not a string, or the config has no ``"hotkeys"``
+    mapping at all.
+    """
+    hotkeys = config.get("hotkeys")
+    if not isinstance(hotkeys, dict):
+        return default
+    value = hotkeys.get(action_key)
+    if not isinstance(value, str) or not value.strip():
+        return default
+    return value.strip()
+
+
 def load_graph_column_widths(
     config: dict[str, Any], repo_path: str | None,
 ) -> list[int] | None:
@@ -296,6 +322,7 @@ __all__ = [
     "load_author_signature",
     "load_config",
     "load_graph_column_widths",
+    "load_hotkey",
     "load_splitter_sizes",
     "save_config",
     "save_graph_column_widths",

@@ -182,16 +182,20 @@ class FileListDelegate(QStyledItemDelegate):
             path_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided,
         )
 
-        # -- stage / unstage button (painted) -----------------------------
+        # -- stage / unstage button (painted, hidden until hover) --------
+        is_row_hovered = (
+            self._hovered_index is not None
+            and self._hovered_index.row() == index.row()
+        )
+        if not is_row_hovered:
+            painter.restore()
+            return
+
         btn_x = rect.right() - self.MARGIN - self.BUTTON_SIZE
         btn_y = rect.top() + (self.ROW_HEIGHT - self.BUTTON_SIZE) // 2
         btn_rect = QRect(btn_x, btn_y, self.BUTTON_SIZE, self.BUTTON_SIZE)
 
-        is_button_hovered = (
-            self._hovered_index is not None
-            and self._hovered_index.row() == index.row()
-            and self._button_row == index.row()
-        )
+        is_button_hovered = is_row_hovered and self._button_row == index.row()
 
         if self._staged:
             btn_color = QColor("#ED7A6E") if is_button_hovered else QColor("#E8685A")
@@ -200,12 +204,13 @@ class FileListDelegate(QStyledItemDelegate):
 
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(btn_color))
-        painter.drawRoundedRect(btn_rect, 3, 3)
+        painter.drawRoundedRect(btn_rect, 4, 4)
 
         painter.setPen(QColor("white"))
         painter.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         symbol = "−" if self._staged else "+"
-        painter.drawText(btn_rect, Qt.AlignmentFlag.AlignCenter, symbol)
+        text_rect = btn_rect.translated(0, -3)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, symbol)
 
         painter.restore()
 

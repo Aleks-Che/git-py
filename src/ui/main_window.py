@@ -68,6 +68,7 @@ from src.ui.dialogs.clone_dialog import CloneDialog
 from src.ui.dialogs.open_or_clone_dialog import OpenOrCloneDialog
 from src.ui.dialogs.remote_manage_dialog import RemoteManageDialog
 from src.ui.dialogs.settings_dialog import SettingsDialog
+from src.ui.widgets.action_history_widget import ActionHistoryWidget
 from src.ui.widgets.diff_view_widget import DiffViewWidget
 from src.ui.widgets.graph_panel import GraphTableWidget
 from src.ui.widgets.left_panel import LeftPanel
@@ -80,6 +81,7 @@ from src.utils.config import (
     SPLITTER_KEY_HORIZONTAL,
     load_config,
     load_graph_column_widths,
+    load_hotkey,
     load_splitter_sizes,
     load_window_size,
     save_config,
@@ -112,6 +114,10 @@ class MainWindow(QMainWindow):
         # :meth:`closeEvent`.
         self._config_path: Path | None = (
             Path(config_path) if config_path is not None else None
+        )
+        # Load config early so `_build_menu` reads hotkey preferences.
+        self._config: dict[str, object] = (
+            load_config(self._config_path) if self._config_path is not None else {}
         )
 
         # The top horizontal splitter (left | graph | right) is kept
@@ -319,32 +325,42 @@ class MainWindow(QMainWindow):
 
         edit_menu = bar.addMenu("&Edit")
         self._action_undo = QAction("&Undo", self)
-        self._action_undo.setShortcut(QKeySequence.StandardKey.Undo)
+        self._action_undo.setShortcut(
+            QKeySequence(load_hotkey(self._config, "undo", "Ctrl+Z")),
+        )
         self._action_undo.setEnabled(False)
         self._action_undo.triggered.connect(self._main_vm.undo)
         edit_menu.addAction(self._action_undo)
 
         self._action_redo = QAction("&Redo", self)
-        self._action_redo.setShortcut(QKeySequence.StandardKey.Redo)
+        self._action_redo.setShortcut(
+            QKeySequence(load_hotkey(self._config, "redo", "Ctrl+Y")),
+        )
         self._action_redo.setEnabled(False)
         self._action_redo.triggered.connect(self._main_vm.redo)
         edit_menu.addAction(self._action_redo)
 
         remote_menu = bar.addMenu("&Remote")
         self._action_fetch = QAction("&Fetch from origin", self)
-        self._action_fetch.setShortcut("Ctrl+Shift+F")
+        self._action_fetch.setShortcut(
+            QKeySequence(load_hotkey(self._config, "fetch", "Ctrl+Shift+F")),
+        )
         self._action_fetch.setEnabled(False)
         self._action_fetch.triggered.connect(lambda: self._main_vm.fetch_changes("origin"))
         remote_menu.addAction(self._action_fetch)
 
         self._action_pull = QAction("&Pull from origin", self)
-        self._action_pull.setShortcut("Ctrl+Shift+P")
+        self._action_pull.setShortcut(
+            QKeySequence(load_hotkey(self._config, "pull", "Ctrl+Shift+P")),
+        )
         self._action_pull.setEnabled(False)
         self._action_pull.triggered.connect(lambda: self._main_vm.pull_changes("origin"))
         remote_menu.addAction(self._action_pull)
 
         self._action_push = QAction("&Push to origin", self)
-        self._action_push.setShortcut("Ctrl+Shift+U")
+        self._action_push.setShortcut(
+            QKeySequence(load_hotkey(self._config, "push", "Ctrl+Shift+U")),
+        )
         self._action_push.setEnabled(False)
         self._action_push.triggered.connect(lambda: self._main_vm.push_changes("origin"))
         remote_menu.addAction(self._action_push)
@@ -357,20 +373,30 @@ class MainWindow(QMainWindow):
 
         stash_menu = bar.addMenu("&Stash")
         self._action_stash_push = QAction("&Stash Changes", self)
-        self._action_stash_push.setShortcut("Ctrl+Shift+S")
+        self._action_stash_push.setShortcut(
+            QKeySequence(load_hotkey(self._config, "stash_push", "Ctrl+Shift+S")),
+        )
         self._action_stash_push.setEnabled(False)
         self._action_stash_push.triggered.connect(self._on_stash_push)
         stash_menu.addAction(self._action_stash_push)
 
         self._action_stash_pop = QAction("Stash &Pop", self)
-        self._action_stash_pop.setShortcut("Ctrl+Shift+O")
+        self._action_stash_pop.setShortcut(
+            QKeySequence(load_hotkey(self._config, "stash_pop", "Ctrl+Shift+O")),
+        )
         self._action_stash_pop.setEnabled(False)
         self._action_stash_pop.triggered.connect(self._on_stash_pop)
         stash_menu.addAction(self._action_stash_pop)
 
         view_menu = bar.addMenu("&View")
-        for label in ("Left Panel", "Commit Detail Panel", "Terminal"):
-            view_menu.addAction(QAction(label, self, checkable=True, checked=True))
+        self._action_view_left_panel = QAction("Left Panel", self, checkable=True, checked=True)
+        view_menu.addAction(self._action_view_left_panel)
+
+        self._action_view_terminal = QAction("Terminal", self, checkable=True, checked=True)
+        view_menu.addAction(self._action_view_terminal)
+
+        self._action_view_history = QAction("History", self, checkable=True, checked=True)
+        view_menu.addAction(self._action_view_history)
 
         help_menu = bar.addMenu("&Help")
         action_about = QAction("&About git-py", self)
@@ -384,8 +410,29 @@ class MainWindow(QMainWindow):
             self._update_undo_redo_actions,
         )
 
+    # ----- View menu toggle handlers ------------------------------------
+
+    def _on_view_terminal_toggled(self, visible: bool) -> None:
+        idx = self._bottom_tabs.indexOf(self._terminal)
+        if idx >= 0:
+            self._bottom_tabs.setTabVisible(idx, visible)
+
+    def _on_view_history_toggled(self, visible: bool) -> None:
+        idx = self._bottom_tabs.indexOf(self._action_history)
+        if idx >= 0:
+            self._bottom_tabs.setTabVisible(idx, visible)
+
     def _build_toolbar(self) -> None:
-        """Add the Push / Pull / Fetch toolbar (Stage 6)."""
+        """Stage 8: Edit toolbar with Undo / Redo, then Remote / Stash / Search."""
+        edit_toolbar = QToolBar("Edit", self)
+        edit_toolbar.setObjectName("edit-toolbar")
+        edit_toolbar.setMovable(False)
+        edit_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        edit_toolbar.addAction(self._action_undo)
+        edit_toolbar.addAction(self._action_redo)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, edit_toolbar)
+        self._edit_toolbar = edit_toolbar
+
         toolbar = QToolBar("Remote", self)
         toolbar.setObjectName("remote-toolbar")
         toolbar.setMovable(False)
@@ -503,10 +550,20 @@ class MainWindow(QMainWindow):
         self._log_widget = LogWidget(self)
         self._log_widget.setMaximumHeight(180)
 
+        self._action_history = ActionHistoryWidget(DARK_THEME, self)
+        self._action_history.setMaximumHeight(180)
+        self._action_history.set_processor(self._main_vm.command_processor())
+
         self._bottom_tabs = QTabWidget(self)
         self._bottom_tabs.setMaximumHeight(200)
         self._bottom_tabs.addTab(self._terminal, "Terminal")
         self._bottom_tabs.addTab(self._log_widget, "Log")
+        self._bottom_tabs.addTab(self._action_history, "History")
+
+        # Wire View-menu toggle actions now that widgets exist.
+        self._action_view_left_panel.toggled.connect(self._left_panel.setVisible)
+        self._action_view_terminal.toggled.connect(self._on_view_terminal_toggled)
+        self._action_view_history.toggled.connect(self._on_view_history_toggled)
 
         main_splitter = QSplitter(self)
         main_splitter.setOrientation(Qt.Orientation.Vertical)
@@ -670,7 +727,7 @@ class MainWindow(QMainWindow):
         """
         if self._config_path is None:
             return
-        config = load_config(self._config_path)
+        config = self._config
         width, height = load_window_size(config)
         self.resize(width, height)
         splitter_sizes = load_splitter_sizes(config)

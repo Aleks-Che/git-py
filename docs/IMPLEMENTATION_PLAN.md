@@ -58,9 +58,11 @@
 - Поиск по коммитам (SHA, сообщение, автор) с фильтрацией графа.
 
 ## Этап 8: Undo/Redo и история действий
-- Полноценная интеграция `CommandProcessor` во все мутирующие операции.
-- Кнопки Undo/Redo на тулбаре, горячие клавиши.
-- Визуальная история действий (опционально, как в GitKraken).
+- Полноценная интеграция `CommandProcessor` во все мутирующие операции — _реализована на Этапах 3–7 (21 команда)_.
+- Кнопки Undo/Redo на тулбаре (Edit), горячие клавиши из конфига (`Ctrl+Z`/`Ctrl+Y`).
+- ActionHistoryWidget — панель истории действий в нижних вкладках (History).
+- View-меню: показ/скрытие левой панели, терминала, истории.
+- 14 новых тестов: CommandProcessor.snapshot/timestamp + ActionHistoryWidget.
 
 ## Этап 9: Конфигурация и темизация
 - Настройка пользовательского профиля (имя, email).
@@ -77,7 +79,7 @@
 
 ## Прогресс разработки
 
-**Общий прогресс:** `[███████████████░░░░░░░░░░]` 7 / 11 этапов (64%)
+**Общий прогресс:** `[█████████████████░░░░░░░░]` 8 / 11 этапов (73%)
 
 Легенда:
 - `[ ]` — не начато
@@ -126,10 +128,10 @@
   - Дата завершения: `2026-06-06`
   - Комментарий: **Stash-команды** (StashPushCommand, StashPopCommand, StashApplyCommand, StashDropCommand, StashPushStagedCommand) реализованы в `viewmodels/commands.py` с undo/redo через CommandProcessor. **Core-операции** дополнены: `stash_apply`, `stash_drop`, `stash_oid_at`, `restore_stash` (через `git stash store`), `stash_push_staged` (через `git stash push -- <paths>`, т.к. pygit2 `paths=` ревертит все изменения). **MainViewModel** — verb-методы `stash_push/pop/apply/drop/stash_push_staged`. **LeftPanel** — контекстное меню stash с Apply/Pop/Drop (с confirm-диалогом для Drop). **Stash на графе** — синтетические узлы с `kind="stash"`, реальный OID, золотой пунктирный ромб + крест; клик — детали в CommitDetailPanel, правый клик — Apply/Pop/Drop через graph. **Порядок узлов** — WIP (Uncommitted) сверху, затем stash, затем HEAD. **Тулбар** — кнопки Stash (Ctrl+Shift+S) и Pop (Ctrl+Shift+O) с авто-обновлением enabled (Pop disabled при пустом stash-листе). **Терминал** — `TerminalWidget` с `QProcess` (cmd.exe/bash), ANSI SGR-парсер в HTML, запуск в корне репо, старт/стоп по `repository_changed`, отложенный старт через `QTimer.singleShot`. **Поиск по коммитам** — `SearchBar` с debounce 300ms, `GraphViewModel.search_commits` (по SHA/сообщению/автору), скролл к первому совпадению через `GraphTableWidget.scroll_to_commit`. **Прочее:** убран дубликат `_execute_rebase_sync` в `main_viewmodel.py`; фикс стартапа — `_restore_state()` через `QTimer.singleShot(0)` c disconnect/reconnect `active_tab_changed`. Итого **643 теста, ruff clean**.
 
-- [ ] **Этап 8: Undo/Redo и история действий** — _не начато_
-  - Дата начала: `—`
-  - Дата завершения: `—`
-  - Комментарий: `—`
+- [x] **Этап 8: Undo/Redo и история действий** — _завершён_
+  - Дата начала: `2026-06-07`
+  - Дата завершения: `2026-06-07`
+  - Комментарий: `CommandProcessor` — 21 команда с undo/redo (8.1: timestamp + undo_stack_snapshot/redo_stack_snapshot аксессоры). Кнопки Undo/Redo на тулбаре Edit (8.2). Конфигурируемые горячие клавиши через `config.py` (8.3: `load_hotkey`, дефолты Ctrl+Z/Ctrl+Y/Fetch/Pull/Push/Stash). `ActionHistoryWidget` — панель истории в нижних вкладках с секциями Applied/Undone (8.4). View-меню — показ/скрытие левой панели, терминала, истории (8.6). **14 новых тестов** (8 snapshot + 6 UI), **657/657 проходят**, `ruff check` чисто.
 
 - [~] **Этап 9: Конфигурация и темизация** — _в работе (под-этапы: темизация ✓, персистентность окна ✓)_
   - Дата начала: `2026-06-03`
@@ -143,5 +145,5 @@
 
 ### Текущий статус
 - **Активный этап:** `Этап 9: Конфигурация и темизация` (под-этапы: темизация ✓, персистентность окна ✓, редизайн правой панели ✓)
-- **Последнее обновление:** `2026-06-06`
-- **Следующий шаг:** `Завершить Settings-диалог (переключатель dark/light), импорт/экспорт настроек. Stage 8 (интеграция undo/redo в тулбар + история действий).`
+- **Последнее обновление:** `2026-06-07`
+- **Следующий шаг:** `Завершить Settings-диалог (переключатель dark/light), импорт/экспорт настроек.`

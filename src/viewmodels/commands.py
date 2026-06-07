@@ -13,6 +13,7 @@ holds no Git state.
 """
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from collections import deque
 
@@ -56,7 +57,15 @@ class GitCommand(ABC):
 
     Subclasses must capture every input they need for ``execute()`` and
     ``undo()`` in ``__init__``; the processor owns no Git state.
+
+    Attributes
+    ----------
+    _timestamp : float | None
+        Set by :class:`CommandProcessor` on successful ``execute()``.
+        Used by the action-history panel for display ordering.
     """
+
+    _timestamp: float | None = None
 
     @abstractmethod
     def execute(self) -> None:
@@ -70,6 +79,11 @@ class GitCommand(ABC):
     @abstractmethod
     def name(self) -> str:
         """Human-readable name used in the undo history UI."""
+
+    @property
+    def timestamp(self) -> float | None:
+        """Wall-clock time when :class:`CommandProcessor` executed this command, or ``None``."""
+        return self._timestamp
 
 
 class CommandProcessor(QObject):
@@ -90,6 +104,7 @@ class CommandProcessor(QObject):
     def execute(self, command: GitCommand) -> None:
         """Run ``command.execute()`` and push it onto the undo stack."""
         command.execute()
+        command._timestamp = time.time()
         self._undo_stack.append(command)
         self._redo_stack.clear()
         self.stack_changed.emit()
@@ -109,6 +124,7 @@ class CommandProcessor(QObject):
             return
         command = self._redo_stack.pop()
         command.execute()
+        command._timestamp = time.time()
         self._undo_stack.append(command)
         self.stack_changed.emit()
 
@@ -119,6 +135,27 @@ class CommandProcessor(QObject):
     @property
     def can_redo(self) -> bool:
         return bool(self._redo_stack)
+
+    def undo_stack_snapshot(self) -> list[dict[str, object]]:
+        """Return a copy of the undo stack metadata (oldest first).
+
+        Each entry contains ``name`` (str) and ``timestamp`` (float or
+        ``None``).  Used by the action-history panel to build its list.
+        """
+        return [
+            {"name": cmd.name, "timestamp": cmd._timestamp}
+            for cmd in self._undo_stack
+        ]
+
+    def redo_stack_snapshot(self) -> list[dict[str, object]]:
+        """Return a copy of the redo stack metadata (oldest first).
+
+        Each entry has the same shape as :meth:`undo_stack_snapshot`.
+        """
+        return [
+            {"name": cmd.name, "timestamp": cmd._timestamp}
+            for cmd in self._redo_stack
+        ]
 
     def clear(self) -> None:
         """Drop both stacks (e.g. after opening a different repository)."""
