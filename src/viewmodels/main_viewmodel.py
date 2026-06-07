@@ -419,6 +419,31 @@ class MainViewModel(QObject):
         except GitError:
             return ""
 
+    def discard_changes(self) -> None:
+        """Discard all uncommitted changes (index + workdir) via ``DiscardChangesCommand``.
+
+        Emits ``error_occurred`` on failure. Refreshes all views on success.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            self._log("discard", "Discard failed: no repo", level="error")
+            return
+        if self._is_busy:
+            self.error_occurred.emit("Another operation is already in progress.")
+            return
+        from src.viewmodels.commands import DiscardChangesCommand
+
+        self._log("discard", "Discarding all changes")
+        command = DiscardChangesCommand(self._repo_manager)
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("discard", f"Discard failed: {exc}", level="error")
+            return
+        self._refresh_all_views()
+        self._log("discard", "All changes discarded")
+
     # ----- branch commands ---------------------------------------------
 
     def checkout_branch(self, name: str) -> bool:

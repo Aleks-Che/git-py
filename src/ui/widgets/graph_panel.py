@@ -100,6 +100,7 @@ class GraphTableWidget(QWidget):
     stash_apply_requested = Signal(str)     # sha of the stash commit
     stash_pop_requested = Signal(str)
     stash_drop_requested = Signal(str)
+    discard_changes_requested = Signal(str)
 
     _AVATAR_COLORS: tuple[str, ...] = (
         "#C44A2B", "#B85C8C", "#9A6E3A", "#5B7FA5",
@@ -258,6 +259,10 @@ class GraphTableWidget(QWidget):
                 lambda: self.stash_drop_requested.emit(sha),
             )
         elif kind == "wip":
+            discard_action = menu.addAction("Discard changes")
+            discard_action.triggered.connect(
+                lambda checked=False, s=sha: self.discard_changes_requested.emit(s),
+            )
             copy_diff_action = menu.addAction("Copy diff")
             copy_diff_action.triggered.connect(
                 lambda checked=False, s=sha: self.copy_diff_requested.emit(s),

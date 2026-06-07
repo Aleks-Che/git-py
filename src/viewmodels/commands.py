@@ -28,6 +28,7 @@ from src.core.operations import (
     commit_changes,
     create_branch,
     delete_branch,
+    discard_changes,
     fetch,
     is_rebase_in_progress,
     list_remotes,
@@ -1000,6 +1001,50 @@ class StashPushStagedCommand(GitCommand):
         return "stash push (staged only)"
 
 
+class DiscardChangesCommand(GitCommand):
+    """Discard all uncommitted changes (index + workdir) in the working tree.
+
+    On :meth:`execute`, the current uncommitted changes are stashed (to
+    support undo) and then the working tree is hard-reset to ``HEAD``.
+    On :meth:`undo`, the stashed entry is restored, returning the working
+    tree to the state before the discard.
+    """
+
+    def __init__(self, repo: RepositoryManager) -> None:
+        self._repo = repo
+        self._captured_oid: str | None = None
+        self._captured_message: str | None = None
+
+    def execute(self) -> None:
+        from src.core.operations import stash_push
+        from src.core.repository import unwrap
+
+        with unwrap(self._repo) as r:
+            if r.is_bare or r.head_is_unborn:
+                return
+            dirty = [p for p, _ in r.status().items()]
+            if not dirty:
+                return
+        oid = stash_push(self._repo, message="WIP (discard backup)", include_untracked=True)
+        if oid is not None:
+            self._captured_oid = oid
+            self._captured_message = "WIP (discarded, restored)"
+        discard_changes(self._repo)
+
+    def undo(self) -> None:
+        if self._captured_oid is None:
+            return
+        try:
+            msg = self._captured_message or "WIP (restored)"
+            restore_stash(self._repo, self._captured_oid, msg)
+        except Exception:
+            pass  # best-effort
+
+    @property
+    def name(self) -> str:
+        return "discard changes"
+
+
 __all__ = [
     "AddRemoteCommand",
     "CheckoutCommand",
@@ -1009,6 +1054,7 @@ __all__ = [
     "CommitCommand",
     "CreateBranchCommand",
     "DeleteBranchCommand",
+    "DiscardChangesCommand",
     "FetchCommand",
     "GitCommand",
     "MergeCommand",

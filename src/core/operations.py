@@ -1299,6 +1299,21 @@ def pull(
     return merge_branch(repo, str(upstream_ref.target))
 
 
+def discard_changes(
+    repo: RepositoryManager | pygit2.Repository,
+) -> None:
+    """Discard all uncommitted changes (index + workdir) by hard-resetting to HEAD.
+
+    Raises :class:`GitError` if the repository is bare or HEAD is unborn.
+    """
+    with unwrap(repo) as r:
+        if r.is_bare:
+            raise GitError("Cannot discard changes in a bare repository.")
+        if r.head_is_unborn:
+            raise GitError("Cannot discard changes: HEAD has no commits yet.")
+    reset(repo, "HEAD", "hard")
+
+
 __all__ = [
     "abort_merge",
     "abort_rebase",
@@ -1311,6 +1326,7 @@ __all__ = [
     "complete_rebase_continue",
     "create_branch",
     "delete_branch",
+    "discard_changes",
     "fetch",
     "is_merge_in_progress",
     "is_rebase_in_progress",

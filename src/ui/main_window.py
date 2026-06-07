@@ -391,6 +391,7 @@ class MainWindow(QMainWindow):
             self._main_vm.checkout_commit,
         )
         self._graph_table.copy_diff_requested.connect(self._on_copy_diff)
+        self._graph_table.discard_changes_requested.connect(self._on_discard_changes)
         self._graph_table.stash_apply_requested.connect(self._on_stash_apply_graph)
         self._graph_table.stash_pop_requested.connect(self._on_stash_pop_graph)
         self._graph_table.stash_drop_requested.connect(self._on_stash_drop_graph)
@@ -551,6 +552,10 @@ class MainWindow(QMainWindow):
             return
         QApplication.clipboard().setText(text)
         self._status.showMessage(f"Diff of {label} copied to clipboard", 3000)
+
+    def _on_discard_changes(self, sha: str) -> None:
+        """Discard all uncommitted changes (from graph WIP context menu)."""
+        self._main_vm.discard_changes()
 
     def _on_stash_apply_graph(self, sha: str) -> None:
         """Apply stash by OID (from graph context menu)."""
