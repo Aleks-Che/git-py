@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QScrollArea,
     QSizePolicy,
     QSplitter,
@@ -166,6 +167,8 @@ class CommitDetailPanel(QWidget):
         self._files.setStyleSheet(
             f"QListWidget::item:selected {{ background: {_SELECTION_BG}; }}",
         )
+        self._files.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._files.customContextMenuRequested.connect(self._on_file_context_menu)
         self._files.itemClicked.connect(self._on_files_item_clicked)
 
         # --- splitter: 60% message+info / 40% files ---
@@ -335,6 +338,33 @@ class CommitDetailPanel(QWidget):
             item.setToolTip(tip)
 
     # ----- file selection (click to show diff in place) ---------------
+
+    def _on_file_context_menu(self, position) -> None:
+        item = self._files.itemAt(position)
+        if item is None or self._current_sha is None:
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if not path:
+            return
+
+        is_stash = self._main_vm.is_stash_sha(self._current_sha)
+        if not is_stash:
+            return
+
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background-color: #2D2D30; color: #D4D4D4; border: 1px solid #3F3F46; "
+            "padding: 4px 0; } "
+            "QMenu::item { padding: 6px 24px 6px 12px; } "
+            "QMenu::item:selected { background-color: #094771; }",
+        )
+
+        apply_action = menu.addAction("Apply stashed file")
+        apply_action.triggered.connect(
+            lambda checked=False, p=path: self._main_vm.apply_stash_file(self._current_sha, p),
+        )
+
+        menu.exec(self._files.viewport().mapToGlobal(position))
 
     def _on_files_item_clicked(self, item: QListWidgetItem) -> None:
         """Toggle the file selection for diff view.

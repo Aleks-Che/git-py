@@ -3,20 +3,24 @@
 Shown when the user clicks the WIP node in the graph (or otherwise
 selects the WIP state). Structure (top-to-bottom):
 
+* **Discard All Changes** — red button with a trash icon above the
+  unstaged list. Discards all working-tree and index changes at once.
 * **Unstaged Files (N)** — collapsible list, with a green *Stage All
   Changes* button on the right of the header. Each row shows the
   file's status badge and path; hovering the row reveals a green
   *Stage File* button on the right.
 * **Staged Files (N)** — collapsible list. Each row shows the badge
-  and path (no stage button — the row is already staged). The user
-  can unstage a file by clicking its row (routed to
-  :meth:`MainViewModel.unstage_file`).
+  and path; hovering reveals a red *Unstage File* button on the right.
 * **Commit block** — sticky at the bottom:
     * Commit Summary (single-line ``QLineEdit``)
     * Description (multi-line ``QPlainTextEdit``)
     * Green *Commit Changes to (N) File(s)* button, enabled once at
       least one of the two fields is non-empty **and** there is at
       least one staged file.
+
+Both the unstaged and staged file lists have right-click context menus
+with actions: Stage/Unstage, Discard Changes, Ignore (with sub-menu),
+Stash File, Show in Folder, Copy File Path, Delete File.
 
 The widget is bound to :class:`MainViewModel` for verbs
 (``stage_file`` / ``unstage_file`` / ``stage_all_unstaged`` /
@@ -26,14 +30,17 @@ never holds Git state and never calls ``pygit2`` directly.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QItemSelectionModel, QModelIndex, QRect, Qt, Signal
-from PySide6.QtGui import QColor
+import os as _os
+
+from PySide6.QtCore import QItemSelectionModel, QModelIndex, QPoint, QRect, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListView,
+    QMenu,
     QPlainTextEdit,
     QPushButton,
     QToolButton,
@@ -50,15 +57,65 @@ from src.ui.widgets.file_list_model import (
 from src.viewmodels.commit_panel_viewmodel import CommitPanelViewModel
 from src.viewmodels.main_viewmodel import MainViewModel
 
-# Short status letter + colour shared with :class:`CommitDetailPanel`
-# so the visual vocabulary is consistent across the two right-panel
-# views.
 _GREEN = "#3FB950"
 _GREEN_HOVER = "#46C75A"
 _GREEN_PRESSED = "#2F8B3B"
 _RED = "#E8685A"
 _RED_HOVER = "#ED7A6E"
 _RED_PRESSED = "#C04D40"
+
+
+# ---------------------------------------------------------------------------
+# Trash icon — painted programmatically (no image resources)
+# ---------------------------------------------------------------------------
+
+
+def _trash_icon(size: int = 14) -> QIcon:
+    """Paint a simple trash-can icon onto a QPixmap and return a QIcon."""
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    w, h = size, size
+    margin = 2
+    lid_y = margin
+    lid_h = max(2, h // 8)
+    lid_w = w - margin * 2
+
+    body_y = lid_y + lid_h + 1
+    body_h = h - body_y - margin
+    body_w = max(4, w - margin * 2 - 2)
+
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(255, 255, 255))
+
+    body_x = (w - body_w) // 2
+    painter.drawRoundedRect(QRect(body_x, body_y, body_w, body_h), 1, 1)
+
+    lid_x = (w - lid_w) // 2
+    painter.drawRoundedRect(QRect(lid_x, lid_y, lid_w, lid_h), 1, 1)
+
+    handle_x = w // 2 - lid_w // 4
+    handle_y = 0
+    handle_w = lid_w // 2
+    handle_h = max(2, lid_y + 1)
+    painter.drawRect(QRect(handle_x, handle_y, handle_w, handle_h))
+
+    # vertical lines inside the body
+    painter.setPen(QColor(80, 80, 80))
+    line_margin = 3
+    for lx in (body_x + line_margin, body_x + body_w // 2, body_x + body_w - line_margin - 1):
+        painter.drawLine(lx, body_y + 2, lx, body_y + body_h - 2)
+
+    painter.end()
+    return QIcon(pix)
+
+
+# ---------------------------------------------------------------------------
+# Commit panel
+# ---------------------------------------------------------------------------
 
 
 class CommitPanel(QWidget):
@@ -77,6 +134,26 @@ class CommitPanel(QWidget):
     # ----- construction -----------------------------------------------
 
     def _build_ui(self) -> None:
+        # --- Discard All Changes button ---------------------------------
+        self._discard_all_button = QPushButton("  Discard All Changes", self)
+        self._discard_all_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._discard_all_button.setIcon(_trash_icon())
+        self._discard_all_button.setStyleSheet(
+            f"QPushButton {{ background-color: {_RED}; "
+            f"color: white; border: none; border-radius: 3px; padding: 4px 10px; "
+            f"font-weight: 600; }} "
+            f"QPushButton:hover {{ background-color: {_RED_HOVER}; }} "
+            f"QPushButton:pressed {{ background-color: {_RED_PRESSED}; }} "
+            f"QPushButton:disabled {{ background-color: #2A2A2A; color: #6A6A6A; }}",
+        )
+        self._discard_all_button.setEnabled(False)
+        self._discard_all_button.clicked.connect(self._on_discard_all_clicked)
+
+        discard_row = QHBoxLayout()
+        discard_row.setContentsMargins(0, 0, 0, 0)
+        discard_row.addStretch(1)
+        discard_row.addWidget(self._discard_all_button)
+
         # --- Unstaged Files block ---
         self._unstaged_expander = QToolButton(self)
         self._unstaged_expander.setCheckable(True)
@@ -96,19 +173,16 @@ class CommitPanel(QWidget):
         self._unstaged_header.setStyleSheet(
             "font-weight: bold; padding: 4px 0; color: #D4D4D4;",
         )
-        # The expander and the label are visually one row; we install
-        # the expander as the actual clickable target but keep the
-        # label updated with the current count.
         self._unstaged_header.setVisible(False)
 
         self._stage_all_button = QPushButton("Stage All Changes", self)
         self._stage_all_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._stage_all_button.setStyleSheet(
-            f"QPushButton {{ background-color: { _GREEN_PRESSED }; "
+            f"QPushButton {{ background-color: {_GREEN_PRESSED}; "
             f"color: white; border: none; border-radius: 3px; padding: 4px 10px; "
             f"font-weight: 600; }} "
-            f"QPushButton:hover {{ background-color: { _GREEN_HOVER }; }} "
-            f"QPushButton:pressed {{ background-color: { _GREEN_PRESSED }; }} "
+            f"QPushButton:hover {{ background-color: {_GREEN_HOVER}; }} "
+            f"QPushButton:pressed {{ background-color: {_GREEN_PRESSED}; }} "
             f"QPushButton:disabled {{ background-color: #2A2A2A; color: #6A6A6A; }}",
         )
         self._stage_all_button.setEnabled(False)
@@ -117,9 +191,6 @@ class CommitPanel(QWidget):
         unstaged_header_row = QHBoxLayout()
         unstaged_header_row.setContentsMargins(0, 0, 0, 0)
         unstaged_header_row.setSpacing(8)
-        # Use the QToolButton as the visible "Unstaged Files" header
-        # (clickable, with the arrow indicator). Push the Stage All
-        # button to the right.
         self._unstaged_expander.setSizePolicy(
             self._unstaged_expander.sizePolicy().horizontalPolicy(),
             self._unstaged_expander.sizePolicy().verticalPolicy(),
@@ -130,6 +201,9 @@ class CommitPanel(QWidget):
         self._unstaged_list = FileListView(staged=False, parent=self)
         self._unstaged_list.clicked.connect(self._on_unstaged_index_clicked)
         self._unstaged_list.stage_file_requested.connect(self._on_stage_file)
+        self._unstaged_list.context_action_requested.connect(
+            self._on_unstaged_context_action,
+        )
 
         # --- Staged Files block ---
         self._staged_expander = QToolButton(self)
@@ -145,11 +219,11 @@ class CommitPanel(QWidget):
         self._unstage_all_button = QPushButton("Unstage All Changes", self)
         self._unstage_all_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._unstage_all_button.setStyleSheet(
-            f"QPushButton {{ background-color: { _RED }; "
+            f"QPushButton {{ background-color: {_RED}; "
             f"color: white; border: none; border-radius: 3px; padding: 4px 10px; "
             f"font-weight: 600; }} "
-            f"QPushButton:hover {{ background-color: { _RED_HOVER }; }} "
-            f"QPushButton:pressed {{ background-color: { _RED_PRESSED }; }} "
+            f"QPushButton:hover {{ background-color: {_RED_HOVER}; }} "
+            f"QPushButton:pressed {{ background-color: {_RED_PRESSED}; }} "
             f"QPushButton:disabled {{ background-color: #2A2A2A; color: #6A6A6A; }}",
         )
         self._unstage_all_button.setEnabled(False)
@@ -168,6 +242,9 @@ class CommitPanel(QWidget):
         self._staged_list = FileListView(staged=True, parent=self)
         self._staged_list.clicked.connect(self._on_staged_index_clicked)
         self._staged_list.stage_file_requested.connect(self._on_unstage_file)
+        self._staged_list.context_action_requested.connect(
+            self._on_staged_context_action,
+        )
 
         # --- Commit block (sticky at the bottom) ---
         self._summary = QLineEdit(self)
@@ -182,11 +259,11 @@ class CommitPanel(QWidget):
         self._commit_button = QPushButton("Commit Changes to 0 File", self)
         self._commit_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._commit_button.setStyleSheet(
-            f"QPushButton {{ background-color: { _GREEN }; color: white; "
+            f"QPushButton {{ background-color: {_GREEN}; color: white; "
             f"border: none; border-radius: 3px; padding: 8px 14px; "
             f"font-weight: 600; font-size: 12px; }} "
-            f"QPushButton:hover {{ background-color: { _GREEN_HOVER }; }} "
-            f"QPushButton:pressed {{ background-color: { _GREEN_PRESSED }; }} "
+            f"QPushButton:hover {{ background-color: {_GREEN_HOVER}; }} "
+            f"QPushButton:pressed {{ background-color: {_GREEN_PRESSED}; }} "
             f"QPushButton:disabled {{ background-color: #2A2A2A; color: #6A6A6A; }}",
         )
         self._commit_button.setEnabled(False)
@@ -212,6 +289,7 @@ class CommitPanel(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
+        outer.addLayout(discard_row)
         outer.addLayout(unstaged_header_row)
         outer.addWidget(self._unstaged_list, stretch=1)
         outer.addLayout(staged_header_row)
@@ -227,13 +305,6 @@ class CommitPanel(QWidget):
         self._vm.commit_summary_changed.connect(self._on_summary_from_vm)
         self._vm.commit_description_changed.connect(self._on_description_from_vm)
         self._vm.selected_file_changed.connect(self._on_selected_file_changed)
-        # Commit-button enabled state depends on the *combined* input
-        # plus the staged set. We refresh the button whenever either
-        # input field changes, in addition to the file-list refreshes
-        # above. The summary/description field handlers call
-        # ``_refresh_commit_button`` directly so we don't need a
-        # separate signal connection here — the file-list refreshes
-        # already call it.
 
     # ----- VM -> UI ---------------------------------------------------
 
@@ -252,11 +323,14 @@ class CommitPanel(QWidget):
 
         n_unstaged = len(unstaged)
         n_staged = len(staged)
+        total_dirty = n_unstaged + n_staged
+
         self._unstaged_expander.setText(f"  Unstaged Files ({n_unstaged})")
         self._staged_expander.setText(f"  Staged Files ({n_staged})")
         self._unstaged_header.setText(f"Unstaged Files ({n_unstaged})")
         self._stage_all_button.setEnabled(n_unstaged > 0)
         self._unstage_all_button.setEnabled(n_staged > 0)
+        self._discard_all_button.setEnabled(total_dirty > 0)
         self._highlight_selected_file()
         self._refresh_commit_button()
 
@@ -300,6 +374,9 @@ class CommitPanel(QWidget):
 
     # ----- UI -> VM ---------------------------------------------------
 
+    def _on_discard_all_clicked(self) -> None:
+        self._main_vm.discard_changes()
+
     def _on_stage_all_clicked(self) -> None:
         self._main_vm.stage_all_unstaged()
 
@@ -312,12 +389,6 @@ class CommitPanel(QWidget):
         self._vm.select_file(None)
 
     def _on_unstaged_index_clicked(self, index: QModelIndex) -> None:
-        """Click on a row in the Unstaged list = show diff for that file.
-
-        Clicking the same file again deselects it and returns the
-        graph view. The *Stage File* hover button is the dedicated
-        way to stage -- this click only previews the diff.
-        """
         change = index.data(FileChangeRole) if index.isValid() else None
         if change is None:
             return
@@ -331,12 +402,6 @@ class CommitPanel(QWidget):
             self._vm.select_file(path)
 
     def _on_staged_index_clicked(self, index: QModelIndex) -> None:
-        """Click on a row in the Staged list = show diff for that file.
-
-        Clicking the same file again deselects it and returns the
-        graph view. The *Unstage File* hover button is the dedicated
-        way to unstage -- this click only previews the diff.
-        """
         change = index.data(FileChangeRole) if index.isValid() else None
         if change is None:
             return
@@ -351,6 +416,64 @@ class CommitPanel(QWidget):
 
     def _on_unstage_all_clicked(self) -> None:
         self._main_vm.unstage_all_staged()
+
+    # ----- context menu handlers --------------------------------------
+
+    def _on_unstaged_context_action(self, action: str, path: str) -> None:
+        if action == "stage":
+            self._main_vm.stage_file(path)
+        elif action == "discard":
+            self._main_vm.discard_file_changes(path)
+        elif action == "ignore":
+            self._main_vm.ignore_pattern(path)
+        elif action == "ignore_dir":
+            parent_dir = _os.path.dirname(path)
+            if parent_dir:
+                self._main_vm.ignore_pattern(parent_dir + "/")
+        elif action == "ignore_parent_dir":
+            parts = path.replace("\\", "/").split("/")
+            if len(parts) >= 2:
+                self._main_vm.ignore_pattern("/".join(parts[:-1]) + "/")
+        elif action == "ignore_ext":
+            _, ext = _os.path.splitext(path)
+            if ext:
+                self._main_vm.ignore_pattern("*" + ext)
+        elif action == "stash":
+            self._main_vm.stash_single_file(path)
+        elif action == "show":
+            self._main_vm.show_in_folder(path)
+        elif action == "copy":
+            self._main_vm.copy_file_path(path)
+        elif action == "delete":
+            self._main_vm.delete_file_from_disk(path)
+
+    def _on_staged_context_action(self, action: str, path: str) -> None:
+        if action == "unstage":
+            self._main_vm.unstage_file(path)
+        elif action == "discard":
+            self._main_vm.discard_file_changes(path)
+        elif action == "ignore":
+            self._main_vm.ignore_pattern(path)
+        elif action == "ignore_dir":
+            parent_dir = _os.path.dirname(path)
+            if parent_dir:
+                self._main_vm.ignore_pattern(parent_dir + "/")
+        elif action == "ignore_parent_dir":
+            parts = path.replace("\\", "/").split("/")
+            if len(parts) >= 2:
+                self._main_vm.ignore_pattern("/".join(parts[:-1]) + "/")
+        elif action == "ignore_ext":
+            _, ext = _os.path.splitext(path)
+            if ext:
+                self._main_vm.ignore_pattern("*" + ext)
+        elif action == "stash":
+            self._main_vm.stash_single_file(path)
+        elif action == "show":
+            self._main_vm.show_in_folder(path)
+        elif action == "copy":
+            self._main_vm.copy_file_path(path)
+        elif action == "delete":
+            self._main_vm.delete_file_from_disk(path)
 
     def _on_selected_file_changed(self, path: str | None) -> None:
         self._highlight_selected_file()
@@ -404,11 +527,17 @@ class FileListView(QListView):
 
     Replaces the old ``FileListWidget`` (``QListWidget`` + per-row
     ``QWidget``) with a pure data model and ``QPainter``-based delegate.
-    Only visible rows are rendered, making it fast even with 28 000 files.
+    Only visible rows are rendered, making it fast even with 28 000 files.
+
+    Provides a right-click context menu with actions forwarded through
+    :attr:`context_action_requested`.
     """
 
     stage_file_requested = Signal(str)
     """Forwarded from :class:`FileListDelegate`."""
+
+    context_action_requested = Signal(str, str)
+    """Emitted with ``(action, path)`` when a context-menu item is chosen."""
 
     def __init__(self, *, staged: bool, parent=None) -> None:
         super().__init__(parent)
@@ -423,6 +552,8 @@ class FileListView(QListView):
         self.setUniformItemSizes(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setFrameShape(QListView.Shape.NoFrame)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_context_menu)
         p = self.palette()
         p.setColor(self.backgroundRole(), QColor("#1E1E1E"))
         self.setPalette(p)
@@ -442,6 +573,106 @@ class FileListView(QListView):
 
     def model(self) -> FileListModel:
         return self._model
+
+    # -- context menu -----------------------------------------------------
+
+    def _on_context_menu(self, position: QPoint) -> None:
+        index = self.indexAt(position)
+        if not index.isValid():
+            return
+        change = index.data(FileChangeRole)
+        if change is None:
+            return
+        path = change.path
+
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background-color: #2D2D30; color: #D4D4D4; border: 1px solid #3F3F46; "
+            "padding: 4px 0; } "
+            "QMenu::item { padding: 6px 24px 6px 12px; } "
+            "QMenu::item:selected { background-color: #094771; } "
+            "QMenu::separator { height: 1px; background: #3F3F46; margin: 3px 8px; }",
+        )
+
+        if self._staged:
+            stage_action = menu.addAction("Unstage")
+            stage_action.triggered.connect(
+                lambda checked=False, p=path: self.context_action_requested.emit("unstage", p),
+            )
+        else:
+            stage_action = menu.addAction("Stage")
+            stage_action.triggered.connect(
+                lambda checked=False, p=path: self.context_action_requested.emit("stage", p),
+            )
+
+        discard_action = menu.addAction("Discard Changes")
+        discard_action.triggered.connect(
+            lambda checked=False, p=path: self.context_action_requested.emit("discard", p),
+        )
+
+        # --- Ignore submenu ---
+        ignore_menu = menu.addMenu("Ignore")
+        ignore_menu.setStyleSheet(menu.styleSheet())
+
+        ignore_file = ignore_menu.addAction(f"Ignore this file ({path})")
+        ignore_file.triggered.connect(
+            lambda checked=False, p=path: self.context_action_requested.emit("ignore", p),
+        )
+
+        # Directory-based ignore options — show up to 2 parent levels.
+        normalized = path.replace("\\", "/")
+        parts = normalized.split("/")
+
+        if len(parts) >= 2:
+            parent_dir = "/".join(parts[:-1]) + "/"
+            ignore_parent = ignore_menu.addAction(f"Ignore /{parent_dir}")
+            ignore_parent.triggered.connect(
+                lambda checked=False, p=path: self.context_action_requested.emit("ignore_dir", p),
+            )
+
+        if len(parts) >= 3:
+            grandparent_dir = "/".join(parts[:-2]) + "/"
+            ignore_grandparent = ignore_menu.addAction(f"Ignore /{grandparent_dir}")
+            ignore_grandparent.triggered.connect(
+                lambda checked=False, p=path: self.context_action_requested.emit(
+                    "ignore_parent_dir", p,
+                ),
+            )
+
+        _, ext = _os.path.splitext(path)
+        if ext:
+            ignore_ext = ignore_menu.addAction(f"Ignore *{ext}")
+            ignore_ext.triggered.connect(
+                lambda checked=False, p=path: self.context_action_requested.emit("ignore_ext", p),
+            )
+
+        menu.addSeparator()
+
+        stash_action = menu.addAction("Stash File")
+        stash_action.triggered.connect(
+            lambda checked=False, p=path: self.context_action_requested.emit("stash", p),
+        )
+
+        menu.addSeparator()
+
+        show_action = menu.addAction("Show in Folder")
+        show_action.triggered.connect(
+            lambda checked=False, p=path: self.context_action_requested.emit("show", p),
+        )
+
+        copy_action = menu.addAction("Copy File Path")
+        copy_action.triggered.connect(
+            lambda checked=False, p=path: self.context_action_requested.emit("copy", p),
+        )
+
+        menu.addSeparator()
+
+        delete_action = menu.addAction("Delete File")
+        delete_action.triggered.connect(
+            lambda checked=False, p=path: self.context_action_requested.emit("delete", p),
+        )
+
+        menu.exec(self.viewport().mapToGlobal(position))
 
     # -- hover forwarding to delegate -------------------------------------
 

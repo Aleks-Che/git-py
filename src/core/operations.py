@@ -1346,10 +1346,152 @@ def discard_changes(
     reset(repo, "HEAD", "hard")
 
 
+def discard_file(
+    repo: RepositoryManager | pygit2.Repository,
+    path: str,
+) -> None:
+    """Discard the uncommitted changes of a single file, restoring it from HEAD.
+
+    Works for both tracked (``git checkout HEAD -- <path>``) and untracked
+    (delete from disk + index) files. Raises :class:`GitError` on failure.
+    """
+    with unwrap(repo) as r:
+        if r.is_bare or r.head_is_unborn:
+            if r.is_bare:
+                raise GitError("Cannot discard a file in a bare repository.")
+            raise GitError("Cannot discard a file: HEAD has no commits yet.")
+        workdir = r.workdir
+        if workdir is None:
+            raise GitError("Cannot discard a file: no working directory.")
+        in_index = path in r.index
+    full_path = Path(workdir) / path
+    if not full_path.exists() and not in_index:
+        return  # nothing to discard
+    git = shutil.which("git")
+    if git is None:
+        raise GitNotInstalledError("`git` CLI is not in PATH; discard requires it.")
+    try:
+        completed = subprocess.run(
+            [git, "checkout", "HEAD", "--", path],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30.0,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise GitError("git checkout timed out after 30s") from exc
+    except OSError as exc:
+        raise GitError(f"Failed to spawn git: {exc}") from exc
+    if completed.returncode != 0:
+        raise GitError(
+            f"Failed to discard {path!r}: "
+            f"{completed.stderr.strip() or completed.stdout.strip()}",
+        )
+
+
+def add_to_gitignore(
+    repo: RepositoryManager | pygit2.Repository,
+    pattern: str,
+) -> None:
+    """Append a pattern to the repository's ``.gitignore`` file.
+
+    Creates the ``.gitignore`` file if it does not exist. The pattern is
+    added on a new line. Raises :class:`GitError` on I/O errors.
+    """
+    with unwrap(repo) as r:
+        workdir = r.workdir
+        if workdir is None:
+            raise GitError("Cannot write .gitignore in a bare repository.")
+    gitignore_path = Path(workdir) / ".gitignore"
+    try:
+        gitignore_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = []
+        if gitignore_path.exists():
+            existing = gitignore_path.read_text(encoding="utf-8").splitlines()
+        if pattern in existing:
+            return  # already ignored
+        with gitignore_path.open("a", encoding="utf-8") as f:
+            f.write(pattern + "\n")
+    except OSError as exc:
+        raise GitError(f"Failed to write .gitignore: {exc}") from exc
+
+
+def delete_file_from_disk(
+    repo: RepositoryManager | pygit2.Repository,
+    path: str,
+) -> None:
+    """Delete a file from disk. Does not stage the deletion.
+
+    Raises :class:`GitError` on I/O errors or if the file does not exist.
+    """
+    with unwrap(repo) as r:
+        workdir = r.workdir
+        if workdir is None:
+            raise GitError("Cannot delete a file in a bare repository.")
+    full_path = Path(workdir) / path
+    if not full_path.exists():
+        raise GitError(f"File not found: {path!r}")
+    try:
+        if full_path.is_dir():
+            shutil.rmtree(full_path)
+        else:
+            full_path.unlink()
+    except OSError as exc:
+        raise GitError(f"Failed to delete {path!r}: {exc}") from exc
+
+
+def apply_file_from_stash(
+    repo: RepositoryManager | pygit2.Repository,
+    stash_sha: str,
+    path: str,
+) -> None:
+    """Apply a single file from a stash commit to the working tree and index.
+
+    Reads the blob for ``path`` from the stash commit's tree, writes it
+    to disk, and stages it. Raises :class:`GitError` on failure.
+    """
+    with unwrap(repo) as r:
+        if r.is_bare:
+            raise GitError("Cannot apply stash file in a bare repository.")
+        workdir = r.workdir
+        if workdir is None:
+            raise GitError("Cannot apply stash file: no working directory.")
+        try:
+            oid = pygit2.Oid(hex=stash_sha)
+            commit = r.get(oid)
+            if commit is None:
+                raise GitError(f"Unknown stash commit: {stash_sha[:8]!r}")
+        except (KeyError, pygit2.GitError, ValueError) as exc:
+            raise GitError(f"Unknown stash commit: {stash_sha[:8]!r}") from exc
+        tree = commit.tree
+        try:
+            entry = tree[path]
+        except KeyError as exc:
+            raise GitError(f"Path {path!r} not found in stash {stash_sha[:8]!r}") from exc
+        blob = r.get(entry.id)
+        if blob is None:
+            raise GitError(f"Cannot read blob for {path!r} in stash")
+    full_path = Path(workdir) / path
+    try:
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_bytes(blob.data)
+    except OSError as exc:
+        raise GitError(f"Failed to write {path!r}: {exc}") from exc
+    with unwrap(repo) as r:
+        try:
+            r.index.add(path)
+            r.index.write()
+        except (pygit2.GitError, KeyError) as exc:
+            raise GitError(f"Failed to stage {path!r} after apply: {exc}") from exc
+
+
 __all__ = [
     "abort_merge",
     "abort_rebase",
     "add_remote",
+    "add_to_gitignore",
+    "apply_file_from_stash",
     "cherry_pick",
     "checkout_branch",
     "checkout_commit",
@@ -1358,7 +1500,9 @@ __all__ = [
     "complete_rebase_continue",
     "create_branch",
     "delete_branch",
+    "delete_file_from_disk",
     "discard_changes",
+    "discard_file",
     "fetch",
     "is_merge_in_progress",
     "is_rebase_in_progress",

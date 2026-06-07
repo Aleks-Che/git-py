@@ -610,6 +610,114 @@ class MainViewModel(QObject):
         self._refresh_all_views()
         self._log("discard", "All changes discarded")
 
+    def discard_file_changes(self, path: str) -> None:
+        """Discard uncommitted changes for a single file via :class:`DiscardFileCommand`.
+
+        Refreshes the commit panel on success so the unstaged/staged
+        lists reflect the restored file.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        if self._is_busy:
+            self.error_occurred.emit("Another operation is already in progress.")
+            return
+        from src.viewmodels.commands import DiscardFileCommand
+
+        self._log("discard", f"Discarding changes for {path!r}")
+        command = DiscardFileCommand(self._repo_manager, path)
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("discard", f"Discard {path!r} failed: {exc}", level="error")
+            return
+        self._commit_panel_view_model.refresh_status()
+        self._log("discard", f"Changes for {path!r} discarded")
+
+    def stash_single_file(self, path: str) -> None:
+        """Stash a single file via :class:`StashSingleFileCommand`."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        if self._is_busy:
+            self.error_occurred.emit("Another operation is already in progress.")
+            return
+        from src.viewmodels.commands import StashSingleFileCommand
+
+        self._log("stash", f"Stashing single file {path!r}")
+        command = StashSingleFileCommand(self._repo_manager, path)
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("stash", f"Stash {path!r} failed: {exc}", level="error")
+            return
+        self._refresh_all_views()
+        self._log("stash", f"File {path!r} stashed")
+
+    def ignore_pattern(self, pattern: str) -> None:
+        """Add a pattern to ``.gitignore`` via :class:`IgnoreCommand`."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        from src.viewmodels.commands import IgnoreCommand
+
+        self._log("gitignore", f"Adding ignore pattern {pattern!r}")
+        command = IgnoreCommand(self._repo_manager, pattern)
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("gitignore", f"Add ignore {pattern!r} failed: {exc}", level="error")
+            return
+        self._commit_panel_view_model.refresh_status()
+        self._log("gitignore", f"Pattern {pattern!r} added to .gitignore")
+
+    def delete_file_from_disk(self, path: str) -> None:
+        """Delete a file from disk; refreshes the commit panel after."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        self._log("file", f"Deleting {path!r} from disk")
+        try:
+            from src.core.operations import delete_file_from_disk as _delete
+            _delete(self._repo_manager, path)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("file", f"Delete {path!r} failed: {exc}", level="error")
+            return
+        self._commit_panel_view_model.refresh_status()
+        self._log("file", f"Deleted {path!r}")
+
+    def show_in_folder(self, path: str) -> None:
+        """Open the file explorer at ``path`` (or its parent folder)."""
+        import os as _os
+        import subprocess as _sp
+
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            return
+        workdir = self._repo_manager.repo.workdir
+        if workdir is None:
+            return
+        full_path = _os.path.join(workdir, path)
+        if not _os.path.exists(full_path):
+            full_path = _os.path.dirname(full_path)
+        if not _os.path.exists(full_path):
+            return
+        try:
+            _sp.Popen(["explorer", "/select,", _os.path.normpath(full_path)])
+        except Exception:
+            pass
+
+    def copy_file_path(self, path: str) -> None:
+        """Copy ``path`` to the system clipboard."""
+        from PySide6.QtWidgets import QApplication
+
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(path)
+
     # ----- branch commands ---------------------------------------------
 
     def checkout_branch(self, name: str) -> bool:
@@ -1396,6 +1504,35 @@ class MainViewModel(QObject):
         self._refresh_all_views()
         self._log("stash", "Stash staged succeeded")
         return True
+
+    def is_stash_sha(self, sha: str) -> bool:
+        """Return ``True`` if ``sha`` corresponds to a stash entry."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            return False
+        stash_list = self._repo_manager.stash_list
+        return any(s.sha == sha for s in stash_list)
+
+    def apply_stash_file(self, stash_sha: str, path: str) -> None:
+        """Apply a single file from the stash identified by ``stash_sha``.
+
+        Reads the file's content from the stash commit and writes it to
+        the working tree. The file is also staged so the user can review
+        and commit it.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        from src.core.operations import apply_file_from_stash
+
+        self._log("stash", f"Apply file {path!r} from stash {stash_sha[:8]!r}")
+        try:
+            apply_file_from_stash(self._repo_manager, stash_sha, path)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("stash", f"Apply stash file {path!r} failed: {exc}", level="error")
+            return
+        self._commit_panel_view_model.refresh_status()
+        self._log("stash", f"Applied {path!r} from stash {stash_sha[:8]!r}")
 
     # ----- remotes: push / pull / fetch / add / remove / clone ---------
 

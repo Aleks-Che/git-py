@@ -23,6 +23,7 @@ from PySide6.QtCore import QObject, Signal
 from src.core.operations import (
     abort_rebase,
     add_remote,
+    add_to_gitignore,
     checkout_branch,
     checkout_commit,
     cherry_pick,
@@ -30,6 +31,7 @@ from src.core.operations import (
     create_branch,
     delete_branch,
     discard_changes,
+    discard_file,
     fetch,
     is_rebase_in_progress,
     list_remotes,
@@ -1038,6 +1040,122 @@ class StashPushStagedCommand(GitCommand):
         return "stash push (staged only)"
 
 
+class DiscardFileCommand(GitCommand):
+    """Discard uncommitted changes for a single file, restoring it from HEAD.
+
+    On :meth:`execute`, the current content of ``path`` is stashed (to
+    support undo) and then the file is restored from HEAD via
+    :func:`discard_file`. On :meth:`undo`, the stashed entry is popped,
+    returning the file to the state before the discard.
+    """
+
+    def __init__(self, repo: RepositoryManager, path: str) -> None:
+        self._repo = repo
+        self._path = path
+        self._captured_oid: str | None = None
+
+    def execute(self) -> None:
+        from src.core.repository import unwrap
+
+        with unwrap(self._repo) as r:
+            if r.is_bare or r.head_is_unborn:
+                return
+        dirty = bool(self._repo.repo.status().get(self._path))
+        if not dirty:
+            discard_file(self._repo, self._path)
+            return
+        oid = stash_push(
+            self._repo,
+            message=f"WIP (discard backup): {self._path}",
+            paths=[self._path],
+        )
+        if oid is not None:
+            self._captured_oid = oid
+        discard_file(self._repo, self._path)
+
+    def undo(self) -> None:
+        if self._captured_oid is None:
+            return
+        try:
+            restore_stash(self._repo, self._captured_oid, f"WIP (restored): {self._path}")
+            stash_pop(self._repo, 0)
+        except Exception:
+            pass
+
+    @property
+    def name(self) -> str:
+        return f"discard {self._path}"
+
+
+class StashSingleFileCommand(GitCommand):
+    """Stash changes for a single file; undo via :func:`stash_pop`."""
+
+    def __init__(self, repo: RepositoryManager, path: str) -> None:
+        self._repo = repo
+        self._path = path
+        self._pushed_oid: str | None = None
+
+    def execute(self) -> None:
+        self._pushed_oid = stash_push(
+            self._repo,
+            message=f"WIP: {self._path}",
+            paths=[self._path],
+        )
+
+    def undo(self) -> None:
+        if self._pushed_oid is None:
+            return
+        try:
+            stash_pop(self._repo, 0)
+        except Exception:
+            pass
+
+    @property
+    def name(self) -> str:
+        return f"stash {self._path}"
+
+
+class IgnoreCommand(GitCommand):
+    """Add a pattern to ``.gitignore``; undo removes the last line.
+
+    This is a best-effort undo — if ``.gitignore`` has been modified
+    concurrently the undo may not be correct.
+    """
+
+    def __init__(self, repo: RepositoryManager, pattern: str) -> None:
+        self._repo = repo
+        self._pattern = pattern
+
+    def execute(self) -> None:
+        add_to_gitignore(self._repo, self._pattern)
+
+    def undo(self) -> None:
+        from pathlib import Path
+
+        from src.core.repository import unwrap
+
+        with unwrap(self._repo) as r:
+            workdir = r.workdir
+            if workdir is None:
+                return
+        gitignore_path = Path(workdir) / ".gitignore"
+        if not gitignore_path.exists():
+            return
+        try:
+            lines = gitignore_path.read_text(encoding="utf-8").splitlines()
+            if lines and lines[-1] == self._pattern:
+                gitignore_path.write_text(
+                    "\n".join(lines[:-1]) + ("\n" if len(lines) > 1 else ""),
+                    encoding="utf-8",
+                )
+        except OSError:
+            pass
+
+    @property
+    def name(self) -> str:
+        return f"ignore {self._pattern}"
+
+
 class DiscardChangesCommand(GitCommand):
     """Discard all uncommitted changes (index + workdir) in the working tree.
 
@@ -1092,8 +1210,10 @@ __all__ = [
     "CreateBranchCommand",
     "DeleteBranchCommand",
     "DiscardChangesCommand",
+    "DiscardFileCommand",
     "FetchCommand",
     "GitCommand",
+    "IgnoreCommand",
     "MergeCommand",
     "PullCommand",
     "PushCommand",
@@ -1106,4 +1226,5 @@ __all__ = [
     "StashPopCommand",
     "StashPushCommand",
     "StashPushStagedCommand",
+    "StashSingleFileCommand",
 ]
