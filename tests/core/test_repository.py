@@ -272,3 +272,64 @@ def test_repo_property_raises_when_closed(tmp_git_repo: Path) -> None:
     mgr = RepositoryManager()
     with pytest.raises(GitError, match="No repository is open"):
         _ = mgr.repo
+
+
+# ----- remote branch interleaved walk ---------------------------------------
+
+
+def test_get_all_history_includes_remote_only_commits(
+    committed_repo: RepositoryManager,
+    tmp_git_repo: Path,
+) -> None:
+    """Commits only reachable from a remote-tracking ref must appear
+    even when local branches already fill the max_count budget."""
+    repo = committed_repo.repo
+    init_sha = committed_repo.get_history()[-1].sha
+    ip = pygit2.Oid(bytes.fromhex(init_sha))
+    sig = pygit2.Signature("tester", "tester@example.com", int(time.time()), 0)
+    builder = repo.TreeBuilder(repo[ip].tree)
+    tree_oid = builder.write()
+    feature_sha = repo.create_commit(None, sig, sig, "feat: remote-only", tree_oid, [ip])
+    repo.references.create(
+        "refs/remotes/origin/feature",
+        feature_sha,
+        force=True,
+    )
+    history = committed_repo.get_all_history(max_count=3)
+    shas = {c.sha for c in history}
+    assert str(feature_sha) in shas
+
+
+def test_get_all_history_remote_walk_is_interleaved(
+    committed_repo: RepositoryManager, make_commit,
+    tmp_git_repo: Path,
+) -> None:
+    """Walk from many local tips first, then a remote tip — the remote tip's
+    unique commit must still be collected (interleaved walk)."""
+    init_sha = committed_repo.get_history()[-1].sha
+    ip = pygit2.Oid(bytes.fromhex(init_sha))
+    # Create several local branches with many commits to saturate max_count.
+    sig = pygit2.Signature("tester", "tester@example.com", int(time.time()), 0)
+    builder = committed_repo.repo.TreeBuilder(committed_repo.repo[ip].tree)
+    tree_oid = builder.write()
+    tip = committed_repo.repo.create_commit("refs/heads/local-a", sig, sig, "a", tree_oid, [ip])
+    for _ in range(5):
+        builder = committed_repo.repo.TreeBuilder(committed_repo.repo[tip].tree)
+        tree_oid = builder.write()
+        tip = committed_repo.repo.create_commit(
+            "refs/heads/local-a", sig, sig, "a", tree_oid, [tip],
+        )
+
+    # Remote-only commit on a different branch.
+    remote_sha = committed_repo.repo.create_commit(
+        None, sig, sig, "remote-only", tree_oid, [ip],
+    )
+    committed_repo.repo.references.create(
+        "refs/remotes/origin/remote-only",
+        remote_sha,
+        force=True,
+    )
+
+    history = committed_repo.get_all_history(max_count=5)
+    shas = {c.sha for c in history}
+    assert str(remote_sha) in shas, "Remote-only commit was starved by local tips"

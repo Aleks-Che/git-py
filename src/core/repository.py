@@ -201,11 +201,10 @@ class RepositoryManager:
                 ),
             )
         for name in self.repo.branches.remote:
-            branch = self.repo.lookup_branch(name, pygit2.enums.BranchType.REMOTE)
-            # ``upstream_name`` is a local-branch-only property; remote
-            # branches raise ``ValueError`` if you call it. The remote
-            # branch's own name (e.g. "origin/main") is the most useful
-            # upstream identifier we have.
+            try:
+                branch = self.repo.lookup_branch(name, pygit2.enums.BranchType.REMOTE)
+            except (KeyError, ValueError) as exc:
+                raise GitError(f"Broken remote-tracking ref {name!r}: {exc}") from exc
             try:
                 upstream: str | None = branch.upstream_name
             except (ValueError, AttributeError):
@@ -350,42 +349,57 @@ class RepositoryManager:
         deduplicate by SHA, then re-sort the merged set by commit time,
         newest first.
 
+        Tip walks are interleaved (one commit per tip per round) so
+        remote-only commits are never starved when local branches
+        already fill the budget.
+
         Returns an empty list if the repository has no commits.
-        ``max_count`` caps the total; we stop as soon as it is reached
-        (no fancy top-K across walks).
+        ``max_count`` caps the total.
         """
         if max_count <= 0 or self.repo.head_is_unborn:
             return []
-        tip_oids: set[pygit2.Oid] = set()
+        tip_oids: list[pygit2.Oid] = []
         for name in self.repo.branches.local:
             branch = self.repo.lookup_branch(name)
             if branch.target is not None:
-                tip_oids.add(branch.target)
+                tip_oids.append(branch.target)
         for name in self.repo.branches.remote:
             try:
                 ref = self.repo.lookup_reference(f"refs/remotes/{name}")
             except (KeyError, ValueError):
                 continue
             if ref.target is not None and isinstance(ref.target, pygit2.Oid):
-                tip_oids.add(ref.target)
+                tip_oids.append(ref.target)
         for ref_name in self.repo.references:
             if not ref_name.startswith("refs/tags/"):
                 continue
             ref = self.repo.lookup_reference(ref_name)
-            tip_oids.add(ref.target)
+            tip_oids.append(ref.target)
         seen: set[str] = set()
         collected: list[pygit2.Commit] = []
+
+        walkers: list[tuple[pygit2.Oid, Iterator[pygit2.Commit]]] = []
         for tip in tip_oids:
-            for commit in self.repo.walk(tip, pygit2.GIT_SORT_TIME):
+            walkers.append((tip, iter(self.repo.walk(tip, pygit2.GIT_SORT_TIME))))
+
+        while walkers and len(collected) < max_count:
+            remaining: list[tuple[pygit2.Oid, Iterator[pygit2.Commit]]] = []
+            for tip, it in walkers:
+                try:
+                    commit = next(it)
+                except StopIteration:
+                    continue
                 sha = str(commit.id)
                 if sha in seen:
+                    remaining.append((tip, it))
                     continue
                 seen.add(sha)
                 collected.append(commit)
+                remaining.append((tip, it))
                 if len(collected) >= max_count:
                     break
-            if len(collected) >= max_count:
-                break
+            walkers = remaining
+
         collected.sort(key=lambda c: -c.commit_time)
         return [self._to_commit_info(c) for c in collected]
 

@@ -498,18 +498,27 @@ class GraphTableWidget(QWidget):
         if avail_w < 40:
             return
 
-        commit_color = QColor(row_data["color"])
+        local_names: set[str] = {
+            b["name"] for b in branch_refs if not b.get("is_remote")
+        }
+
         chip_text_color = QColor("#FFFFFF")
         cursor_x = col_left + 6
 
         for branch in branch_refs:
             is_head = branch.get("is_head")
             is_remote = branch.get("is_remote")
-            display = branch["name"]
+            name = branch["name"]
+
             if is_remote:
-                parts = display.split("/", 1)
-                if len(parts) == 2:
-                    display = parts[1]
+                parts = name.split("/", 1)
+                if len(parts) == 2 and parts[1] in local_names:
+                    continue
+                display = name
+            else:
+                display = name
+
+            branch_color = QColor(branch.get("color") or row_data["color"])
 
             reserved = (
                 pad * 2 + (icon_size + gap if is_head else 0)
@@ -529,13 +538,17 @@ class GraphTableWidget(QWidget):
                 content_w += gap + icon_size
             content_w += gap + avatar_size + pad
 
-            # Высота подложки ветки = диаметр ноды коммита
             chip_h = self._cfg.node_radius * 2
             chip_top = y_center - chip_h / 2
 
             chip_path = QPainterPath()
             chip_path.addRoundedRect(cursor_x, chip_top, content_w, chip_h, 4, 4)
-            painter.fillPath(chip_path, QBrush(commit_color))
+            if is_remote:
+                painter.fillPath(chip_path, QBrush(QColor(0, 0, 0, 0)))
+                painter.setPen(QPen(branch_color, 1.2))
+                painter.drawPath(chip_path)
+            else:
+                painter.fillPath(chip_path, QBrush(branch_color))
 
             inner_x = cursor_x + pad
             inner_cy = y_center
@@ -550,7 +563,10 @@ class GraphTableWidget(QWidget):
                 painter.drawPath(ck)
                 inner_x += icon_size + gap
 
-            painter.setPen(QPen(chip_text_color))
+            if is_remote:
+                painter.setPen(QPen(branch_color))
+            else:
+                painter.setPen(QPen(chip_text_color))
             painter.setFont(self.font())
             text_y = inner_cy + text_h / 2 - fm.descent()
             painter.drawText(int(inner_x), int(text_y), display)

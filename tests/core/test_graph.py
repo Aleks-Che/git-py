@@ -15,6 +15,8 @@ import pygit2
 from src.core.graph import (
     BRANCH_PALETTE,
     GraphNode,
+    _assign_branch_colors,
+    _assign_lanes,
     compute_layout,
     nodes_to_rows,
 )
@@ -133,6 +135,26 @@ def test_refs_include_head_and_branch_refs_hold_branches() -> None:
     assert nodes[0].branch_refs[0].name == "main"
     assert nodes[0].branch_refs[0].is_head is True
     assert nodes[0].branch_refs[0].is_remote is False
+    # Per-branch lane and colour are populated.
+    assert nodes[0].branch_refs[0].lane == 0
+    assert nodes[0].branch_refs[0].color == BRANCH_PALETTE[0]
+
+
+def test_branch_refs_have_distinct_colors() -> None:
+    sha = "a" * 40
+    history = [_commit_info(sha, ts=1)]
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha=sha),
+        BranchInfo(name="feature", is_head=False, target_sha=sha),
+        BranchInfo(name="origin/main", is_head=False, is_remote=True, target_sha=sha),
+    ]
+    nodes = compute_layout(history, branches, [], head_target_sha=sha, head_shorthand="main")
+    refs = nodes[0].branch_refs
+    # All three branches share the same commit but get distinct colours.
+    assert len({b.color for b in refs}) == 3
+    assert refs[0].color != refs[1].color != refs[2].color
+    # They share the same lane (same tip SHA).
+    assert refs[0].lane == refs[1].lane == refs[2].lane
 
 
 def test_branch_refs_order_matches_input() -> None:
@@ -463,3 +485,118 @@ def test_display_column_defaults_to_lane_when_uncompacted() -> None:
     nodes = compute_layout(history, [], [], None, None, max_columns=12)
     assert nodes[0].display_column == 0
     assert nodes[0].lane == 0
+
+
+# ----- per-branch colour and lane assignment ----------------------------
+
+
+def test_assign_branch_colors_cycles_palette() -> None:
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha="a" * 40),
+        BranchInfo(name="feature", is_head=False, target_sha="b" * 40),
+        BranchInfo(name="origin/main", is_head=False, is_remote=True, target_sha="a" * 40),
+        BranchInfo(name="origin/feature", is_head=False, is_remote=True, target_sha="c" * 40),
+    ]
+    colors = _assign_branch_colors(branches, head_target_sha="a" * 40)
+    # HEAD's branch gets palette[0].
+    assert colors["main"] == BRANCH_PALETTE[0]
+    # Other locals come next.
+    assert colors["feature"] == BRANCH_PALETTE[1]
+    # Remote branches follow.
+    assert colors["origin/main"] == BRANCH_PALETTE[2]
+    assert colors["origin/feature"] == BRANCH_PALETTE[3]
+
+
+def test_assign_branch_colors_remote_at_same_sha_gets_distinct_color() -> None:
+    """Local and remote branches at the same SHA get different colours."""
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha="a" * 40),
+        BranchInfo(name="origin/main", is_head=False, is_remote=True, target_sha="a" * 40),
+    ]
+    colors = _assign_branch_colors(branches, head_target_sha="a" * 40)
+    assert colors["main"] == BRANCH_PALETTE[0]
+    assert colors["origin/main"] == BRANCH_PALETTE[1]
+    assert colors["main"] != colors["origin/main"]
+
+
+def test_assign_lanes_returns_branch_lanes_for_all_branches() -> None:
+    """_assign_lanes returns branch_lane dict that covers every branch name."""
+    sha_a, sha_b = "a" * 40, "b" * 40
+    history = [
+        _commit_info(sha_b, parents=[sha_a], ts=2),
+        _commit_info(sha_a, ts=1),
+    ]
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha=sha_b),
+        BranchInfo(name="origin/main", is_head=False, is_remote=True, target_sha=sha_b),
+    ]
+    lane_of, branch_lane = _assign_lanes(history, branches, head_target_sha=sha_b)
+    assert "main" in branch_lane
+    assert "origin/main" in branch_lane
+    # Both share the same commit SHA, so they share the same lane.
+    assert branch_lane["main"] == branch_lane["origin/main"]
+
+
+def test_assign_lanes_remote_only_branch_gets_own_lane() -> None:
+    """A remote branch at a distinct SHA gets its own lane."""
+    sha_a, sha_b, sha_c = "a" * 40, "b" * 40, "c" * 40
+    history = [
+        _commit_info(sha_c, parents=[sha_a], ts=3),
+        _commit_info(sha_b, parents=[sha_a], ts=2),
+        _commit_info(sha_a, ts=1),
+    ]
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha=sha_b),
+        BranchInfo(name="origin/feature", is_head=False, is_remote=True, target_sha=sha_c),
+    ]
+    lane_of, branch_lane = _assign_lanes(history, branches, head_target_sha=sha_b)
+    assert branch_lane["main"] != branch_lane["origin/feature"]
+
+
+def test_assign_lanes_detached_head_with_remote_branch() -> None:
+    """Detached HEAD gets a lane; a remote branch at a different SHA gets its own."""
+    sha_a, sha_b = "a" * 40, "b" * 40
+    history = [
+        _commit_info(sha_b, parents=[sha_a], ts=2),
+        _commit_info(sha_a, ts=1),
+    ]
+    branches = [
+        BranchInfo(name="origin/main", is_head=False, is_remote=True, target_sha=sha_b),
+    ]
+    lane_of, branch_lane = _assign_lanes(history, branches, head_target_sha=sha_a)
+    assert "origin/main" in branch_lane
+    # HEAD gets lane 0 (detached, synthesised from head_target_sha).
+    assert branch_lane["origin/main"] >= 0
+
+
+def test_graphnode_to_dict_includes_branch_ref_lane_color() -> None:
+    """to_dict() serialises branch_ref's lane and color fields."""
+    from src.core.graph import BranchRef
+    node = GraphNode(
+        sha="a" * 40,
+        short_sha="abcdefg",
+        subject="hello",
+        author_name="tester",
+        author_email="t@example.com",
+        author_time=123,
+        parents=["b" * 40],
+        refs=["HEAD"],
+        branch_refs=[
+            BranchRef(name="main", is_head=True, is_remote=False, lane=0, color="#ff0000"),
+            BranchRef(name="origin/main", is_head=False, is_remote=True, lane=0, color="#00ff00"),
+        ],
+        lane=0,
+        display_column=0,
+        color="#ff0000",
+        row=0,
+        kind="commit",
+    )
+    d = node.to_dict()
+    assert d["branch_refs"][0] == {
+        "name": "main", "is_head": True, "is_remote": False,
+        "lane": 0, "color": "#ff0000",
+    }
+    assert d["branch_refs"][1] == {
+        "name": "origin/main", "is_head": False, "is_remote": True,
+        "lane": 0, "color": "#00ff00",
+    }

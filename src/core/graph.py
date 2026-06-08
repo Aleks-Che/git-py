@@ -71,11 +71,17 @@ class BranchRef:
     ``True`` for remote-tracking refs (``origin/main`` and friends);
     local branches have it ``False``. The widget uses these flags
     to choose which decoration to draw next to the branch name.
+
+    ``lane`` and ``color`` carry branch-level display properties so
+    that remote-tracking refs can be rendered with their own lane
+    line and colour independently of the commit they point at.
     """
 
     name: str
     is_head: bool
     is_remote: bool
+    lane: int = 0
+    color: str = ""
 
     def to_dict(self) -> dict:
         """Serialise to a plain dict (safe for Qt signal payload)."""
@@ -83,6 +89,8 @@ class BranchRef:
             "name": self.name,
             "is_head": self.is_head,
             "is_remote": self.is_remote,
+            "lane": self.lane,
+            "color": self.color,
         }
 
 
@@ -163,20 +171,17 @@ def compute_layout(
         return []
 
     refs_by_sha = _build_refs_map(branches, tags, head_target_sha, head_shorthand)
-    branch_refs_by_sha = _build_branch_refs_map(branches)
+    branch_lanes_dict: dict[str, int]
+    branch_colors_dict: dict[str, str]
+    lanes, branch_lanes_dict = _assign_lanes(history, branches, head_target_sha)
     branch_tips = {b.target_sha for b in branches if b.target_sha}
-    lanes = _assign_lanes(history, branches, head_target_sha)
     colors = _assign_colors(history, branch_tips)
+    branch_colors_dict = _assign_branch_colors(branches, head_target_sha)
+    branch_refs_by_sha = _build_branch_refs_map(
+        branches, branch_lanes_dict, branch_colors_dict,
+    )
     column_of_lane = _compact_lanes(history, lanes, max_columns)
 
-    # Build per-row "rightmost non-stash column".  Unlike a single
-    # global rightmost, this lets stashes that are far away from a
-    # branch use its column when it no longer interferes visually.
-    #
-    # A proximity zone (+-ZONE rows) is added around each non-stash
-    # lane so stashes sitting just above or below the branch (where
-    # they would appear connected by a vertical edge) still avoid
-    # that column.  Stashes far outside the zone get no extra shift.
     _zone = 3
 
     stash_groups: list[list[int]] = []
@@ -218,13 +223,8 @@ def compute_layout(
             if col > row_rightmost[row]:
                 row_rightmost[row] = col
 
-    # Assign per-stash display_column without touching column_of_lane,
-    # so real-branch commits that share a lane with a stash keep their
-    # own column.
     stash_col: dict[str, int] = {}
     for group in stash_groups:
-        # Stash at the very top of the graph (row 0, no commits or
-        # WIP above it) sits on the parent's own line — no offset.
         if group[0] == 0:
             first = history[0]
             if first.parents:
@@ -275,6 +275,7 @@ def compute_layout(
                 kind=getattr(commit, "kind", "commit"),
             ),
         )
+
     return nodes
 
 
@@ -324,6 +325,8 @@ def _build_refs_map(
 
 def _build_branch_refs_map(
     branches: list[BranchInfo],
+    branch_lanes: dict[str, int],
+    branch_colors: dict[str, str],
 ) -> dict[str, list[BranchRef]]:
     """Map commit SHA -> ordered list of :class:`BranchRef` for the widget.
 
@@ -332,6 +335,11 @@ def _build_branch_refs_map(
     carries ``is_head=True``; remote-tracking refs carry
     ``is_remote=True``. Within each group the original input order
     is preserved so the column renders predictably.
+
+    Each :class:`BranchRef` receives its own ``lane`` and ``color``
+    from *branch_lanes* and *branch_colors* so the widget can render
+    branch-specific lane lines and chip colours independently of the
+    commit they point at.
     """
     result: dict[str, list[BranchRef]] = {}
     for branch in branches:
@@ -342,6 +350,8 @@ def _build_branch_refs_map(
                 name=branch.name,
                 is_head=branch.is_head,
                 is_remote=branch.is_remote,
+                lane=branch_lanes.get(branch.name, 0),
+                color=branch_colors.get(branch.name, BRANCH_PALETTE[0]),
             ),
         )
     return result
@@ -386,50 +396,47 @@ def _assign_lanes(
     history: list[CommitInfo],
     branches: list[BranchInfo],
     head_target_sha: str | None,
-) -> dict[str, int]:
-    """Return ``sha -> lane`` for every commit in ``history``.
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Return ``(sha -> primary_lane, branch_name -> branch_lane)``.
 
-    See the module docstring for the two-phase algorithm. Limitations
-    accepted for Stage 2:
-
-    * Only the **first** parent is followed during the priority walk.
-      A merge's other parents get their lane from whichever branch
-      later claims them (or from the orphan walk).
-    * If a branch's tip is reachable only through a second parent
-      of a merge (i.e. that branch has never been on lane 0 itself),
-      the priority walk will still follow the first parent down and
-      the branch gets a higher lane number — which is the right
-      visual outcome.
+    Each branch tip is assigned a lane. When a branch's tip SHA is
+    already claimed by a higher-priority branch, it shares that same
+    lane rather than opening a new one. The branch still appears in
+    ``branch_lane`` so the widget can find its lane position.
     """
     if not history:
-        return {}
+        return {}, {}
 
     lane_of: dict[str, int] = {}
+    branch_lane: dict[str, int] = {}
     commits_by_sha = {c.sha: c for c in history}
     next_lane = 0
 
-    # Phase 1: priority walk, first-parent only.
-    for tip in _priority_tips(branches, head_target_sha):
-        if tip.target_sha in lane_of:
+    tips = _priority_tips(branches, head_target_sha)
+
+    for tip in tips:
+        sha = tip.target_sha
+
+        if sha in lane_of:
+            branch_lane[tip.name] = lane_of[sha]
             continue
+
         my_lane = next_lane
         next_lane += 1
-        stack = [tip.target_sha]
+        branch_lane[tip.name] = my_lane
+        lane_of[sha] = my_lane
+        stack = [sha]
         while stack:
-            sha = stack.pop()
-            if sha in lane_of:
+            cur = stack.pop()
+            if cur in lane_of:
                 continue
-            commit = commits_by_sha.get(sha)
+            commit = commits_by_sha.get(cur)
             if commit is None:
                 continue
-            lane_of[sha] = my_lane
+            lane_of[cur] = my_lane
             if commit.parents:
                 stack.append(commit.parents[0])
 
-    # Phase 2: orphan walk (commits no branch reached). Process
-    # oldest-first and use the "first available lane" rule.
-    # Stash entries always get their own lane so they render as
-    # dead-end branches forking off their parent commit.
     lane_last_commit: list[str | None] = []
     for commit in reversed(history):
         if commit.sha in lane_of:
@@ -459,7 +466,7 @@ def _assign_lanes(
         lane_last_commit[my_lane] = commit.sha
         lane_of[commit.sha] = my_lane
 
-    return lane_of
+    return lane_of, branch_lane
 
 
 def _first_free_lane(lane_last_commit: list[str | None]) -> int:
@@ -481,7 +488,7 @@ def _assign_colors(
     **down** the first-parent chain from each tip so that every
     ancestor on the same lineage inherits the branch colour. Earlier
     tips (lower palette index) take precedence — once a commit has a
-    colour it is never overwritten. CommitWith no branch tip and
+    colour it is never overwritten. Commits with no branch tip and
     whose first parent is already coloured inherit that colour in a
     final oldest-first pass.
     """
@@ -489,7 +496,6 @@ def _assign_colors(
     commits_by_sha = {c.sha: c for c in history}
     palette_idx = 0
 
-    # Pass 1: assign colours to branch tips.
     tips_in_order: list[str] = []
     for commit in history:
         if commit.sha in branch_tips:
@@ -497,8 +503,6 @@ def _assign_colors(
             tips_in_order.append(commit.sha)
             palette_idx += 1
 
-    # Pass 2: walk down each tip's first-parent chain. Lower-index
-    # tips (earlier in the palette) have priority.
     for tip_sha in tips_in_order:
         tip_color = color_of[tip_sha]
         sha: str | None = tip_sha
@@ -511,9 +515,6 @@ def _assign_colors(
                 color_of[parent_sha] = tip_color
             sha = parent_sha
 
-    # Pass 3: back-fill any remaining uncoloured commits by
-    # inheriting from their first parent (oldest-first so the parent
-    # is already resolved). Root orphans get ``BRANCH_PALETTE[0]``.
     for commit in reversed(history):
         if commit.sha in color_of:
             continue
@@ -523,6 +524,24 @@ def _assign_colors(
             color_of[commit.sha] = BRANCH_PALETTE[0]
 
     return color_of
+
+
+def _assign_branch_colors(
+    branches: list[BranchInfo],
+    head_target_sha: str | None,
+) -> dict[str, str]:
+    """Return ``branch_name -> hex color`` so each branch has a unique colour.
+
+    Branches are ordered by priority (HEAD, locals, remotes — via
+    :func:`_priority_tips`) and each is assigned the next palette
+    colour. Every branch tip gets its own colour, even when two
+    branches point to the same commit SHA.
+    """
+    tips = _priority_tips(branches, head_target_sha)
+    result: dict[str, str] = {}
+    for i, tip in enumerate(tips):
+        result[tip.name] = BRANCH_PALETTE[i % len(BRANCH_PALETTE)]
+    return result
 
 
 def _compact_lanes(
