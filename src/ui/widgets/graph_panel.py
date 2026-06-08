@@ -382,10 +382,12 @@ class GraphTableWidget(QWidget):
     def _draw_cells(self, painter: QPainter, header_h: int) -> None:
         """Draw the graph using cell data from each row."""
         dh = self._cfg.row_height
-        r = self._cfg.node_radius
-        ew = self._cfg.edge_width
+        nr = self._cfg.node_radius
+        ew = max(3, self._cfg.edge_width)
         col_cx = self._column_center_x()
-        lane_w = self._cfg.node_radius * 2 + 8
+        lane_w = nr * 2 + 8
+
+        prev_occupied: set[int] = set()
 
         for row_idx, row_data in enumerate(self._rows):
             y = self._row_y(row_idx)
@@ -394,7 +396,38 @@ class GraphTableWidget(QWidget):
                 continue
 
             cells = row_data.get("cells", [])
-            _draw_cell_row(painter, cells, col_cx, lane_w, y_center, r, ew)
+            lane = row_data.get("lane", 0)
+
+            cur_occupied: set[int] = set()
+            for ci, cell in enumerate(cells):
+                if cell.get("t", _T_EMPTY) != _T_EMPTY:
+                    cur_occupied.add(ci // 2)
+            if row_data.get("commit") is not None or row_data.get("is_uncommitted"):
+                cur_occupied.add(lane)
+
+            if row_idx > 0:
+                prev_y_center = self._row_y(row_idx - 1) + dh / 2
+                common = prev_occupied & cur_occupied
+                for li in common:
+                    x = self._lane_x(li, col_cx, lane_w)
+                    clr_idx = 0
+                    for ci, cell in enumerate(cells):
+                        if ci // 2 == li and cell.get("t", _T_EMPTY) != _T_EMPTY:
+                            clr_idx = cell.get("c", 0)
+                            break
+                    if clr_idx == 0 and li == lane:
+                        clr_idx = row_data.get("color_index", 0)
+                    clr = _cell_color(clr_idx)
+                    pen = QPen(clr, ew, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
+                    painter.setPen(pen)
+                    painter.drawLine(
+                        int(x), int(prev_y_center + nr),
+                        int(x), int(y_center - nr),
+                    )
+
+            prev_occupied = cur_occupied
+
+            _draw_cell_row(painter, cells, col_cx, lane_w, y_center, dh, ew, nr)
 
     def _draw_row_backgrounds(self, painter: QPainter, header_h: int) -> None:
         dh = self._cfg.row_height
@@ -570,7 +603,7 @@ class GraphTableWidget(QWidget):
 
         if is_uncommitted:
             radius = self._cfg.wip_node_radius
-            painter.setPen(QPen(color, 1.5, Qt.PenStyle.DashLine))
+            painter.setPen(QPen(color, 1.5, Qt.PenStyle.SolidLine))
             fill = QColor(self._cfg.background_color)
             fill.setAlpha(80)
             painter.setBrush(fill)
@@ -842,26 +875,17 @@ def _draw_cell_row(
     col_cx: float,
     lane_w: float,
     y_center: float,
-    node_radius: float,
+    row_height: float,
     edge_width: float,
+    node_radius: float,
 ) -> None:
     """Draw one row of graph cells at *y_center*.
 
-    Parameters
-    ----------
-    cells:
-        List of cell dicts ``{"t": int, "c": int, "p": int}``.
-    col_cx:
-        Center X of the graph column.
-    lane_w:
-        Width between adjacent lanes.
-    y_center:
-        Vertical center of this row.
-    node_radius:
-        Radius of commit node circles.
-    edge_width:
-        Thickness of connection lines.
+    Vertical lines (PIPE) now span the full *row_height* so that
+    consecutive rows stack seamlessly without gaps or overlap artifacts.
     """
+    half_h = row_height / 2.0
+
     for idx, cell in enumerate(cells):
         t = cell.get("t", 0)
         c = cell.get("c", 0)
@@ -883,39 +907,41 @@ def _draw_cell_row(
         elif t == _T_PIPE:
             _draw_vert_line(painter, x, y_center, node_radius, edge_width, color)
         elif t == _T_COMMIT:
-            pass  # node drawn by _draw_graph_node
+            _draw_vert_line(painter, x, y_center, node_radius, edge_width, color)
         elif t == _T_BRANCH_RIGHT:
-            _draw_branch_right(painter, x, y_center, node_radius, edge_width, color)
+            _draw_branch_right(painter, x, y_center, half_h, edge_width, color)
         elif t == _T_BRANCH_LEFT:
-            _draw_branch_left(painter, x, y_center, node_radius, edge_width, color)
+            _draw_branch_left(painter, x, y_center, half_h, edge_width, color)
         elif t == _T_MERGE_RIGHT:
-            _draw_merge_right(painter, x, y_center, node_radius, edge_width, color)
+            _draw_merge_right(painter, x, y_center, half_h, edge_width, color)
         elif t == _T_MERGE_LEFT:
-            _draw_merge_left(painter, x, y_center, node_radius, edge_width, color)
+            _draw_merge_left(painter, x, y_center, half_h, edge_width, color)
         elif t == _T_HORIZONTAL:
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
         elif t == _T_HORIZONTAL_PIPE:
-            _draw_vert_line(painter, x, y_center, node_radius, edge_width, p_color)
+            _draw_vert_line(painter, x, y_center, half_h, edge_width, p_color)
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
         elif t == _T_TEE_RIGHT:
-            _draw_vert_line(painter, x, y_center, node_radius, edge_width, color)
+            _draw_vert_line(painter, x, y_center, half_h, edge_width, color)
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
         elif t == _T_TEE_LEFT:
-            _draw_vert_line(painter, x, y_center, node_radius, edge_width, color)
+            _draw_vert_line(painter, x, y_center, half_h, edge_width, color)
             _draw_horiz_line(painter, x, y_center, -lane_w, edge_width, color)
         elif t == _T_TEE_UP:
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
-            _draw_vert_line(painter, x, y_center, node_radius, edge_width, color, upward_only=True)
+            _draw_vert_line(painter, x, y_center, half_h, edge_width, color, upward_only=True)
 
 
 def _draw_vert_line(
     painter: QPainter, x: float, y_center: float,
-    radius: float, width: float, color: QColor, *, upward_only: bool = False,
+    half_h: float, width: float, color: QColor, *, upward_only: bool = False,
 ) -> None:
-    pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+    """Draw a vertical line segment centred at *y_center*, spanning *half_h*
+    pixels above and below (or only above when *upward_only*)."""
+    pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
     painter.setPen(pen)
-    top = y_center - radius
-    bot = y_center + radius
+    top = y_center - half_h
+    bot = y_center + half_h
     if upward_only:
         bot = y_center
     painter.drawLine(int(x), int(top), int(x), int(bot))
@@ -925,7 +951,7 @@ def _draw_horiz_line(
     painter: QPainter, x: float, y_center: float,
     lane_w: float, width: float, color: QColor,
 ) -> None:
-    pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+    pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
     painter.setPen(pen)
     sign = 1 if lane_w > 0 else -1
     abs_w = abs(lane_w)
@@ -937,7 +963,7 @@ def _draw_branch_right(
     radius: float, width: float, color: QColor,
 ) -> None:
     """Branch starting here, going down and right (╭)."""
-    pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+    pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
     painter.setPen(pen)
     cr = min(radius, 8.0)
     path = QPainterPath()
@@ -952,7 +978,7 @@ def _draw_branch_left(
     radius: float, width: float, color: QColor,
 ) -> None:
     """Branch starting here, going down and left (╮)."""
-    pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+    pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
     painter.setPen(pen)
     cr = min(radius, 8.0)
     path = QPainterPath()
@@ -967,7 +993,7 @@ def _draw_merge_right(
     radius: float, width: float, color: QColor,
 ) -> None:
     """Merge from below, going up and right (╰)."""
-    pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+    pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
     painter.setPen(pen)
     cr = min(radius, 8.0)
     path = QPainterPath()
@@ -982,7 +1008,7 @@ def _draw_merge_left(
     radius: float, width: float, color: QColor,
 ) -> None:
     """Merge from below, going up and left (╯)."""
-    pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+    pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
     painter.setPen(pen)
     cr = min(radius, 8.0)
     path = QPainterPath()

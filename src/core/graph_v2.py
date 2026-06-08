@@ -772,10 +772,13 @@ def _build_fork_connector_cells(
 
     merging_lane_nums = sorted(ml for ml, _ in merging_lanes)
 
-    # T-junction on main lane
+    # Main lane: PIPE (single merge) or TEE_RIGHT (multiple merges).
     main_cell_idx = main_lane * 2
     if main_cell_idx < len(cells):
-        cells[main_cell_idx] = CellInfo.tee_right(main_color)
+        if len(merging_lanes) == 1:
+            cells[main_cell_idx] = CellInfo.pipe(main_color)
+        else:
+            cells[main_cell_idx] = CellInfo.tee_right(main_color)
 
     # Vertical lines for active lanes (except main and merging)
     for lane_idx, lane_oid in enumerate(active_lanes):
