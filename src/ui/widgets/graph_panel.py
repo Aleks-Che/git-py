@@ -14,7 +14,9 @@ exact geometry to draw.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime
 from hashlib import md5
 
 from PySide6.QtCore import Qt, Signal
@@ -25,8 +27,10 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
+    QShortcut,
 )
 from PySide6.QtWidgets import (
+    QFileDialog,
     QMenu,
     QScrollBar,
     QWidget,
@@ -177,6 +181,9 @@ class GraphTableWidget(QWidget):
 
         self._view_model.graph_updated.connect(self._on_graph_updated)
         self._view_model.commit_selected.connect(self._on_external_select)
+
+        self._dump_shortcut = QShortcut("Ctrl+Shift+D", self)
+        self._dump_shortcut.activated.connect(self._dump_graph)
 
     # ------------------------------------------------------------------
     # public API
@@ -413,7 +420,11 @@ class GraphTableWidget(QWidget):
                     clr_idx = 0
                     for ci, cell in enumerate(cells):
                         if ci // 2 == li and cell.get("t", _T_EMPTY) != _T_EMPTY:
-                            clr_idx = cell.get("c", 0)
+                            t = cell.get("t", _T_EMPTY)
+                            if t == _T_HORIZONTAL_PIPE:
+                                clr_idx = cell.get("p", 0)
+                            else:
+                                clr_idx = cell.get("c", 0)
                             break
                     if clr_idx == 0 and li == lane:
                         clr_idx = row_data.get("color_index", 0)
@@ -864,6 +875,58 @@ class GraphTableWidget(QWidget):
                 return row_data
         return None
 
+    def _dump_graph(self) -> None:
+        """Save a diagnostic JSON dump of the current graph layout (Ctrl+Shift+D)."""
+        rows_data: list[dict] = []
+        for idx, row_data in enumerate(self._rows):
+            commit = row_data.get("commit")
+            cells_out: list[dict] = []
+            for ci, cell in enumerate(row_data.get("cells", [])):
+                t = cell.get("t", 0)
+                cells_out.append({
+                    "idx": ci,
+                    "lane": ci // 2,
+                    "type": t,
+                    "color": cell.get("c", 0),
+                    "pipe_color": cell.get("p", 0),
+                })
+            rows_data.append({
+                "row": idx,
+                "lane": row_data.get("lane", 0),
+                "color_index": row_data.get("color_index", 0),
+                "branch_names": row_data.get("branch_names", []),
+                "is_head": row_data.get("is_head", False),
+                "is_uncommitted": row_data.get("is_uncommitted", False),
+                "sha": commit["sha"] if commit else None,
+                "short_sha": commit["short_sha"] if commit else None,
+                "subject": row_data.get("commit", {}).get("subject", ""),
+                "cells": cells_out,
+            })
+
+        palette_map = {i: c for i, c in enumerate(BRANCH_PALETTE)}
+        palette_map[UNCOMMITTED_COLOR_INDEX] = self._cfg.wip_color
+
+        dump = {
+            "timestamp": datetime.now().isoformat(),
+            "row_count": len(self._rows),
+            "max_lane": max(
+                (row_data.get("lane", 0) for row_data in self._rows), default=0,
+            ),
+            "palette": palette_map,
+            "wip_color_index": UNCOMMITTED_COLOR_INDEX,
+            "stash_color": self._cfg.stash_color,
+            "rows": rows_data,
+        }
+
+        default_name = f"graph_dump_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Graph Dump", default_name, "JSON (*.json)",
+        )
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(dump, f, indent=2, ensure_ascii=False)
+
 
 # --------------------------------------------------------------------------
 # Standalone cell drawing (used by _draw_cells and reusable for tests)
@@ -881,8 +944,8 @@ def _draw_cell_row(
 ) -> None:
     """Draw one row of graph cells at *y_center*.
 
-    Vertical lines (PIPE) now span the full *row_height* so that
-    consecutive rows stack seamlessly without gaps or overlap artifacts.
+    Vertical lines (PIPE, COMMIT) span *node_radius* above and below
+    the centre; the inter-row gap is bridged by ``_draw_cells``.
     """
     half_h = row_height / 2.0
 

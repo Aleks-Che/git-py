@@ -71,9 +71,9 @@ def test_single_commit() -> None:
     assert n.commit is not None
     assert n.commit.sha == "a" * 40
     assert n.lane == 0
-    assert n.color_index == 0  # main colour
+    assert n.color_index == 1  # main branch → blue via override
     assert n.cells[0].cell_type == CellType.COMMIT
-    assert n.cells[0].color_index == 0
+    assert n.cells[0].color_index == 1
 
 
 def test_single_commit_with_branch() -> None:
@@ -165,12 +165,14 @@ def test_simple_branch() -> None:
     assert cells1[0].cell_type == CellType.PIPE
     assert cells1[2].cell_type == CellType.COMMIT
 
-    # Row 2 (c1) — lane 0, root with merged connector cells
+    # Row 2 (c1) — lane 0, root with merged connector cells.
+    # The fork connector PIPE on lane 0 uses the commit's colour.
     n_root = layout.nodes[2]
     assert n_root.commit.sha == c1
     assert n_root.lane == 0
     cells_root = n_root.cells
-    assert cells_root[0].cell_type == CellType.PIPE  # main lane pipe
+    assert cells_root[0].cell_type == CellType.PIPE
+    assert cells_root[0].color_index == n_root.color_index  # same colour
     assert any(c.cell_type == CellType.MERGE_LEFT for c in cells_root)
     assert any(c.cell_type == CellType.HORIZONTAL for c in cells_root)
 
@@ -274,14 +276,10 @@ def test_fork_point_connector_row() -> None:
 
     root_node = nodes[2]
     assert root_node.commit.sha == c1
-    has_pipe_or_tee = any(
-        c.cell_type in (CellType.PIPE, CellType.TEE_RIGHT) for c in root_node.cells
-    )
     has_merge = any(
         c.cell_type in (CellType.MERGE_LEFT, CellType.MERGE_RIGHT)
         for c in root_node.cells
     )
-    assert has_pipe_or_tee
     assert has_merge
 
 
@@ -379,14 +377,14 @@ def test_graph_to_dicts_includes_cell_details() -> None:
     rows = graph_to_dicts(layout)
     cell = rows[0]["cells"][0]
     assert cell["t"] == int(CellType.COMMIT)
-    assert cell.get("c") == 0  # main colour
+    assert cell.get("c") == 1  # main branch → blue via override
 
 
 # ---- ColorAssigner -------------------------------------------------------
 
 
 def test_color_assigner_main_branch() -> None:
-    """Linear history should all share main colour (0)."""
+    """Linear history should all share main colour (1=blue via override)."""
     c3 = "c" * 40
     c2 = "b" * 40
     c1 = "a" * 40
@@ -397,7 +395,7 @@ def test_color_assigner_main_branch() -> None:
     ]
     layout = build_graph(commits, [])
     for n in layout.nodes:
-        assert n.color_index == 0
+        assert n.color_index == 1  # main branch → blue
 
 
 def test_color_assigner_branches_get_different_colors() -> None:

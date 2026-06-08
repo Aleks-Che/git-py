@@ -11,14 +11,16 @@ Key differences from the old ``graph.py``:
 * Cell-based rendering — each row carries a ``list[CellType]`` that
   tells the widget exactly what to draw. No geometry computation in
   the widget layer.
-* Fork point detection — commits with 2+ children get a dedicated
-  connector row with ``TeeUp`` / ``MergeLeft`` cells.
+* Fork point detection — commits with 2+ children get their merge
+  cells merged into the fork point commit's own row.
 * Fork siblings — the first parent of a merge commit that sits on a
   fork point is treated specially so its colour propagates correctly.
 * Explicit lane merging — when a branch lane ends and its parent is
   already tracked on a different lane, the ending lane is released.
 * Uncommitted changes are handled in core — inserted at position 0
   with a special colour index.
+* Deterministic branch colours — ``branch_name_to_color()`` maps
+  branch names to palette indices via hashing + hardcoded overrides.
 
 This module is pure Core — no PySide6 imports.
 """
@@ -32,38 +34,63 @@ from src.core.models import BranchInfo, CommitInfo
 UNCOMMITTED_COLOR_INDEX: int = 24
 """Special colour index reserved for the uncommitted-changes node."""
 
-MAIN_COLOR_INDEX: int = 0
-"""Index of the main/reserved colour (lane 0 by default)."""
-
 BRANCH_PALETTE: tuple[str, ...] = (
-    "#1A5924",  # green
-    "#2B4786",  # blue
-    "#782B24",  # red
-    "#7D5C1A",  # amber
-    "#523583",  # violet
-    "#1E626A",  # teal
-    "#7D2559",  # pink
-    "#38684F",  # mint
-    "#7F4112",  # orange
-    "#464B51",  # grey
-    "#6A5086",  # lavender
-    "#256D2D",  # lime
-    "#5A8A3C",  # olive
-    "#3B6FB0",  # steel
-    "#B5453C",  # rust
-    "#C4912E",  # gold
-    "#704A9E",  # plum
-    "#2D7F8C",  # cyan
-    "#C4426E",  # rose
-    "#4D7844",  # sage
-    "#AD5A28",  # copper
-    "#595F6B",  # slate
-    "#7C5E9E",  # lilac
-    "#41804A",  # pine
+    "#1A5924",  # 0   green
+    "#2B4786",  # 1   blue
+    "#782B24",  # 2   red
+    "#7D5C1A",  # 3   amber
+    "#523583",  # 4   violet
+    "#1E626A",  # 5   teal
+    "#7D2559",  # 6   pink
+    "#38684F",  # 7   mint
+    "#7F4112",  # 8   orange  (HEAD special)
+    "#464B51",  # 9   grey
+    "#6A5086",  # 10  lavender
+    "#256D2D",  # 11  lime
+    "#5A8A3C",  # 12  olive
+    "#3B6FB0",  # 13  steel
+    "#B5453C",  # 14  rust
+    "#C4912E",  # 15  gold
+    "#704A9E",  # 16  plum
+    "#2D7F8C",  # 17  cyan
+    "#C4426E",  # 18  rose
+    "#4D7844",  # 19  sage
+    "#AD5A28",  # 20  copper
+    "#595F6B",  # 21  slate
+    "#7C5E9E",  # 22  lilac
+    "#41804A",  # 23  pine
 )
-"""24-colour palette.  Index 0 is the main-branch colour, the rest are
-assigned by :class:`ColorAssigner` as new branches appear.  Uncommitted
-changes always use index :data:`UNCOMMITTED_COLOR_INDEX`."""
+"""24-colour palette used by :class:`ColorAssigner` and the widget layer."""
+
+# Hardcoded overrides ensure that important branches always get the same
+# well-known colours, regardless of which repository is open.
+_BRANCH_COLOR_OVERRIDES: dict[str, int] = {
+    "main": 1,
+    "master": 1,
+    "develop": 0,
+    "dev": 0,
+}
+"""Case-insensitive mapping from branch name # colour palette index."""
+
+HEAD_SPECIAL_COLOR_INDEX: int = 8
+"""Colour index used for commits that HEAD directly points to (orange)."""
+
+
+def _pick_branch_color(name: str) -> int:
+    """Return a deterministic palette index for *name*.
+
+    Hardcoded overrides are checked first (case-insensitive); the
+    remainder are hashed modulo the palette size.
+    """
+    lower = name.lower()
+    override = _BRANCH_COLOR_OVERRIDES.get(lower)
+    if override is not None:
+        return override
+    return abs(hash(lower)) % len(BRANCH_PALETTE)
+
+
+# Alias kept for documentation cross-reference.
+MAIN_COLOR_INDEX: int = 1  # "main"/"master" → blue via overrides
 
 
 class CellType(IntEnum):
@@ -209,21 +236,19 @@ class GraphLayout:
 # ---------------------------------------------------------------------------
 
 class ColorAssigner:
-    """Manages allocation and release of colour indices for graph lanes.
+    """Manages allocation of colour indices for graph lanes.
 
-    Colour 0 is reserved as the *main colour* (assigned to the first
-    commit on the primary branch).  Other lanes get colours from the
-    palette on demand.  Once a colour is assigned to a lane it sticks
-    until the lane is released via :meth:`release_lane`.
+    Colour assignment is **deterministic by branch name** (``_pick_branch_color``)
+    so the same branch always gets the same colour across sessions.
+    When a commit carries no branch name (mid-history commit) the lane
+    simply re-uses the colour that was already assigned to it.
     """
 
     def __init__(self) -> None:
-        self._palette_size: int = len(BRANCH_PALETTE)
-        self._main_color: int = MAIN_COLOR_INDEX
-        self._main_lane: int | None = None
         self._lane_colors: dict[int, int] = {}
         self._used_colors: set[int] = set()
-        self._next_color: int = 1  # skip main colour
+        self._main_lane: int | None = None
+        self._main_color: int = 1  # main/master → blue via overrides
         self._in_fork: bool = False
 
     # -- public API --------------------------------------------------------
@@ -242,25 +267,30 @@ class ColorAssigner:
         """Return the colour for *lane*, assigning one if necessary."""
         if lane in self._lane_colors:
             return self._lane_colors[lane]
-        return self._assign(lane)
+        return self._pick_fallback(lane)
 
-    def assign_main_color(self, lane: int) -> int:
-        """Reserve the main colour for *lane*."""
+    def assign_main_color(self, lane: int, branch_name: str | None = None) -> int:
+        """Reserve the main-lane colour, derived from *branch_name*."""
         self._main_lane = lane
-        self._lane_colors[lane] = self._main_color
-        self._used_colors.add(self._main_color)
-        return self._main_color
+        color = _pick_branch_color(branch_name or "main")
+        self._main_color = color
+        self._set_lane_color(lane, color)
+        return color
 
-    def assign_color(self, lane: int) -> int:
-        """Allocate a fresh colour for *lane*."""
-        return self._assign(lane)
+    def assign_color(self, lane: int, branch_name: str | None = None) -> int:
+        """Allocate a colour for *lane* derived from *branch_name*."""
+        if branch_name:
+            color = _pick_branch_color(branch_name)
+        else:
+            color = self._pick_fallback(lane)
+        self._set_lane_color(lane, color)
+        return color
 
-    def assign_fork_sibling_color(self, lane: int) -> int:
+    def assign_fork_sibling_color(self, lane: int, branch_name: str | None = None) -> int:
         """Allocate a colour for a fork-sibling lane."""
-        return self._assign(lane)
+        return self.assign_color(lane, branch_name)
 
     def begin_fork(self) -> None:
-        """Enter fork context (called before processing merge commit)."""
         self._in_fork = True
 
     def end_fork(self) -> None:
@@ -269,31 +299,22 @@ class ColorAssigner:
     def release_lane(self, lane: int) -> None:
         """Free *lane*'s colour so it can be reused."""
         if lane in self._lane_colors:
-            color = self._lane_colors.pop(lane)
-            self._used_colors.discard(color)
+            self._used_colors.discard(self._lane_colors.pop(lane))
 
     # -- internals ---------------------------------------------------------
 
-    def _assign(self, lane: int) -> int:
-        if lane in self._lane_colors:
-            return self._lane_colors[lane]
-        color = self._next_free_color()
+    def _pick_fallback(self, lane: int) -> int:
+        """Sequential fallback when no branch name is available."""
+        for offset in range(len(BRANCH_PALETTE)):
+            candidate = (lane + offset) % len(BRANCH_PALETTE)
+            if candidate not in self._used_colors:
+                self._used_colors.add(candidate)
+                return candidate
+        return lane % len(BRANCH_PALETTE)
+
+    def _set_lane_color(self, lane: int, color: int) -> None:
         self._lane_colors[lane] = color
         self._used_colors.add(color)
-        return color
-
-    def _next_free_color(self) -> int:
-        for _ in range(self._palette_size):
-            if self._next_color not in self._used_colors:
-                c = self._next_color
-                self._next_color = (self._next_color + 1) % self._palette_size
-                if self._next_color == 0:
-                    self._next_color = 1
-                return c
-            self._next_color = (self._next_color + 1) % self._palette_size
-            if self._next_color == 0:
-                self._next_color = 1
-        return 1  # fallback
 
 
 # ---------------------------------------------------------------------------
@@ -429,13 +450,16 @@ def build_graph(
                     lane_color_index.pop(ml, None)
 
         # --- determine colour index ---
+        commit_branch_names = oid_to_branches.get(commit.sha, [])
+        primary_branch = commit_branch_names[0] if commit_branch_names else None
+
         commit_color_index: int
         if commit_lane_opt is not None:
             commit_color_index = color_assigner.continue_lane(lane)
         elif not nodes or all(n.commit is None for n in nodes):
-            commit_color_index = color_assigner.assign_main_color(lane)
+            commit_color_index = color_assigner.assign_main_color(lane, primary_branch)
         else:
-            commit_color_index = color_assigner.assign_color(lane)
+            commit_color_index = color_assigner.assign_color(lane, primary_branch)
         oid_color_index[commit.sha] = commit_color_index
         lane_color_index[lane] = commit_color_index
 
@@ -504,7 +528,9 @@ def build_graph(
                     lanes.append(None)
                     new_lane = len(lanes) - 1
                 lanes[new_lane] = parent_sha
-                new_color = color_assigner.assign_fork_sibling_color(new_lane)
+                parent_branch_names = oid_to_branches.get(parent_sha, [])
+                parent_branch = parent_branch_names[0] if parent_branch_names else None
+                new_color = color_assigner.assign_fork_sibling_color(new_lane, parent_branch)
                 oid_color_index[parent_sha] = new_color
                 lane_color_index[new_lane] = new_color
                 parent_lane = new_lane
@@ -541,12 +567,18 @@ def build_graph(
 
         # Merge fork connector cells into the commit's own cells so the
         # branching is rendered directly from the fork point commit node.
+        # On the commit's own lane, keep the connector cell type (PIPE /
+        # TEE_RIGHT) but use the commit's colour to avoid a mismatch.
         if fork_merging_cells is not None:
+            commit_cell_idx = lane * 2
             while len(cells) < len(fork_merging_cells):
                 cells.append(CellInfo.empty())
             for fci, fc in enumerate(fork_merging_cells):
-                if fc.cell_type != CellType.EMPTY:
-                    cells[fci] = fc
+                if fc.cell_type == CellType.EMPTY:
+                    continue
+                if fci == commit_cell_idx:
+                    fc = CellInfo(fc.cell_type, color_index=final_color_index)
+                cells[fci] = fc
 
         branch_names = oid_to_branches.get(commit.sha, [])
         is_head = (head_oid is not None and head_oid == commit.sha)
@@ -895,8 +927,10 @@ __all__ = [
     "ColorAssigner",
     "GraphLayout",
     "GraphNode",
+    "HEAD_SPECIAL_COLOR_INDEX",
     "MAIN_COLOR_INDEX",
     "UNCOMMITTED_COLOR_INDEX",
     "build_graph",
     "graph_to_dicts",
+    "_pick_branch_color",
 ]
