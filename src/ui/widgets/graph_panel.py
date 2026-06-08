@@ -10,6 +10,7 @@ per-repository.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from hashlib import md5
 
@@ -21,6 +22,7 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
+    QShortcut,
 )
 from PySide6.QtWidgets import (
     QMenu,
@@ -28,8 +30,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.core.graph_debug import check_graph_integrity, dump_graph_rows
 from src.utils.theme import DARK_THEME, Theme
 from src.viewmodels.graph_viewmodel import GraphViewModel
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -147,6 +152,9 @@ class GraphTableWidget(QWidget):
         self._view_model.graph_updated.connect(self._on_graph_updated)
         self._view_model.commit_selected.connect(self._on_external_select)
 
+        self._shortcut_dump = QShortcut("Ctrl+Shift+D", self)
+        self._shortcut_dump.activated.connect(self.dump_structure)
+
     # ----- public API ---------------------------------------------------
 
     def divider_positions(self) -> list[int]:
@@ -196,6 +204,11 @@ class GraphTableWidget(QWidget):
     def _on_graph_updated(self, rows: list[dict]) -> None:
         self._rows = rows
         self._update_scrollbar()
+        problems = check_graph_integrity(rows)
+        if problems:
+            _log.warning("Graph integrity issues detected:")
+            for p in problems:
+                _log.warning("  %s", p)
         self.update()
 
     def _on_scroll(self, value: int) -> None:
@@ -205,6 +218,13 @@ class GraphTableWidget(QWidget):
     def _on_external_select(self, sha: str) -> None:
         self._selected_sha = sha
         self.update()
+
+    def dump_structure(self) -> None:
+        """Print the current graph layout to stderr (Ctrl+Shift+D)."""
+        import sys
+
+        dump_graph_rows(self._rows, file=sys.stderr)
+        _log.info("Graph dumped to stderr (%d rows)", len(self._rows))
 
     # ----- layout helpers ----------------------------------------------
 
@@ -365,74 +385,146 @@ class GraphTableWidget(QWidget):
         return self._dividers[1] - self._dividers[0]
 
     def _draw_edges(self, painter: QPainter, header_h: int) -> None:
-        row_by_sha: dict[str, dict] = {r["sha"]: r for r in self._rows}
+        """Draw parent-child edges and lane-continuation verticals.
+
+        1. For each commit, draw L-shaped or straight edges to each parent.
+        2. For lanes that pass through a row without a commit node, draw
+           a straight vertical line connecting the two adjacent rows.
+        """
+        if not self._rows:
+            return
+
         dh = self._cfg.row_height
         r = self._cfg.node_radius
         col_cx = self._column_center_x()
         lane_w = self._cfg.node_radius * 2 + 8
 
-        for row_data in self._rows:
-            child_col = row_data.get("display_column", row_data.get("lane", 0))
-            child_cx = self._lane_x(child_col, col_cx, lane_w)
-            child_cy = self._row_y(row_data["row"]) + dh / 2
+        row_by_sha: dict[str, dict] = {rd["sha"]: rd for rd in self._rows}
 
+        # Build a set of SHAs that appear as commit nodes (exclude floating entries).
+        commit_shas: set[str] = {rd["sha"] for rd in self._rows}
+
+        for i, row_data in enumerate(self._rows):
+            sha = row_data["sha"]
+            node_col = row_data.get("display_column", row_data.get("lane", 0))
+            node_cx = self._lane_x(node_col, col_cx, lane_w)
+            node_cy = self._row_y(row_data["row"]) + dh / 2
+
+            # ── parent-child edges ──
             for parent_sha in row_data.get("parents", []):
-                parent = row_by_sha.get(parent_sha)
-                if parent is None:
+                parent_row = row_by_sha.get(parent_sha)
+                if parent_row is None:
                     continue
-                parent_col = parent.get("display_column", parent.get("lane", 0))
+                parent_col = parent_row.get("display_column", parent_row.get("lane", 0))
                 parent_cx = self._lane_x(parent_col, col_cx, lane_w)
-                parent_cy = self._row_y(parent["row"]) + dh / 2
+                parent_cy = self._row_y(parent_row["row"]) + dh / 2
 
-                path = QPainterPath()
-                if abs(child_cx - parent_cx) < 0.5:
-                    path.moveTo(child_cx, child_cy + r)
-                    path.lineTo(parent_cx, parent_cy - r)
-                else:
-                    mid_y = (child_cy + parent_cy) / 2
-                    cr = 8
-                    k = 0.5522847498
-                    path.moveTo(child_cx, child_cy)
-                    path.lineTo(child_cx, mid_y - cr)
-                    if parent_cx > child_cx:
-                        path.cubicTo(
-                            child_cx, mid_y - cr * (1 - k),
-                            child_cx + cr * (1 - k), mid_y,
-                            child_cx + cr, mid_y,
-                        )
-                    else:
-                        path.cubicTo(
-                            child_cx, mid_y - cr * (1 - k),
-                            child_cx - cr * (1 - k), mid_y,
-                            child_cx - cr, mid_y,
-                        )
-                    if parent_cx > child_cx:
-                        path.lineTo(parent_cx - cr, mid_y)
-                        path.cubicTo(
-                            parent_cx - cr * (1 - k), mid_y,
-                            parent_cx, mid_y + cr * (1 - k),
-                            parent_cx, mid_y + cr,
-                        )
-                    else:
-                        path.lineTo(parent_cx + cr, mid_y)
-                        path.cubicTo(
-                            parent_cx + cr * (1 - k), mid_y,
-                            parent_cx, mid_y + cr * (1 - k),
-                            parent_cx, mid_y + cr,
-                        )
-                    path.lineTo(parent_cx, parent_cy)
-
-                if row_data["sha"] == "WIP":
+                kind = row_data.get("kind", "commit")
+                parents = row_data.get("parents", [])
+                if kind == "wip":
                     edge_color = QColor(self._cfg.wip_color)
-                elif parent_sha == row_data["parents"][0]:
+                elif kind == "stash":
+                    edge_color = QColor(self._cfg.stash_color)
+                elif parents and parent_sha == parents[0]:
                     edge_color = QColor(row_data["color"])
                 else:
-                    edge_color = QColor(parent["color"])
+                    edge_color = QColor(parent_row["color"])
 
+                path = self._make_edge_path(node_cx, node_cy, parent_cx, parent_cy, r)
                 pen = QPen(edge_color, self._cfg.edge_width)
                 pen.setCapStyle(Qt.PenCapStyle.RoundCap)
                 painter.setPen(pen)
                 painter.drawPath(path)
+
+            # ── lane-continuation verticals ──
+            # For entries in input_lanes that are NOT the current commit
+            # AND also appear in the next row's input_lanes at the same
+            # position, draw a straight vertical through the gap.
+            if i + 1 >= len(self._rows):
+                continue
+            next_row = self._rows[i + 1]
+            input_entries = row_data.get("input_lanes", [])
+            next_input = next_row.get("input_lanes", [])
+
+            next_input_map: dict[str, int] = {}
+            for j, entry in enumerate(next_input):
+                next_input_map[entry["sha"]] = entry.get("column", j)
+
+            for lane_i, entry in enumerate(input_entries):
+                lane_sha = entry["sha"]
+                if lane_sha == sha:
+                    continue  # This is the commit node itself, skip
+                next_idx = next_input_map.get(lane_sha)
+                if next_idx is None:
+                    continue  # Lane terminates, no continuation needed
+
+                child_col = entry.get("column", lane_i)
+                child_cx = self._lane_x(child_col, col_cx, lane_w)
+                next_cx = self._lane_x(next_idx, col_cx, lane_w)
+                child_cy = node_cy  # current row center
+                next_cy = self._row_y(next_row["row"]) + dh / 2
+
+                # Only draw vertical for lanes that have at least one
+                # real commit in either this or the next row.
+                if lane_sha not in commit_shas:
+                    # Check if this SHA appears as a commit in next row too
+                    if lane_sha != next_row["sha"]:
+                        continue
+
+                lane_color = QColor(entry["color"])
+                path = QPainterPath()
+                if abs(child_cx - next_cx) < 0.5:
+                    path.moveTo(child_cx, child_cy + r)
+                    path.lineTo(next_cx, next_cy - r)
+                else:
+                    path = self._make_edge_path(child_cx, child_cy, next_cx, next_cy, r)
+                pen = QPen(lane_color, self._cfg.edge_width)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(pen)
+                painter.drawPath(path)
+
+    @staticmethod
+    def _make_edge_path(
+        cx: float, cy: float, px: float, py: float, r: float = 0,
+    ) -> QPainterPath:
+        path = QPainterPath()
+        if abs(cx - px) < 0.5:
+            path.moveTo(cx, cy + r)
+            path.lineTo(px, py - r)
+        else:
+            mid_y = (cy + py) / 2
+            cr = 8
+            k = 0.5522847498
+            path.moveTo(cx, cy)
+            path.lineTo(cx, mid_y - cr)
+            if px > cx:
+                path.cubicTo(
+                    cx, mid_y - cr * (1 - k),
+                    cx + cr * (1 - k), mid_y,
+                    cx + cr, mid_y,
+                )
+            else:
+                path.cubicTo(
+                    cx, mid_y - cr * (1 - k),
+                    cx - cr * (1 - k), mid_y,
+                    cx - cr, mid_y,
+                )
+            if px > cx:
+                path.lineTo(px - cr, mid_y)
+                path.cubicTo(
+                    px - cr * (1 - k), mid_y,
+                    px, mid_y + cr * (1 - k),
+                    px, mid_y + cr,
+                )
+            else:
+                path.lineTo(px + cr, mid_y)
+                path.cubicTo(
+                    px + cr * (1 - k), mid_y,
+                    px, mid_y + cr * (1 - k),
+                    px, mid_y + cr,
+                )
+            path.lineTo(px, py)
+        return path
 
     def _lane_x(self, column: int, center_x: float, lane_w: float) -> float:
         offset = column - 1  # center around column 1

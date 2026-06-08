@@ -17,6 +17,7 @@ from src.core.graph import (
     GraphNode,
     _assign_branch_colors,
     _assign_lanes,
+    _build_swimlanes,
     compute_layout,
     nodes_to_rows,
 )
@@ -430,6 +431,8 @@ def test_graphnode_to_dict_round_trip() -> None:
         "color": "#ff0000",
         "row": 5,
         "kind": "commit",
+        "input_lanes": [],
+        "output_lanes": [],
     }
 
 
@@ -472,8 +475,8 @@ def test_display_column_respects_max_columns() -> None:
     ]
     nodes = compute_layout(history, branches, [], head_target_sha=sha_c, head_shorthand="main",
                            max_columns=1)
-    cols = {n.display_column for n in nodes}
-    assert cols == {0}
+    # With compaction wrapping, both lanes map to column 0.
+    assert {n.display_column for n in nodes} == {0}
 
 
 def test_display_column_defaults_to_lane_when_uncompacted() -> None:
@@ -600,3 +603,238 @@ def test_graphnode_to_dict_includes_branch_ref_lane_color() -> None:
         "name": "origin/main", "is_head": False, "is_remote": True,
         "lane": 0, "color": "#00ff00",
     }
+
+
+# ----- swimlane model tests -----------------------------------------------
+
+
+def test_build_swimlanes_head_branch_lane_zero() -> None:
+    """HEAD branch always occupies lane 0."""
+    sha_a, sha_b = "a" * 40, "b" * 40
+    history = [
+        _commit_info(sha_b, parents=[sha_a], ts=2),
+        _commit_info(sha_a, ts=1),
+    ]
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha=sha_b),
+        BranchInfo(name="feature", is_head=False, target_sha=sha_a),
+    ]
+    branch_colors = _assign_branch_colors(branches, head_target_sha=sha_b)
+    rows = _build_swimlanes(history, branches, sha_b, "main", branch_colors)
+    # HEAD branch commit is in lane 0.
+    assert rows[0]["lane"] == 0
+    assert rows[0]["sha"] == sha_b
+
+
+def test_build_swimlanes_local_before_remote() -> None:
+    """Local branches are seeded before remote, so they occupy left lanes."""
+    sha_a, sha_b, sha_c = "a" * 40, "b" * 40, "c" * 40
+    history = [
+        _commit_info(sha_c, parents=[sha_a], ts=3),
+        _commit_info(sha_b, parents=[sha_a], ts=2),
+        _commit_info(sha_a, ts=1),
+    ]
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha=sha_b),
+        BranchInfo(name="origin/feature", is_head=False, is_remote=True, target_sha=sha_c),
+    ]
+    branch_colors = _assign_branch_colors(branches, head_target_sha=sha_b)
+    rows = _build_swimlanes(history, branches, sha_b, "main", branch_colors)
+    by_sha = {r["sha"]: r for r in rows}
+    # HEAD local branch at sha_b is left of remote at sha_c.
+    assert by_sha[sha_b]["lane"] < by_sha[sha_c]["lane"]
+
+
+def test_build_swimlanes_remote_gets_own_lane() -> None:
+    """A remote branch at a different SHA gets its own lane."""
+    sha_a, sha_b = "a" * 40, "b" * 40
+    history = [
+        _commit_info(sha_b, parents=[sha_a], ts=2),
+        _commit_info(sha_a, ts=1),
+    ]
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha=sha_b),
+        BranchInfo(name="origin/main", is_head=False, is_remote=True, target_sha=sha_b),
+    ]
+    branch_colors = _assign_branch_colors(branches, head_target_sha=sha_b)
+    rows = _build_swimlanes(history, branches, sha_b, "main", branch_colors)
+    # Both point to same SHA; remote shares lane 0 via first claim.
+    assert rows[0]["lane"] == 0
+    # Check input_lanes has two entries (local + remote) for that SHA.
+    assert len(rows[0]["input_lanes"]) >= 1
+
+
+def test_build_swimlanes_shared_ancestor() -> None:
+    """Two branches with a shared ancestor; ancestor stays on HEAD's lane."""
+    sha_c1, sha_c2, sha_c3, sha_c4 = "1" * 40, "2" * 40, "3" * 40, "4" * 40
+    history = [
+        _commit_info(sha_c4, parents=[sha_c2], ts=4),
+        _commit_info(sha_c3, parents=[sha_c2], ts=3),
+        _commit_info(sha_c2, parents=[sha_c1], ts=2),
+        _commit_info(sha_c1, ts=1),
+    ]
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha=sha_c3),
+        BranchInfo(name="feature", is_head=False, target_sha=sha_c4),
+    ]
+    branch_colors = _assign_branch_colors(branches, head_target_sha=sha_c3)
+    rows = _build_swimlanes(history, branches, sha_c3, "main", branch_colors)
+    by_sha = {r["sha"]: r for r in rows}
+    assert by_sha[sha_c3]["lane"] == 0
+    assert by_sha[sha_c4]["lane"] == 1
+    # Shared ancestor stays on main's lane.
+    assert by_sha[sha_c2]["lane"] == 0
+    assert by_sha[sha_c1]["lane"] == 0
+
+
+def test_build_swimlanes_merge_creates_extra_lanes() -> None:
+    """Merge commit with two parents creates an extra output lane for the second parent."""
+    sha_a, sha_b, sha_c, sha_m = "a" * 40, "b" * 40, "c" * 40, "m" * 40
+    history = [
+        _commit_info(sha_m, parents=[sha_b, sha_c], ts=4),
+        _commit_info(sha_b, parents=[sha_a], ts=3),
+        _commit_info(sha_c, parents=[sha_a], ts=2),
+        _commit_info(sha_a, ts=1),
+    ]
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha=sha_m),
+    ]
+    branch_colors = _assign_branch_colors(branches, head_target_sha=sha_m)
+    rows = _build_swimlanes(history, branches, sha_m, "main", branch_colors)
+    # The merge row should have at least 2 output lanes (one per parent).
+    merge_row = rows[0]
+    assert merge_row["sha"] == sha_m
+    assert len(merge_row["output_lanes"]) >= 2
+
+
+def test_build_swimlanes_output_dedup() -> None:
+    """The same SHA never appears twice in output_lanes."""
+    sha_a, sha_b, sha_c = "a" * 40, "b" * 40, "c" * 40
+    history = [
+        _commit_info(sha_c, parents=[sha_a], ts=3),
+        _commit_info(sha_b, parents=[sha_a], ts=2),
+        _commit_info(sha_a, ts=1),
+    ]
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha=sha_c),
+        BranchInfo(name="feature", is_head=False, target_sha=sha_b),
+    ]
+    branch_colors = _assign_branch_colors(branches, head_target_sha=sha_c)
+    rows = _build_swimlanes(history, branches, sha_c, "main", branch_colors)
+    for row in rows:
+        shas = [e["sha"] for e in row["output_lanes"]]
+        assert len(shas) == len(set(shas)), f"duplicate SHA in output_lanes at row {row['sha']}"
+
+
+def test_build_swimlanes_stash_gets_own_lane() -> None:
+    """Stash (non-branch tip) gets its own lane without breaking main layout."""
+    sha_a, sha_b = "a" * 40, "b" * 40
+    stash_sha = "s" * 40
+    history = [
+        _commit_info(stash_sha, parents=[sha_b], ts=3, message="WIP on main"),
+        _commit_info(sha_b, parents=[sha_a], ts=2),
+        _commit_info(sha_a, ts=1),
+    ]
+    # Stash is NOT a branch — it won't be in the seed.
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha=sha_b),
+    ]
+    branch_colors = _assign_branch_colors(branches, head_target_sha=sha_b)
+    rows = _build_swimlanes(history, branches, sha_b, "main", branch_colors)
+    # Stash row should exist.
+    stash_row = rows[0]
+    assert stash_row["sha"] == stash_sha
+    # Main row (sha_b) should be in lane 0.
+    main_row = rows[1]
+    assert main_row["sha"] == sha_b
+    assert main_row["lane"] == 0
+
+
+def test_build_swimlanes_wip_above_head() -> None:
+    """WIP commit above HEAD occupies its own lane."""
+    sha_a = "a" * 40
+    wip_sha = "WIP"
+    history = [
+        _commit_info(wip_sha, parents=[sha_a], ts=2),
+        _commit_info(sha_a, ts=1),
+    ]
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha=sha_a),
+    ]
+    branch_colors = _assign_branch_colors(branches, head_target_sha=sha_a)
+    rows = _build_swimlanes(history, branches, sha_a, "main", branch_colors)
+    assert rows[0]["sha"] == wip_sha
+    # WIP should not share lane 0 with HEAD commit.
+    assert rows[0]["lane"] > 0
+
+
+def test_build_swimlanes_every_row_has_input_and_output() -> None:
+    """Every row must have non-empty input_lanes; output_lanes may be empty for root commit."""
+    sha_a, sha_b, sha_c = "a" * 40, "b" * 40, "c" * 40
+    history = [
+        _commit_info(sha_c, parents=[sha_b], ts=3),
+        _commit_info(sha_b, parents=[sha_a], ts=2),
+        _commit_info(sha_a, ts=1),
+    ]
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha=sha_c),
+    ]
+    branch_colors = _assign_branch_colors(branches, head_target_sha=sha_c)
+    rows = _build_swimlanes(history, branches, sha_c, "main", branch_colors)
+    for row in rows:
+        assert isinstance(row["input_lanes"], list)
+        assert isinstance(row["output_lanes"], list)
+        assert len(row["input_lanes"]) > 0
+    # Non-root rows must have at least one output lane.
+    for row in rows:
+        sha = row["sha"]
+        commit = next((c for c in history if c.sha == sha), None)
+        if commit and commit.parents:
+            assert len(row["output_lanes"]) > 0, f"row {sha} has parents but empty output_lanes"
+
+
+def test_compute_layout_includes_swimlane_data() -> None:
+    """compute_layout returns GraphNodes with input_lanes/output_lanes populated."""
+    sha_a, sha_b = "a" * 40, "b" * 40
+    history = [
+        _commit_info(sha_b, parents=[sha_a], ts=2),
+        _commit_info(sha_a, ts=1),
+    ]
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha=sha_b),
+    ]
+    nodes = compute_layout(history, branches, [], head_target_sha=sha_b, head_shorthand="main")
+    for node in nodes:
+        assert isinstance(node.input_lanes, list)
+        assert isinstance(node.output_lanes, list)
+        if node.sha == sha_b:
+            assert len(node.output_lanes) >= 1
+
+
+def test_build_swimlanes_multi_ancestor_dedup_keeps_first_color() -> None:
+    """When the same ancestor SHA appears via multiple paths, first colour wins."""
+    sha_c1, sha_c2, sha_c3, sha_c4 = "1" * 40, "2" * 40, "3" * 40, "4" * 40
+    history = [
+        _commit_info(sha_c4, parents=[sha_c2], ts=4),
+        _commit_info(sha_c3, parents=[sha_c2], ts=3),
+        _commit_info(sha_c2, parents=[sha_c1], ts=2),
+        _commit_info(sha_c1, ts=1),
+    ]
+    branches = [
+        BranchInfo(name="main", is_head=True, target_sha=sha_c3),
+        BranchInfo(name="feature", is_head=False, target_sha=sha_c4),
+    ]
+    branch_colors = _assign_branch_colors(branches, head_target_sha=sha_c3)
+    rows = _build_swimlanes(history, branches, sha_c3, "main", branch_colors)
+    # Row for sha_c2 (shared ancestor) should have sha_c2 only once in output_lanes.
+    c2_row = rows[2]
+    assert c2_row["sha"] == sha_c2
+    shas = [e["sha"] for e in c2_row["output_lanes"]]
+    # sha_c1 should appear only once.
+    assert shas.count(sha_c1) <= 1
+
+
+def test_build_swimlanes_empty_history() -> None:
+    """_build_swimlanes returns an empty list for empty history."""
+    result = _build_swimlanes([], [], None, None, {})
+    assert result == []

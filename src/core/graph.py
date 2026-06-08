@@ -1,4 +1,4 @@
-"""DAG model and lane-based layout for the commit graph.
+"""DAG model and swimlane-based layout for the commit graph.
 
 This module is **pure Core**: it talks to :class:`src.core.models`
 dataclasses and nothing else, so it can be unit-tested without a Qt
@@ -7,7 +7,7 @@ event loop and reused by any future UI backend.
 The public API is:
 
 * :class:`GraphNode` — a single commit enriched with display metadata
-  (lane index, color, refs, row).
+  (lane index, color, refs, row, input_lanes, output_lanes).
 * :func:`compute_layout` — turn ``get_history()`` + ``branches`` +
   ``tags`` + head info into a list of :class:`GraphNode` in display
   order.
@@ -15,27 +15,19 @@ The public API is:
   can be shipped over a Qt signal without leaking the dataclass type
   to the UI layer.
 
-The lane algorithm is a three-phase walk inspired by GitKraken's
-display engine, but kept deliberately simple:
+The layout algorithm is a single-phase top-down swimlane model
+inspired by VS Code's scmHistory.ts:
 
-1. **Phase 1 (priority walk).** Order branches by priority — HEAD's
-   branch first, then other local branches, then remote-tracking —
-   and for each branch, walk from its tip toward the root, claiming
-   each commit for that branch's lane. The walk stops when it hits
-   a commit already claimed by a higher-priority branch (a shared
-   ancestor). The first parent only is followed; the merge's other
-   parents are left for whichever branch later claims them.
-2. **Phase 2 (orphan walk).** Any commit not reached by a branch
-   tip is laid out with a simple time-ordered fallback: each
-   commit tries to continue its first parent's lane; if that lane
-   is already occupied by a more recent commit, a new lane is
-   opened. This handles repositories with no local branches and
-   ad-hoc tag-only commits.
-3. **Phase 3 (lane compaction).** Logical lanes are mapped to a
-   limited set of display columns via greedy interval coloring.
-   Lanes whose row ranges do not overlap may share a column,
-   keeping the visual width bounded, controlled by ``max_columns``
-   (default 12).
+1. **Seed.** Output lanes are seeded from branch-tips in priority
+   order (HEAD branch → other locals → remote), giving each branch
+   its own lane with its own colour from the start.
+2. **Top-down walk.** For each commit (newest first), input lanes
+   are a copy of the previous row's output lanes. The commit's
+   position in input lanes is found; its first-parent inherits its
+   column; additional parents (merges) create new lanes on the
+   right. Each lane retains its branch colour throughout.
+3. **Deduplication.** The same SHA cannot appear in multiple
+   output lanes — the first occurrence wins.
 """
 from __future__ import annotations
 
@@ -60,6 +52,14 @@ BRANCH_PALETTE: tuple[str, ...] = (
     "#6A5086",  # lavender
     "#256D2D",  # lime
 )
+
+
+@dataclass(frozen=True)
+class _SwimlaneEntry:
+    """One swimlane column: SHA of the commit + colour of the lane."""
+
+    sha: str
+    color: str
 
 
 @dataclass(frozen=True)
@@ -112,6 +112,8 @@ class GraphNode:
     color: str = BRANCH_PALETTE[0]
     row: int = 0
     kind: str = "commit"  # "commit" | "wip" | "stash"
+    input_lanes: list[dict] = field(default_factory=list)
+    output_lanes: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Serialise to a plain dict (safe for Qt signal payload)."""
@@ -130,6 +132,8 @@ class GraphNode:
             "color": self.color,
             "row": self.row,
             "kind": self.kind,
+            "input_lanes": list(self.input_lanes),
+            "output_lanes": list(self.output_lanes),
         }
 
 
@@ -142,6 +146,183 @@ class _TipRef:
     target_sha: str
 
 
+def _build_swimlanes(
+    history: list[CommitInfo],
+    branches: list[BranchInfo],
+    head_target_sha: str | None,
+    head_shorthand: str | None,
+    branch_colors: dict[str, str],
+) -> list[dict]:
+    """Build swimlane layout rows for each commit in ``history`` (newest first).
+
+    Returns a list of dicts, one per row, with keys:
+        sha, lane, color, input_lanes, output_lanes
+    """
+    if not history:
+        return []
+
+    shas_in_history: set[str] = {c.sha for c in history}
+
+    # Build sha → branch colour lookup (for branch-tips actually in history).
+    sha_to_branch_color: dict[str, str] = {}
+    for b in branches:
+        if b.target_sha and b.target_sha in shas_in_history:
+            if b.target_sha not in sha_to_branch_color:
+                sha_to_branch_color[b.target_sha] = branch_colors.get(
+                    b.name, BRANCH_PALETTE[0],
+                )
+
+    # Minimal seed: only HEAD target SHA to guarantee lane 0 for HEAD.
+    output_lanes: list[_SwimlaneEntry] = []
+    if head_target_sha and head_target_sha in shas_in_history:
+        color = sha_to_branch_color.get(head_target_sha, BRANCH_PALETTE[0])
+        output_lanes.append(_SwimlaneEntry(sha=head_target_sha, color=color))
+    rows: list[dict] = []
+
+    for commit in history:
+        sha = commit.sha
+
+        # ---- input lanes: copy of previous row's output ----
+        input_lanes = list(output_lanes)
+
+        # ---- find commit position in input lanes ----
+        idx = None
+        for i, entry in enumerate(input_lanes):
+            if entry.sha == sha:
+                idx = i
+                break
+
+        if idx is None:
+            color = sha_to_branch_color.get(sha, BRANCH_PALETTE[0])
+            idx = len(input_lanes)
+            input_lanes.append(_SwimlaneEntry(sha=sha, color=color))
+
+        commit_color = sha_to_branch_color.get(sha, input_lanes[idx].color)
+
+        # ---- collect all positions of this commit ----
+        commit_positions: set[int] = {
+            i for i, entry in enumerate(input_lanes) if entry.sha == sha
+        }
+
+        # ---- build output lanes ----
+        output_lanes = []
+        first_parent_placed = False
+        primary_idx = min(commit_positions)
+
+        for i, entry in enumerate(input_lanes):
+            if i in commit_positions:
+                if i == primary_idx and commit.parents and not first_parent_placed:
+                    parent_color = sha_to_branch_color.get(
+                        commit.parents[0], entry.color,
+                    )
+                    output_lanes.append(
+                        _SwimlaneEntry(sha=commit.parents[0], color=parent_color),
+                    )
+                    first_parent_placed = True
+            else:
+                output_lanes.append(entry)
+
+        # ---- additional parents (merge) create new lanes on the right ----
+        start = 1 if first_parent_placed else 0
+        for p in commit.parents[start:]:
+            p_color = sha_to_branch_color.get(
+                p, entry.color if entry else BRANCH_PALETTE[0],
+            )
+            output_lanes.append(_SwimlaneEntry(sha=p, color=p_color))
+
+        # ---- deduplicate SHA in output lanes ----
+        seen: set[str] = set()
+        deduped: list[_SwimlaneEntry] = []
+        for entry in output_lanes:
+            if entry.sha not in seen:
+                seen.add(entry.sha)
+                deduped.append(entry)
+        output_lanes = deduped
+
+        rows.append({
+            "sha": sha,
+            "lane": idx,
+            "color": commit_color,
+            "input_lanes": [
+                {"sha": e.sha, "color": e.color} for e in input_lanes
+            ],
+            "output_lanes": [
+                {"sha": e.sha, "color": e.color} for e in output_lanes
+            ],
+        })
+
+    return rows
+
+
+def _compact_swimlane_columns(
+    rows: list[dict],
+    max_columns: int,
+) -> dict[int, int]:
+    """Map position indices in input_lanes to compact display columns.
+
+    Two positions whose row ranges overlap need different columns.
+    Non-overlapping positions may share a column. Uses greedy
+    interval coloring.
+    """
+    if not rows:
+        return {}
+
+    # Build position -> (min_row, max_row).
+    pos_rows: dict[int, tuple[int, int]] = {}
+    for i, row in enumerate(rows):
+        input_entries = row.get("input_lanes", [])
+        for pos in range(len(input_entries)):
+            if pos not in pos_rows:
+                pos_rows[pos] = (i, i)
+            else:
+                cur_min, cur_max = pos_rows[pos]
+                pos_rows[pos] = (min(cur_min, i), max(cur_max, i))
+
+    if not pos_rows:
+        return {}
+
+    # Sort by first appearance.
+    sorted_pos = sorted(pos_rows.items(), key=lambda x: x[1][0])
+
+    column_of_pos: dict[int, int] = {}
+    for pos, (pos_min, pos_max) in sorted_pos:
+        used_cols: set[int] = set()
+        for other_pos, other_col in column_of_pos.items():
+            other_min, other_max = pos_rows[other_pos]
+            if not (pos_max < other_min or pos_min > other_max):
+                used_cols.add(other_col)
+        col = 0
+        while col in used_cols:
+            col += 1
+        column_of_pos[pos] = col % max_columns if max_columns > 0 else col
+
+    return column_of_pos
+
+
+def _compute_branch_lanes(
+    branches: list[BranchInfo],
+    swimlane_rows: list[dict],
+) -> dict[str, int]:
+    """Map branch_name → lane index from the swimlane layout.
+
+    Uses the first row where the branch's target SHA appears to
+    determine which lane the branch occupies.
+    """
+    result: dict[str, int] = {}
+    if not swimlane_rows:
+        return result
+    for branch in branches:
+        if not branch.target_sha:
+            continue
+        for row in swimlane_rows:
+            if row["sha"] == branch.target_sha:
+                result[branch.name] = row["lane"]
+                break
+        else:
+            result[branch.name] = 0
+    return result
+
+
 def compute_layout(
     history: list[CommitInfo],
     branches: list[BranchInfo],
@@ -151,17 +332,12 @@ def compute_layout(
     *,
     max_columns: int = 12,
 ) -> list[GraphNode]:
-    """Compute a lane-based layout for ``history``.
+    """Compute a swimlane-based layout for ``history``.
 
     ``head_target_sha`` is the SHA ``HEAD`` resolves to (``None`` if
     unborn). ``head_shorthand`` is the symbolic name ``HEAD`` carries
     — a branch name like ``"main"`` when on a branch, or
     ``"(detached)"`` when HEAD is detached.
-
-    ``max_columns`` caps the number of display columns produced by
-    lane compaction. Lanes whose row-range intervals do not overlap
-    may share a display column; when more than ``max_columns``
-    intervals overlap simultaneously, excess ones wrap around.
 
     The returned list is in the same order as ``history`` (newest
     first). Each :class:`GraphNode` has ``row`` matching its position
@@ -171,108 +347,52 @@ def compute_layout(
         return []
 
     refs_by_sha = _build_refs_map(branches, tags, head_target_sha, head_shorthand)
-    branch_lanes_dict: dict[str, int]
-    branch_colors_dict: dict[str, str]
-    lanes, branch_lanes_dict = _assign_lanes(history, branches, head_target_sha)
-    branch_tips = {b.target_sha for b in branches if b.target_sha}
-    colors = _assign_colors(history, branch_tips)
-    branch_colors_dict = _assign_branch_colors(branches, head_target_sha)
-    branch_refs_by_sha = _build_branch_refs_map(
-        branches, branch_lanes_dict, branch_colors_dict,
+    branch_colors = _assign_branch_colors(branches, head_target_sha)
+
+    swimlane_rows = _build_swimlanes(
+        history, branches, head_target_sha, head_shorthand, branch_colors,
     )
-    column_of_lane = _compact_lanes(history, lanes, max_columns)
 
-    _zone = 3
+    branch_lanes_by_name = _compute_branch_lanes(branches, swimlane_rows)
+    branch_refs_by_sha = _build_branch_refs_map(
+        branches, branch_lanes_by_name, branch_colors,
+    )
 
-    stash_groups: list[list[int]] = []
-    current: list[int] = []
-    for row, commit in enumerate(history):
-        if getattr(commit, "kind", "commit") == "stash":
-            current.append(row)
-        else:
-            if current:
-                stash_groups.append(current)
-                current = []
-    if current:
-        stash_groups.append(current)
-
-    row_rightmost = [-1] * len(history)
-    for lane, col in column_of_lane.items():
-        has_non_stash = any(
-            lanes[commit.sha] == lane
-            and getattr(commit, "kind", "commit") != "stash"
-            for commit in history
-        )
-        if not has_non_stash:
-            continue
-
-        lane_min = len(history)
-        lane_max = -1
-        for row, commit in enumerate(history):
-            if (
-                lanes[commit.sha] == lane
-                and getattr(commit, "kind", "commit") != "stash"
-            ):
-                lane_min = min(lane_min, row)
-                lane_max = max(lane_max, row)
-        if lane_max < 0:
-            continue
-        lo = max(0, lane_min - _zone)
-        hi = min(len(history) - 1, lane_max + _zone)
-        for row in range(lo, hi + 1):
-            if col > row_rightmost[row]:
-                row_rightmost[row] = col
-
-    stash_col: dict[str, int] = {}
-    for group in stash_groups:
-        if group[0] == 0:
-            first = history[0]
-            if first.parents:
-                p_lane = lanes.get(first.parents[0])
-                col = column_of_lane.get(p_lane, 0) if p_lane is not None else 0
-            else:
-                col = 0
-            sha = history[0].sha
-            stash_col[sha] = col
-            col += 1
-            for row in group[1:]:
-                while col <= row_rightmost[row]:
-                    col += 1
-                sha = history[row].sha
-                stash_col[sha] = col
-                col += 1
-        else:
-            col = max(row_rightmost[row] for row in group) + 1
-            for row in group:
-                while col <= row_rightmost[row]:
-                    col += 1
-                sha = history[row].sha
-                stash_col[sha] = col
-                col += 1
+    column_of_pos = _compact_swimlane_columns(swimlane_rows, max_columns)
 
     nodes: list[GraphNode] = []
     for row, commit in enumerate(history):
-        sha = commit.sha
-        if sha in stash_col:
-            display_column = stash_col[sha]
-        else:
-            display_column = column_of_lane.get(lanes[sha], 0)
+        sw = swimlane_rows[row]
+        logical_lane = sw["lane"]
+
+        # Add display column to each input/output lane entry.
+        in_lanes = [
+            {"sha": e["sha"], "color": e["color"], "column": column_of_pos.get(i, i)}
+            for i, e in enumerate(sw["input_lanes"])
+        ]
+        out_lanes = [
+            {"sha": e["sha"], "color": e["color"], "column": column_of_pos.get(i, i)}
+            for i, e in enumerate(sw["output_lanes"])
+        ]
+
         nodes.append(
             GraphNode(
-                sha=sha,
+                sha=commit.sha,
                 short_sha=commit.short_sha,
                 subject=_subject(commit.message),
                 author_name=commit.author_name,
                 author_email=commit.author_email,
                 author_time=commit.author_time,
                 parents=list(commit.parents),
-                refs=refs_by_sha.get(sha, []),
-                branch_refs=branch_refs_by_sha.get(sha, []),
-                lane=lanes[sha],
-                display_column=display_column,
-                color=colors[sha],
+                refs=refs_by_sha.get(commit.sha, []),
+                branch_refs=branch_refs_by_sha.get(commit.sha, []),
+                lane=logical_lane,
+                display_column=column_of_pos.get(logical_lane, logical_lane),
+                color=sw["color"],
                 row=row,
                 kind=getattr(commit, "kind", "commit"),
+                input_lanes=in_lanes,
+                output_lanes=out_lanes,
             ),
         )
 
@@ -477,55 +597,6 @@ def _first_free_lane(lane_last_commit: list[str | None]) -> int:
     return len(lane_last_commit)
 
 
-def _assign_colors(
-    history: list[CommitInfo],
-    branch_tips: set[str],
-) -> dict[str, str]:
-    """Return ``sha -> hex color`` for every commit in ``history``.
-
-    Branch tips pick up a fresh palette colour in the order they
-    appear in ``history`` (newest first). The colour is then walked
-    **down** the first-parent chain from each tip so that every
-    ancestor on the same lineage inherits the branch colour. Earlier
-    tips (lower palette index) take precedence — once a commit has a
-    colour it is never overwritten. Commits with no branch tip and
-    whose first parent is already coloured inherit that colour in a
-    final oldest-first pass.
-    """
-    color_of: dict[str, str] = {}
-    commits_by_sha = {c.sha: c for c in history}
-    palette_idx = 0
-
-    tips_in_order: list[str] = []
-    for commit in history:
-        if commit.sha in branch_tips:
-            color_of[commit.sha] = BRANCH_PALETTE[palette_idx % len(BRANCH_PALETTE)]
-            tips_in_order.append(commit.sha)
-            palette_idx += 1
-
-    for tip_sha in tips_in_order:
-        tip_color = color_of[tip_sha]
-        sha: str | None = tip_sha
-        while sha is not None:
-            commit = commits_by_sha.get(sha)
-            if commit is None or not commit.parents:
-                break
-            parent_sha = commit.parents[0]
-            if parent_sha not in color_of:
-                color_of[parent_sha] = tip_color
-            sha = parent_sha
-
-    for commit in reversed(history):
-        if commit.sha in color_of:
-            continue
-        if commit.parents and commit.parents[0] in color_of:
-            color_of[commit.sha] = color_of[commit.parents[0]]
-        else:
-            color_of[commit.sha] = BRANCH_PALETTE[0]
-
-    return color_of
-
-
 def _assign_branch_colors(
     branches: list[BranchInfo],
     head_target_sha: str | None,
@@ -544,68 +615,11 @@ def _assign_branch_colors(
     return result
 
 
-def _compact_lanes(
-    history: list[CommitInfo],
-    lane_of: dict[str, int],
-    max_columns: int,
-) -> dict[int, int]:
-    """Compact logical lanes into a limited set of display columns.
-
-    Each lane spans a contiguous row range in ``history`` (row 0 is
-    newest). Two lanes whose ranges overlap must occupy different
-    columns; non-overlapping lanes may share a column. The algorithm
-    uses greedy interval coloring — sort lanes by their topmost row
-    (lowest row number), then assign each the smallest free column
-    that does not conflict with already-placed overlapping lanes.
-
-    ``max_columns`` caps the result: when the greedy assignment
-    exhausts all columns, it wraps around modulo ``max_columns``,
-    reusing the earliest column. This keeps the graph compact at the
-    cost of occasional visual overlap on repos with many
-    simultaneously active branches.
-    """
-    if not history or not lane_of:
-        return {}
-
-    # Build lane -> (min_row, max_row) — the row range each lane occupies.
-    lane_rows: dict[int, tuple[int, int]] = {}
-    for row, commit in enumerate(history):
-        lane = lane_of.get(commit.sha)
-        if lane is None:
-            continue
-        if lane not in lane_rows:
-            lane_rows[lane] = (row, row)
-        else:
-            cur_min, cur_max = lane_rows[lane]
-            lane_rows[lane] = (min(cur_min, row), max(cur_max, row))
-
-    if not lane_rows:
-        return {}
-
-    # Sort lanes by their topmost row (lowest row number = newest on top).
-    sorted_lanes = sorted(lane_rows.items(), key=lambda item: item[1][0])
-
-    lane_column: dict[int, int] = {}
-
-    for lane, (lane_min, lane_max) in sorted_lanes:
-        used_columns: set[int] = set()
-        for other_lane, other_col in lane_column.items():
-            other_min, other_max = lane_rows[other_lane]
-            if not (lane_max < other_min or lane_min > other_max):
-                used_columns.add(other_col)
-
-        col = 0
-        while col in used_columns:
-            col += 1
-        lane_column[lane] = col % max_columns if max_columns > 0 else col
-
-    return lane_column
-
-
 __all__ = [
     "BRANCH_PALETTE",
     "BranchRef",
     "GraphNode",
     "compute_layout",
     "nodes_to_rows",
+    "_build_swimlanes",
 ]
