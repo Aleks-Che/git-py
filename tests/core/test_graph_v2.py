@@ -137,8 +137,8 @@ def test_linear_three_commits() -> None:
 def test_simple_branch() -> None:
     """Two branches diverging from a common ancestor.
 
-    Fork point (c1 with 2 children) triggers a connector row, so
-    we get 4 nodes: c3, c2, connector, c1.
+    Fork point (c1 with 2 children) gets connector cells merged into
+    its own row, so we get 3 nodes: c3, c2, c1.
     """
     c1 = "a" * 40  # root (fork point — 2 children)
     c2 = "b" * 40  # main branch
@@ -149,8 +149,7 @@ def test_simple_branch() -> None:
         _c(c1, ts=1),
     ]
     layout = build_graph(commits, [])
-    # c3, c2, fork-connector, c1 = 4 nodes
-    assert len(layout.nodes) == 4
+    assert len(layout.nodes) == 3
 
     # Row 0 (c3) — lane 0
     n0 = layout.nodes[0]
@@ -158,29 +157,22 @@ def test_simple_branch() -> None:
     assert n0.lane == 0
     assert n0.cells[0].cell_type == CellType.COMMIT
 
-    # Row 1 (c2) — lane 1. Parent c1 is a fork point, so c1 is placed
-    # on lane 1 as a fork sibling (same lane as c2 — no horizontal needed).
+    # Row 1 (c2) — lane 1
     n1 = layout.nodes[1]
     assert n1.commit.sha == c2
     assert n1.lane == 1
     cells1 = n1.cells
-    # Lane 0 has PIPE (c1 tracked from c3), lane 1 has COMMIT (c2)
-    assert cells1[0].cell_type == CellType.PIPE  # c1 tracked on lane 0
-    assert cells1[2].cell_type == CellType.COMMIT  # c2 on lane 1
+    assert cells1[0].cell_type == CellType.PIPE
+    assert cells1[2].cell_type == CellType.COMMIT
 
-    # Row 2 — fork connector (no commit)
-    n_conn = layout.nodes[2]
-    assert n_conn.commit is None
-    assert not n_conn.is_uncommitted
-    # Single merging lane → PIPE on main (not TEE_RIGHT), HORIZONTAL + MERGE_LEFT
-    assert n_conn.cells[0].cell_type == CellType.PIPE  # main lane continues
-    has_merge = any(c.cell_type == CellType.MERGE_LEFT for c in n_conn.cells)
-    assert has_merge
-
-    # Row 3 (c1) — lane 0, root commit
-    n_root = layout.nodes[3]
+    # Row 2 (c1) — lane 0, root with merged connector cells
+    n_root = layout.nodes[2]
     assert n_root.commit.sha == c1
     assert n_root.lane == 0
+    cells_root = n_root.cells
+    assert cells_root[0].cell_type == CellType.PIPE  # main lane pipe
+    assert any(c.cell_type == CellType.MERGE_LEFT for c in cells_root)
+    assert any(c.cell_type == CellType.HORIZONTAL for c in cells_root)
 
 
 def test_branch_with_refs() -> None:
@@ -264,7 +256,7 @@ def test_merge_with_branch_names() -> None:
 
 
 def test_fork_point_connector_row() -> None:
-    """When a commit has 2+ children, a connector row is inserted."""
+    """When a commit has 2+ children, connector cells are merged into its row."""
     c1 = "a" * 40  # root (fork point)
     c2 = "b" * 40  # child 1 (main)
     c3 = "c" * 40  # child 2 (branch)
@@ -280,19 +272,21 @@ def test_fork_point_connector_row() -> None:
     assert commit_shas[1] == c2
     assert commit_shas[2] == c1
 
-    fork_connectors = [n for n in nodes if n.commit is None and not n.is_uncommitted]
-    assert len(fork_connectors) >= 1
-
-    fc = fork_connectors[0]
-    # Single merging lane: main lane has PIPE (not TEE_RIGHT)
-    has_pipe_or_tee = any(c.cell_type in (CellType.PIPE, CellType.TEE_RIGHT) for c in fc.cells)
-    has_merge = any(c.cell_type in (CellType.MERGE_LEFT, CellType.MERGE_RIGHT) for c in fc.cells)
+    root_node = nodes[2]
+    assert root_node.commit.sha == c1
+    has_pipe_or_tee = any(
+        c.cell_type in (CellType.PIPE, CellType.TEE_RIGHT) for c in root_node.cells
+    )
+    has_merge = any(
+        c.cell_type in (CellType.MERGE_LEFT, CellType.MERGE_RIGHT)
+        for c in root_node.cells
+    )
     assert has_pipe_or_tee
     assert has_merge
 
 
 def test_fork_point_with_three_children() -> None:
-    """Three children create connector with TEE_RIGHT + TEE_UP + MERGE_LEFT."""
+    """Three children create merge cells on the root commit's row."""
     c1 = "a" * 40
     c2 = "b" * 40
     c3 = "c" * 40
@@ -305,12 +299,12 @@ def test_fork_point_with_three_children() -> None:
     ]
     layout = build_graph(commits, [])
     nodes = layout.nodes
-    fork_connectors = [n for n in nodes if n.commit is None and not n.is_uncommitted]
-    assert len(fork_connectors) >= 1
+    commit_nodes = [n for n in nodes if n.commit is not None]
+    assert len(commit_nodes) == 4
 
-    fc = fork_connectors[0]
-    # With 3+ merging lanes, main should have TEE_RIGHT
-    has_tee = any(c.cell_type == CellType.TEE_RIGHT for c in fc.cells)
+    root_node = commit_nodes[-1]
+    assert root_node.commit.sha == c1
+    has_tee = any(c.cell_type == CellType.TEE_RIGHT for c in root_node.cells)
     assert has_tee
 
 

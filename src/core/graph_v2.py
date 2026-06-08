@@ -397,6 +397,7 @@ def build_graph(
 
         # --- fork point handling: multiple lanes track the same commit ---
         fork_lanes: list[int] = [i for i, lo in enumerate(lanes) if lo == commit.sha]
+        fork_merging_cells: list[CellInfo] | None = None
         if len(fork_lanes) >= 2:
             main_lane = min(fork_lanes)
             merging_lanes: list[tuple[int, int]] = []
@@ -416,16 +417,10 @@ def build_graph(
                 lane_color_index.get(main_lane)
                 or oid_color_index.get(commit.sha, main_lane)
             )
-            fork_cells = _build_fork_connector_cells(
+            fork_merging_cells = _build_fork_connector_cells(
                 main_lane, main_color, merging_lanes, lanes,
                 oid_color_index, lane_color_index, max_lane,
             )
-            nodes.append(GraphNode(
-                commit=None,
-                lane=main_lane,
-                color_index=main_color,
-                cells=fork_cells,
-            ))
 
             for ml, _ in merging_lanes:
                 if ml < len(lanes):
@@ -543,6 +538,15 @@ def build_graph(
             lane, final_color_index, parent_lanes, lanes,
             oid_color_index, lane_color_index, max_lane,
         )
+
+        # Merge fork connector cells into the commit's own cells so the
+        # branching is rendered directly from the fork point commit node.
+        if fork_merging_cells is not None:
+            while len(cells) < len(fork_merging_cells):
+                cells.append(CellInfo.empty())
+            for fci, fc in enumerate(fork_merging_cells):
+                if fc.cell_type != CellType.EMPTY:
+                    cells[fci] = fc
 
         branch_names = oid_to_branches.get(commit.sha, [])
         is_head = (head_oid is not None and head_oid == commit.sha)
