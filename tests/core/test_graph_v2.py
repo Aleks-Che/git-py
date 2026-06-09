@@ -175,7 +175,6 @@ def test_simple_branch() -> None:
     assert cells_root[0].cell_type == CellType.TEE_RIGHT
     assert cells_root[0].pipe_color_index == n_root.color_index  # root's pipe colour
     assert any(c.cell_type == CellType.MERGE_LEFT for c in cells_root)
-    assert any(c.cell_type == CellType.HORIZONTAL for c in cells_root)
 
 
 def test_branch_with_refs() -> None:

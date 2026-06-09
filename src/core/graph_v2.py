@@ -839,17 +839,20 @@ def _build_fork_connector_cells(
 
     prev_lane = main_lane
     for idx, (merge_lane, merge_color) in enumerate(merging_lanes):
-        for col in range(prev_lane * 2 + 1, merge_lane * 2):
-            if col < len(cells):
-                existing = cells[col]
-                if existing.cell_type == CellType.PIPE:
-                    cells[col] = CellInfo.horizontal_pipe(merge_color, existing.color_index)
-                elif existing.cell_type in (CellType.EMPTY, CellType.HORIZONTAL):
-                    cells[col] = CellInfo.horizontal(merge_color)
+        is_rightmost = (idx == len(merging_lanes) - 1)
+
+        if not is_rightmost:
+            for col in range(prev_lane * 2 + 1, merge_lane * 2):
+                if col < len(cells):
+                    existing = cells[col]
+                    if existing.cell_type == CellType.PIPE:
+                        cells[col] = CellInfo.horizontal_pipe(merge_color, existing.color_index)
+                    elif existing.cell_type in (CellType.EMPTY, CellType.HORIZONTAL):
+                        cells[col] = CellInfo.horizontal(merge_color)
 
         end_idx = merge_lane * 2
         if end_idx < len(cells):
-            if idx < len(merging_lanes) - 1:
+            if not is_rightmost:
                 next_merge_color = merging_lanes[idx + 1][1]
                 cells[end_idx] = CellInfo(CellType.TEE_UP,
                                           color_index=next_merge_color,
