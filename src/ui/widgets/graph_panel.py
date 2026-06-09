@@ -421,8 +421,8 @@ class GraphTableWidget(QWidget):
                     for ci, cell in enumerate(cells):
                         if ci // 2 == li and cell.get("t", _T_EMPTY) != _T_EMPTY:
                             t = cell.get("t", _T_EMPTY)
-                            if t == _T_HORIZONTAL_PIPE:
-                                clr_idx = cell.get("p", 0)
+                            if t in (_T_HORIZONTAL_PIPE, _T_TEE_RIGHT, _T_TEE_LEFT, _T_TEE_UP):
+                                clr_idx = cell.get("p", cell.get("c", 0))
                             else:
                                 clr_idx = cell.get("c", 0)
                             break
@@ -985,14 +985,17 @@ def _draw_cell_row(
             _draw_vert_line(painter, x, y_center, half_h, edge_width, p_color)
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
         elif t == _T_TEE_RIGHT:
-            _draw_vert_line(painter, x, y_center, half_h, edge_width, color)
+            vert_color = p_color if p else color
+            _draw_vert_line(painter, x, y_center, half_h, edge_width, vert_color)
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
         elif t == _T_TEE_LEFT:
-            _draw_vert_line(painter, x, y_center, half_h, edge_width, color)
+            vert_color = p_color if p else color
+            _draw_vert_line(painter, x, y_center, half_h, edge_width, vert_color)
             _draw_horiz_line(painter, x, y_center, -lane_w, edge_width, color)
         elif t == _T_TEE_UP:
+            vert_color = p_color if p else color
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
-            _draw_vert_line(painter, x, y_center, half_h, edge_width, color, upward_only=True)
+            _draw_vert_line(painter, x, y_center, half_h, edge_width, vert_color, upward_only=True)
 
 
 def _draw_vert_line(

@@ -166,13 +166,14 @@ def test_simple_branch() -> None:
     assert cells1[2].cell_type == CellType.COMMIT
 
     # Row 2 (c1) — lane 0, root with merged connector cells.
-    # The fork connector PIPE on lane 0 uses the commit's colour.
+    # The fork connector TEE_RIGHT carries the first child's colour on
+    # the horizontal and the root's colour on the vertical pipe.
     n_root = layout.nodes[2]
     assert n_root.commit.sha == c1
     assert n_root.lane == 0
     cells_root = n_root.cells
-    assert cells_root[0].cell_type == CellType.PIPE
-    assert cells_root[0].color_index == n_root.color_index  # same colour
+    assert cells_root[0].cell_type == CellType.TEE_RIGHT
+    assert cells_root[0].pipe_color_index == n_root.color_index  # root's pipe colour
     assert any(c.cell_type == CellType.MERGE_LEFT for c in cells_root)
     assert any(c.cell_type == CellType.HORIZONTAL for c in cells_root)
 

@@ -118,20 +118,28 @@ class CellInfo:
     """A single cell with its type and colour payload.
 
     For most cell types the payload is a single ``color_index``.
-    ``HORIZONTAL_PIPE`` carries *two* indices: ``(horizontal_color, pipe_color)``.
+    ``HORIZONTAL_PIPE``, ``TEE_RIGHT``, ``TEE_LEFT``, and ``TEE_UP`` carry
+    *two* indices: ``(horizontal_color, pipe_color)`` --- when
+    ``pipe_color_index`` is non-zero it overrides the vertical-line colour.
     """
 
     cell_type: CellType
     color_index: int = 0
-    pipe_color_index: int = 0  # only for HORIZONTAL_PIPE
+    pipe_color_index: int = 0
 
     def to_dict(self) -> dict:
         d: dict = {"t": int(self.cell_type)}
         if self.cell_type == CellType.EMPTY:
             return d
-        if self.cell_type == CellType.HORIZONTAL_PIPE:
+        if self.cell_type in (
+            CellType.HORIZONTAL_PIPE,
+            CellType.TEE_RIGHT,
+            CellType.TEE_LEFT,
+            CellType.TEE_UP,
+        ):
             d["c"] = self.color_index
-            d["p"] = self.pipe_color_index
+            if self.pipe_color_index:
+                d["p"] = self.pipe_color_index
         else:
             d["c"] = self.color_index
         return d
@@ -567,17 +575,14 @@ def build_graph(
 
         # Merge fork connector cells into the commit's own cells so the
         # branching is rendered directly from the fork point commit node.
-        # On the commit's own lane, keep the connector cell type (PIPE /
-        # TEE_RIGHT) but use the commit's colour to avoid a mismatch.
+        # The fork connector already supplies the correct horizontal and
+        # pipe colours, so the cells are used as-is.
         if fork_merging_cells is not None:
-            commit_cell_idx = lane * 2
             while len(cells) < len(fork_merging_cells):
                 cells.append(CellInfo.empty())
             for fci, fc in enumerate(fork_merging_cells):
                 if fc.cell_type == CellType.EMPTY:
                     continue
-                if fci == commit_cell_idx:
-                    fc = CellInfo(fc.cell_type, color_index=final_color_index)
                 cells[fci] = fc
 
         branch_names = oid_to_branches.get(commit.sha, [])
@@ -808,13 +813,21 @@ def _build_fork_connector_cells(
 
     merging_lane_nums = sorted(ml for ml, _ in merging_lanes)
 
-    # Main lane: PIPE (single merge) or TEE_RIGHT (multiple merges).
+    # Main lane: PIPE (single merge) or TEE_RIGHT with first-merge
+    # horizontal colour (multiple merges).
     main_cell_idx = main_lane * 2
+    first_merge_color = merging_lanes[0][1] if merging_lanes else main_color
     if main_cell_idx < len(cells):
         if len(merging_lanes) == 1:
-            cells[main_cell_idx] = CellInfo.pipe(main_color)
+            cells[main_cell_idx] = CellInfo(CellType.TEE_RIGHT,
+                                            color_index=first_merge_color,
+                                            pipe_color_index=main_color)
+        elif len(merging_lanes) >= 2:
+            cells[main_cell_idx] = CellInfo(CellType.TEE_RIGHT,
+                                            color_index=first_merge_color,
+                                            pipe_color_index=main_color)
         else:
-            cells[main_cell_idx] = CellInfo.tee_right(main_color)
+            cells[main_cell_idx] = CellInfo.pipe(main_color)
 
     # Vertical lines for active lanes (except main and merging)
     for lane_idx, lane_oid in enumerate(active_lanes):
@@ -824,10 +837,9 @@ def _build_fork_connector_cells(
                 color = lane_color_index.get(lane_idx) or oid_color_index.get(lane_oid, lane_idx)
                 cells[cell_idx] = CellInfo.pipe(color)
 
-    rightmost_lane = merging_lane_nums[-1] if merging_lane_nums else main_lane
-
-    for merge_lane, merge_color in merging_lanes:
-        for col in range(main_lane * 2 + 1, merge_lane * 2):
+    prev_lane = main_lane
+    for idx, (merge_lane, merge_color) in enumerate(merging_lanes):
+        for col in range(prev_lane * 2 + 1, merge_lane * 2):
             if col < len(cells):
                 existing = cells[col]
                 if existing.cell_type == CellType.PIPE:
@@ -837,10 +849,15 @@ def _build_fork_connector_cells(
 
         end_idx = merge_lane * 2
         if end_idx < len(cells):
-            if merge_lane == rightmost_lane:
-                cells[end_idx] = CellInfo.merge_left(merge_color)
+            if idx < len(merging_lanes) - 1:
+                next_merge_color = merging_lanes[idx + 1][1]
+                cells[end_idx] = CellInfo(CellType.TEE_UP,
+                                          color_index=next_merge_color,
+                                          pipe_color_index=merge_color)
             else:
-                cells[end_idx] = CellInfo.tee_up(merge_color)
+                cells[end_idx] = CellInfo.merge_left(merge_color)
+
+        prev_lane = merge_lane
 
     return cells
 
