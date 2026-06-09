@@ -761,14 +761,24 @@ def _build_row_cells(
             continue
 
         if parent_lane > commit_lane:
-            # Connection to the right
-            for col in range(commit_lane * 2 + 1, parent_lane * 2):
-                if col < len(cells):
-                    existing = cells[col]
-                    if existing.cell_type == CellType.PIPE:
-                        cells[col] = CellInfo.horizontal_pipe(parent_color, existing.color_index)
-                    elif existing.cell_type == CellType.EMPTY:
-                        cells[col] = CellInfo.horizontal(parent_color)
+            # Connection to the right.
+            if parent_lane == commit_lane + 1:
+                # Adjacent parent — replace COMMIT with TEE_RIGHT so the
+                # horizontal exactly reaches the parent lane centre.
+                if commit_cell_idx < len(cells):
+                    cells[commit_cell_idx] = CellInfo(
+                        CellType.TEE_RIGHT,
+                        color_index=parent_color,
+                        pipe_color_index=commit_color,
+                    )
+            else:
+                for col in range(commit_lane * 2 + 1, parent_lane * 2 - 1):
+                    if col < len(cells):
+                        existing = cells[col]
+                        if existing.cell_type == CellType.PIPE:
+                            cells[col] = CellInfo.horizontal_pipe(parent_color, existing.color_index)
+                        elif existing.cell_type == CellType.EMPTY:
+                            cells[col] = CellInfo.horizontal(parent_color)
 
             end_idx = parent_lane * 2
             if end_idx < len(cells):
@@ -779,14 +789,23 @@ def _build_row_cells(
                 else:
                     cells[end_idx] = CellInfo.branch_left(parent_color)
         else:
-            # Connection to the left
-            for col in range(parent_lane * 2 + 1, commit_lane * 2):
-                if col < len(cells):
-                    existing = cells[col]
-                    if existing.cell_type == CellType.PIPE:
-                        cells[col] = CellInfo.horizontal_pipe(parent_color, existing.color_index)
-                    elif existing.cell_type == CellType.EMPTY:
-                        cells[col] = CellInfo.horizontal(parent_color)
+            # Connection to the left.
+            if parent_lane == commit_lane - 1:
+                # Adjacent parent — replace COMMIT with TEE_LEFT.
+                if commit_cell_idx < len(cells):
+                    cells[commit_cell_idx] = CellInfo(
+                        CellType.TEE_LEFT,
+                        color_index=parent_color,
+                        pipe_color_index=commit_color,
+                    )
+            else:
+                for col in range(parent_lane * 2 + 1, commit_lane * 2 - 1):
+                    if col < len(cells):
+                        existing = cells[col]
+                        if existing.cell_type == CellType.PIPE:
+                            cells[col] = CellInfo.horizontal_pipe(parent_color, existing.color_index)
+                        elif existing.cell_type == CellType.EMPTY:
+                            cells[col] = CellInfo.horizontal(parent_color)
 
             start_idx = parent_lane * 2
             if start_idx < len(cells):
@@ -840,9 +859,18 @@ def _build_fork_connector_cells(
     prev_lane = main_lane
     for idx, (merge_lane, merge_color) in enumerate(merging_lanes):
         is_rightmost = (idx == len(merging_lanes) - 1)
+        is_adjacent = (merge_lane == prev_lane + 1)
 
-        if not is_rightmost:
-            for col in range(prev_lane * 2 + 1, merge_lane * 2):
+        # Skip intermediate horizontals for the rightmost merge only
+        # when it is adjacent (the previous cell's horizontal already
+        # covers the gap).  For non-adjacent rightmost merges stop one
+        # cell early --- the HORIZONTAL_PIPE on the intermediate lane
+        # already reaches the merge point.
+        if not is_rightmost or not is_adjacent:
+            end_col = merge_lane * 2
+            if is_rightmost and not is_adjacent:
+                end_col -= 1
+            for col in range(prev_lane * 2 + 1, end_col):
                 if col < len(cells):
                     existing = cells[col]
                     if existing.cell_type == CellType.PIPE:

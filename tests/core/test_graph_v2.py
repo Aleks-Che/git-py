@@ -220,12 +220,16 @@ def test_merge_commit() -> None:
     assert n0.lane == 0
 
     # Should have connections to both parents
-    # First parent c2 on lane 0, second parent c1 on lane 1
+    # First parent c2 on lane 0, second parent c1 on lane 1.
+    # The merge uses TEE_RIGHT at lane 0 (exact-length horizontal
+    # to lane 1) instead of COMMIT + intermediate HORIZONTAL.
     cells0 = n0.cells
-    assert cells0[0].cell_type == CellType.COMMIT
-    # There should be some connection to lane 1
+    assert cells0[0].cell_type == CellType.TEE_RIGHT
+    assert cells0[0].pipe_color_index == n0.color_index  # commit's pipe colour
+    # There should be some merge/branch indicator on lane 1
     has_lane1_connection = any(
-        c.cell_type != CellType.EMPTY for c in cells0[2:]
+        c.cell_type in (CellType.MERGE_LEFT, CellType.TEE_LEFT, CellType.BRANCH_LEFT)
+        for c in cells0[2:]
     )
     assert has_lane1_connection, f"Expected lane 1 connection in {cells0}"
 

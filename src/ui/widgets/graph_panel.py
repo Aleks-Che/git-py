@@ -624,7 +624,7 @@ class GraphTableWidget(QWidget):
             )
         elif is_stash:
             radius = self._cfg.wip_node_radius
-            stash_c = QColor(self._cfg.stash_color)
+            stash_c = color if color.isValid() else QColor(self._cfg.stash_color)
             painter.setPen(QPen(stash_c, 1.5, Qt.PenStyle.DashLine))
             painter.setBrush(QColor(self._cfg.background_color))
             painter.drawEllipse(
