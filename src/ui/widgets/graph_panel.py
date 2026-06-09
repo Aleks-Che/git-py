@@ -57,6 +57,7 @@ class RenderConfig:
     ref_chip_gap: int = 3
     header_height: int = 28
     divider_width: int = 3
+    graph_left_padding: int = 24
     background_color: str = DARK_THEME.bg
     header_bg_color: str = "#1e1e2e"
     text_color: str = DARK_THEME.text
@@ -161,6 +162,8 @@ class GraphTableWidget(QWidget):
         self._selected_sha: str | None = None
         self._hovered_sha: str | None = None
         self._scroll_offset = 0
+        self._h_scrolls: list[int] = [0, 0, 0]
+        self._active_col: int = 1
         self._avatar_cache: dict[str, QPixmap] = {}
 
         self._dividers: list[int] = [180, 500]
@@ -171,6 +174,16 @@ class GraphTableWidget(QWidget):
         self._scrollbar = QScrollBar(Qt.Orientation.Vertical, self)
         self._scrollbar.valueChanged.connect(self._on_scroll)
         self._scrollbar.setRange(0, 0)
+
+        self._h_scrollbars: list[QScrollBar] = [
+            QScrollBar(Qt.Orientation.Horizontal, self),
+            QScrollBar(Qt.Orientation.Horizontal, self),
+            QScrollBar(Qt.Orientation.Horizontal, self),
+        ]
+        for i, bar in enumerate(self._h_scrollbars):
+            bar.valueChanged.connect(lambda value, idx=i: self._on_h_scroll(idx, value))
+            bar.setRange(0, 0)
+            bar.hide()
 
         self.setMouseTracking(True)
         self.setMinimumHeight(100)
@@ -196,6 +209,7 @@ class GraphTableWidget(QWidget):
         if len(positions) == 2:
             self._dividers[0] = max(80, min(positions[0], positions[1] - 60))
             self._dividers[1] = max(self._dividers[0] + 60, positions[1])
+            self._update_scrollbar()
             self.update()
 
     def selected_sha(self) -> str | None:
@@ -239,6 +253,10 @@ class GraphTableWidget(QWidget):
         self._scroll_offset = value
         self.update()
 
+    def _on_h_scroll(self, col: int, value: int) -> None:
+        self._h_scrolls[col] = value
+        self.update()
+
     def _on_external_select(self, sha: str) -> None:
         self._selected_sha = sha
         self.update()
@@ -253,6 +271,91 @@ class GraphTableWidget(QWidget):
         self._scrollbar.setRange(0, max(0, total_h - visible_h))
         self._scrollbar.setPageStep(max(1, visible_h))
         self._scrollbar.setSingleStep(self._cfg.row_height // 2)
+
+        bar_h = self._h_scrollbars[0].sizeHint().height()
+        ranges = self._col_ranges()
+        overflows = self._compute_column_overflows(ranges, bar_h)
+        for col, (overflow, (left, right)) in enumerate(zip(overflows, ranges, strict=True)):
+            visible_w = max(1, right - left)
+            bar = self._h_scrollbars[col]
+            bar.setRange(0, max(0, overflow))
+            bar.setPageStep(max(1, visible_w))
+            bar.setSingleStep(20)
+            if overflow > 0:
+                bar.setGeometry(left, self.height() - bar_h, visible_w, bar_h)
+                bar.show()
+            else:
+                bar.hide()
+            self._h_scrolls[col] = bar.value()
+        if self._active_col >= 0 and overflows[self._active_col] == 0:
+            self._active_col = next(
+                (i for i, o in enumerate(overflows) if o > 0),
+                1,
+            )
+
+    def _compute_column_overflows(
+        self, ranges: list[tuple[int, int]], bar_h: int,
+    ) -> list[int]:
+        del bar_h
+        nr = self._cfg.node_radius
+        lane_w = nr * 2 + 8
+        pad = self._cfg.graph_left_padding
+        col1_left, col1_right = ranges[1]
+        col1_width = col1_right - col1_left
+
+        max_lane = 0
+        for row in self._rows:
+            cells = row.get("cells", [])
+            if cells:
+                max_lane = max(max_lane, (len(cells) - 1) // 2)
+            lane = row.get("lane", 0)
+            max_lane = max(max_lane, lane)
+        graph_needed = max_lane * lane_w + nr * 2 + pad
+        graph_overflow = graph_needed - (col1_width - pad)
+
+        fm = self.fontMetrics()
+        max_branch_w = 0
+        max_text_w = 0
+        for row in self._rows:
+            branch_refs = row.get("branch_refs", [])
+            if branch_refs:
+                w = self._measure_branch_row(branch_refs, fm)
+                if w > max_branch_w:
+                    max_branch_w = w
+            commit = row.get("commit")
+            if commit is not None:
+                subject = commit.get("subject", "") or ""
+                w = fm.horizontalAdvance(subject)
+                if w > max_text_w:
+                    max_text_w = w
+        col0_left, col0_right = ranges[0]
+        col0_width = col0_right - col0_left
+        col2_left, col2_right = ranges[2]
+        col2_width = col2_right - col2_left
+        branch_overflow = max_branch_w - (col0_width - 10)
+        text_overflow = max_text_w - (col2_width - 24)
+
+        return [max(0, branch_overflow), max(0, graph_overflow), max(0, text_overflow)]
+
+    def _measure_branch_row(self, branch_refs: list, fm) -> int:
+        icon_size = self._cfg.branch_icon_size
+        pad = 5
+        gap = 3
+        avatar_size = icon_size + 4
+        cursor = 6
+        for branch in branch_refs:
+            display = branch["name"]
+            if branch.get("is_remote"):
+                parts = display.split("/", 1)
+                if len(parts) == 2:
+                    display = parts[1]
+            reserved = (
+                pad * 2 + (icon_size + gap if branch.get("is_head") else 0)
+                + (gap + icon_size if not branch.get("is_remote") else 0)
+                + gap + avatar_size
+            )
+            cursor += fm.horizontalAdvance(display) + reserved
+        return cursor
 
     def _col_ranges(self) -> list[tuple[int, int]]:
         ranges: list[tuple[int, int]] = []
@@ -352,9 +455,22 @@ class GraphTableWidget(QWidget):
         painter.save()
         painter.setClipRect(0, hh, w, self.height() - hh)
         self._draw_row_backgrounds(painter, hh)
-        self._draw_cells(painter, hh)
-        self._draw_row_content(painter, hh)
         painter.restore()
+
+        col_ranges = self._col_ranges()
+        for col, (left, right) in enumerate(col_ranges):
+            if right <= left:
+                continue
+            painter.save()
+            painter.setClipRect(left, hh, right - left, self.height() - hh)
+            painter.translate(-self._h_scrolls[col], 0)
+            if col == 0:
+                self._draw_branch_column(painter, hh, left, right)
+            elif col == 1:
+                self._draw_graph_column(painter, hh, left, right)
+            else:
+                self._draw_commit_column(painter, hh, left, right)
+            painter.restore()
 
         # column guide lines
         painter.setPen(QPen(QColor("#2a2a3a"), 1, Qt.PenStyle.DotLine))
@@ -372,6 +488,9 @@ class GraphTableWidget(QWidget):
     def _row_y(self, row: int) -> float:
         return self._cfg.header_height + self._cfg.row_height * row - self._scroll_offset
 
+    def _column_left_x(self) -> float:
+        return self._dividers[0] + self._cfg.graph_left_padding
+
     def _column_center_x(self) -> float:
         return (self._dividers[0] + self._dividers[1]) / 2
 
@@ -382,16 +501,17 @@ class GraphTableWidget(QWidget):
     # cell-based graph rendering
     # ------------------------------------------------------------------
 
-    def _lane_x(self, lane: int, center_x: float, lane_w: float) -> float:
-        """X coordinate for *lane* (0-indexed), centred in the graph column."""
-        return center_x + (lane - 0.5) * lane_w
+    def _lane_x(self, lane: int, lane_w: float) -> float:
+        """X coordinate for *lane* (0-indexed), aligned to the left edge of
+        the graph column with ``graph_left_padding`` indent."""
+        return self._column_left_x() + lane * lane_w
 
     def _draw_cells(self, painter: QPainter, header_h: int) -> None:
         """Draw the graph using cell data from each row."""
         dh = self._cfg.row_height
         nr = self._cfg.node_radius
         ew = max(3, self._cfg.edge_width)
-        col_cx = self._column_center_x()
+        col_left = self._column_left_x()
         lane_w = nr * 2 + 8
 
         prev_occupied: set[int] = set()
@@ -416,7 +536,7 @@ class GraphTableWidget(QWidget):
                 prev_y_center = self._row_y(row_idx - 1) + dh / 2
                 common = prev_occupied & cur_occupied
                 for li in common:
-                    x = self._lane_x(li, col_cx, lane_w)
+                    x = self._lane_x(li, lane_w)
                     clr_idx = 0
                     for ci, cell in enumerate(cells):
                         if ci // 2 == li and cell.get("t", _T_EMPTY) != _T_EMPTY:
@@ -438,7 +558,7 @@ class GraphTableWidget(QWidget):
 
             prev_occupied = cur_occupied
 
-            _draw_cell_row(painter, cells, col_cx, lane_w, y_center, dh, ew, nr)
+            _draw_cell_row(painter, cells, col_left, lane_w, y_center, dh, ew, nr)
 
     def _draw_row_backgrounds(self, painter: QPainter, header_h: int) -> None:
         dh = self._cfg.row_height
@@ -463,22 +583,44 @@ class GraphTableWidget(QWidget):
                     QColor(bg_color),
                 )
 
-    def _draw_row_content(self, painter: QPainter, header_h: int) -> None:
+    def _draw_branch_column(
+        self, painter: QPainter, header_h: int, left: int, right: int,
+    ) -> None:
         dh = self._cfg.row_height
-        col_ranges = self._col_ranges()
-        col_cx = self._column_center_x()
-        lane_w = self._cfg.node_radius * 2 + 8
         fm = self.fontMetrics()
-
         for row_idx, row_data in enumerate(self._rows):
             y = self._row_y(row_idx)
             y_center = y + dh / 2
             if y + dh < header_h or y > self.height():
                 continue
+            self._draw_branch_chips(painter, row_data, (left, right), y_center, fm)
 
-            self._draw_branch_chips(painter, row_data, col_ranges[0], y_center, fm)
+    def _draw_graph_column(
+        self, painter: QPainter, header_h: int, left: int, right: int,
+    ) -> None:
+        self._draw_cells(painter, header_h)
+        dh = self._cfg.row_height
+        col_cx = self._column_center_x()
+        lane_w = self._cfg.node_radius * 2 + 8
+        del left, right
+        for row_idx, row_data in enumerate(self._rows):
+            y = self._row_y(row_idx)
+            y_center = y + dh / 2
+            if y + dh < header_h or y > self.height():
+                continue
             self._draw_graph_node(painter, row_data, col_cx, lane_w, y_center)
-            self._draw_commit_text(painter, row_data, col_ranges[2], y_center, fm)
+
+    def _draw_commit_column(
+        self, painter: QPainter, header_h: int, left: int, right: int,
+    ) -> None:
+        dh = self._cfg.row_height
+        fm = self.fontMetrics()
+        for row_idx, row_data in enumerate(self._rows):
+            y = self._row_y(row_idx)
+            y_center = y + dh / 2
+            if y + dh < header_h or y > self.height():
+                continue
+            self._draw_commit_text(painter, row_data, (left, right), y_center, fm)
 
     # ------------------------------------------------------------------
     # branch chips (unchanged from old code)
@@ -498,7 +640,7 @@ class GraphTableWidget(QWidget):
         avatar_size = icon_size + 4
         col_left, col_right = col_range
         avail_w = col_right - col_left - 10
-        if avail_w < 40:
+        if avail_w < 20:
             return
 
         commit_color = _row_color(row_data)
@@ -514,13 +656,6 @@ class GraphTableWidget(QWidget):
                 if len(parts) == 2:
                     display = parts[1]
 
-            reserved = (
-                pad * 2 + (icon_size + gap if is_head else 0)
-                + (gap + icon_size if not is_remote else 0)
-                + gap + avatar_size
-            )
-            max_text_w = max(20, avail_w - (cursor_x - col_left) - reserved)
-            display = fm.elidedText(display, Qt.TextElideMode.ElideRight, max_text_w)
             text_w = fm.horizontalAdvance(display)
             text_h = fm.height()
 
@@ -582,8 +717,6 @@ class GraphTableWidget(QWidget):
             )
             painter.drawPixmap(int(inner_x + gap), int(inner_cy - avatar_size / 2), avatar)
             cursor_x += content_w + gap
-            if cursor_x > col_right:
-                break
 
     # ------------------------------------------------------------------
     # graph node rendering
@@ -602,7 +735,7 @@ class GraphTableWidget(QWidget):
             return
 
         lane = row_data.get("lane", 0)
-        cx = self._lane_x(lane, col_cx, lane_w)
+        cx = self._lane_x(lane, lane_w)
         color_index = row_data.get("color_index", 0)
         color = _cell_color(color_index) if not is_uncommitted else QColor(self._cfg.wip_color)
         sha = _row_sha(row_data)
@@ -700,9 +833,7 @@ class GraphTableWidget(QWidget):
         col_range: tuple[int, int], y_center: float, fm,
     ) -> None:
         col_left, col_right = col_range
-        pad_x = 8
-        avail_w = col_right - col_left - pad_x * 2
-        if avail_w < 20:
+        if col_right - col_left < 20:
             return
 
         subject = _row_subject(row_data)
@@ -710,14 +841,11 @@ class GraphTableWidget(QWidget):
             return
 
         kind = _row_kind(row_data)
-        if fm.horizontalAdvance(subject) > avail_w:
-            subject = fm.elidedText(subject, Qt.TextElideMode.ElideRight, avail_w)
-
         text_color = (
             QColor(self._cfg.dim_text_color) if kind in ("wip", "stash")
             else QColor(self._cfg.text_color)
         )
-        subject_x = col_left + pad_x
+        subject_x = col_left + 8
         subject_y = int(y_center + fm.ascent() / 2 - 1)
 
         painter.setPen(QPen(text_color))
@@ -821,6 +949,8 @@ class GraphTableWidget(QWidget):
         x, y = event.pos().x(), event.pos().y()
         hh = self._cfg.header_height
 
+        self._active_col = self._column_at(x)
+
         if self._divider_at(x) >= 0:
             self.setCursor(Qt.CursorShape.SplitHCursor)
         else:
@@ -843,14 +973,58 @@ class GraphTableWidget(QWidget):
         super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event) -> None:  # noqa: N802
-        delta = event.angleDelta().y()
+        mods = event.modifiers()
+        delta_y = event.angleDelta().y()
+        delta_x = event.angleDelta().x()
+        if mods & Qt.KeyboardModifier.ShiftModifier or delta_x != 0:
+            col = self._column_at(event.position().x())
+            bar = self._h_scrollbars[col]
+            delta = delta_x or delta_y
+            bar.setValue(bar.value() - delta // 3)
+            event.accept()
+            return
+        delta = delta_y
         self._scrollbar.setValue(self._scrollbar.value() - delta // 3)
+
+    def _column_at(self, x: float) -> int:
+        for col, (left, right) in enumerate(self._col_ranges()):
+            if left <= x < right:
+                return col
+        return min(self._active_col, 2)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        key = event.key()
+        if key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+            col = min(max(self._active_col, 0), 2)
+            bar = self._h_scrollbars[col]
+            if bar.maximum() == 0:
+                col = next(
+                    (i for i, b in enumerate(self._h_scrollbars) if b.maximum() > 0),
+                    col,
+                )
+                bar = self._h_scrollbars[col]
+            step = 20 if key == Qt.Key.Key_Right else -20
+            bar.setValue(bar.value() + step)
+            event.accept()
+            return
+        if key == Qt.Key.Key_Home:
+            col = min(max(self._active_col, 0), 2)
+            self._h_scrollbars[col].setValue(0)
+            event.accept()
+            return
+        if key == Qt.Key.Key_End:
+            col = min(max(self._active_col, 0), 2)
+            self._h_scrollbars[col].setValue(self._h_scrollbars[col].maximum())
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         w = self.width()
+        h = self.height()
         bar_w = self._scrollbar.sizeHint().width()
-        self._scrollbar.setGeometry(w - bar_w, 0, bar_w, self.height())
+        self._scrollbar.setGeometry(w - bar_w, 0, bar_w, h)
         self._update_scrollbar()
 
     def _move_divider(self, index: int, new_x: int) -> None:
@@ -858,6 +1032,7 @@ class GraphTableWidget(QWidget):
             self._dividers[0] = max(80, min(new_x, self._dividers[1] - 60))
         else:
             self._dividers[1] = max(self._dividers[0] + 60, new_x)
+        self._update_scrollbar()
 
     def _hit_test_commit(self, x: int, y: int) -> str | None:
         hh = self._cfg.header_height
@@ -935,7 +1110,7 @@ class GraphTableWidget(QWidget):
 def _draw_cell_row(
     painter: QPainter,
     cells: list[dict],
-    col_cx: float,
+    col_left: float,
     lane_w: float,
     y_center: float,
     row_height: float,
@@ -958,9 +1133,9 @@ def _draw_cell_row(
         is_even = (idx % 2 == 0)
 
         if is_even:
-            x = col_cx + (lane - 0.5) * lane_w
+            x = col_left + lane * lane_w
         else:
-            x = col_cx + lane * lane_w
+            x = col_left + lane * lane_w + lane_w / 2
 
         color = _cell_color(c)
         p_color = _cell_color(p) if p else color
