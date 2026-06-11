@@ -203,7 +203,12 @@ class RepositoryManager:
         result: list[BranchInfo] = []
         head_name = self.repo.head.shorthand if not self.repo.head_is_unborn else None
         for name in self.repo.branches.local:
-            branch = self.repo.lookup_branch(name)
+            try:
+                branch = self.repo.lookup_branch(name)
+            except Exception:
+                continue
+            if branch.target is None:
+                continue
             result.append(
                 BranchInfo(
                     name=name,
@@ -213,7 +218,20 @@ class RepositoryManager:
                 ),
             )
         for name in self.repo.branches.remote:
-            branch = self.repo.lookup_branch(name, pygit2.enums.BranchType.REMOTE)
+            try:
+                branch = self.repo.lookup_branch(name, pygit2.enums.BranchType.REMOTE)
+            except Exception:
+                continue
+            # Resolve symbolic refs (e.g. origin/HEAD → origin/main) so
+            # ``target_sha`` is always a commit OID string, never a
+            # symbolic path like ``refs/remotes/origin/main``.
+            try:
+                resolved = branch.resolve()
+                target_sha = None if resolved.target is None else str(resolved.target)
+            except Exception:
+                target_sha = None
+            if target_sha is None:
+                continue
             # ``upstream_name`` is a local-branch-only property; remote
             # branches raise ``ValueError`` if you call it. The remote
             # branch's own name (e.g. "origin/main") is the most useful
@@ -228,7 +246,7 @@ class RepositoryManager:
                     is_head=False,
                     is_remote=True,
                     upstream=upstream,
-                    target_sha=str(branch.target),
+                    target_sha=target_sha,
                 ),
             )
         return result
@@ -394,6 +412,7 @@ class RepositoryManager:
         for name in self.repo.branches.remote:
             try:
                 ref = self.repo.lookup_reference(f"refs/remotes/{name}")
+                ref = ref.resolve()
             except (KeyError, ValueError):
                 continue
             if ref.target is not None and isinstance(ref.target, pygit2.Oid):
@@ -402,7 +421,11 @@ class RepositoryManager:
             if not ref_name.startswith("refs/tags/"):
                 continue
             ref = self.repo.lookup_reference(ref_name)
-            tip_oids.add(ref.target)
+            try:
+                tip_oids.add(ref.peel(pygit2.Commit).id)
+            except Exception:
+                if isinstance(ref.target, pygit2.Oid):
+                    tip_oids.add(ref.target)
 
         revwalk = self.repo.walk(None, SORT_TOPOLOGICAL_TIME)
         for tip in tip_oids:

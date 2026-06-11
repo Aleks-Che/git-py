@@ -581,3 +581,24 @@ def test_performance_500_commits_branched() -> None:
     elapsed = time.perf_counter() - t0
     assert len(layout.nodes) >= 500
     assert elapsed < 2.0, f"Graph build took {elapsed:.2f}s"
+
+
+def test_build_branch_refs_map_filters_invalid_sha_keys() -> None:
+    """Branches with non-SHA target_sha (symref paths or None) are dropped."""
+    from src.core.graph_v2 import _build_branch_refs_map
+
+    branches_list = [
+        BranchInfo(name="main", is_head=True, is_remote=False, target_sha="a" * 40),
+        BranchInfo(name="origin/main", is_head=False, is_remote=True, target_sha="a" * 40),
+        BranchInfo(name="origin/HEAD", is_head=False, is_remote=True,
+                   target_sha="refs/remotes/origin/main"),
+        BranchInfo(name="broken", is_head=False, is_remote=False, target_sha=None),
+    ]
+
+    result = _build_branch_refs_map(branches_list)
+
+    assert "a" * 40 in result
+    assert len(result["a" * 40]) == 2
+    # Every key must be a valid 40-char hex SHA
+    for sha in result:
+        assert len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)

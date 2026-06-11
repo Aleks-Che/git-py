@@ -948,6 +948,8 @@ def _build_branch_refs_map(branches: list[BranchInfo]) -> dict[str, list[BranchR
     for branch in branches:
         if not branch.target_sha:
             continue
+        if not _is_valid_sha(branch.target_sha):
+            continue
         result.setdefault(branch.target_sha, []).append(
             BranchRef(name=branch.name, is_head=branch.is_head, is_remote=branch.is_remote),
         )
@@ -965,6 +967,11 @@ def _subject(message: str) -> str:
         if line:
             return line
     return ""
+
+
+def _is_valid_sha(s: str) -> bool:
+    """Return ``True`` if *s* looks like a full hex SHA-1 (40 hex chars)."""
+    return len(s) == 40 and all(c in "0123456789abcdef" for c in s)
 
 
 __all__ = [

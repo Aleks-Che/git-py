@@ -125,6 +125,53 @@ def test_branches_includes_head_and_remote_only_when_present(
     )
 
 
+def test_branches_resolves_symref_remote_target(
+    committed_repo: RepositoryManager,
+) -> None:
+    """Regression: a symbolic remote branch like ``origin/HEAD`` must
+    get a real commit SHA as ``target_sha``, not the symbolic path
+    ``refs/remotes/origin/main``."""
+    repo = committed_repo.repo
+    head_sha = committed_repo.head_commit.sha
+    head_oid = pygit2.Oid(bytes.fromhex(head_sha))
+
+    repo.references.create("refs/remotes/origin/main", head_oid)
+    repo.references.create("refs/remotes/origin/HEAD", "refs/remotes/origin/main", force=True)
+
+    by_name = {b.name: b for b in committed_repo.branches}
+
+    assert "origin/main" in by_name
+    assert "origin/HEAD" in by_name
+    sha = by_name["origin/HEAD"].target_sha
+    assert sha and len(sha) == 40 and sha == head_sha, f"{sha!r} != {head_sha}"
+
+
+def test_branches_skips_broken_symref(
+    committed_repo: RepositoryManager,
+) -> None:
+    """A remote symref whose target reference does not exist is omitted."""
+    repo = committed_repo.repo
+    repo.references.create(
+        "refs/remotes/origin/DEAD", "refs/remotes/origin/nonexistent", force=True
+    )
+    assert not any(b.name == "origin/DEAD" for b in committed_repo.branches)
+
+
+def test_get_all_history_includes_remote_symref_tip(
+    committed_repo: RepositoryManager,
+) -> None:
+    """A commit only reachable via a symbolic remote ref must still appear."""
+    repo = committed_repo.repo
+    head_sha = committed_repo.head_commit.sha
+    head_oid = pygit2.Oid(bytes.fromhex(head_sha))
+
+    repo.references.create("refs/remotes/origin/main", head_oid)
+    repo.references.create("refs/remotes/origin/HEAD", "refs/remotes/origin/main", force=True)
+
+    shas = {c.sha for c in committed_repo.get_all_history()}
+    assert head_sha in shas
+
+
 def test_tags_includes_lightweight_and_annotated(committed_repo: RepositoryManager) -> None:
     repo = committed_repo.repo
     sig = pygit2.Signature("tester", "tester@example.com", int(time.time()), 0)
