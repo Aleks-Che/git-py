@@ -652,6 +652,9 @@ class MainWindow(QMainWindow):
         if sha == "WIP":
             text = self._main_vm.get_workdir_diff_text()
             label = "WIP"
+        elif self._main_vm.is_stash_sha(sha):
+            text = self._main_vm.get_stash_diff_text(sha)
+            label = f"stash {sha[:7]}"
         else:
             text = self._main_vm.get_commit_diff_text(sha)
             label = sha[:7]
@@ -886,12 +889,15 @@ class MainWindow(QMainWindow):
         """Display a short-lived notification in the bottom-right corner.
 
         Dismisses any currently visible toast, then shows a new
-        red-background label that hides itself after 12 seconds or
-        on click. If the mouse is over the toast the auto-hide timer
-        is paused so the user can read the message at their own pace.
-        The toast is positioned above the status bar.
+        red-background widget that hides itself after 12 seconds or
+        on click. A small ``×`` button in the top-right corner of the
+        toast lets the user dismiss the notification manually. If the
+        mouse is over the toast the auto-hide timer is paused so the
+        user can read the message at their own pace. The toast is
+        positioned above the status bar.
         """
         from PySide6.QtCore import QEvent, QObject, QTimer
+        from PySide6.QtWidgets import QPushButton, QWidget
 
         if hasattr(self, "_toast_label") and self._toast_label is not None:
             try:
@@ -903,23 +909,60 @@ class MainWindow(QMainWindow):
 
         toast_timeout_ms = 12_000
 
-        label = QLabel(message, self)
-        label.setStyleSheet(
-            "background-color: #c0392b; color: white; padding: 10px 14px; "
-            "border-radius: 6px; font-size: 13px;"
+        container = QWidget(self)
+        container.setObjectName("toast_container")
+        container.setStyleSheet(
+            "QWidget#toast_container { background-color: #c0392b; "
+            "border-radius: 6px; }"
+            "QLabel { color: white; background: transparent; "
+            "font-size: 13px; }"
+            "QPushButton { color: white; background: transparent; "
+            "border: none; font-size: 16px; font-weight: bold; "
+            "padding: 0px; }"
+            "QPushButton:hover { color: #ffd6d2; }"
         )
+
+        label = QLabel(message, container)
         label.setWordWrap(True)
-        label.setMaximumWidth(420)
+        label.setMaximumWidth(380)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        label.setContentsMargins(14, 10, 28, 10)
+
+        close_btn = QPushButton("×", container)
+        close_btn.setFixedSize(20, 20)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setToolTip("Close")
+        close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        # Resize the container to fit the label plus padding.
         label.adjustSize()
-        label.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        container.setFixedSize(
+            max(label.width() + 28 + 24, 120),
+            max(label.height() + 20, 36),
+        )
 
-        # Click to dismiss
-        label.mousePressEvent = lambda _e: label.hide()  # type: ignore[assignment]
+        # Layout: place the close button in the top-right corner of the container.
+        close_btn.move(container.width() - close_btn.width() - 6, 6)
 
-        # Event filter: pause / resume auto-hide on hover
-        timer = QTimer(label)
+        def _dismiss() -> None:
+            timer.stop()
+            container.hide()
+            container.deleteLater()
+            if getattr(self, "_toast_label", None) is container:
+                self._toast_label = None
+
+        close_btn.clicked.connect(_dismiss)
+
+        # Click on the message text dismisses the toast (preserve old UX).
+        label.mousePressEvent = lambda _e: _dismiss()  # type: ignore[assignment]
+
+        container.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+        # Event filter: pause / resume auto-hide on hover over the
+        # whole container (so hovering the close button keeps it open).
+        timer = QTimer(container)
         timer.setSingleShot(True)
-        timer.timeout.connect(label.hide)
+        timer.timeout.connect(_dismiss)
         timer.setInterval(toast_timeout_ms)
 
         class _HoverFilter(QObject):
@@ -930,17 +973,19 @@ class MainWindow(QMainWindow):
                     timer.start(toast_timeout_ms)
                 return False
 
-        toast_filter = _HoverFilter(label)
+        toast_filter = _HoverFilter(container)
+        container.installEventFilter(toast_filter)
         label.installEventFilter(toast_filter)
+        close_btn.installEventFilter(toast_filter)
 
         y_offset = 40  # above the status bar
-        label.move(
-            self.width() - label.width() - 16,
-            self.height() - label.height() - y_offset,
+        container.move(
+            self.width() - container.width() - 16,
+            self.height() - container.height() - y_offset,
         )
-        label.show()
-        label.raise_()
-        self._toast_label = label
+        container.show()
+        container.raise_()
+        self._toast_label = container
 
         timer.start()
 

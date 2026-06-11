@@ -571,6 +571,20 @@ class MainViewModel(QObject):
         except GitError:
             return ""
 
+    def get_stash_diff_text(self, sha: str) -> str:
+        """Return the unified diff for a stash commit.
+
+        Returns an empty string when no repository is open or the SHA
+        cannot be resolved. Used by the graph widget's "Copy diff"
+        context-menu action on stash nodes.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            return ""
+        try:
+            return self._repo_manager.get_stash_diff_text(sha)
+        except GitError:
+            return ""
+
     def get_workdir_diff_text(self) -> str:
         """Return the full unified diff of the working tree vs HEAD.
 

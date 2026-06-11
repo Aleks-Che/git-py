@@ -391,6 +391,11 @@ class GraphTableWidget(QWidget):
             pop_action = menu.addAction("Pop Stash")
             pop_action.triggered.connect(lambda: self.stash_pop_requested.emit(sha))
             menu.addSeparator()
+            copy_diff_action = menu.addAction("Copy diff")
+            copy_diff_action.triggered.connect(
+                lambda checked=False, s=sha: self.copy_diff_requested.emit(s),
+            )
+            menu.addSeparator()
             drop_action = menu.addAction("Delete Stash")
             drop_action.triggered.connect(lambda: self.stash_drop_requested.emit(sha))
         elif kind == "wip":

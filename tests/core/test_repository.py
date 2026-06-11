@@ -19,6 +19,7 @@ from src.core.models import (
     FileChange,
     FileStatus,
 )
+from src.core.operations import stash_push
 from src.core.repository import RepositoryManager
 
 # ----- lifecycle -----------------------------------------------------------
@@ -272,3 +273,31 @@ def test_repo_property_raises_when_closed(tmp_git_repo: Path) -> None:
     mgr = RepositoryManager()
     with pytest.raises(GitError, match="No repository is open"):
         _ = mgr.repo
+
+
+# ----- diff text ---------------------------------------------------------
+
+
+def test_get_stash_diff_text_returns_unified_diff(
+    committed_repo: RepositoryManager,
+    tmp_git_repo: Path,
+) -> None:
+    """A stash entry's diff is its tree vs the original commit it was taken from."""
+    (tmp_git_repo / "hello.txt").write_text("hello, stash\n")
+    stash_push(committed_repo, "wip")
+
+    stash = committed_repo.stash_list
+    assert stash, "stash list should contain the entry we just created"
+
+    text = committed_repo.get_stash_diff_text(stash[0].sha)
+
+    assert "diff --git a/hello.txt b/hello.txt" in text
+    assert "-hello, world" in text
+    assert "+hello, stash" in text
+
+
+def test_get_stash_diff_text_handles_unknown_sha(
+    committed_repo: RepositoryManager,
+) -> None:
+    with pytest.raises(InvalidRefError):
+        committed_repo.get_stash_diff_text("deadbeef" * 5)

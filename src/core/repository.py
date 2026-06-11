@@ -462,6 +462,37 @@ class RepositoryManager:
             raise GitError(f"Failed to diff {sha!r}: {exc}") from exc
         return diff.patch or ""
 
+    def get_stash_diff_text(self, sha: str, context_lines: int = 3) -> str:
+        """Return the unified diff for a stash commit.
+
+        A stash commit's tree is the working-tree state that was saved
+        when ``git stash`` ran; its first parent is the commit that was
+        current at that moment.  Diffing the two is exactly what
+        ``git stash show`` displays, and matches what ``git stash apply``
+        would replay onto the working tree.
+
+        Returns an empty string for stash entries with no parent (e.g.
+        the very first commit of an empty repo) or when the resulting
+        diff is empty.  Raises :class:`InvalidRefError` if ``sha`` does
+        not resolve to a commit.
+        """
+        try:
+            obj = self.repo.revparse_single(sha).peel(pygit2.Commit)
+        except (KeyError, pygit2.GitError, ValueError) as exc:
+            raise InvalidRefError(f"Unknown revision: {sha!r}") from exc
+        if obj.parent_ids:
+            try:
+                parent_tree = obj.parents[0].tree
+            except (KeyError, ValueError):
+                parent_tree = self.repo.TreeBuilder().write()
+        else:
+            parent_tree = self.repo.TreeBuilder().write()
+        try:
+            diff = self.repo.diff(parent_tree, obj.tree, context_lines=context_lines)
+        except (pygit2.GitError, KeyError, ValueError) as exc:
+            raise GitError(f"Failed to diff stash {sha!r}: {exc}") from exc
+        return diff.patch or ""
+
     def get_workdir_diff_text(self, context_lines: int = 3) -> str:
         """Return the full unified diff of the working tree vs HEAD.
 
