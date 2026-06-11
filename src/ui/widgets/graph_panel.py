@@ -194,6 +194,7 @@ class GraphTableWidget(QWidget):
 
         self._view_model.graph_updated.connect(self._on_graph_updated)
         self._view_model.commit_selected.connect(self._on_external_select)
+        self._view_model.scroll_to_commit_requested.connect(self.scroll_to_commit)
 
         self._dump_shortcut = QShortcut("Ctrl+Shift+D", self)
         self._dump_shortcut.activated.connect(self._dump_graph)
@@ -226,6 +227,24 @@ class GraphTableWidget(QWidget):
         return self._scrollbar
 
     def scroll_to_commit(self, sha: str) -> None:
+        """Center *sha* vertically and bring its lane into the graph column.
+
+        Used by the search bar, the left-panel branch/tag click handler,
+        and by :attr:`GraphViewModel.scroll_to_commit_requested` (which
+        the widget subscribes to). The horizontal scroll only operates
+        on the graph column (index 1) — the branch chip in column 0
+        and the commit message in column 2 are left as the user left
+        them, since they are decorated / scrolled by their own
+        scrollbars when their text overflows.
+
+        The commit is considered "out of view" if its lane's centre
+        falls outside the visible portion of the graph column (with a
+        one-node-radius margin on each side). When that happens the
+        graph column's horizontal scrollbar is moved just enough to
+        bring the lane to roughly the column's centre; otherwise the
+        scroll is left untouched so we don't jerk the view around when
+        the commit is already visible.
+        """
         for idx, row in enumerate(self._rows):
             row_sha = _row_sha(row)
             if row_sha == sha:
@@ -237,8 +256,53 @@ class GraphTableWidget(QWidget):
                 viewport_center = self.height() // 2
                 target = max(0, row_center_y - viewport_center)
                 self._scrollbar.setValue(target)
+                self._scroll_horizontal_to_lane(row)
                 self.update()
                 return
+
+    def _scroll_horizontal_to_lane(self, row: dict) -> None:
+        """Adjust the graph column's horizontal scroll so *row*'s lane is visible.
+
+        No-op when the row is a connector (no node, no lane) or when the
+        graph column has no horizontal overflow (the bar is hidden, so
+        the user can already see the whole column). The new value
+        clamps to ``[0, bar.maximum()]`` so a too-narrow viewport never
+        lands us in an invalid scroll state.
+        """
+        commit = row.get("commit")
+        is_uncommitted = row.get("is_uncommitted", False)
+        if commit is None and not is_uncommitted:
+            return
+        bar = self._h_scrollbars[1]
+        if bar.maximum() <= 0:
+            return
+        col_ranges = self._col_ranges()
+        col1_left, col1_right = col_ranges[1]
+        col1_width = col1_right - col1_left
+        if col1_width <= 0:
+            return
+        lane = row.get("lane", 0)
+        lane_w = self._cfg.node_radius * 2 + 8
+        col_left = self._column_left_x()
+        node_cx = col_left + lane * lane_w
+        margin = self._cfg.node_radius
+        # Visible region in *content* coordinates (i.e. accounting for
+        # the current horizontal scroll). The painter translates by
+        # ``-value``, so a content-x of X appears at widget-x
+        # ``col1_left + (X - col1_left - value) = X - value``.
+        current_value = self._h_scrolls[1]
+        visible_left = col1_left + current_value + margin
+        visible_right = col1_left + current_value + col1_width - margin
+        if visible_left <= node_cx <= visible_right:
+            return
+        # Centre the lane in the column. The column's left edge in
+        # content coordinates is ``col1_left`` (no padding inside the
+        # content), so a scroll value of ``node_cx - col1_center``
+        # brings the lane to the middle of the column.
+        col1_center = col1_left + col1_width // 2
+        new_value = node_cx - col1_center
+        new_value = max(0, min(int(bar.maximum()), int(new_value)))
+        bar.setValue(new_value)
 
     # ------------------------------------------------------------------
     # signal handlers

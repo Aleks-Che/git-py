@@ -53,6 +53,11 @@ class GraphViewModel(QObject):
     commit_selected = Signal(str)
     error_occurred = Signal(str)
     search_results_changed = Signal(list)
+    scroll_to_commit_requested = Signal(str)
+    """Emitted by :meth:`scroll_to_commit`; the view scrolls the commit
+    (vertically and horizontally) so the user lands on it. Decoupled from
+    :attr:`commit_selected` so the view can suppress the visual highlight
+    ring (e.g. when the user only navigates from the left panel)."""
 
     def __init__(self, repo_manager: RepositoryManager | None = None, parent=None) -> None:
         super().__init__(parent)
@@ -179,6 +184,24 @@ class GraphViewModel(QObject):
     def select_commit(self, sha: str) -> None:
         """Forward a user click on a commit."""
         self.commit_selected.emit(sha)
+
+    def scroll_to_commit(self, sha: str) -> None:
+        """Ask the view to bring *sha* into view.
+
+        The view (the :class:`GraphTableWidget`) is the only thing that
+        knows the current scroll offsets and the per-column overflow
+        ranges; the ViewModel just forwards the request. The signal is
+        decoupled from :attr:`commit_selected` so callers (the left
+        panel, the search bar) can drive the scroll without forcing a
+        visual selection on the graph — the caller decides whether to
+        pair the scroll with a selection.
+
+        No-op when *sha* is falsy or when no graph is currently loaded
+        (e.g. a :attr:`graph_updated` with an empty list is in flight).
+        """
+        if not sha:
+            return
+        self.scroll_to_commit_requested.emit(sha)
 
     def get_commit_details(self, sha: str) -> CommitInfo | None:
         """Resolve *sha* to a :class:`CommitInfo` for the detail panel."""

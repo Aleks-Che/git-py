@@ -329,6 +329,303 @@ def test_double_click_on_tag_creates_branch_from_it(
     assert any(b.name == "v1" for b in committed_repo.branches)
 
 
+# ----- single-click focuses graph -----------------------------------
+
+
+def test_single_click_on_local_branch_selects_and_scrolls_graph(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """Single-clicking a local branch row drives the graph view.
+
+    The branch's target SHA becomes :attr:`MainViewModel.selected_commit_sha`
+    so the right panel switches to the commit-detail view, and the
+    :class:`GraphViewModel` emits :attr:`scroll_to_commit_requested`
+    so the graph scrolls to that commit. The existing double-click
+    behaviour (checkout) is unaffected — we exercise it through the
+    ``itemClicked`` signal only, not ``itemDoubleClicked``.
+    """
+    from src.core.operations import create_branch
+
+    create_branch(
+        committed_repo,
+        "feature",
+        target_sha=committed_repo.head_commit.parents[0],
+    )
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    branches = _top_level(panel, "Branches")
+    local = _child(branches, "Local")
+    feature = _child(local, "feature")
+    assert feature is not None
+
+    expected_sha = committed_repo.head_commit.parents[0]
+    with qtbot.waitSignal(
+        vm.graph_view_model().scroll_to_commit_requested, timeout=1000,
+    ) as blocker:
+        panel.itemClicked.emit(feature, 0)
+    assert blocker.args[0] == expected_sha
+    assert vm.selected_commit_sha() == expected_sha
+    # HEAD did not change — that is a double-click concern.
+    assert committed_repo.repo.head.shorthand == "main"
+
+
+def test_single_click_on_local_branch_with_no_explicit_scroll(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    """The branch row's click is forwarded to the graph VM verbatim.
+
+    We replace :meth:`GraphViewModel.scroll_to_commit` with a capturing
+    stub and assert it was called with the branch's target SHA. This
+    decouples the test from the graph widget's scroll internals
+    (which are tested separately in ``test_graph_widget.py``).
+    """
+    from src.core.operations import create_branch
+
+    create_branch(
+        committed_repo,
+        "feature",
+        target_sha=committed_repo.head_commit.sha,
+    )
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    captured: list[str] = []
+    monkeypatch.setattr(
+        vm.graph_view_model(),
+        "scroll_to_commit",
+        lambda sha: captured.append(sha),
+    )
+
+    branches = _top_level(panel, "Branches")
+    local = _child(branches, "Local")
+    feature = _child(local, "feature")
+    assert feature is not None
+
+    panel.itemClicked.emit(feature, 0)
+    assert captured == [committed_repo.head_commit.sha]
+    assert vm.selected_commit_sha() == committed_repo.head_commit.sha
+
+
+def test_single_click_on_remote_branch_selects_and_scrolls(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    """Single-click on a remote-tracking branch also focuses the graph.
+
+    The remote branch's ``target_sha`` is used as the scroll target,
+    so the user lands on the commit the remote ref points at. No
+    network call happens (the fetch+checkout verb still lives on
+    double-click).
+    """
+    branch_name = _set_up_repo_with_remotes(committed_repo)
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    branches = _top_level(panel, "Branches")
+    remote = _child(branches, "Remote")
+    origin_main = _child(remote, f"origin/{branch_name}")
+    assert origin_main is not None
+
+    # The VM should NOT have called fetch — that is a double-click verb.
+    monkeypatch.setattr(
+        vm,
+        "fetch_and_checkout_remote_branch",
+        lambda name: (_ for _ in ()).throw(
+            AssertionError(f"unexpected fetch on click: {name!r}"),
+        ),
+    )
+
+    captured: list[str] = []
+    monkeypatch.setattr(
+        vm.graph_view_model(),
+        "scroll_to_commit",
+        lambda sha: captured.append(sha),
+    )
+
+    panel.itemClicked.emit(origin_main, 0)
+    expected_sha = committed_repo.repo.head.target
+    assert captured == [str(expected_sha)]
+    assert vm.selected_commit_sha() == str(expected_sha)
+
+
+def test_single_click_on_tag_selects_and_scrolls(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    """Single-click on a tag focuses the commit the tag points at."""
+    import time
+
+    import pygit2
+
+    sig = pygit2.Signature("t", "t@x", int(time.time()), 0)
+    obj = committed_repo.repo.revparse_single("HEAD").peel(pygit2.Commit)
+    committed_repo.repo.create_tag("v1", obj.id, pygit2.GIT_OBJECT_COMMIT, sig, "v1")
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    tags = _top_level(panel, "Tags")
+    v1 = _child(tags, "v1")
+    assert v1 is not None
+
+    captured: list[str] = []
+    monkeypatch.setattr(
+        vm.graph_view_model(),
+        "scroll_to_commit",
+        lambda sha: captured.append(sha),
+    )
+
+    panel.itemClicked.emit(v1, 0)
+    assert captured == [committed_repo.head_commit.sha]
+    assert vm.selected_commit_sha() == committed_repo.head_commit.sha
+    # No branch called "v1" yet — double-click (not click) creates it.
+    assert not any(b.name == "v1" for b in committed_repo.branches)
+
+
+def test_single_click_on_stash_leaf_is_a_noop(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    """Clicking a stash entry does not focus the graph or scroll.
+
+    Stash entries are different from branches and tags: a single
+    click on a stash row should not jump the graph to a (potentially
+    already-shown) commit. The user opens the apply / pop / drop
+    context menu through the standard double-click / right-click
+    flow.
+    """
+    from pathlib import Path
+    (Path(committed_repo.path) / "hello.txt").write_text("wip\n")
+    from src.core.operations import stash_push
+
+    stash_push(committed_repo, "scroll test")
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    captured: list[str] = []
+    monkeypatch.setattr(
+        vm.graph_view_model(),
+        "scroll_to_commit",
+        lambda sha: captured.append(sha),
+    )
+    monkeypatch.setattr(
+        vm,
+        "set_selected_commit",
+        lambda sha: captured.append(f"SELECT:{sha}"),
+    )
+
+    stash = _top_level(panel, "Stash")
+    stash_entry = stash.child(0) if stash else None
+    assert stash_entry is not None
+
+    panel.itemClicked.emit(stash_entry, 0)
+    assert captured == []
+
+
+def test_single_click_branch_with_empty_target_sha_is_a_noop(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    """A click on a branch with no target SHA leaves the selection alone.
+
+    Defends against a stale or malformed :class:`BranchInfo`: if the
+    resolver returns ``None`` (no SHA), the focus handler must bail
+    out instead of calling :meth:`MainViewModel.set_selected_commit`
+    with ``None`` and clearing the right panel mid-action. We
+    monkey-patch the panel's VM to return a fake branch with an
+    empty target SHA — the panel code path under test does not care
+    how the snapshot got into that state.
+    """
+    from src.core.operations import create_branch
+    from src.core.models import BranchInfo
+
+    create_branch(committed_repo, "feature", target_sha=committed_repo.head_commit.sha)
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    # Pin the existing selection so we can verify it survives.
+    head_sha = committed_repo.head_commit.sha
+    vm.set_selected_commit(head_sha)
+
+    # Replace the local_branches snapshot with a row whose target_sha
+    # is empty — the resolver will return ``None`` for it.
+    monkeypatch.setattr(
+        vm.branch_panel_view_model(),
+        "local_branches",
+        lambda: [BranchInfo(name="feature", is_head=False, target_sha="")],
+    )
+
+    captured: list[object] = []
+    monkeypatch.setattr(
+        vm,
+        "set_selected_commit",
+        lambda sha: captured.append(sha),
+    )
+    monkeypatch.setattr(
+        vm.graph_view_model(),
+        "scroll_to_commit",
+        lambda sha: captured.append(f"SCROLL:{sha}"),
+    )
+
+    # The visible tree still has the old (real) feature row, which is
+    # fine — the resolver consults the VM snapshot, not the QTreeWidget.
+    panel.itemClicked.emit(
+        _child(_child(_top_level(panel, "Branches"), "Local"), "feature"),
+        0,
+    )
+    # Nothing was emitted: the resolver returned ``None`` and the
+    # focus handler bailed out before calling either VM method.
+    assert captured == []
+    assert vm.selected_commit_sha() == head_sha
+
+
+def test_single_click_on_branch_leaf_does_not_toggle_group(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """Single-clicking a branch leaf must not collapse the group header.
+
+    Regression for the existing ``test_click_on_leaf_does_not_toggle_parent_group``
+    test: the new branch-handling branch in ``_on_item_clicked`` runs
+    only when ``_ROLE_KIND`` is set, so the group-toggle path is
+    bypassed for leaves. The group must stay expanded after a click
+    on a branch inside it.
+    """
+    from src.core.operations import create_branch
+
+    create_branch(committed_repo, "feature", target_sha=committed_repo.head_commit.sha)
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    branches = _top_level(panel, "Branches")
+    local = _child(branches, "Local")
+    feature = _child(local, "feature")
+    assert feature is not None
+    assert local.isExpanded() is True
+
+    panel.itemClicked.emit(feature, 0)
+    assert local.isExpanded() is True
+
+
 # ----- context menu --------------------------------------------------
 
 
