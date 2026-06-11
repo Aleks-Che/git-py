@@ -155,6 +155,48 @@ def test_stage_file_persists_to_index(
     assert "new.txt" in fresh.index
 
 
+def test_stage_deleted_tracked_file(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """Staging a file that was deleted from disk must work via ``index.remove()``."""
+    _ensure_app()
+    from pathlib import Path
+    worktree = Path(committed_repo.path)
+    (worktree / "hello.txt").unlink()
+    vm = CommitPanelViewModel()
+    vm.set_repository(committed_repo)
+
+    assert "hello.txt" in [c.path for c in vm.unstaged_files()]
+
+    with qtbot.waitSignal(vm.staged_files_changed, timeout=500) as blocker:
+        vm.stage_file("hello.txt")
+    assert "hello.txt" in blocker.args[0]
+    assert "hello.txt" in vm.staged_files()
+
+
+def test_stage_deleted_then_unstage_restores_unstaged(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """Unstaging a staged deletion must restore the file to the unstaged list."""
+    _ensure_app()
+    from pathlib import Path
+    worktree = Path(committed_repo.path)
+    (worktree / "hello.txt").unlink()
+    vm = CommitPanelViewModel()
+    vm.set_repository(committed_repo)
+
+    vm.stage_file("hello.txt")
+    assert "hello.txt" in vm.staged_files()
+
+    with qtbot.waitSignal(vm.staged_files_changed, timeout=2000) as blocker:
+        vm.unstage_file("hello.txt")
+    assert "hello.txt" not in vm.staged_files()
+    assert blocker.args[0] == []
+    # The file should be back in the unstaged list as WT_DELETED.
+    unstaged = {c.path for c in vm.unstaged_files()}
+    assert "hello.txt" in unstaged
+
+
 def test_unstage_file_drops_from_index_and_set(
     qtbot, tmp_git_repo: Path,
 ) -> None:

@@ -760,18 +760,29 @@ def unstage_changes(
     of what the UI wants. We shell out to ``git reset`` because
     pygit2 1.x has no high-level per-path "reset to HEAD" primitive.
 
-    On an unborn HEAD (or when the path is not in the index at all),
-    the call is a no-op so callers can blindly "unstage" anything.
+    For files staged for deletion (``INDEX_DELETED`` — in HEAD but not
+    in index) the function restores the HEAD entry back into the index,
+    moving the file back to the unstaged list.
+
+    On an unborn HEAD (or when the path is not in HEAD at all), the
+    call is a no-op so callers can blindly "unstage" anything.
     """
     with unwrap(repo) as r:
-        if path not in r.index:
-            # Path is not in the index — nothing to unstage.
-            return
-        if r.head_is_unborn:
-            # No HEAD to reset to; just drop the staged entry.
-            r.index.remove(path)
-            r.index.write()
-            return
+        if path in r.index:
+            if r.head_is_unborn:
+                # No HEAD to reset to; just drop the staged entry.
+                r.index.remove(path)
+                r.index.write()
+                return
+        else:
+            # Path is not in the index — could be INDEX_DELETED
+            # (staged for deletion, in HEAD but not in index).
+            if r.head_is_unborn:
+                return  # No HEAD to restore from.
+            try:
+                r.revparse_single(f"HEAD:{path}")
+            except (KeyError, pygit2.GitError, ValueError):
+                return  # Not in HEAD either — nothing to unstage.
         workdir = r.workdir
     if workdir is None:
         raise GitError("Cannot unstage in a bare repository.")

@@ -217,6 +217,10 @@ class CommitPanelViewModel(QObject):
     def stage_file(self, path: str) -> None:
         """Add ``path`` to the index (``git add <path>``).
 
+        For files deleted from the working tree the method uses
+        ``index.remove()`` instead of ``index.add()`` because libgit2's
+        ``git_index_add_bypath`` cannot stat a non-existent file.
+
         On success :attr:`staged_files_changed` is emitted (via
         :meth:`refresh_status`). Errors are surfaced through
         :attr:`error_occurred`.
@@ -224,12 +228,30 @@ class CommitPanelViewModel(QObject):
         if self._repo is None or not self._repo.is_open:
             return
         try:
-            self._repo.repo.index.add(path)
+            if self._is_deleted_from_disk(self._repo, path):
+                self._repo.repo.index.remove(path)
+            else:
+                self._repo.repo.index.add(path)
             self._repo.repo.index.write()
         except (pygit2.GitError, OSError, KeyError) as exc:
             self.error_occurred.emit(f"Failed to stage {path!r}: {exc}")
             return
         self.refresh_status()
+
+    @staticmethod
+    def _is_deleted_from_disk(repo: RepositoryManager, path: str) -> bool:
+        """Return ``True`` if *path* was tracked in HEAD but is gone from the worktree."""
+        workdir = repo.repo.workdir
+        if workdir is None:
+            return False
+        from pathlib import Path as _Path
+        if (_Path(workdir) / path).exists():
+            return False
+        try:
+            repo.repo.revparse_single(f"HEAD:{path}")
+        except (KeyError, pygit2.GitError, ValueError):
+            return False
+        return True
 
     def unstage_file(self, path: str) -> None:
         """Reset the index entry for ``path`` back to ``HEAD``.
