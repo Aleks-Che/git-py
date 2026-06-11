@@ -30,6 +30,18 @@ from src.core.models import (
     TagInfo,
 )
 
+SORT_TOPOLOGICAL_TIME: int = pygit2.GIT_SORT_TOPOLOGICAL | pygit2.GIT_SORT_TIME
+"""Combined sort flag: topological order primary, committer time as tiebreaker.
+
+Used by :meth:`RepositoryManager.get_history` and
+:meth:`RepositoryManager.get_all_history` so the returned list is a
+proper ancestor-first commit order, not a flat "newest by time"
+list. This is the same combination keifu's
+``git2::Sort::TOPOLOGICAL | git2::Sort::TIME`` uses, and the one the
+graph layout engine in :mod:`src.core.graph_v2` assumes (its lane
+algorithm depends on the first element being HEAD topologically).
+"""
+
 
 @contextlib.contextmanager
 def unwrap(repo_or_manager: RepositoryManager | pygit2.Repository) -> Iterator[pygit2.Repository]:
@@ -318,6 +330,14 @@ class RepositoryManager:
 
         ``branch`` is a local branch name; ``None`` means ``HEAD``.
         Returns an empty list if the repository has no commits.
+
+        Sort order is **topological primary, committer time
+        secondary** (see :data:`SORT_TOPOLOGICAL_TIME`). A plain
+        ``GIT_SORT_TIME`` walk can place a parent after its child
+        when two commits have the same timestamp (very common on
+        CI runs), which then breaks the graph layout in
+        :mod:`src.core.graph_v2` because that algorithm assumes
+        ``history[0]`` is the HEAD commit topologically.
         """
         if max_count <= 0:
             return []
@@ -334,7 +354,7 @@ class RepositoryManager:
                 raise InvalidRefError(f"Unknown branch: {branch!r}")
             start = looked_up.target
         result: list[CommitInfo] = []
-        for commit in self.repo.walk(start, pygit2.GIT_SORT_TIME):
+        for commit in self.repo.walk(start, SORT_TOPOLOGICAL_TIME):
             if len(result) >= max_count:
                 break
             result.append(self._to_commit_info(commit))
@@ -344,15 +364,25 @@ class RepositoryManager:
         """Walk the full commit DAG reachable from any branch (local/remote) or tag.
 
         Used by the graph view, which needs every commit visible in the
-        repository (not just the chain under ``HEAD``). We collect the
-        tip OIDs of every local branch, every remote-tracking branch
-        and every tag, walk each one with :data:`pygit2.GIT_SORT_TIME`,
-        deduplicate by SHA, then re-sort the merged set by commit time,
-        newest first.
+        repository (not just the chain under ``HEAD``). All tip OIDs
+        (local branches, remote-tracking branches, tags) are pushed
+        into a **single** revwalk sorted with
+        :data:`SORT_TOPOLOGICAL_TIME` (``GIT_SORT_TOPOLOGICAL |
+        GIT_SORT_TIME``). libgit2 then emits commits in ancestor
+        order, deduplicating internally when two tips share an
+        ancestor. We stop as soon as ``max_count`` commits have been
+        collected.
 
-        Returns an empty list if the repository has no commits.
-        ``max_count`` caps the total; we stop as soon as it is reached
-        (no fancy top-K across walks).
+        The previous implementation walked each tip with
+        ``GIT_SORT_TIME`` and then re-sorted the merged set by
+        ``commit_time``; that completely destroyed topological order
+        on repositories with many CI-style commits sharing the same
+        timestamp and was the root cause of mis-rendered branch
+        graphs on large projects. Mirrors ``keifu``'s
+        ``Repository::get_commits`` (``src/git/repository.rs:60``).
+
+        Returns an empty list if the repository has no commits or
+        ``max_count <= 0``.
         """
         if max_count <= 0 or self.repo.head_is_unborn:
             return []
@@ -373,21 +403,17 @@ class RepositoryManager:
                 continue
             ref = self.repo.lookup_reference(ref_name)
             tip_oids.add(ref.target)
-        seen: set[str] = set()
-        collected: list[pygit2.Commit] = []
+
+        revwalk = self.repo.walk(None, SORT_TOPOLOGICAL_TIME)
         for tip in tip_oids:
-            for commit in self.repo.walk(tip, pygit2.GIT_SORT_TIME):
-                sha = str(commit.id)
-                if sha in seen:
-                    continue
-                seen.add(sha)
-                collected.append(commit)
-                if len(collected) >= max_count:
-                    break
-            if len(collected) >= max_count:
+            revwalk.push(tip)
+
+        result: list[CommitInfo] = []
+        for commit in revwalk:
+            if len(result) >= max_count:
                 break
-        collected.sort(key=lambda c: -c.commit_time)
-        return [self._to_commit_info(c) for c in collected]
+            result.append(self._to_commit_info(commit))
+        return result
 
     def get_commit(self, sha: str) -> CommitInfo:
         """Resolve any revision (``HEAD``, branch name, short SHA, full SHA) to a commit."""
