@@ -501,6 +501,18 @@ class MainWindow(QMainWindow):
         self._main_vm.selection_changed.connect(
             self._graph_table.set_selected_sha,
         )
+        # Stash toolbar actions are gated on graph selection: Push
+        # and Pop are only enabled when a stash node is selected, so
+        # re-evaluate them whenever the user picks / deselects a
+        # commit in the graph, the stash list changes, or the
+        # working-tree status changes.
+        self._main_vm.selection_changed.connect(self._update_stash_actions)
+        self._main_vm.branch_panel_view_model().references_changed.connect(
+            self._update_stash_actions,
+        )
+        self._main_vm.commit_panel_view_model().file_changes_changed.connect(
+            self._update_stash_actions,
+        )
 
         # Diff view shown in place of the graph when the user clicks
         # an unstaged file in the commit panel.
@@ -862,23 +874,20 @@ class MainWindow(QMainWindow):
             self._action_push,
             self._action_manage_remotes,
         )
-        stash_actions = (
-            self._action_stash_push,
-            self._action_stash_pop,
-        )
         for action in (
             self._action_undo,
             self._action_redo,
             self._action_close,
             *remote_actions,
-            *stash_actions,
+            self._action_stash_push,
+            self._action_stash_pop,
         ):
             action.setEnabled(action.isEnabled() and not busy)
         # When a busy operation ends, the actions' enabled state must
         # be re-evaluated against the new repository state.
         if not busy:
             self._status.clearMessage()
-            self._update_remote_actions()
+            self._update_repo_actions()
 
     def _on_error(self, message: str) -> None:
         """Show error in the status bar and as a toast popup."""
@@ -998,9 +1007,9 @@ class MainWindow(QMainWindow):
             self._action_close.setEnabled(True)
             # Ensure there is a tab for this repository (no-op if already present).
             self._repo_tabs_vm.add_tab(path)
-        self._update_remote_actions()
+        self._update_repo_actions()
 
-    def _update_remote_actions(self) -> None:
+    def _update_repo_actions(self) -> None:
         """Enable Push / Pull / Fetch only when a repository is open."""
         repo_open = (
             self._main_vm.repository_manager() is not None
@@ -1014,17 +1023,56 @@ class MainWindow(QMainWindow):
             self._action_manage_remotes,
         ):
             action.setEnabled(repo_open and not busy)
-        # Stash push needs a worktree (any open repo qualifies). Stash
-        # pop additionally needs at least one stash entry in the list
-        # to be useful — disabled when the list is empty.
-        self._action_stash_push.setEnabled(repo_open and not busy)
-        if repo_open and not busy:
+        self._update_stash_actions()
+
+    def _update_stash_actions(self) -> None:
+        """Recompute Stash Push / Stash Pop enabled state.
+
+        Each button gates on a different graph selection:
+
+        * **Stash Pop** is active only when a *stash* node is
+          currently selected in the graph
+          (``MainViewModel.is_stash_sha`` on ``selected_commit_sha``)
+          **and** the stash list has at least one entry — there is
+          nothing to pop otherwise.
+        * **Stash Changes (push)** is active only when the *WIP*
+          node is selected (``selected_commit_sha == WIP_SHA``)
+          **and** the working tree has uncommitted changes — there
+          is nothing to stash otherwise. Selecting a stash node
+          does *not* enable push: push creates a *new* stash
+          archive, which is unrelated to any existing one.
+
+        Both are disabled while a long-running operation is in
+        flight (busy) or no repository is open.
+        """
+        repo_open = (
+            self._main_vm.repository_manager() is not None
+            and self._main_vm.repository_manager().is_open
+        )
+        busy = self._main_vm.is_busy()
+        if not repo_open or busy:
+            self._action_stash_push.setEnabled(False)
+            self._action_stash_pop.setEnabled(False)
+            return
+        from src.viewmodels.graph_viewmodel import WIP_SHA
+
+        selected = self._main_vm.selected_commit_sha()
+        is_stash = selected is not None and self._main_vm.is_stash_sha(selected)
+        is_wip = selected == WIP_SHA
+        if is_stash:
             stash_count = len(
                 self._main_vm.branch_panel_view_model().stash_list(),
             )
+            self._action_stash_pop.setEnabled(stash_count > 0)
         else:
-            stash_count = 0
-        self._action_stash_pop.setEnabled(repo_open and not busy and stash_count > 0)
+            self._action_stash_pop.setEnabled(False)
+        if is_wip:
+            has_uncommitted = bool(
+                self._main_vm.commit_panel_view_model().file_changes(),
+            )
+            self._action_stash_push.setEnabled(has_uncommitted)
+        else:
+            self._action_stash_push.setEnabled(False)
 
     def _on_stash_push(self) -> None:
         """Run :meth:`MainViewModel.stash_push` with the default message.

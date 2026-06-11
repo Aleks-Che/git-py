@@ -6,7 +6,13 @@ Two actions are exposed:
 
 * **Stash Changes** (``Ctrl+Shift+S``) — pushes the current WIP.
 * **Stash Pop** (``Ctrl+Shift+O``) — pops the most recent entry
-  (index 0). The button is *disabled* when the stash list is empty.
+  (index 0).
+
+Both buttons are gated on the graph selection: they are only
+enabled when a stash node is currently selected in the commit
+graph (see :meth:`MainWindow._update_stash_actions`). Stash Pop
+additionally needs a non-empty stash list; Stash Changes
+additionally needs the working tree to have uncommitted changes.
 
 The tests verify the enablement contract and the click → VM wiring
 (``Ctrl+Shift+S`` must end up calling :meth:`MainViewModel.stash_push`).
@@ -36,6 +42,16 @@ def _make_dirty(repo: RepositoryManager, text: str = "wip\n") -> None:
 
     assert repo.path is not None
     (Path(repo.path) / "hello.txt").write_text(text)
+
+
+def _select_stash(window: MainWindow, repo: RepositoryManager) -> str:
+    """Pick the most recent stash entry's SHA on the graph VM.
+
+    Returns the selected SHA so the caller can assert on it.
+    """
+    stash = repo.stash_list[0]
+    window._main_vm.set_selected_commit(stash.sha)  # noqa: SLF001
+    return stash.sha
 
 
 # ----- toolbar presence and shortcuts ---------------------------------
@@ -73,12 +89,25 @@ def test_stash_actions_disabled_without_repo(qtbot, tmp_path) -> None:
     assert not win._action_stash_pop.isEnabled()
 
 
-def test_stash_push_enabled_with_repo(qtbot, committed_repo) -> None:
+def test_stash_actions_disabled_without_graph_selection(
+    qtbot, committed_repo,
+) -> None:
+    """Push / Pop stay disabled when no stash node is selected in the graph.
+
+    A repository with an existing stash entry still leaves both
+    toolbar buttons greyed out until the user actually picks a
+    stash node in the commit graph.
+    """
     _ensure_app()
+    from src.core.operations import stash_push
+
+    _make_dirty(committed_repo)
+    stash_push(committed_repo, "for the toolbar")
     win = MainWindow(config_path=None)
     qtbot.addWidget(win)
     win.set_repository(committed_repo)
-    assert win._action_stash_push.isEnabled()
+    assert not win._action_stash_push.isEnabled()
+    assert not win._action_stash_pop.isEnabled()
 
 
 def test_stash_pop_disabled_when_stash_empty(qtbot, committed_repo) -> None:
@@ -89,7 +118,9 @@ def test_stash_pop_disabled_when_stash_empty(qtbot, committed_repo) -> None:
     assert not win._action_stash_pop.isEnabled()
 
 
-def test_stash_pop_enabled_when_stash_present(qtbot, committed_repo) -> None:
+def test_stash_pop_enabled_when_stash_node_selected(
+    qtbot, committed_repo,
+) -> None:
     _ensure_app()
     from src.core.operations import stash_push
 
@@ -98,7 +129,56 @@ def test_stash_pop_enabled_when_stash_present(qtbot, committed_repo) -> None:
     win = MainWindow(config_path=None)
     qtbot.addWidget(win)
     win.set_repository(committed_repo)
+    _select_stash(win, committed_repo)
     assert win._action_stash_pop.isEnabled()
+
+
+def test_stash_push_disabled_without_uncommitted_changes(
+    qtbot, committed_repo,
+) -> None:
+    """A clean worktree disables Stash Changes even with a stash selected."""
+    _ensure_app()
+    from src.core.operations import stash_push
+
+    _make_dirty(committed_repo)
+    stash_push(committed_repo, "for the toolbar")
+    # Restore the worktree back to HEAD so there are no uncommitted
+    # changes left.
+    import subprocess
+    subprocess.run(
+        ["git", "checkout", "--", "hello.txt"],
+        cwd=committed_repo.path, check=True, capture_output=True,
+    )
+    win = MainWindow(config_path=None)
+    qtbot.addWidget(win)
+    win.set_repository(committed_repo)
+    _select_stash(win, committed_repo)
+    assert win._action_stash_pop.isEnabled()
+    assert not win._action_stash_push.isEnabled()
+
+
+def test_stash_push_enabled_with_uncommitted_changes(
+    qtbot, committed_repo,
+) -> None:
+    _ensure_app()
+    from src.core.operations import stash_push
+
+    _make_dirty(committed_repo)
+    stash_push(committed_repo, "for the toolbar")
+    # New uncommitted change on top of an existing stash entry.
+    _make_dirty(committed_repo, "more wip\n")
+    win = MainWindow(config_path=None)
+    qtbot.addWidget(win)
+    win.set_repository(committed_repo)
+    _select_stash(win, committed_repo)
+    # Selecting the stash enables Pop, not Push.
+    assert not win._action_stash_push.isEnabled()
+    assert win._action_stash_pop.isEnabled()
+
+    # Selecting WIP enables Push (we still have uncommitted changes).
+    win._main_vm.set_selected_commit("WIP")  # noqa: SLF001
+    assert win._action_stash_push.isEnabled()
+    assert not win._action_stash_pop.isEnabled()
 
 
 # ----- click → VM wiring ----------------------------------------------
@@ -110,6 +190,8 @@ def test_stash_push_action_invokes_vm(qtbot, committed_repo, monkeypatch) -> Non
     win = MainWindow(config_path=None)
     qtbot.addWidget(win)
     win.set_repository(committed_repo)
+    # Push is gated on the WIP node being selected in the graph.
+    win._main_vm.set_selected_commit("WIP")  # noqa: SLF001
 
     captured: list[str] = []
     monkeypatch.setattr(
@@ -129,6 +211,7 @@ def test_stash_pop_action_invokes_vm(qtbot, committed_repo, monkeypatch) -> None
     win = MainWindow(config_path=None)
     qtbot.addWidget(win)
     win.set_repository(committed_repo)
+    _select_stash(win, committed_repo)
 
     captured: list[int] = []
     monkeypatch.setattr(
@@ -151,17 +234,16 @@ def test_stash_actions_disabled_when_busy(qtbot, committed_repo) -> None:
     win = MainWindow(config_path=None)
     qtbot.addWidget(win)
     win.set_repository(committed_repo)
-    assert win._action_stash_push.isEnabled()
+    _select_stash(win, committed_repo)
     assert win._action_stash_pop.isEnabled()
 
     # Simulate a long-running op starting.
-    win._main_vm._is_busy = True
-    win._on_busy_changed(True)
+    win._main_vm._is_busy = True  # noqa: SLF001
+    win._on_busy_changed(True)  # noqa: SLF001
     assert not win._action_stash_push.isEnabled()
     assert not win._action_stash_pop.isEnabled()
 
     # Op ends — the actions re-evaluate against the live repo state.
-    win._main_vm._is_busy = False
-    win._on_busy_changed(False)
-    assert win._action_stash_push.isEnabled()
+    win._main_vm._is_busy = False  # noqa: SLF001
+    win._on_busy_changed(False)  # noqa: SLF001
     assert win._action_stash_pop.isEnabled()
