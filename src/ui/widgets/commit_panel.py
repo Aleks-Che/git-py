@@ -36,6 +36,7 @@ from PySide6.QtCore import QItemSelectionModel, QModelIndex, QPoint, QRect, Qt, 
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -306,6 +307,26 @@ class CommitPanel(QWidget):
         self._vm.commit_description_changed.connect(self._on_description_from_vm)
         self._vm.selected_file_changed.connect(self._on_selected_file_changed)
 
+        # Track multi-selection changes for the counter badge.
+        unstaged_sel = self._unstaged_list.selectionModel()
+        staged_sel = self._staged_list.selectionModel()
+        if unstaged_sel is not None:
+            unstaged_sel.selectionChanged.connect(self._on_selection_changed)
+        if staged_sel is not None:
+            staged_sel.selectionChanged.connect(self._on_selection_changed)
+
+        # Batch context actions.
+        self._unstaged_list.batch_context_action_requested.connect(
+            self._on_unstaged_batch_context_action,
+        )
+        self._staged_list.batch_context_action_requested.connect(
+            self._on_staged_batch_context_action,
+        )
+
+        # Selection model cleared after repopulate.
+        self._unstaged_list.model().modelReset.connect(self._on_selection_changed)
+        self._staged_list.model().modelReset.connect(self._on_selection_changed)
+
     # ----- VM -> UI ---------------------------------------------------
 
     def _refresh_all(self) -> None:
@@ -375,10 +396,23 @@ class CommitPanel(QWidget):
     # ----- UI -> VM ---------------------------------------------------
 
     def _on_discard_all_clicked(self) -> None:
-        self._main_vm.discard_changes()
+        selected = (
+            self._unstaged_list.selected_paths()
+            + self._staged_list.selected_paths()
+        )
+        if len(selected) >= 2:
+            for path in selected:
+                self._main_vm.discard_file_changes(path)
+        else:
+            self._main_vm.discard_changes()
 
     def _on_stage_all_clicked(self) -> None:
-        self._main_vm.stage_all_unstaged()
+        selected = self._unstaged_list.selected_paths()
+        if selected:
+            for path in selected:
+                self._main_vm.stage_file(path)
+        else:
+            self._main_vm.stage_all_unstaged()
 
     def _on_stage_file(self, path: str) -> None:
         self._main_vm.stage_file(path)
@@ -393,6 +427,9 @@ class CommitPanel(QWidget):
         if change is None:
             return
         path = change.path
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
+            return
         current = self._vm.selected_file()
         if current == path:
             self._vm.select_file(None)
@@ -406,6 +443,9 @@ class CommitPanel(QWidget):
         if change is None:
             return
         path = change.path
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
+            return
         current = self._vm.selected_file()
         if current == path:
             self._vm.select_file(None)
@@ -415,7 +455,37 @@ class CommitPanel(QWidget):
             self._vm.select_file(path, staged=True)
 
     def _on_unstage_all_clicked(self) -> None:
-        self._main_vm.unstage_all_staged()
+        selected = self._staged_list.selected_paths()
+        if selected:
+            for path in selected:
+                self._main_vm.unstage_file(path)
+        else:
+            self._main_vm.unstage_all_staged()
+
+    # ----- selection badge / multi-selection --------------------------
+
+    def _on_selection_changed(self) -> None:
+        """Update button labels when multi-selection changes."""
+        unstaged_selected = self._unstaged_list.selected_paths()
+        staged_selected = self._staged_list.selected_paths()
+        total = len(unstaged_selected) + len(staged_selected)
+
+        n_unstaged = len(unstaged_selected)
+        self._stage_all_button.setText(
+            f"Stage {n_unstaged} Files" if n_unstaged >= 2
+            else "Stage All Changes",
+        )
+
+        n_staged = len(staged_selected)
+        self._unstage_all_button.setText(
+            f"Unstage {n_staged} Files" if n_staged >= 2
+            else "Unstage All Changes",
+        )
+
+        self._discard_all_button.setText(
+            f"Discard {total} Files" if total >= 2
+            else "Discard All Changes",
+        )
 
     # ----- context menu handlers --------------------------------------
 
@@ -474,6 +544,14 @@ class CommitPanel(QWidget):
             self._main_vm.copy_file_path(path)
         elif action == "delete":
             self._main_vm.delete_file_from_disk(path)
+
+    def _on_unstaged_batch_context_action(self, action: str, paths: list[str]) -> None:
+        for path in paths:
+            self._on_unstaged_context_action(action, path)
+
+    def _on_staged_batch_context_action(self, action: str, paths: list[str]) -> None:
+        for path in paths:
+            self._on_staged_context_action(action, path)
 
     def _on_selected_file_changed(self, path: str | None) -> None:
         self._highlight_selected_file()
@@ -539,6 +617,9 @@ class FileListView(QListView):
     context_action_requested = Signal(str, str)
     """Emitted with ``(action, path)`` when a context-menu item is chosen."""
 
+    batch_context_action_requested = Signal(str, list)
+    """Emitted with ``(action, [path, ...])`` for multi-file context-menu actions."""
+
     def __init__(self, *, staged: bool, parent=None) -> None:
         super().__init__(parent)
         self._staged = staged
@@ -546,7 +627,7 @@ class FileListView(QListView):
         self._delegate = FileListDelegate(staged, self)
         self.setModel(self._model)
         self.setItemDelegate(self._delegate)
-        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setMouseTracking(True)
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setUniformItemSizes(True)
@@ -574,16 +655,42 @@ class FileListView(QListView):
     def model(self) -> FileListModel:
         return self._model
 
+    def selected_paths(self) -> list[str]:
+        """Return list of file paths currently selected in this view."""
+        paths: list[str] = []
+        sel_model = self.selectionModel()
+        if sel_model is None:
+            return paths
+        for idx in sel_model.selectedIndexes():
+            change = idx.data(FileChangeRole)
+            if change is not None:
+                paths.append(change.path)
+        return paths
+
     # -- context menu -----------------------------------------------------
 
     def _on_context_menu(self, position: QPoint) -> None:
         index = self.indexAt(position)
         if not index.isValid():
             return
-        change = index.data(FileChangeRole)
-        if change is None:
+
+        # Determine which files are selected for the context action.
+        selected = self.selected_paths()
+        if not selected:
             return
-        path = change.path
+
+        # If clicked item is not part of the current selection, isolate it.
+        clicked_change = index.data(FileChangeRole)
+        if clicked_change is None:
+            return
+        if clicked_change.path not in selected:
+            self.selectionModel().clearSelection()
+            self.selectionModel().select(
+                index, QItemSelectionModel.SelectionFlag.Select,
+            )
+            selected = [clicked_change.path]
+
+        is_multi = len(selected) > 1
 
         menu = QMenu(self)
         menu.setStyleSheet(
@@ -594,83 +701,123 @@ class FileListView(QListView):
             "QMenu::separator { height: 1px; background: #3F3F46; margin: 3px 8px; }",
         )
 
-        if self._staged:
-            stage_action = menu.addAction("Unstage")
-            stage_action.triggered.connect(
-                lambda checked=False, p=path: self.context_action_requested.emit("unstage", p),
-            )
-        else:
-            stage_action = menu.addAction("Stage")
-            stage_action.triggered.connect(
-                lambda checked=False, p=path: self.context_action_requested.emit("stage", p),
-            )
+        def _emit(action: str, p: str) -> None:
+            self.context_action_requested.emit(action, p)
 
-        discard_action = menu.addAction("Discard Changes")
-        discard_action.triggered.connect(
-            lambda checked=False, p=path: self.context_action_requested.emit("discard", p),
-        )
-
-        # --- Ignore submenu ---
-        ignore_menu = menu.addMenu("Ignore")
-        ignore_menu.setStyleSheet(menu.styleSheet())
-
-        ignore_file = ignore_menu.addAction(f"Ignore this file ({path})")
-        ignore_file.triggered.connect(
-            lambda checked=False, p=path: self.context_action_requested.emit("ignore", p),
-        )
-
-        # Directory-based ignore options — show up to 2 parent levels.
-        normalized = path.replace("\\", "/")
-        parts = normalized.split("/")
-
-        if len(parts) >= 2:
-            parent_dir = "/".join(parts[:-1]) + "/"
-            ignore_parent = ignore_menu.addAction(f"Ignore /{parent_dir}")
-            ignore_parent.triggered.connect(
-                lambda checked=False, p=path: self.context_action_requested.emit("ignore_dir", p),
-            )
-
-        if len(parts) >= 3:
-            grandparent_dir = "/".join(parts[:-2]) + "/"
-            ignore_grandparent = ignore_menu.addAction(f"Ignore /{grandparent_dir}")
-            ignore_grandparent.triggered.connect(
-                lambda checked=False, p=path: self.context_action_requested.emit(
-                    "ignore_parent_dir", p,
+        if is_multi:
+            n = len(selected)
+            staged_action = "Unstage" if self._staged else "Stage"
+            act = menu.addAction(f"{staged_action} {n} Files")
+            act.triggered.connect(
+                lambda checked=False, paths=selected: self.batch_context_action_requested.emit(
+                    "unstage" if self._staged else "stage", paths,
                 ),
             )
 
-        _, ext = _os.path.splitext(path)
-        if ext:
-            ignore_ext = ignore_menu.addAction(f"Ignore *{ext}")
-            ignore_ext.triggered.connect(
-                lambda checked=False, p=path: self.context_action_requested.emit("ignore_ext", p),
+            act = menu.addAction(f"Discard {n} Files")
+            act.triggered.connect(
+                lambda checked=False, paths=selected: self.batch_context_action_requested.emit(
+                    "discard", paths,
+                ),
             )
 
-        menu.addSeparator()
+            act = menu.addAction(f"Ignore {n} Files")
+            act.triggered.connect(
+                lambda checked=False, paths=selected: self.batch_context_action_requested.emit(
+                    "ignore", paths,
+                ),
+            )
 
-        stash_action = menu.addAction("Stash File")
-        stash_action.triggered.connect(
-            lambda checked=False, p=path: self.context_action_requested.emit("stash", p),
-        )
+            act = menu.addAction(f"Delete {n} Files")
+            act.triggered.connect(
+                lambda checked=False, paths=selected: self.batch_context_action_requested.emit(
+                    "delete", paths,
+                ),
+            )
 
-        menu.addSeparator()
+            act = menu.addAction(f"Stash {n} Files")
+            act.triggered.connect(
+                lambda checked=False, paths=selected: self.batch_context_action_requested.emit(
+                    "stash", paths,
+                ),
+            )
+        else:
+            path = selected[0]
 
-        show_action = menu.addAction("Show in Folder")
-        show_action.triggered.connect(
-            lambda checked=False, p=path: self.context_action_requested.emit("show", p),
-        )
+            if self._staged:
+                stage_action = menu.addAction("Unstage")
+                stage_action.triggered.connect(
+                    lambda checked=False, p=path: _emit("unstage", p),
+                )
+            else:
+                stage_action = menu.addAction("Stage")
+                stage_action.triggered.connect(
+                    lambda checked=False, p=path: _emit("stage", p),
+                )
 
-        copy_action = menu.addAction("Copy File Path")
-        copy_action.triggered.connect(
-            lambda checked=False, p=path: self.context_action_requested.emit("copy", p),
-        )
+            discard_action = menu.addAction("Discard Changes")
+            discard_action.triggered.connect(
+                lambda checked=False, p=path: _emit("discard", p),
+            )
 
-        menu.addSeparator()
+            # --- Ignore submenu ---
+            ignore_menu = menu.addMenu("Ignore")
+            ignore_menu.setStyleSheet(menu.styleSheet())
 
-        delete_action = menu.addAction("Delete File")
-        delete_action.triggered.connect(
-            lambda checked=False, p=path: self.context_action_requested.emit("delete", p),
-        )
+            ignore_file = ignore_menu.addAction(f"Ignore this file ({path})")
+            ignore_file.triggered.connect(
+                lambda checked=False, p=path: _emit("ignore", p),
+            )
+
+            normalized = path.replace("\\", "/")
+            parts = normalized.split("/")
+
+            if len(parts) >= 2:
+                parent_dir = "/".join(parts[:-1]) + "/"
+                ignore_parent = ignore_menu.addAction(f"Ignore /{parent_dir}")
+                ignore_parent.triggered.connect(
+                    lambda checked=False, p=path: _emit("ignore_dir", p),
+                )
+
+            if len(parts) >= 3:
+                grandparent_dir = "/".join(parts[:-2]) + "/"
+                ignore_grandparent = ignore_menu.addAction(f"Ignore /{grandparent_dir}")
+                ignore_grandparent.triggered.connect(
+                    lambda checked=False, p=path: _emit("ignore_parent_dir", p),
+                )
+
+            _, ext = _os.path.splitext(path)
+            if ext:
+                ignore_ext = ignore_menu.addAction(f"Ignore *{ext}")
+                ignore_ext.triggered.connect(
+                    lambda checked=False, p=path: _emit("ignore_ext", p),
+                )
+
+            menu.addSeparator()
+
+            stash_action = menu.addAction("Stash File")
+            stash_action.triggered.connect(
+                lambda checked=False, p=path: _emit("stash", p),
+            )
+
+            menu.addSeparator()
+
+            show_action = menu.addAction("Show in Folder")
+            show_action.triggered.connect(
+                lambda checked=False, p=path: _emit("show", p),
+            )
+
+            copy_action = menu.addAction("Copy File Path")
+            copy_action.triggered.connect(
+                lambda checked=False, p=path: _emit("copy", p),
+            )
+
+            menu.addSeparator()
+
+            delete_action = menu.addAction("Delete File")
+            delete_action.triggered.connect(
+                lambda checked=False, p=path: _emit("delete", p),
+            )
 
         menu.exec(self.viewport().mapToGlobal(position))
 
