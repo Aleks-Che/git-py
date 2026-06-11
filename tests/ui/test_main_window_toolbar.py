@@ -75,7 +75,7 @@ def test_remote_actions_disabled_while_busy(
     window.set_repository(committed_repo)
     # Simulate an in-flight async op.
     window._main_vm._is_busy = True  # noqa: SLF001
-    window._update_remote_actions()  # noqa: SLF001
+    window._update_repo_actions()  # noqa: SLF001
     assert not window._action_fetch.isEnabled()  # noqa: SLF001
     assert not window._action_pull.isEnabled()  # noqa: SLF001
     assert not window._action_push.isEnabled()  # noqa: SLF001
@@ -90,10 +90,10 @@ def test_remote_actions_reenabled_after_busy_clears(
     window.show()
     window.set_repository(committed_repo)
     window._main_vm._is_busy = True  # noqa: SLF001
-    window._update_remote_actions()  # noqa: SLF001
+    window._update_repo_actions()  # noqa: SLF001
     assert not window._action_fetch.isEnabled()  # noqa: SLF001
     window._main_vm._is_busy = False  # noqa: SLF001
-    window._update_remote_actions()  # noqa: SLF001
+    window._update_repo_actions()  # noqa: SLF001
     assert window._action_fetch.isEnabled()  # noqa: SLF001
 
 

@@ -217,7 +217,7 @@ def test_wip_node_appears_when_worktree_has_changes(
         vm.refresh_graph()
     rows = blocker.args[0]
     # WIP node on top, then the existing two commits.
-    assert rows[0]["sha"] == "WIP"
+    assert rows[0]["is_uncommitted"] is True
     assert rows[0]["subject"] == "WIP: Uncommitted changes"
     assert rows[0]["parents"] == [rows[1]["sha"]]  # WIP's parent is real HEAD
     assert len(rows) == 3
@@ -231,7 +231,7 @@ def test_wip_node_absent_on_clean_worktree(
     with qtbot.waitSignal(vm.graph_updated, timeout=2000) as blocker:
         vm.refresh_graph()
     rows = blocker.args[0]
-    assert all(r["sha"] != "WIP" for r in rows)
+    assert all(not r.get("is_uncommitted", False) for r in rows)
 
 
 def test_wip_node_on_unborn_head_with_untracked_file(
@@ -245,7 +245,7 @@ def test_wip_node_on_unborn_head_with_untracked_file(
         vm.refresh_graph()
     rows = blocker.args[0]
     assert len(rows) == 1
-    assert rows[0]["sha"] == "WIP"
+    assert rows[0]["is_uncommitted"] is True
     # Unborn HEAD → WIP has no parent commit.
     assert rows[0]["parents"] == []
 

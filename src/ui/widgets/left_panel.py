@@ -320,9 +320,73 @@ class LeftPanel(QTreeWidget):
         toggles cancel out, so a double-click on a group header ends
         up as a single toggle via the ``itemDoubleClicked`` handler
         above — net effect: the state flips once, as expected.
+
+        Single-click on a **leaf** (local/remote branch or tag) drives
+        the graph: the commit the ref points at becomes the selected
+        commit in the graph and the graph scrolls to bring it into
+        view (both vertically and horizontally on the graph column).
+        The double-click handler keeps its old verb (checkout /
+        create branch) — the scroll-then-act sequence is what
+        GitKraken does. Stash leaves are intentionally left alone on
+        single-click: the user double-clicks a stash entry to open
+        the apply / pop / drop context menu via the standard
+        double-click path.
         """
-        if item.data(0, _ROLE_KIND) is None:
+        kind = item.data(0, _ROLE_KIND)
+        if kind is None:
             item.setExpanded(not item.isExpanded())
+            return
+        if kind in (_KIND_LOCAL_BRANCH, _KIND_REMOTE_BRANCH, _KIND_TAG):
+            self._focus_ref_on_graph(kind=kind, name=item.data(0, _ROLE_NAME))
+
+    def _focus_ref_on_graph(self, *, kind: str, name: str | None) -> None:
+        """Select the commit pointed to by *name* on the graph and scroll to it.
+
+        Resolves *name* against the :class:`BranchPanelViewModel`
+        snapshot to find the target SHA, then asks the
+        :class:`MainViewModel` to make it the selected commit and the
+        :class:`GraphViewModel` to scroll the graph view to it. The
+        two calls go through different paths on purpose: the
+        selection drives the right panel (and the selection ring on
+        the graph node), the scroll moves the viewport to the commit
+        row. Stash entries are filtered out by the caller.
+
+        No-op when the ref cannot be resolved (e.g. the snapshot is
+        stale) or the target SHA is empty — the right panel and the
+        graph selection would otherwise be set to ``None`` and the
+        current selection cleared, which is surprising for a single
+        misclick on an outdated row.
+        """
+        if not name:
+            return
+        sha = self._resolve_ref_sha(kind=kind, name=name)
+        if not sha:
+            return
+        self._main_vm.set_selected_commit(sha)
+        self._main_vm.graph_view_model().scroll_to_commit(sha)
+
+    def _resolve_ref_sha(self, *, kind: str, name: str) -> str | None:
+        """Look up the commit SHA a branch / tag leaf points at.
+
+        Branches and tags both expose ``target_sha`` on the
+        :class:`BranchInfo` / :class:`TagInfo` dataclasses, so the
+        lookup is uniform. Returns ``None`` if *name* is no longer
+        in the panel's snapshot — that happens after a ``refresh()``
+        races with a click and the user clicked the old row.
+        """
+        if kind == _KIND_LOCAL_BRANCH:
+            for branch in self._vm.local_branches():
+                if branch.name == name:
+                    return branch.target_sha
+        elif kind == _KIND_REMOTE_BRANCH:
+            for branch in self._vm.remote_branches():
+                if branch.name == name:
+                    return branch.target_sha
+        elif kind == _KIND_TAG:
+            for tag in self._vm.tags():
+                if tag.name == name:
+                    return tag.target_sha
+        return None
 
     def _on_context_menu(self, position) -> None:  # noqa: ANN001 - QPoint
         item = self.itemAt(position)

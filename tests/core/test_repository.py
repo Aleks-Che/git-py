@@ -19,6 +19,7 @@ from src.core.models import (
     FileChange,
     FileStatus,
 )
+from src.core.operations import stash_push
 from src.core.repository import RepositoryManager
 
 # ----- lifecycle -----------------------------------------------------------
@@ -122,6 +123,53 @@ def test_branches_includes_head_and_remote_only_when_present(
         is_remote=False,
         target_sha=branches[0].target_sha,
     )
+
+
+def test_branches_resolves_symref_remote_target(
+    committed_repo: RepositoryManager,
+) -> None:
+    """Regression: a symbolic remote branch like ``origin/HEAD`` must
+    get a real commit SHA as ``target_sha``, not the symbolic path
+    ``refs/remotes/origin/main``."""
+    repo = committed_repo.repo
+    head_sha = committed_repo.head_commit.sha
+    head_oid = pygit2.Oid(bytes.fromhex(head_sha))
+
+    repo.references.create("refs/remotes/origin/main", head_oid)
+    repo.references.create("refs/remotes/origin/HEAD", "refs/remotes/origin/main", force=True)
+
+    by_name = {b.name: b for b in committed_repo.branches}
+
+    assert "origin/main" in by_name
+    assert "origin/HEAD" in by_name
+    sha = by_name["origin/HEAD"].target_sha
+    assert sha and len(sha) == 40 and sha == head_sha, f"{sha!r} != {head_sha}"
+
+
+def test_branches_skips_broken_symref(
+    committed_repo: RepositoryManager,
+) -> None:
+    """A remote symref whose target reference does not exist is omitted."""
+    repo = committed_repo.repo
+    repo.references.create(
+        "refs/remotes/origin/DEAD", "refs/remotes/origin/nonexistent", force=True
+    )
+    assert not any(b.name == "origin/DEAD" for b in committed_repo.branches)
+
+
+def test_get_all_history_includes_remote_symref_tip(
+    committed_repo: RepositoryManager,
+) -> None:
+    """A commit only reachable via a symbolic remote ref must still appear."""
+    repo = committed_repo.repo
+    head_sha = committed_repo.head_commit.sha
+    head_oid = pygit2.Oid(bytes.fromhex(head_sha))
+
+    repo.references.create("refs/remotes/origin/main", head_oid)
+    repo.references.create("refs/remotes/origin/HEAD", "refs/remotes/origin/main", force=True)
+
+    shas = {c.sha for c in committed_repo.get_all_history()}
+    assert head_sha in shas
 
 
 def test_tags_includes_lightweight_and_annotated(committed_repo: RepositoryManager) -> None:
@@ -248,6 +296,87 @@ def test_get_all_history_deduplicates_across_tips(
     assert counts == 1
 
 
+def test_get_all_history_keeps_topological_order_under_duplicate_timestamps(
+    tmp_git_repo: Path,
+) -> None:
+    """Regression: with ``GIT_SORT_TIME`` only a parent commit could
+    appear **after** its child when they shared a timestamp, which
+    broke :mod:`src.core.graph_v2`. We now use
+    ``GIT_SORT_TOPOLOGICAL | GIT_SORT_TIME`` so every commit is
+    preceded only by its descendants.
+
+    The fixture stamps the parent *after* the child on purpose: a
+    pure time-based walk would emit ``[child, parent]``. Topological
+    order must emit ``[child, parent]`` too (child first because it
+    is the tip), but more importantly must never let a parent leak
+    ahead of any of its descendants.
+    """
+    repo = pygit2.Repository(str(tmp_git_repo))
+    base_time = 1_700_000_000
+
+    # ``child`` has a strictly earlier timestamp than its ``parent``
+    # so a time-sorted walk would mis-order them.
+    child_sig = pygit2.Signature("tester", "t@example.com", base_time, 0)
+    parent_sig = pygit2.Signature("tester", "t@example.com", base_time + 10, 0)
+    # Inherit tree across commits so file content does not matter here.
+    tree_oid = repo.TreeBuilder().write()
+    parent_oid = repo.create_commit(
+        "refs/heads/main", parent_sig, parent_sig,
+        "parent", tree_oid, [],
+    )
+    child_oid = repo.create_commit(
+        "refs/heads/main", child_sig, child_sig,
+        "child", tree_oid, [parent_oid],
+    )
+
+    mgr = RepositoryManager(str(tmp_git_repo))
+    history = mgr.get_all_history()
+    shas = [c.sha for c in history]
+    assert shas == [str(child_oid), str(parent_oid)], (
+        f"Topological order broken under duplicate/inverted timestamps: {shas}"
+    )
+    assert history[0].author_time < history[1].author_time  # invariant used to break it
+
+
+def test_get_all_history_merges_parallel_branches_in_topological_order(
+    tmp_git_repo: Path,
+) -> None:
+    """Two parallel branches off a common root must interleave
+    correctly: root, then either branch tip, then the other. The
+    previous time-sorted multi-walk implementation could scatter the
+    branches arbitrarily."""
+    repo = pygit2.Repository(str(tmp_git_repo))
+    base = 1_700_000_000
+
+    def make_sig(offset: int) -> pygit2.Signature:
+        return pygit2.Signature(
+            "tester", "t@example.com", base + offset, 0,
+        )
+
+    tree_oid = repo.TreeBuilder().write()
+    root_oid = repo.create_commit(
+        "refs/heads/main", make_sig(0), make_sig(0), "root", tree_oid, [],
+    )
+    main_oid = repo.create_commit(
+        "refs/heads/main", make_sig(10), make_sig(10), "main tip",
+        tree_oid, [root_oid],
+    )
+    feat_oid = repo.create_commit(
+        "refs/heads/feature", make_sig(20), make_sig(20), "feature tip",
+        tree_oid, [root_oid],
+    )
+
+    mgr = RepositoryManager(str(tmp_git_repo))
+    history = mgr.get_all_history()
+    shas = [c.sha for c in history]
+
+    # Root must come last (it is the oldest topologically).
+    assert shas[-1] == str(root_oid)
+    # Both tips must come before the root.
+    assert shas.index(str(main_oid)) < shas.index(str(root_oid))
+    assert shas.index(str(feat_oid)) < shas.index(str(root_oid))
+
+
 def test_get_commit_resolves_short_sha(committed_repo: RepositoryManager) -> None:
     full = committed_repo.head_commit.sha
     short = full[:7]
@@ -272,3 +401,31 @@ def test_repo_property_raises_when_closed(tmp_git_repo: Path) -> None:
     mgr = RepositoryManager()
     with pytest.raises(GitError, match="No repository is open"):
         _ = mgr.repo
+
+
+# ----- diff text ---------------------------------------------------------
+
+
+def test_get_stash_diff_text_returns_unified_diff(
+    committed_repo: RepositoryManager,
+    tmp_git_repo: Path,
+) -> None:
+    """A stash entry's diff is its tree vs the original commit it was taken from."""
+    (tmp_git_repo / "hello.txt").write_text("hello, stash\n")
+    stash_push(committed_repo, "wip")
+
+    stash = committed_repo.stash_list
+    assert stash, "stash list should contain the entry we just created"
+
+    text = committed_repo.get_stash_diff_text(stash[0].sha)
+
+    assert "diff --git a/hello.txt b/hello.txt" in text
+    assert "-hello, world" in text
+    assert "+hello, stash" in text
+
+
+def test_get_stash_diff_text_handles_unknown_sha(
+    committed_repo: RepositoryManager,
+) -> None:
+    with pytest.raises(InvalidRefError):
+        committed_repo.get_stash_diff_text("deadbeef" * 5)

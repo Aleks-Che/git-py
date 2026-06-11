@@ -272,7 +272,7 @@ class GraphWidget(QGraphicsView):
         if is_wip:
             color = QColor(self._cfg.wip_color)
             radius = self._cfg.wip_node_radius
-            pen = QPen(color, 1, Qt.PenStyle.DashLine)
+            pen = QPen(color, 1, Qt.PenStyle.SolidLine)
             brush = QBrush(QColor(self._cfg.background_color))
         else:
             color = QColor(row["color"])

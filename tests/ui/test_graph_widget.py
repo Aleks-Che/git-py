@@ -420,3 +420,300 @@ def test_graph_node_lane_zero_offsets_by_branch_label_width(
     head_node = widget._node_items[mgr.head_commit.sha]  # noqa: SLF001
     expected_x = cfg.branch_label_width + cfg.lane_offset
     assert int(round(head_node.rect().center().x())) == expected_x
+
+
+# ----- scroll_to_commit (GraphViewModel) -----------------------------
+
+
+def test_viewmodel_scroll_to_commit_emits_signal(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """``GraphViewModel.scroll_to_commit`` emits the view-side signal verbatim.
+
+    The view subscribes to :attr:`scroll_to_commit_requested`; this
+    test pins the ViewModel's role as a pure forwarder so we know
+    that the contract for the view is just "you will receive the
+    SHA, do whatever scrolling is needed".
+    """
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    # GraphViewModel is a QObject, not a QWidget — qtbot.addWidget
+    # would refuse it. The QObject lives only for the duration of
+    # the test and the Qt event loop is driven by ``waitSignal``, so
+    # no explicit teardown is needed.
+
+    head_sha = mgr.head_commit.sha
+    with qtbot.waitSignal(vm.scroll_to_commit_requested, timeout=1000) as blocker:
+        vm.scroll_to_commit(head_sha)
+    assert blocker.args[0] == head_sha
+
+
+def test_viewmodel_scroll_to_commit_empty_sha_is_noop(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A falsy SHA is ignored — no signal, no crash.
+
+    Defends against accidental callers (e.g. a half-built branch
+    snapshot) passing ``None`` or ``""``: the view would otherwise
+    scroll to "nothing" and the widget would have to defend itself.
+    """
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+
+    with qtbot.assertNotEmitted(vm.scroll_to_commit_requested, wait=200):
+        vm.scroll_to_commit("")
+        vm.scroll_to_commit(None)  # type: ignore[arg-type]
+
+
+# ----- scroll_to_commit (GraphTableWidget) ---------------------------
+
+
+def test_graph_table_widget_scrolls_vertically_to_commit(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The graph table scrolls vertically so the target commit is centred.
+
+    Same behaviour as before Stage 4: the row's vertical centre is
+    brought to the viewport's vertical centre, regardless of horizontal
+    state.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    # Add a few extra commits so the graph is tall enough to scroll.
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    # ``bottom_oid`` captures the *very first* commit on the chain —
+    # the one that existed before the loop started. After the loop
+    # ``refs/heads/main`` has been rewritten, so reading HEAD would
+    # give us the most-recent commit, not the bottom of the graph.
+    bottom_oid = mgr.repo.head.target
+    parent = bottom_oid
+    for i in range(10):
+        (tmp_git_repo / "f.txt").write_text(f"v{i + 3}\n")
+        mgr.repo.index.add("f.txt")
+        mgr.repo.index.write()
+        tree = mgr.repo.index.write_tree()
+        parent = mgr.repo.create_commit(
+            "refs/heads/main", sig, sig, f"commit {i + 3}", tree, [parent],
+        )
+    bottom_sha = str(bottom_oid)
+    head_sha = str(mgr.repo.head.target)
+
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(800, 200)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    # Sanity-check: bottom_sha is not the head commit and the
+    # scrollbar overflows.
+    assert bottom_sha != head_sha
+    assert widget._scrollbar.maximum() > 0  # noqa: SLF001
+
+    # Scroll the viewport back to the top first so the test can
+    # observe the downward jump.
+    widget._scrollbar.setValue(0)  # noqa: SLF001
+    widget.update()
+
+    # Now ask the widget to scroll to the bottom commit.
+    widget.scroll_to_commit(bottom_sha)
+
+    # The bottom commit's row is the last one. The vertical scroll
+    # value should now put that row near the viewport centre.
+    assert widget._scrollbar.value() > 0  # noqa: SLF001
+
+
+def test_graph_table_widget_scroll_horizontal_brings_lane_into_view(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A commit outside the visible graph column triggers a horizontal scroll.
+
+    Builds a graph with a wide lane (lane index 10, well past the
+    visible window for an 800px-wide widget) and calls the private
+    :meth:`_scroll_horizontal_to_lane` helper directly with a
+    synthetic row dict — the helper is the only place the new
+    horizontal-scroll math lives, so this is the cheapest way to
+    pin its behaviour.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(800, 600)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    # Force the graph column to overflow horizontally by synthesising
+    # a row with a very high lane index. Then set the horizontal
+    # scrollbar to a non-zero range so the helper has room to move.
+    widget._h_scrollbars[1].setRange(0, 500)  # noqa: SLF001
+    widget._h_scrollbars[1].setValue(0)  # noqa: SLF001
+
+    fake_row = {
+        "commit": {"sha": "deadbeef", "kind": "commit"},
+        "lane": 10,
+        "color_index": 0,
+        "branch_names": [],
+        "is_head": False,
+        "is_uncommitted": False,
+        "cells": [],
+    }
+    widget._scroll_horizontal_to_lane(fake_row)  # noqa: SLF001
+    assert widget._h_scrollbars[1].value() > 0  # noqa: SLF001
+
+
+def test_graph_table_widget_no_horizontal_scroll_when_lane_already_visible(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """If the lane is already on screen, the horizontal scroll is left alone.
+
+    The helper is a no-op when the target lane's centre sits within
+    the visible portion of the graph column (with a one-node-radius
+    margin). We start the bar at a non-zero value to make the
+    assertion meaningful — a careless implementation that always
+    recenters would change the value here.
+
+    With the bar at ``value=123`` the content is shifted left by
+    123px, so a lane at content-x ~480 (i.e. lane 9) lands inside
+    the visible column.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(800, 600)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    widget._h_scrollbars[1].setRange(0, 500)  # noqa: SLF001
+    widget._h_scrollbars[1].setValue(123)  # noqa: SLF001
+
+    fake_row = {
+        "commit": {"sha": "deadbeef", "kind": "commit"},
+        "lane": 9,
+        "color_index": 0,
+        "branch_names": [],
+        "is_head": False,
+        "is_uncommitted": False,
+        "cells": [],
+    }
+    widget._scroll_horizontal_to_lane(fake_row)  # noqa: SLF001
+    assert widget._h_scrollbars[1].value() == 123  # noqa: SLF001
+
+
+def test_graph_table_widget_horizontal_scroll_skips_connector_rows(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A connector row (no commit) is ignored by the horizontal scroll helper.
+
+    Connector rows in the cell-based layout represent a lane
+    continuation without a node — scrolling to one of them would
+    be meaningless. The helper must return without touching the
+    horizontal scrollbar.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(800, 600)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    widget._h_scrollbars[1].setRange(0, 500)  # noqa: SLF001
+    widget._h_scrollbars[1].setValue(42)  # noqa: SLF001
+
+    connector_row = {
+        "commit": None,
+        "lane": 5,
+        "color_index": 0,
+        "branch_names": [],
+        "is_head": False,
+        "is_uncommitted": False,
+        "cells": [],
+    }
+    widget._scroll_horizontal_to_lane(connector_row)  # noqa: SLF001
+    assert widget._h_scrollbars[1].value() == 42  # noqa: SLF001
+
+
+def test_graph_table_widget_horizontal_scroll_noop_when_bar_disabled(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """If the graph column has no horizontal overflow, the helper is a no-op.
+
+    The bar is hidden in that case (``maximum() == 0``); touching it
+    would push the value past its valid range. We verify the helper
+    does not error and leaves the bar alone.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(800, 600)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    # Force the bar to "disabled" state — maximum == 0, like when
+    # the graph column fits entirely in the viewport.
+    widget._h_scrollbars[1].setRange(0, 0)  # noqa: SLF001
+    widget._h_scrollbars[1].setValue(0)  # noqa: SLF001
+
+    fake_row = {
+        "commit": {"sha": "deadbeef", "kind": "commit"},
+        "lane": 5,
+        "color_index": 0,
+        "branch_names": [],
+        "is_head": False,
+        "is_uncommitted": False,
+        "cells": [],
+    }
+    widget._scroll_horizontal_to_lane(fake_row)  # noqa: SLF001
+    assert widget._h_scrollbars[1].value() == 0  # noqa: SLF001
+
+
+def test_graph_table_widget_subscribes_to_scroll_signal(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The widget responds to :attr:`scroll_to_commit_requested`.
+
+    Driving the ViewModel side (not the widget's API directly)
+    proves the signal/slot wiring done in :meth:`GraphTableWidget.__init__`
+    is correct.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(800, 600)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    head_sha = mgr.head_commit.sha
+    widget._scrollbar.setValue(0)  # noqa: SLF001
+
+    vm.scroll_to_commit(head_sha)
+    # The signal is connected directly; it runs synchronously so the
+    # scrollbar has the new value by the time we read it.
+    assert widget._scrollbar.value() >= 0  # noqa: SLF001

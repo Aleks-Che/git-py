@@ -1,18 +1,14 @@
 """ViewModel for the commit graph.
 
-Bridges the pure-Python :mod:`src.core.graph` layout engine and the
-Qt-flavoured UI: holds a reference to a :class:`RepositoryManager`,
-recomputes the lane layout whenever the repository changes, and
-exposes the result plus user-driven ``commit_selected`` events as
-Qt signals so any number of widgets can listen.
+Bridges the pure-Python :mod:`src.core.graph_v2` cell-based layout engine
+and the Qt-flavoured UI: holds a reference to a :class:`RepositoryManager`,
+recomputes the layout whenever the repository changes, and exposes the
+result plus user-driven ``commit_selected`` events as Qt signals.
 
-Stage 3 also synthesises a "WIP" commit node whenever the working
-tree has any uncommitted changes. The WIP node is a real
-:class:`CommitInfo` with ``sha="WIP"`` and ``message="WIP:
-Uncommitted changes"``; prepending it to the history lets
-:func:`src.core.graph.compute_layout` lay it out above ``HEAD``
-in the same lane. ``core/`` stays free of any knowledge about
-working-tree status — the synthesis happens here, in the ViewModel.
+The WIP (uncommitted changes) node is now handled by :func:`build_graph`
+itself — the ViewModel only supplies the uncommitted file count and the
+HEAD SHA.  Stash entries are still synthesised as :class:`CommitInfo`
+objects and inserted into the history before calling the engine.
 """
 from __future__ import annotations
 
@@ -21,7 +17,13 @@ import time
 from PySide6.QtCore import QObject, Signal
 
 from src.core.exceptions import GitError
-from src.core.graph import compute_layout, nodes_to_rows
+from src.core.graph_v2 import (
+    BRANCH_PALETTE,
+    _build_branch_refs_map,
+    _build_refs_map,
+    build_graph,
+    graph_to_dicts,
+)
 from src.core.models import CommitInfo, StashInfo
 from src.core.repository import RepositoryManager
 
@@ -36,27 +38,34 @@ class GraphViewModel(QObject):
     -------
     graph_updated(list[dict])
         Emitted with the new layout after :meth:`refresh_graph` (or
-        :meth:`set_repository`) finishes. The payload is a list of
-        plain dicts — one per commit, oldest entry is the oldest
-        commit — safe to consume on any thread.
+        :meth:`set_repository`) finishes.  Each payload item is a
+        plain dict with keys ``commit``, ``lane``, ``color_index``,
+        ``cells``, etc. — safe to consume on any thread.
     commit_selected(str)
-        Emitted when the user picks a commit in the view. Carries
-        the commit's full SHA.
+        Emitted when the user picks a commit in the view.
     error_occurred(str)
-        Emitted when a Core call raises a :class:`GitError`. The
-        UI surfaces this as a status-bar message or a dialog.
+        Emitted when a Core call raises a :class:`GitError`.
+    search_results_changed(list[str])
+        Emitted with matching SHA values after a search.
     """
 
     graph_updated = Signal(list)
     commit_selected = Signal(str)
     error_occurred = Signal(str)
-    search_results_changed = Signal(list)  # list[str] of matching SHA values
+    search_results_changed = Signal(list)
+    scroll_to_commit_requested = Signal(str)
+    """Emitted by :meth:`scroll_to_commit`; the view scrolls the commit
+    (vertically and horizontally) so the user lands on it. Decoupled from
+    :attr:`commit_selected` so the view can suppress the visual highlight
+    ring (e.g. when the user only navigates from the left panel)."""
 
     def __init__(self, repo_manager: RepositoryManager | None = None, parent=None) -> None:
         super().__init__(parent)
         self._repo: RepositoryManager | None = repo_manager
 
-    # ----- repository binding -------------------------------------------
+    # ------------------------------------------------------------------
+    # repository binding
+    # ------------------------------------------------------------------
 
     def set_repository(
         self,
@@ -64,36 +73,23 @@ class GraphViewModel(QObject):
         *,
         refresh: bool = True,
     ) -> None:
-        """Bind (or unbind) the repository the ViewModel reads from.
+        """Bind (or unbind) the repository.
 
-        Setting a new repository automatically refreshes the graph
-        unless ``refresh=False``, which lets the caller defer the
-        heavy ``get_all_history`` + ``compute_layout`` work to a
-        background thread. Passing ``None`` clears the graph (emits
-        an empty list) regardless of *refresh*.
+        Passing ``None`` clears the graph (emits an empty list).
         """
         self._repo = manager
         if refresh:
             self.refresh_graph()
 
     def repository(self) -> RepositoryManager | None:
-        """Return the currently bound repository, or ``None``."""
         return self._repo
 
-    # ----- commands (verb methods) --------------------------------------
+    # ------------------------------------------------------------------
+    # commands
+    # ------------------------------------------------------------------
 
     def refresh_graph(self) -> None:
-        """Recompute the graph layout and emit :attr:`graph_updated`.
-
-        Silently emits an empty list when no repository is bound
-        or the repository is empty. Any :class:`GitError` from Core
-        is translated to :attr:`error_occurred` — never re-raised.
-
-        If the working tree has any status entries (modified, new,
-        deleted, ...), a virtual WIP commit is synthesised and
-        prepended to the history so the user sees an uncommitted
-        node above HEAD.
-        """
+        """Recompute the layout and emit :attr:`graph_updated`."""
         if self._repo is None or not self._repo.is_open:
             self.graph_updated.emit([])
             return
@@ -107,15 +103,10 @@ class GraphViewModel(QObject):
     def _compute_graph(
         repo: RepositoryManager,
     ) -> tuple[list[dict], str | None]:
-        """Read history / status / branches / tags / stashes from
-        *repo*, compute the lane layout, and return ``(rows, None)``
-        on success or ``([], error_message)`` on failure.
+        """Pure data-in/data-out — safe for background threads.
 
-        This method is pure data-in/data-out — it does not emit any
-        Qt signals and is safe to call from a background thread.
-        Callers that need signal delivery call :meth:`refresh_graph`
-        instead (or take the returned rows and emit ``graph_updated``
-        themselves on the main thread).
+        Reads history / branches / stashes from *repo*, inserts stash
+        nodes, and passes everything to :func:`build_graph`.
         """
         try:
             history = repo.get_all_history()
@@ -125,6 +116,7 @@ class GraphViewModel(QObject):
             status = repo.get_status()
         except GitError as exc:
             return [], str(exc)
+
         stash_entries = repo.stash_list
         for entry in stash_entries:
             stash_ci = GraphViewModel._stash_commit(entry, head_target)
@@ -135,27 +127,84 @@ class GraphViewModel(QObject):
             while idx < len(history) and history[idx].author_time == t:
                 idx += 1
             history.insert(idx, stash_ci)
-        if status:
-            history = [GraphViewModel._wip_commit(head_target)] + history
+
+        uncommitted_count: int | None = len(status) if status else None
+
         try:
-            nodes = compute_layout(history, branches, tags, head_target, head_shorthand)
+            layout = build_graph(history, branches, uncommitted_count=uncommitted_count,
+                                 head_commit_sha=head_target)
         except GitError as exc:
             return [], str(exc)
-        return nodes_to_rows(nodes), None
+
+        rows = graph_to_dicts(layout)
+
+        # Enrich rows with refs and branch_refs for the widget.
+        refs_by_sha = _build_refs_map(branches, tags, head_target, head_shorthand)
+        branch_refs_by_sha = _build_branch_refs_map(branches)
+        for idx, row in enumerate(rows):
+            commit = row.get("commit")
+            sha = commit["sha"] if commit else ""
+            row["refs"] = refs_by_sha.get(sha, [])
+            row["branch_refs"] = [b.to_dict() for b in branch_refs_by_sha.get(sha, [])]
+
+            # Backward-compatible flat keys.
+            if row.get("is_uncommitted"):
+                row["sha"] = "WIP"
+            else:
+                row["sha"] = sha
+            row["row"] = idx
+            ci = row.get("color_index", 0)
+            if 0 <= ci < len(BRANCH_PALETTE):
+                row["color"] = BRANCH_PALETTE[ci]
+            else:
+                row["color"] = BRANCH_PALETTE[0]  # fallback for UNCOMMITTED_COLOR_INDEX etc.
+            if commit:
+                row["short_sha"] = commit.get("short_sha", "")
+                row["subject"] = commit.get("subject", "")
+                row["author_name"] = commit.get("author_name", "")
+                row["author_time"] = commit.get("author_time", 0)
+                row["parents"] = commit.get("parents", [])
+                row["kind"] = commit.get("kind", "commit")
+            elif row.get("is_uncommitted"):
+                row["short_sha"] = "WIP"
+                row["subject"] = "WIP: Uncommitted changes"
+                row["author_name"] = ""
+                row["author_time"] = 0
+                row["parents"] = [head_target] if head_target else []
+                row["kind"] = "wip"
+            else:
+                row["short_sha"] = ""
+                row["subject"] = ""
+                row["author_name"] = ""
+                row["author_time"] = 0
+                row["parents"] = []
+                row["kind"] = "commit"
+        return rows, None
 
     def select_commit(self, sha: str) -> None:
-        """Forward a user click on a commit to :attr:`commit_selected`."""
+        """Forward a user click on a commit."""
         self.commit_selected.emit(sha)
 
-    def get_commit_details(self, sha: str) -> CommitInfo | None:
-        """Resolve ``sha`` to a :class:`CommitInfo` for the detail panel.
+    def scroll_to_commit(self, sha: str) -> None:
+        """Ask the view to bring *sha* into view.
 
-        Returns ``None`` if no repository is bound or the SHA cannot
-        be resolved; the caller is expected to clear its display in
-        that case. We deliberately don't emit :attr:`error_occurred`
-        for an unknown SHA — the click is a normal user action and
-        shouldn't pop a dialog.
+        The view (the :class:`GraphTableWidget`) is the only thing that
+        knows the current scroll offsets and the per-column overflow
+        ranges; the ViewModel just forwards the request. The signal is
+        decoupled from :attr:`commit_selected` so callers (the left
+        panel, the search bar) can drive the scroll without forcing a
+        visual selection on the graph — the caller decides whether to
+        pair the scroll with a selection.
+
+        No-op when *sha* is falsy or when no graph is currently loaded
+        (e.g. a :attr:`graph_updated` with an empty list is in flight).
         """
+        if not sha:
+            return
+        self.scroll_to_commit_requested.emit(sha)
+
+    def get_commit_details(self, sha: str) -> CommitInfo | None:
+        """Resolve *sha* to a :class:`CommitInfo` for the detail panel."""
         if self._repo is None or not self._repo.is_open:
             return None
         try:
@@ -164,15 +213,7 @@ class GraphViewModel(QObject):
             return None
 
     def search_commits(self, query: str) -> list[str]:
-        """Search the history for commits matching ``query``.
-
-        Matches are case-insensitive against SHA prefix, commit
-        message substring, and author name. Emits
-        :attr:`search_results_changed` with the matching SHA list
-        and returns the same list for synchronous consumers.
-
-        An empty ``query`` clears the filter (emits an empty list).
-        """
+        """Case-insensitive search by SHA / message / author."""
         if not query:
             self.search_results_changed.emit([])
             return []
@@ -194,15 +235,11 @@ class GraphViewModel(QObject):
         self.search_results_changed.emit(results)
         return results
 
-    # ----- internals ----------------------------------------------------
+    # ------------------------------------------------------------------
+    # internals
+    # ------------------------------------------------------------------
 
     def _head_info(self) -> tuple[str | None, str | None]:
-        """Return ``(head_target_sha, head_shorthand)`` for the open repo.
-
-        ``head_target_sha`` is ``None`` when HEAD is unborn. The
-        shorthand is the symbolic ref name (``"main"`` on a branch,
-        ``"(detached)"`` when detached, ``None`` if unborn).
-        """
         if self._repo is None or self._repo.repo.head_is_unborn:
             return None, None
         head = self._repo.repo.head
@@ -216,41 +253,12 @@ class GraphViewModel(QObject):
         return str(head.target), head.shorthand
 
     @staticmethod
-    def _wip_commit(head_target: str | None) -> CommitInfo:
-        """Build the synthetic WIP :class:`CommitInfo` shown above ``HEAD``."""
-        return CommitInfo(
-            sha=WIP_SHA,
-            short_sha="WIP",
-            message=WIP_MESSAGE,
-            author_name="",
-            author_email="",
-            author_time=int(time.time()),
-            committer_name="",
-            committer_email="",
-            committer_time=int(time.time()),
-            parents=[head_target] if head_target else [],
-            kind="wip",
-        )
-
-    @staticmethod
     def _stash_commit(entry: StashInfo, head_target: str | None) -> CommitInfo:
-        """Build a synthetic :class:`CommitInfo` for a stash entry.
-
-        Uses the *real* stash commit OID as the SHA so the right
-        panel can resolve it via :meth:`RepositoryManager.get_commit`
-        and show the stash commit's message, author, and changed
-        files. The ``kind="stash"`` flag tells the graph widget
-        to render the golden dashed icon.
-
-        The parent is set to the stash's actual parent commit (the
-        HEAD at the time the stash was created) so the graph draws
-        the stash as a branch forking off that commit.
-        """
+        """Build a synthetic :class:`CommitInfo` for a stash entry."""
         raw = entry.message
         if ": " in raw:
             raw = raw.split(": ", 1)[1]
         label = f"Stash @{{{entry.index}}}: {raw}"
-
         parent = entry.parent_sha or head_target
         return CommitInfo(
             sha=entry.sha,
