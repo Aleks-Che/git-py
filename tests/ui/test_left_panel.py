@@ -550,8 +550,8 @@ def test_single_click_branch_with_empty_target_sha_is_a_noop(
     empty target SHA — the panel code path under test does not care
     how the snapshot got into that state.
     """
-    from src.core.operations import create_branch
     from src.core.models import BranchInfo
+    from src.core.operations import create_branch
 
     create_branch(committed_repo, "feature", target_sha=committed_repo.head_commit.sha)
     vm = MainViewModel()
@@ -648,9 +648,15 @@ def test_context_menu_has_checkout_on_local_branch(
     actions = panel._context_menu_actions(feature)  # noqa: SLF001
     labels = {a.text() for a in actions}
     assert "Checkout" in labels
+    assert "Pull" in labels
+    assert "Push" in labels
     assert any("Create Branch from" in t for t in labels)
-    assert "Rename…" in labels
-    assert "Delete…" in labels
+    assert "Rename feature…" in labels
+    assert "Delete feature" in labels
+    assert "Copy branch name" in labels
+    assert "Copy commit sha" in labels
+    assert "Create tag here…" in labels
+    assert "Create annotated tag here…" in labels
 
 
 def test_context_menu_create_branch_invokes_main_vm(

@@ -732,6 +732,14 @@ class MainViewModel(QObject):
         if clipboard is not None:
             clipboard.setText(path)
 
+    def copy_to_clipboard(self, text: str) -> None:
+        """Copy arbitrary *text* to the system clipboard."""
+        from PySide6.QtWidgets import QApplication
+
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(text)
+
     # ----- branch commands ---------------------------------------------
 
     def checkout_branch(self, name: str) -> bool:
@@ -1062,6 +1070,64 @@ class MainViewModel(QObject):
             return
         self._refresh_all_views()
         self._log("branch", f"Branch {name!r} deleted")
+
+    def delete_remote_branch(self, remote_branch_name: str) -> None:
+        """Delete a branch on the remote by pushing a deletion refspec.
+
+        ``remote_branch_name`` is in the form ``origin/feature``. The
+        push command carries a ``:refs/heads/<branch>`` refspec which
+        instructs the remote to delete the ref.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            self._log(
+                "branch",
+                f"Delete remote branch {remote_branch_name!r} failed: no repo",
+                level="error",
+            )
+            return
+        if "/" not in remote_branch_name:
+            self.error_occurred.emit(f"Not a remote branch: {remote_branch_name!r}")
+            return
+        remote_name, branch_name = remote_branch_name.split("/", 1)
+        spec = f":refs/heads/{branch_name}"
+        self._log(
+            "branch",
+            f"Deleting remote branch {remote_branch_name!r} "
+            f"(push :refs/heads/{branch_name})",
+        )
+        self.push_changes(remote_name, spec)
+
+    def delete_local_and_remote_branch(self, local_name: str, remote_branch_name: str) -> None:
+        """Delete both the local branch and its remote counterpart."""
+        self._log("branch", f"Deleting local {local_name!r} and remote {remote_branch_name!r}")
+        self.delete_branch(local_name)
+        self.delete_remote_branch(remote_branch_name)
+
+    def create_tag(
+        self,
+        name: str,
+        target_sha: str,
+        message: str | None = None,
+    ) -> None:
+        """Create a tag (lightweight or annotated) via :class:`CreateTagCommand`."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            self._log("tag", f"Create tag {name!r} failed: no repo", level="error")
+            return
+        from src.viewmodels.commands import CreateTagCommand
+
+        kind = "annotated tag" if message else "lightweight tag"
+        self._log("tag", f"Creating {kind} {name!r} at {target_sha[:7]}")
+        command = CreateTagCommand(self._repo_manager, name, target_sha, message)
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("tag", f"Create tag {name!r} failed: {exc}", level="error")
+            return
+        self._refresh_all_views()
+        self._log("tag", f"Tag {name!r} created")
 
     def rename_branch(self, old_name: str, new_name: str, force: bool = False) -> None:
         """Rename a local branch via :class:`RenameBranchCommand`."""

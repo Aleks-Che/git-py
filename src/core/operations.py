@@ -1342,6 +1342,52 @@ def pull(
     return merge_branch(repo, str(upstream_ref.target))
 
 
+# ----- tags ----------------------------------------------------------------
+
+
+def create_tag(
+    repo: RepositoryManager | pygit2.Repository,
+    name: str,
+    target_sha: str,
+    message: str | None = None,
+    tagger: pygit2.Signature | None = None,
+) -> None:
+    """Create a tag — lightweight (``message is None``) or annotated."""
+    with unwrap(repo) as r:
+        try:
+            target = r.get(pygit2.Oid(hex=target_sha))
+        except (KeyError, ValueError) as exc:
+            raise InvalidRefError(f"Cannot resolve {target_sha[:7]!r}") from exc
+        if target is None:
+            raise InvalidRefError(f"Cannot resolve {target_sha[:7]!r}")
+        try:
+            if message:
+                tagger = tagger or _now_signature()
+                r.create_tag(name, target.oid, pygit2.GIT_OBJECT_COMMIT, tagger, message)
+            else:
+                r.create_tag(name, target.oid, pygit2.GIT_OBJECT_COMMIT)
+        except pygit2.GitError as exc:
+            kind = "annotated tag" if message else "lightweight tag"
+            raise GitError(f"Failed to create {kind} {name!r}: {exc}") from exc
+
+
+def delete_tag(
+    repo: RepositoryManager | pygit2.Repository,
+    name: str,
+) -> None:
+    """Delete a tag by its *name* (without ``refs/tags/`` prefix)."""
+    with unwrap(repo) as r:
+        ref_name = f"refs/tags/{name}"
+        try:
+            ref = r.lookup_reference(ref_name)
+        except KeyError as exc:
+            raise InvalidRefError(f"Unknown tag: {name!r}") from exc
+        try:
+            ref.delete()
+        except pygit2.GitError as exc:
+            raise GitError(f"Failed to delete tag {name!r}: {exc}") from exc
+
+
 def discard_changes(
     repo: RepositoryManager | pygit2.Repository,
 ) -> None:

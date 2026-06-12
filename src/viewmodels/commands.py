@@ -29,7 +29,9 @@ from src.core.operations import (
     cherry_pick,
     commit_changes,
     create_branch,
+    create_tag,
     delete_branch,
+    delete_tag,
     discard_changes,
     discard_file,
     fetch,
@@ -1200,6 +1202,51 @@ class DiscardChangesCommand(GitCommand):
         return "discard changes"
 
 
+class CreateTagCommand(GitCommand):
+    """Create a tag (lightweight or annotated); undo by deleting it.
+
+    :meth:`execute` records whether the tag already existed *before*
+    the call. If it did, :meth:`undo` is a no-op — we would otherwise
+    destroy a tag the user did not create through this command.
+
+    Annotated tags carry a message (and an optional tagger signature);
+    lightweight tags have ``message=None``.
+    """
+
+    def __init__(
+        self,
+        repo: RepositoryManager,
+        name: str,
+        target_sha: str,
+        message: str | None = None,
+        tagger: pygit2.Signature | None = None,
+    ) -> None:
+        self._repo = repo
+        self._name = name
+        self._target_sha = target_sha
+        self._message = message
+        self._tagger = tagger
+        self._existed_before = False
+
+    def execute(self) -> None:
+        existing = {t.name for t in self._repo.tags}
+        self._existed_before = self._name in existing
+        create_tag(self._repo, self._name, self._target_sha, self._message, self._tagger)
+
+    def undo(self) -> None:
+        if self._existed_before:
+            return
+        try:
+            delete_tag(self._repo, self._name)
+        except Exception:
+            pass  # best-effort: tag may have been deleted externally
+
+    @property
+    def name(self) -> str:
+        suffix = " (annotated)" if self._message else ""
+        return f"create tag {self._name}{suffix}"
+
+
 __all__ = [
     "AddRemoteCommand",
     "CheckoutCommand",
@@ -1208,6 +1255,7 @@ __all__ = [
     "CommandProcessor",
     "CommitCommand",
     "CreateBranchCommand",
+    "CreateTagCommand",
     "DeleteBranchCommand",
     "DiscardChangesCommand",
     "DiscardFileCommand",

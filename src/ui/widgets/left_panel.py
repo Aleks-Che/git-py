@@ -416,18 +416,7 @@ class LeftPanel(QTreeWidget):
         if kind == _KIND_LOCAL_BRANCH:
             actions.extend(self._local_branch_actions(name))
         elif kind == _KIND_REMOTE_BRANCH:
-            create_from = QAction(f"Create Branch from {name}…", self)
-            create_from.triggered.connect(lambda: self._prompt_create_branch(from_name=name))
-            actions.append(create_from)
-            # ``name`` is like ``origin/main`` — the leading segment is
-            # the remote. The fetch is per-remote, not per-branch.
-            remote_name = self._vm.get_remote_for_branch(name)
-            if remote_name:
-                fetch_action = QAction(f"Fetch from {remote_name}", self)
-                fetch_action.triggered.connect(
-                    lambda: self._main_vm.fetch_changes(remote_name),
-                )
-                actions.append(fetch_action)
+            actions.extend(self._remote_branch_actions(name))
         elif kind == _KIND_TAG:
             create_from = QAction(f"Create Branch from {name}…", self)
             create_from.triggered.connect(lambda: self._prompt_create_branch(from_name=name))
@@ -454,21 +443,171 @@ class LeftPanel(QTreeWidget):
     def _local_branch_actions(self, name: str) -> list[QAction]:
         """Build the context-menu actions for a local branch leaf."""
         actions: list[QAction] = []
+        mgr = self._main_vm.repository_manager()
+        is_current = (
+            mgr is not None
+            and not mgr.repo.head_is_unborn
+            and mgr.repo.head.shorthand == name
+        )
+        upstream_name = self._get_upstream_remote_name(name)
+        target_sha = self._resolve_local_branch_sha(name)
+
+        # ----- push / pull (current branch only) ------------------------
+
+        pull = QAction("Pull", self)
+        pull.triggered.connect(lambda: self._main_vm.pull_changes())
+        pull.setEnabled(is_current)
+        actions.append(pull)
+
+        push = QAction("Push", self)
+        push.triggered.connect(lambda: self._main_vm.push_changes())
+        push.setEnabled(is_current)
+        actions.append(push)
+
+        # ----- checkout / merge / rebase --------------------------------
+
         checkout = QAction("Checkout", self)
         checkout.triggered.connect(lambda: self._main_vm.checkout_branch(name))
         actions.append(checkout)
+
         actions.extend(self._merge_rebase_against_current(name))
-        actions.append(QAction(self))  # visual separator; exec skips it
+
+        actions.append(QAction(self))
         actions[-1].setSeparator(True)
+
+        # ----- create / rename / delete ---------------------------------
+
         create_from = QAction(f"Create Branch from {name}…", self)
         create_from.triggered.connect(lambda: self._prompt_create_branch(from_name=name))
         actions.append(create_from)
-        rename = QAction("Rename…", self)
+
+        rename = QAction(f"Rename {name}…", self)
         rename.triggered.connect(lambda: self._prompt_rename(old_name=name))
         actions.append(rename)
-        delete = QAction("Delete…", self)
+
+        delete = QAction(f"Delete {name}", self)
         delete.triggered.connect(lambda: self._prompt_delete(name))
         actions.append(delete)
+
+        if upstream_name:
+            delete_remote = QAction(f"Delete {upstream_name}", self)
+            delete_remote.triggered.connect(
+                lambda checked=False, u=upstream_name: self._main_vm.delete_remote_branch(u),
+            )
+            actions.append(delete_remote)
+
+            delete_both = QAction(f"Delete {name} and {upstream_name}", self)
+            delete_both.triggered.connect(
+                lambda checked=False, n=name, u=upstream_name: (
+                    self._main_vm.delete_local_and_remote_branch(n, u)
+                ),
+            )
+            actions.append(delete_both)
+
+        actions.append(QAction(self))
+        actions[-1].setSeparator(True)
+
+        # ----- copy -----------------------------------------------------
+
+        copy_name = QAction("Copy branch name", self)
+        copy_name.triggered.connect(lambda: self._main_vm.copy_to_clipboard(name))
+        actions.append(copy_name)
+
+        if target_sha:
+            copy_sha = QAction("Copy commit sha", self)
+            copy_sha.triggered.connect(lambda: self._main_vm.copy_to_clipboard(target_sha))
+            actions.append(copy_sha)
+
+        actions.append(QAction(self))
+        actions[-1].setSeparator(True)
+
+        # ----- tag ------------------------------------------------------
+
+        if target_sha:
+            create_tag = QAction("Create tag here…", self)
+            create_tag.triggered.connect(
+                lambda checked=False, s=target_sha, n=name: (
+                    self._prompt_create_tag(annotated=False, sha=s, from_name=n)
+                ),
+            )
+            actions.append(create_tag)
+
+            create_annotated = QAction("Create annotated tag here…", self)
+            create_annotated.triggered.connect(
+                lambda checked=False, s=target_sha, n=name: (
+                    self._prompt_create_tag(annotated=True, sha=s, from_name=n)
+                ),
+            )
+            actions.append(create_annotated)
+
+        return actions
+
+    def _remote_branch_actions(self, name: str) -> list[QAction]:
+        """Build the context-menu actions for a remote branch leaf.
+
+        ``name`` is like ``origin/main``. The leading segment is the
+        remote name; the rest is the branch name on the remote.
+        """
+        actions: list[QAction] = []
+        remote_name = self._vm.get_remote_for_branch(name)
+        # Resolve the SHA of this remote-tracking branch.
+        target_sha = None
+        for b in self._vm.remote_branches():
+            if b.name == name:
+                target_sha = b.target_sha
+                break
+
+        # ----- checkout (create local tracking branch) ------------------
+
+        checkout = QAction(f"Checkout {name} as local branch", self)
+        checkout.triggered.connect(
+            lambda: self._main_vm.fetch_and_checkout_remote_branch(name),
+        )
+        actions.append(checkout)
+
+        actions.append(QAction(self))
+        actions[-1].setSeparator(True)
+
+        # ----- create local branch from here ----------------------------
+
+        create_from = QAction(f"Create Branch from {name}…", self)
+        create_from.triggered.connect(lambda: self._prompt_create_branch(from_name=name))
+        actions.append(create_from)
+
+        # ----- delete remote branch -------------------------------------
+
+        delete_remote = QAction(f"Delete {name}", self)
+        delete_remote.triggered.connect(
+            lambda checked=False, u=name: self._main_vm.delete_remote_branch(u),
+        )
+        actions.append(delete_remote)
+
+        actions.append(QAction(self))
+        actions[-1].setSeparator(True)
+
+        # ----- copy -----------------------------------------------------
+
+        copy_name = QAction("Copy branch name", self)
+        copy_name.triggered.connect(lambda: self._main_vm.copy_to_clipboard(name))
+        actions.append(copy_name)
+
+        if target_sha:
+            copy_sha = QAction("Copy commit sha", self)
+            copy_sha.triggered.connect(lambda: self._main_vm.copy_to_clipboard(target_sha))
+            actions.append(copy_sha)
+
+        actions.append(QAction(self))
+        actions[-1].setSeparator(True)
+
+        # ----- fetch ----------------------------------------------------
+
+        if remote_name:
+            fetch_action = QAction(f"Fetch from {remote_name}", self)
+            fetch_action.triggered.connect(
+                lambda checked=False, r=remote_name: self._main_vm.fetch_changes(r),
+            )
+            actions.append(fetch_action)
+
         return actions
 
     def _merge_rebase_against_current(self, name: str) -> list[QAction]:
@@ -689,6 +828,66 @@ class LeftPanel(QTreeWidget):
             self._main_vm.delete_branch(name)
         except GitError as exc:
             QMessageBox.warning(self, "Delete Branch", str(exc))
+
+    # ----- helpers: branch metadata -----------------------------------
+
+    def _get_upstream_remote_name(self, local_name: str) -> str | None:
+        """Return the remote-tracking name for *local_name*, e.g. ``origin/main``.
+
+        Returns ``None`` when the branch has no upstream configured or
+        the upstream is not a remote-tracking reference (e.g. another
+        local branch).
+        """
+        mgr = self._main_vm.repository_manager()
+        if mgr is None:
+            return None
+        try:
+            branch = mgr.repo.lookup_branch(local_name)
+            if branch is None:
+                return None
+            upstream = branch.upstream_name
+            if upstream and upstream.startswith("refs/remotes/"):
+                return upstream[len("refs/remotes/"):]
+        except Exception:
+            pass
+        return None
+
+    def _resolve_local_branch_sha(self, name: str) -> str | None:
+        """Look up the commit SHA a local branch points at."""
+        for branch in self._vm.local_branches():
+            if branch.name == name:
+                return branch.target_sha
+        return None
+
+    # ----- prompts (small dialogs) ------------------------------------
+
+    def _prompt_create_tag(self, *, annotated: bool, sha: str, from_name: str) -> None:
+        """Ask for a tag name; create it at *sha* (lightweight or annotated)."""
+        tag_name, ok = QInputDialog.getText(
+            self,
+            "Create Annotated Tag" if annotated else "Create Tag",
+            f"Tag name (at {from_name!r}):",
+            QLineEdit.EchoMode.Normal,
+            "",
+        )
+        if not ok:
+            return
+        tag_name = tag_name.strip()
+        if not tag_name:
+            return
+        message = None
+        if annotated:
+            msg, ok = QInputDialog.getText(
+                self,
+                "Tag Message",
+                f"Message for annotated tag {tag_name!r}:",
+                QLineEdit.EchoMode.Normal,
+                "",
+            )
+            if not ok:
+                return
+            message = msg.strip() or None
+        self._main_vm.create_tag(tag_name, sha, message=message)
 
     # ----- stash verb delegations --------------------------------------
 
