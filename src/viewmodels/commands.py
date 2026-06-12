@@ -16,6 +16,7 @@ from __future__ import annotations
 import time
 from abc import ABC, abstractmethod
 from collections import deque
+from pathlib import Path
 
 import pygit2
 from PySide6.QtCore import QObject, Signal
@@ -1049,12 +1050,23 @@ class DiscardFileCommand(GitCommand):
     support undo) and then the file is restored from HEAD via
     :func:`discard_file`. On :meth:`undo`, the stashed entry is popped,
     returning the file to the state before the discard.
+
+    Untracked files are handled specially: backing them up via
+    ``stash_push(include_untracked=True, paths=[...])`` would also stash
+    every other untracked file in the worktree, which is not what the
+    user asked for. For untracked files the content is read into memory
+    and the file is removed from disk; undo writes it back.
     """
 
     def __init__(self, repo: RepositoryManager, path: str) -> None:
         self._repo = repo
         self._path = path
         self._captured_oid: str | None = None
+        self._untracked_backup: bytes | None = None
+
+    def _is_untracked(self) -> bool:
+        flag = self._repo.repo.status().get(self._path)
+        return bool(flag and flag & pygit2.GIT_STATUS_WT_NEW)
 
     def execute(self) -> None:
         from src.core.repository import unwrap
@@ -1066,17 +1078,45 @@ class DiscardFileCommand(GitCommand):
         if not dirty:
             discard_file(self._repo, self._path)
             return
+        if self._is_untracked():
+            self._discard_untracked()
+            return
         oid = stash_push(
             self._repo,
             message=f"WIP (discard backup): {self._path}",
+            include_untracked=False,
             paths=[self._path],
         )
         if oid is not None:
             self._captured_oid = oid
         discard_file(self._repo, self._path)
 
+    def _discard_untracked(self) -> None:
+        from src.core.repository import unwrap
+
+        with unwrap(self._repo) as r:
+            workdir = r.workdir
+        if workdir is None:
+            return
+        full_path = Path(workdir) / self._path
+        if not full_path.exists():
+            return
+        self._untracked_backup = full_path.read_bytes()
+        full_path.unlink()
+
     def undo(self) -> None:
-        if self._captured_oid is None:
+        if self._captured_oid is None and self._untracked_backup is None:
+            return
+        if self._untracked_backup is not None:
+            from src.core.repository import unwrap
+
+            with unwrap(self._repo) as r:
+                workdir = r.workdir
+            if workdir is not None:
+                full_path = Path(workdir) / self._path
+                full_path.parent.mkdir(parents=True, exist_ok=True)
+                full_path.write_bytes(self._untracked_backup)
+            self._untracked_backup = None
             return
         try:
             restore_stash(self._repo, self._captured_oid, f"WIP (restored): {self._path}")
@@ -1132,8 +1172,6 @@ class IgnoreCommand(GitCommand):
         add_to_gitignore(self._repo, self._pattern)
 
     def undo(self) -> None:
-        from pathlib import Path
-
         from src.core.repository import unwrap
 
         with unwrap(self._repo) as r:
