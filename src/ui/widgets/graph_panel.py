@@ -126,6 +126,14 @@ def _cell_color(index: int) -> QColor:
     return QColor(BRANCH_PALETTE[0])
 
 
+def _lighten_color(color: QColor, factor: float) -> QColor:
+    """Lighten *color* by *factor* (0..1) toward white."""
+    r = min(255, int(color.red() + (255 - color.red()) * factor))
+    g = min(255, int(color.green() + (255 - color.green()) * factor))
+    b = min(255, int(color.blue() + (255 - color.blue()) * factor))
+    return QColor(r, g, b, color.alpha())
+
+
 class GraphTableWidget(QWidget):
     """Unified table-like commit graph.
 
@@ -827,6 +835,8 @@ class GraphTableWidget(QWidget):
         elif is_stash:
             radius = self._cfg.wip_node_radius
             stash_c = color if color.isValid() else QColor(self._cfg.stash_color)
+            if is_selected:
+                stash_c = _lighten_color(stash_c, 0.4)
             painter.setPen(QPen(stash_c, 1.5, Qt.PenStyle.DashLine))
             painter.setBrush(QColor(self._cfg.background_color))
             painter.drawEllipse(
