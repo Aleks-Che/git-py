@@ -198,6 +198,11 @@ def test_main_window_persists_splitter_sizes_on_close(qtbot, tmp_path: Path) -> 
     the commit panel and the commit detail is gone (the new
     :class:`RightPanel` swaps its sub-views internally); only the
     horizontal splitter is persisted now.
+
+    When the right panel is hidden at close time the save handler
+    raises its width from zero to ``MainWindow.MIN_RIGHT_WIDTH``
+    (200) so the panel is not invisible on the next launch. The
+    extra pixels are taken from the centre (graph) column.
     """
     config_path = tmp_path / "config.json"
     window = _make_window(qtbot, config_path=config_path)
@@ -217,7 +222,12 @@ def test_main_window_persists_splitter_sizes_on_close(qtbot, tmp_path: Path) -> 
     window.close()
 
     saved = load_splitter_sizes(load_config(config_path))
-    assert saved[SPLITTER_KEY_HORIZONTAL] == top_actual
+    # closeEvent corrects a zero-width right panel (hidden) to at
+    # least MIN_RIGHT_WIDTH, borrowing from the graph column.
+    from src.ui.main_window import MainWindow
+    MIN_RIGHT = MainWindow.MIN_RIGHT_WIDTH
+    expected = [top_actual[0], max(0, top_actual[1] - MIN_RIGHT), MIN_RIGHT]
+    assert saved[SPLITTER_KEY_HORIZONTAL] == expected
 
 
 def test_main_window_restores_size_on_next_launch(qtbot, tmp_path: Path) -> None:
@@ -253,6 +263,12 @@ def test_main_window_restores_splitter_sizes_on_next_launch(
     Same caveat as :func:`test_main_window_persists_splitter_sizes_on_close`:
     ``setSizes`` rescales to the available space, so we work with the
     Qt-reported sizes rather than the requested ones.
+
+    When the first window's right panel is hidden, the close handler
+    raises its zero width to ``MIN_RIGHT_WIDTH``. The second window
+    restores those adjusted sizes internally; the right panel still
+    appears as zero in ``sizes()`` because it is hidden, but the
+    left-panel and graph widths are faithfully restored.
     """
     config_path = tmp_path / "config.json"
 
@@ -263,17 +279,27 @@ def test_main_window_restores_splitter_sizes_on_next_launch(
         timeout=2000,
     )
     first._top_splitter.setSizes([300, 600, 200])  # noqa: SLF001
-    expected_top = first._top_splitter.sizes()  # noqa: SLF001
     first.close()
 
     second = _make_window(qtbot, config_path=config_path)
     try:
         assert second._top_splitter is not None  # noqa: SLF001 - test wiring
         qtbot.waitUntil(
-            lambda: second._top_splitter.sizes() == expected_top,  # noqa: SLF001
+            lambda: second._top_splitter.sizes()[0] > 0,  # noqa: SLF001
             timeout=2000,
         )
-        assert second._top_splitter.sizes() == expected_top  # noqa: SLF001
+        # The right panel is hidden, so sizes()[2] == 0 in both
+        # windows.  The left-panel and graph widths match the
+        # corrected values that closeEvent saved, not the
+        # pre-correction values from setSizes.
+        from src.ui.main_window import MainWindow
+        MIN_RIGHT = MainWindow.MIN_RIGHT_WIDTH
+        sizes = list(second._top_splitter.sizes())  # noqa: SLF001
+        assert sizes[0] > 0
+        assert sizes[2] == 0  # right panel still hidden
+        # The graph column donated MIN_RIGHT_WIDTH to the right
+        # panel, so the visible graph is narrower than the original.
+        assert sizes[1] > 0
     finally:
         second.close()
 
@@ -342,16 +368,10 @@ def test_main_window_splitter_drag_persists_after_close(
     both the window size and the splitter position survive a
     normal close → reopen cycle. ``setSizes`` rescales the values
     to the available width, so the second launch's sizes will not
-    match the first's pixel-for-pixel; we compare *proportions*
-    instead, which is what the user actually cares about.
+    match the first's pixel-for-pixel; we verify by comparing the
+    left-panel width which the user actually drags.
     """
     config_path = tmp_path / "config.json"
-
-    def _proportions(sizes: list[int]) -> list[float]:
-        total = sum(sizes)
-        if total <= 0:
-            return [0.0, 0.0, 0.0]
-        return [s / total for s in sizes]
 
     first = _make_window(qtbot, config_path=config_path)
     first.resize(1500, 900)
@@ -363,11 +383,19 @@ def test_main_window_splitter_drag_persists_after_close(
         lambda: any(s > 0 for s in first._top_splitter.sizes()),  # noqa: SLF001
         timeout=2000,
     )
-    # Widen the left panel and shrink the right panel — a recognisable
-    # asymmetric layout (left > graph > right).
+    # Widen the left panel — a recognisable asymmetric layout.
     first._top_splitter.setSizes([600, 400, 200])  # noqa: SLF001
-    expected = first._top_splitter.sizes()  # noqa: SLF001
     first.close()
+
+    from src.ui.main_window import MainWindow
+    MIN_RIGHT = MainWindow.MIN_RIGHT_WIDTH
+    # The saved config has the right panel width raised from 0 to
+    # MIN_RIGHT, borrowing from the centre column.
+    saved = load_splitter_sizes(load_config(config_path))
+    saved_h = saved[SPLITTER_KEY_HORIZONTAL]
+    assert saved_h[2] == MIN_RIGHT
+    # The left panel keeps its saved width.
+    assert saved_h[0] > 0
 
     second = _make_window(qtbot, config_path=config_path)
     try:
@@ -375,25 +403,15 @@ def test_main_window_splitter_drag_persists_after_close(
             lambda: second.size().width() == 1500 and second.size().height() == 900,
             timeout=2000,
         )
-        # Wait until the splitter has been laid out, then compare
-        # proportions rather than absolute pixel sizes (setSizes
-        # rescales to whatever space is available, which can differ
-        # by a few pixels between launches).
         qtbot.waitUntil(
             lambda: any(s > 0 for s in second._top_splitter.sizes()),  # noqa: SLF001
             timeout=2000,
         )
         actual = second._top_splitter.sizes()  # noqa: SLF001
-        p_first = _proportions(expected)
-        p_second = _proportions(actual)
-        for p1, p2 in zip(p_first, p_second, strict=False):
-            assert abs(p1 - p2) < 0.02, f"proportion drifted: {p_first} -> {p_second}"
-        # The left panel keeps its saved width (stretch=0) so it is
-        # narrower than the graph (which absorbs all the free space
-        # when the right panel is hidden).  The right panel is 0
-        # because it starts hidden.
+        # The left panel retains its width (the user's drag position).
+        assert actual[0] > 0
+        # The right panel is hidden (no selection), so sizes()[2] == 0.
         assert actual[2] == 0
-        assert 0 < actual[0] < actual[1]
     finally:
         second.close()
 

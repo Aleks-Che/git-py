@@ -95,6 +95,12 @@ from src.viewmodels.repo_tabs_viewmodel import RepoTabViewModel
 class MainWindow(QMainWindow):
     """Top-level window: graph + right panel over a terminal stub."""
 
+    # Minimum width for the right panel — used as a safety net to
+    # prevent the panel from disappearing when it is restored from a
+    # config that saved it with zero width (a known regression from
+    # Stage 9). 200 px is wide enough to show meaningful content.
+    MIN_RIGHT_WIDTH = 200
+
     def __init__(self, config_path: Path | str | None = None) -> None:
         super().__init__()
         self.setWindowTitle("git-py")
@@ -549,10 +555,20 @@ class MainWindow(QMainWindow):
         top.setStretchFactor(1, 5)
         top.setStretchFactor(2, 3)
         self._top_splitter = top
+        # Prevent the user from collapsing the right panel to zero
+        # width by dragging its left edge — a common source of the
+        # "right panel disappeared" bug. The panel can still be
+        # hidden programmatically (via ``setVisible(False)`` when
+        # nothing is selected).
+        top.setCollapsible(2, False)
         # Track splitter drags while the left panel is in its normal
         # (visible) state so we can restore the user's layout if the
         # window is closed with the diff view open. See ``closeEvent``
-        # for the consumer side.
+        # for the consumer side. We also gate on the right panel
+        # being visible — dragging while the right panel is hidden
+        # would produce cached sizes with a zero-width right column,
+        # and those would overwrite the user's normal layout on close
+        # (regression #2 for the same "right panel disappeared" bug).
         top.splitterMoved.connect(self._on_top_splitter_moved)
 
         self._terminal = TerminalWidget(DARK_THEME, self)
@@ -708,17 +724,20 @@ class MainWindow(QMainWindow):
         return -1
 
     def _on_top_splitter_moved(self, _pos: int, _index: int) -> None:
-        """Cache the current splitter sizes when the left panel is visible.
+        """Cache the current splitter sizes when both panels are visible.
 
         The cache is used by :meth:`closeEvent` to avoid overwriting
         the saved layout with the zeroed-out sizes that the splitter
-        reports while the left panel is hidden (i.e. while the diff
-        view is open). We deliberately do nothing while the left
-        panel is hidden — the cache must reflect a "normal" state.
+        reports while one of the panels is hidden (i.e. while the
+        diff view is open *or* while no commit is selected so the
+        right panel is hidden). We deliberately do nothing while
+        either panel is hidden — the cache must reflect a "normal"
+        state where all three columns are visible.
         """
         if (
             self._top_splitter is not None
             and self._left_panel.isVisible()
+            and self._right_panel.isVisible()
         ):
             self._last_normal_splitter_sizes = self._top_splitter.sizes()
 
@@ -748,7 +767,21 @@ class MainWindow(QMainWindow):
         splitter_sizes = load_splitter_sizes(config)
         horizontal = splitter_sizes.get(SPLITTER_KEY_HORIZONTAL)
         if horizontal is not None and self._top_splitter is not None and len(horizontal) == 3:
-            self._top_splitter.setSizes(horizontal)
+            # Guard against old configs where the right panel was
+            # saved with zero width (a known regression from Stage 9).
+            # ``QSplitter.setSizes`` remembers the value for hidden
+            # widgets and restores it when they become visible, so a
+            # zero would make the panel invisible until the user
+            # manually drags the splitter handle. We raise the right
+            # column to at least ``MIN_RIGHT_WIDTH`` *before* calling
+            # ``setSizes``, taking the space from the centre column.
+            safe = list(horizontal)
+            if safe[2] < self.MIN_RIGHT_WIDTH:
+                donation = self.MIN_RIGHT_WIDTH - safe[2]
+                if safe[1] >= donation:
+                    safe[1] -= donation
+                    safe[2] += donation
+            self._top_splitter.setSizes(safe)
         recent_repos = config.get("recent_repos", [])
         active_repo = config.get("active_repo")
         if recent_repos:
@@ -794,7 +827,7 @@ class MainWindow(QMainWindow):
             config["window_size"] = [self.width(), self.height()]
             splitter_sizes: dict[str, list[int]] = {}
             if self._top_splitter is not None:
-                if self._left_panel.isVisible():
+                if self._left_panel.isVisible() and self._right_panel.isVisible():
                     splitter_sizes[SPLITTER_KEY_HORIZONTAL] = (
                         self._top_splitter.sizes()
                     )
@@ -802,6 +835,14 @@ class MainWindow(QMainWindow):
                     splitter_sizes[SPLITTER_KEY_HORIZONTAL] = (
                         self._last_normal_splitter_sizes
                     )
+                else:
+                    live = list(self._top_splitter.sizes())
+                    if len(live) == 3 and live[2] < self.MIN_RIGHT_WIDTH:
+                        donation = self.MIN_RIGHT_WIDTH - live[2]
+                        if live[1] >= donation:
+                            live[1] -= donation
+                            live[2] += donation
+                    splitter_sizes[SPLITTER_KEY_HORIZONTAL] = live
             config["splitter_sizes"] = splitter_sizes
             # Persist repo tabs.
             tab_state = self._repo_tabs_vm.save_to_state()
