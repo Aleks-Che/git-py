@@ -407,9 +407,8 @@ class CommitPanel(QWidget):
             self._main_vm.discard_changes()
 
     def _on_stage_all_clicked(self) -> None:
-        selected = self._unstaged_list.selected_paths()
-        if selected:
-            for path in selected:
+        if len(self._unstaged_list.selected_paths()) >= 2:
+            for path in self._unstaged_list.selected_paths():
                 self._main_vm.stage_file(path)
         else:
             self._main_vm.stage_all_unstaged()
@@ -455,9 +454,8 @@ class CommitPanel(QWidget):
             self._vm.select_file(path, staged=True)
 
     def _on_unstage_all_clicked(self) -> None:
-        selected = self._staged_list.selected_paths()
-        if selected:
-            for path in selected:
+        if len(self._staged_list.selected_paths()) >= 2:
+            for path in self._staged_list.selected_paths():
                 self._main_vm.unstage_file(path)
         else:
             self._main_vm.unstage_all_staged()
