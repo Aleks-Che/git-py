@@ -1046,22 +1046,13 @@ class StashPushStagedCommand(GitCommand):
 class DiscardFileCommand(GitCommand):
     """Discard uncommitted changes for a single file, restoring it from HEAD.
 
-    On :meth:`execute`, the current content of ``path`` is stashed (to
-    support undo) and then the file is restored from HEAD via
-    :func:`discard_file`. On :meth:`undo`, the stashed entry is popped,
-    returning the file to the state before the discard.
-
-    Untracked files are handled specially: backing them up via
-    ``stash_push(include_untracked=True, paths=[...])`` would also stash
-    every other untracked file in the worktree, which is not what the
-    user asked for. For untracked files the content is read into memory
+    Untracked files are handled specially: the content is read into memory
     and the file is removed from disk; undo writes it back.
     """
 
     def __init__(self, repo: RepositoryManager, path: str) -> None:
         self._repo = repo
         self._path = path
-        self._captured_oid: str | None = None
         self._untracked_backup: bytes | None = None
 
     def _is_untracked(self) -> bool:
@@ -1081,14 +1072,6 @@ class DiscardFileCommand(GitCommand):
         if self._is_untracked():
             self._discard_untracked()
             return
-        oid = stash_push(
-            self._repo,
-            message=f"WIP (discard backup): {self._path}",
-            include_untracked=False,
-            paths=[self._path],
-        )
-        if oid is not None:
-            self._captured_oid = oid
         discard_file(self._repo, self._path)
 
     def _discard_untracked(self) -> None:
@@ -1105,24 +1088,17 @@ class DiscardFileCommand(GitCommand):
         full_path.unlink()
 
     def undo(self) -> None:
-        if self._captured_oid is None and self._untracked_backup is None:
+        if self._untracked_backup is None:
             return
-        if self._untracked_backup is not None:
-            from src.core.repository import unwrap
+        from src.core.repository import unwrap
 
-            with unwrap(self._repo) as r:
-                workdir = r.workdir
-            if workdir is not None:
-                full_path = Path(workdir) / self._path
-                full_path.parent.mkdir(parents=True, exist_ok=True)
-                full_path.write_bytes(self._untracked_backup)
-            self._untracked_backup = None
-            return
-        try:
-            restore_stash(self._repo, self._captured_oid, f"WIP (restored): {self._path}")
-            stash_pop(self._repo, 0)
-        except Exception:
-            pass
+        with unwrap(self._repo) as r:
+            workdir = r.workdir
+        if workdir is not None:
+            full_path = Path(workdir) / self._path
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            full_path.write_bytes(self._untracked_backup)
+        self._untracked_backup = None
 
     @property
     def name(self) -> str:
@@ -1199,41 +1175,23 @@ class IgnoreCommand(GitCommand):
 class DiscardChangesCommand(GitCommand):
     """Discard all uncommitted changes (index + workdir) in the working tree.
 
-    On :meth:`execute`, the current uncommitted changes are stashed (to
-    support undo) and then the working tree is hard-reset to ``HEAD``.
-    On :meth:`undo`, the stashed entry is restored, returning the working
-    tree to the state before the discard.
+    The working tree is hard-reset to ``HEAD``.  Undo is a no-op since
+    the changes are discarded without a backup.
     """
 
     def __init__(self, repo: RepositoryManager) -> None:
         self._repo = repo
-        self._captured_oid: str | None = None
-        self._captured_message: str | None = None
 
     def execute(self) -> None:
-        from src.core.operations import stash_push
         from src.core.repository import unwrap
 
         with unwrap(self._repo) as r:
             if r.is_bare or r.head_is_unborn:
                 return
-            dirty = [p for p, _ in r.status().items()]
-            if not dirty:
-                return
-        oid = stash_push(self._repo, message="WIP (discard backup)", include_untracked=True)
-        if oid is not None:
-            self._captured_oid = oid
-            self._captured_message = "WIP (discarded, restored)"
         discard_changes(self._repo)
 
     def undo(self) -> None:
-        if self._captured_oid is None:
-            return
-        try:
-            msg = self._captured_message or "WIP (restored)"
-            restore_stash(self._repo, self._captured_oid, msg)
-        except Exception:
-            pass  # best-effort
+        pass
 
     @property
     def name(self) -> str:
