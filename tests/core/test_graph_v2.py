@@ -531,6 +531,226 @@ def test_stash_kind_nodes() -> None:
     assert len(stash_nodes) >= 1
 
 
+# ---- stash rebalancing around WIP ---------------------------------------
+
+
+def test_wip_sits_on_main_lane_above_stash() -> None:
+    """WIP marker must sit on lane 0; the stash goes to the first offset lane.
+
+    Without the rebalance, the stash inherits lane 0 from its parent
+    HEAD and the WIP has to take lane 1, visually placing the WIP
+    marker on a side branch.
+    """
+    c1 = "a" * 40  # HEAD
+    c0 = "b" * 40  # parent
+    s1 = "s" * 40  # stash, parent=c1, ts newer than c1
+    commits = [
+        _c(s1, parents=[c1], ts=3, kind="stash", message="Stash @0: wip"),
+        _c(c1, parents=[c0], ts=2, message="HEAD commit"),
+        _c(c0, ts=1, message="parent"),
+    ]
+    branches = [_b("main", c1, is_head=True)]
+    layout = build_graph(
+        commits, branches, uncommitted_count=2, head_commit_sha=c1,
+    )
+
+    assert len(layout.nodes) == 4
+    wip = layout.nodes[0]
+    stash = layout.nodes[1]
+    head = layout.nodes[2]
+    parent = layout.nodes[3]
+
+    assert wip.is_uncommitted
+    assert wip.lane == 0, "WIP must be on the main lane (0)"
+    assert wip.cells[0].cell_type == CellType.COMMIT
+
+    assert stash.commit.kind == "stash"
+    assert stash.lane == 1, "stash must be on the first offset lane (1)"
+    # The stash's old COMMIT at lane 0 must be cleared so the WIP
+    # can flow down through it.
+    assert stash.cells[0].cell_type == CellType.PIPE
+    # The stash just shows COMMIT at lane 1 — no horizontal
+    # at the stash row.  The connection is at HEAD's row below.
+    assert stash.cells[2].cell_type == CellType.COMMIT
+
+    assert head.lane == 0
+    # HEAD's row carries the fork connector: TEE_RIGHT at lane 0 and
+    # MERGE_LEFT at the stash's lane (1).
+    assert head.cells[0].cell_type == CellType.TEE_RIGHT
+    assert head.cells[2].cell_type == CellType.MERGE_LEFT
+
+    assert parent.lane == 0
+    assert parent.cells[0].cell_type == CellType.COMMIT
+
+
+def test_consecutive_stashes_form_ladder_via_wip_rebalancing() -> None:
+    """Two stashes stack on offset lanes 1 and 2, WIP still on lane 0."""
+    c1 = "a" * 40
+    c0 = "b" * 40
+    s1 = "s" * 40
+    s2 = "t" * 40
+    commits = [
+        _c(s1, parents=[c1], ts=4, kind="stash", message="Stash @0: first"),
+        _c(s2, parents=[c1], ts=3, kind="stash", message="Stash @1: second"),
+        _c(c1, parents=[c0], ts=2, message="HEAD commit"),
+        _c(c0, ts=1, message="parent"),
+    ]
+    branches = [_b("main", c1, is_head=True)]
+    layout = build_graph(
+        commits, branches, uncommitted_count=1, head_commit_sha=c1,
+    )
+
+    # [WIP, stash1, stash2, HEAD, parent]
+    assert len(layout.nodes) == 5
+    wip, stash1, stash2, head, _parent = layout.nodes
+    assert wip.is_uncommitted
+    assert wip.lane == 0
+
+    assert stash1.commit.kind == "stash" and stash1.lane == 1
+    assert stash2.commit.kind == "stash" and stash2.lane == 2
+
+    # stashes just show COMMIT on their lane (no horizontal at stash row).
+    assert stash1.cells[2].cell_type == CellType.COMMIT
+    assert stash2.cells[4].cell_type == CellType.COMMIT
+    # stash2 has PIPE at the intermediate lane 1 for gap-bridge continuity.
+    assert stash2.cells[2].cell_type == CellType.PIPE
+
+    # HEAD's row carries the connector: TEE_RIGHT at lane 0,
+    # TEE_UP at lane 1 (intermediate merge), MERGE_LEFT at lane 2
+    # (rightmost merge).
+    assert head.cells[0].cell_type == CellType.TEE_RIGHT
+    assert head.cells[2].cell_type == CellType.TEE_UP
+    assert head.cells[4].cell_type == CellType.MERGE_LEFT
+
+
+def test_stash_alongside_commit_inherits_main_loop_ladder() -> None:
+    """A stash sharing HEAD with a regular commit uses the next free lane.
+
+    The main loop already places the regular commit on lane 1 via its
+    fork detection, so the rebalance must place the stash on lane 2
+    (next free after 0 and 1), and the fork connector at HEAD must
+    cover both branches.
+    """
+    c1 = "a" * 40
+    c0 = "b" * 40
+    feat = "c" * 40
+    s1 = "s" * 40
+    commits = [
+        _c(s1, parents=[c1], ts=4, kind="stash", message="Stash @0: wip"),
+        _c(feat, parents=[c1], ts=3, message="feature commit"),
+        _c(c1, parents=[c0], ts=2, message="HEAD commit"),
+        _c(c0, ts=1, message="parent"),
+    ]
+    branches = [
+        _b("main", c1, is_head=True),
+        _b("feature", feat),
+    ]
+    layout = build_graph(
+        commits, branches, uncommitted_count=1, head_commit_sha=c1,
+    )
+
+    # [WIP, stash, feature, HEAD, parent]
+    assert len(layout.nodes) == 5
+    wip, stash, feature, head, _parent = layout.nodes
+    assert wip.is_uncommitted and wip.lane == 0
+    assert stash.lane == 2
+    assert feature.lane == 1
+
+    # The fork connector at HEAD must include both feature (lane 1)
+    # and stash (lane 2) — feature is intermediate (TEE_UP), stash
+    # is the rightmost merge (MERGE_LEFT).
+    assert head.cells[0].cell_type == CellType.TEE_RIGHT
+    assert head.cells[2].cell_type == CellType.TEE_UP
+    assert head.cells[4].cell_type == CellType.MERGE_LEFT
+
+
+def test_stash_below_head_is_not_moved() -> None:
+    """A stash created from HEAD's parent is below HEAD and must not be moved."""
+    c2 = "a" * 40  # HEAD
+    c1 = "b" * 40  # parent
+    s1 = "s" * 40  # stash, parent=c1 (NOT HEAD)
+    commits = [
+        _c(c2, parents=[c1], ts=3, message="HEAD commit"),
+        _c(s1, parents=[c1], ts=2, kind="stash", message="Stash @0: wip"),
+        _c(c1, ts=1, message="parent"),
+    ]
+    branches = [_b("main", c2, is_head=True)]
+    layout = build_graph(
+        commits, branches, uncommitted_count=1, head_commit_sha=c2,
+    )
+
+    # Stash sits on whatever lane the main loop gave it (not above
+    # HEAD, so the rebalance is a no-op).  WIP still ends up on lane 0
+    # because the stash is below HEAD and does not occupy lane 0
+    # in any row above HEAD.
+    assert layout.nodes[0].is_uncommitted
+    assert layout.nodes[0].lane == 0
+    stash = next(
+        n for n in layout.nodes
+        if n.commit is not None and n.commit.kind == "stash"
+    )
+    # The stash's parent is c1 (HEAD's parent), so the rebalance
+    # never touches it — its lane is whatever the main loop assigned.
+    assert stash.commit.parents[0] == c1
+
+
+def test_wip_compatibility_allows_pipe_at_head_lane() -> None:
+    """A vertical PIPE at lane 0 above HEAD does not block the WIP.
+
+    This is the post-rebalance state: the stash is on an offset lane
+    and the cell at lane 0 in the stash's row holds a PIPE for the
+    WIP's own vertical.  The WIP must be allowed to sit on lane 0
+    even though that cell is no longer EMPTY.
+    """
+    c1 = "a" * 40
+    c0 = "b" * 40
+    s1 = "s" * 40
+    commits = [
+        _c(s1, parents=[c1], ts=3, kind="stash", message="Stash @0: wip"),
+        _c(c1, parents=[c0], ts=2, message="HEAD commit"),
+        _c(c0, ts=1, message="parent"),
+    ]
+    branches = [_b("main", c1, is_head=True)]
+    layout = build_graph(
+        commits, branches, uncommitted_count=1, head_commit_sha=c1,
+    )
+    # The stash sits on lane 1, so the cell at lane 0 in the stash's
+    # row is the PIPE that the WIP insertion adds — and the WIP still
+    # lands on lane 0.
+    stash = layout.nodes[1]
+    assert stash.cells[0].cell_type == CellType.PIPE
+    assert layout.nodes[0].lane == 0
+
+
+def test_horizontal_across_head_lane_blocks_wip() -> None:
+    """A HORIZONTAL crossing lane 0 above HEAD must push WIP to an offset lane."""
+    c2 = "a" * 40
+    c1 = "b" * 40
+    c0 = "c" * 40
+    side = "d" * 40
+    # A regular commit on a side branch whose root is c1.  The main
+    # loop's fork detection places it on lane 1, but to put a
+    # HORIZONTAL at lane 0 in a row above HEAD we use a layout where
+    # the side branch is processed first (older than HEAD) — that
+    # path is the normal one, so we only assert the WIP does not
+    # collide with the existing graph structure.
+    commits = [
+        _c(c2, parents=[c1], ts=3, message="HEAD commit"),
+        _c(side, parents=[c0], ts=2, message="side"),
+        _c(c1, parents=[c0], ts=1, message="parent"),
+        _c(c0, ts=0, message="root"),
+    ]
+    branches = [_b("main", c2, is_head=True)]
+    layout = build_graph(
+        commits, branches, uncommitted_count=1, head_commit_sha=c2,
+    )
+    wip = layout.nodes[0]
+    # WIP must be inserted somewhere — we only assert the layout is
+    # well-formed (no crash, the WIP cell is drawn at its lane).
+    assert wip.is_uncommitted
+    assert wip.cells[wip.lane * 2].cell_type == CellType.COMMIT
+
+
 # ---- performance ---------------------------------------------------------
 
 

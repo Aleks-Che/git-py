@@ -630,6 +630,20 @@ def build_graph(
                     color_assigner.release_lane(ending_l)
                     lane_color_index.pop(ending_l, None)
 
+    # --- Rebalance stashes above HEAD onto offset lanes -------------------
+    # Without this step, a stash whose first parent is HEAD inherits
+    # lane 0 from the main loop (its parent is HEAD which lives on lane
+    # 0), and the WIP node below then has to take the next free offset
+    # lane — visually putting the WIP marker on a side branch.
+    #
+    # The rebalance moves every stash whose first parent is HEAD to a
+    # fresh offset lane (1, 2, 3, …), updates the stash's own row to
+    # draw a TEE_LEFT (or COMMIT + HORIZONTAL) connection back to HEAD,
+    # and re-renders HEAD's fork connector so it joins every lane that
+    # has a branch into HEAD — including the freshly-shifted stashes
+    # and any pre-existing branches the main loop already placed.
+    max_lane = _rebalance_stashes_for_wip(nodes, head_oid, max_lane)
+
     # --- Insert uncommitted changes node ---
     if uncommitted_count is not None and uncommitted_count >= 0:
         head_node_idx: int | None = None
@@ -642,13 +656,7 @@ def build_graph(
         if head_node_idx is not None:
             head_lane = nodes[head_node_idx].lane
 
-            head_lane_available = True
-            head_cell_idx = head_lane * 2
-            for i in range(head_node_idx):
-                if head_cell_idx < len(nodes[i].cells):
-                    if nodes[i].cells[head_cell_idx].cell_type != CellType.EMPTY:
-                        head_lane_available = False
-                        break
+            head_lane_available = _is_wip_compatible(nodes, head_node_idx, head_lane)
 
             uncommitted_lane: int
             if head_lane_available:
@@ -730,6 +738,176 @@ def build_graph(
 # ---------------------------------------------------------------------------
 # Cell building helpers
 # ---------------------------------------------------------------------------
+
+def _is_wip_compatible(
+    nodes: list[GraphNode],
+    head_node_idx: int,
+    head_lane: int,
+) -> bool:
+    """Return True if a WIP node could sit on *head_lane* above HEAD.
+
+    Lane 0 (the main line) is "free" for the WIP when no row above
+    HEAD places something at that lane that would interrupt the
+    vertical pipe leading from WIP down to HEAD.  Concretely:
+
+    * ``EMPTY`` — trivially fine.
+    * ``PIPE`` / ``TEE_*`` / ``MERGE_*`` / ``BRANCH_*`` / ``COMMIT`` —
+      these all share a vertical line at the cell centre, so the WIP's
+      vertical pipe continues through them without a visual break.
+    * ``HORIZONTAL`` / ``HORIZONTAL_PIPE`` — these are *crossings*
+      where the WIP's vertical pipe would be cut by a horizontal line
+      coming from another lane (e.g. a branch from a sibling feature
+      crossing the main line).  Those block the WIP.
+    """
+    head_cell_idx = head_lane * 2
+    blocking = {CellType.HORIZONTAL, CellType.HORIZONTAL_PIPE}
+    for i in range(head_node_idx):
+        if head_cell_idx >= len(nodes[i].cells):
+            continue
+        if nodes[i].cells[head_cell_idx].cell_type in blocking:
+            return False
+    return True
+
+
+def _rebalance_stashes_for_wip(
+    nodes: list[GraphNode],
+    head_oid: str | None,
+    max_lane: int,
+) -> int:
+    """Move stash nodes above HEAD to offset lanes, freeing lane 0 for WIP.
+
+    Stashes above HEAD whose first parent is HEAD are normally assigned
+    lane 0 by the main loop (their parent HEAD lives on lane 0, so the
+    stash inherits the lane when no other commit claims it first).  The
+    WIP insertion step below then has to take the next free offset
+    lane, which puts the WIP marker on a side branch.  This rebalance
+    shifts every such stash to the next free offset lane (1, 2, 3, …)
+    and re-draws the connection in both the stash's row (TEE_LEFT or
+    COMMIT + HORIZONTAL) and HEAD's row (a fresh fork connector that
+    joins all branches into HEAD, including the shifted stashes and
+    any pre-existing branches the main loop already placed).
+
+    The function is a no-op when there are no stashes above HEAD.
+
+    Returns the updated ``max_lane``.
+    """
+    if head_oid is None:
+        return max_lane
+
+    head_node_idx: int | None = None
+    for i, n in enumerate(nodes):
+        if n.commit is not None and n.commit.sha == head_oid:
+            head_node_idx = i
+            break
+
+    if head_node_idx is None:
+        return max_lane
+
+    # Find stash rows above HEAD whose first parent is HEAD — these are
+    # the only stashes the rebalance needs to move.
+    stash_indices: list[int] = [
+        i for i in range(head_node_idx)
+        if nodes[i].commit is not None
+        and nodes[i].commit.kind == "stash"
+        and nodes[i].commit.parents
+        and nodes[i].commit.parents[0] == head_oid
+    ]
+
+    if not stash_indices:
+        return max_lane
+
+    stash_indices.sort()  # top to bottom in the rendered output
+
+    head_node = nodes[head_node_idx]
+    head_lane = head_node.lane
+    head_color = head_node.color_index
+
+    # Lanes already in use by *non-stash* commits above HEAD — the
+    # stash gets the first offset lane (1, 2, 3, …) that does not
+    # collide with one of these.  Stash lanes are excluded because
+    # the rebalance is about to free them.
+    used_lanes: set[int] = {
+        nodes[i].lane for i in range(head_node_idx)
+        if nodes[i].commit is None or nodes[i].commit.kind != "stash"
+    }
+
+    stash_assignments: list[tuple[int, int]] = []  # (stash_idx, target_lane)
+    next_lane = max(1, head_lane + 1)
+    for stash_idx in stash_indices:
+        while next_lane in used_lanes:
+            next_lane += 1
+        stash_assignments.append((stash_idx, next_lane))
+        used_lanes.add(next_lane)
+        next_lane += 1
+
+    new_max_lane = max(max_lane, max((t for _, t in stash_assignments), default=0))
+    required_cells = (new_max_lane + 1) * 2
+    for node in nodes:
+        while len(node.cells) < required_cells:
+            node.cells.append(CellInfo.empty())
+
+    # --- move each stash to its new lane --------------------------------
+    for stash_idx, target_lane in stash_assignments:
+        stash = nodes[stash_idx]
+        old_lane = stash.lane
+
+        # Clear the stash's old COMMIT cell so lane 0 is free for WIP.
+        old_cell_idx = old_lane * 2
+        if old_cell_idx < len(stash.cells):
+            stash.cells[old_cell_idx] = CellInfo.empty()
+
+        # Update the stash's lane and add a PIPE at the new lane for
+        # every row above it (so the stash's vertical line is drawn
+        # through all those rows).
+        stash.lane = target_lane
+        new_cell_idx = target_lane * 2
+        for i in range(stash_idx):
+            cell = nodes[i].cells[new_cell_idx]
+            if cell.cell_type == CellType.EMPTY:
+                nodes[i].cells[new_cell_idx] = CellInfo.pipe(head_color)
+
+        # Place a plain COMMIT at the stash's lane.  For non-adjacent
+        # lanes, add PIPE cells at every intermediate lane so the gap
+        # bridge maintains the vertical line — without adding any
+        # horizontals at the stash row.  The fork connector at HEAD
+        # below handles the visual join at the parent row.
+        stash.cells[new_cell_idx] = CellInfo.commit(head_color)
+        for between_lane in range(head_lane + 1, target_lane):
+            between_cell_idx = between_lane * 2  # left half of intermediate lane
+            if between_cell_idx >= len(stash.cells):
+                continue
+            existing = stash.cells[between_cell_idx]
+            if existing.cell_type == CellType.EMPTY:
+                stash.cells[between_cell_idx] = CellInfo.pipe(head_color)
+
+    # --- rebuild HEAD's fork connector ----------------------------------
+    # Collect every branch above HEAD that shares HEAD as its first
+    # parent — both the stashes we just shifted and any pre-existing
+    # branches the main loop already placed on offset lanes.
+    merging_lanes: list[tuple[int, int]] = []
+    for i in range(head_node_idx):
+        n = nodes[i]
+        if (n.commit is not None
+                and n.commit.parents
+                and n.commit.parents[0] == head_oid):
+            merging_lanes.append((n.lane, head_color))
+    merging_lanes.sort()
+
+    active_lanes: list[str | None] = [None] * (new_max_lane + 1)
+    fork_cells = _build_fork_connector_cells(
+        head_lane, head_color, merging_lanes, active_lanes,
+        {}, {}, new_max_lane,
+    )
+
+    # Overlay the fork connector on HEAD's row.  HEAD's PIPE at the
+    # main lane is replaced by TEE_RIGHT, which keeps the vertical line
+    # intact and adds the horizontal that starts the connector.
+    for fci, fc in enumerate(fork_cells):
+        if fc.cell_type != CellType.EMPTY:
+            head_node.cells[fci] = fc
+
+    return new_max_lane
+
 
 def _build_row_cells(
     commit_lane: int,

@@ -118,6 +118,13 @@ class GraphViewModel(QObject):
             return [], str(exc)
 
         stash_entries = repo.stash_list
+        # Find HEAD index so stashes based on HEAD can be placed above it.
+        head_idx: int = 0
+        if head_target is not None:
+            for i, c in enumerate(history):
+                if c.sha == head_target:
+                    head_idx = i
+                    break
         for entry in stash_entries:
             stash_ci = GraphViewModel._stash_commit(entry, head_target)
             t = stash_ci.author_time
@@ -126,7 +133,14 @@ class GraphViewModel(QObject):
                 idx += 1
             while idx < len(history) and history[idx].author_time == t:
                 idx += 1
+            # Stashes whose first parent is HEAD must appear above HEAD
+            # so the rebalance step in build_graph can move them to
+            # offset lanes, freeing lane 0 for the WIP node.
+            if stash_ci.parents and stash_ci.parents[0] == head_target:
+                idx = min(idx, head_idx)
             history.insert(idx, stash_ci)
+            if idx <= head_idx:
+                head_idx += 1
 
         uncommitted_count: int | None = len(status) if status else None
 

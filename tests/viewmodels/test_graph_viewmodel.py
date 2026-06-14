@@ -316,3 +316,47 @@ def test_multiple_stash_nodes_appear_in_order(
     # Most recent stash (index 0, created second) is at row 0 (top).
     assert "Stash @{0}" in stash_nodes[0]["subject"]
     assert "Stash @{1}" in stash_nodes[1]["subject"]
+
+
+def test_stash_with_uncommitted_keeps_wip_on_main_lane(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """With both a stash and uncommitted changes, WIP must be on lane 0.
+
+    Reproduces the bug where a stash on the worktree plus dirty files
+    caused the WIP node to land on an offset lane and the stash to
+    inherit the main lane.  The expected layout (top → bottom):
+
+      * WIP node on lane 0 (the main line)
+      * Stash node on lane 1 (an offset branch off HEAD)
+      * HEAD on lane 0
+    """
+    _ensure_app()
+    from pathlib import Path
+
+    from src.core.operations import stash_push
+
+    (Path(committed_repo.path) / "hello.txt").write_text("stashed\n")
+    stash_push(committed_repo, "graph-stash")
+    # Now make a fresh change so the worktree is dirty again.
+    (Path(committed_repo.path) / "hello.txt").write_text("uncommitted\n")
+
+    vm = GraphViewModel(committed_repo)
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000) as blocker:
+        vm.refresh_graph()
+    rows = blocker.args[0]
+
+    wip_rows = [r for r in rows if r.get("is_uncommitted")]
+    stash_rows = [r for r in rows if r.get("kind") == "stash"]
+    assert len(wip_rows) == 1
+    assert len(stash_rows) == 1
+
+    wip = wip_rows[0]
+    stash = stash_rows[0]
+
+    assert wip["lane"] == 0, f"WIP must sit on lane 0, got lane {wip['lane']}"
+    assert stash["lane"] >= 1, (
+        f"Stash must sit on an offset lane (>=1), got lane {stash['lane']}"
+    )
+    # The WIP node appears above the stash in the rendered output.
+    assert rows.index(wip) < rows.index(stash)
