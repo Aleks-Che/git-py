@@ -847,6 +847,20 @@ def _rebalance_stashes_for_wip(
             node.cells.append(CellInfo.empty())
 
     # --- move each stash to its new lane --------------------------------
+    # Prepare a mapping from lane → owning stash's colour so PIPE cells
+    # drawn at each lane use the correct colour (not all head_color).
+    stash_assignments.sort(key=lambda x: x[0])  # top to bottom
+    single_color_map: dict[int, int] = {}
+    for stash_idx, target_lane in stash_assignments:
+        single_color_map[target_lane] = nodes[stash_idx].color_index
+
+    # Also seed the map with non-stash lanes above HEAD so intermediate
+    # PIPE cells pick up pre-existing branch colours (e.g. a feature
+    # branch on lane 1 while a stash ends up on lane 3).
+    for i in range(head_node_idx):
+        if nodes[i].lane not in single_color_map:
+            single_color_map[nodes[i].lane] = nodes[i].color_index
+
     for stash_idx, target_lane in stash_assignments:
         stash = nodes[stash_idx]
         old_lane = stash.lane
@@ -855,30 +869,37 @@ def _rebalance_stashes_for_wip(
         old_cell_idx = old_lane * 2
         if old_cell_idx < len(stash.cells):
             stash.cells[old_cell_idx] = CellInfo.empty()
+        # Also clear the head-lane cell — a stash that was NOT on
+        # head_lane may have a PIPE there from the main loop's active-lane
+        # tracking.  WIP insertion below will fill it with the correct
+        # PIPE(UNCOMMITTED_COLOR_INDEX).
+        head_cell_idx = head_lane * 2
+        if head_cell_idx < len(stash.cells) and head_cell_idx != old_cell_idx:
+            stash.cells[head_cell_idx] = CellInfo.empty()
 
-        # Update the stash's lane and add a PIPE at the new lane for
-        # every row above it (so the stash's vertical line is drawn
-        # through all those rows).
+        # Update the stash's lane and draw the commit at its new lane.
+        # No vertical PIPE is added above the stash — the commit's own
+        # upward nub (node_radius) is sufficient, matching how the main
+        # loop renders the topmost commit of a side branch.
         stash.lane = target_lane
         new_cell_idx = target_lane * 2
-        for i in range(stash_idx):
-            cell = nodes[i].cells[new_cell_idx]
-            if cell.cell_type == CellType.EMPTY:
-                nodes[i].cells[new_cell_idx] = CellInfo.pipe(head_color)
+        stash_color = single_color_map[target_lane]
+        stash.cells[new_cell_idx] = CellInfo.commit(stash_color)
 
-        # Place a plain COMMIT at the stash's lane.  For non-adjacent
-        # lanes, add PIPE cells at every intermediate lane so the gap
-        # bridge maintains the vertical line — without adding any
-        # horizontals at the stash row.  The fork connector at HEAD
-        # below handles the visual join at the parent row.
-        stash.cells[new_cell_idx] = CellInfo.commit(head_color)
+        # Plain COMMIT at the stash's lane — no TEE_LEFT, no HORIZONTAL.
+        # For non-adjacent lanes, add PIPE at intermediate lanes so the
+        # gap bridge maintains vertical continuity through all rows
+        # (matching how the main loop renders side branches between
+        # regular commits — PIPE at every active lane).
+        stash.cells[new_cell_idx] = CellInfo.commit(stash_color)
         for between_lane in range(head_lane + 1, target_lane):
-            between_cell_idx = between_lane * 2  # left half of intermediate lane
+            between_cell_idx = between_lane * 2
             if between_cell_idx >= len(stash.cells):
                 continue
             existing = stash.cells[between_cell_idx]
             if existing.cell_type == CellType.EMPTY:
-                stash.cells[between_cell_idx] = CellInfo.pipe(head_color)
+                lane_color = single_color_map.get(between_lane, head_color)
+                stash.cells[between_cell_idx] = CellInfo.pipe(lane_color)
 
     # --- rebuild HEAD's fork connector ----------------------------------
     # Collect every branch above HEAD that shares HEAD as its first
@@ -890,7 +911,7 @@ def _rebalance_stashes_for_wip(
         if (n.commit is not None
                 and n.commit.parents
                 and n.commit.parents[0] == head_oid):
-            merging_lanes.append((n.lane, head_color))
+            merging_lanes.append((n.lane, n.color_index))
     merging_lanes.sort()
 
     active_lanes: list[str | None] = [None] * (new_max_lane + 1)

@@ -41,3 +41,5 @@ coverage.xml
 # OS
 .DS_Store
 Thumbs.db
+
+graphify-out/cache/

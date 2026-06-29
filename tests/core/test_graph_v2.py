@@ -609,10 +609,11 @@ def test_consecutive_stashes_form_ladder_via_wip_rebalancing() -> None:
     assert stash1.commit.kind == "stash" and stash1.lane == 1
     assert stash2.commit.kind == "stash" and stash2.lane == 2
 
-    # stashes just show COMMIT on their lane (no horizontal at stash row).
+    # Both stashes just show COMMIT at their lane — no horizontals,
+    # no TEE_LEFT at stash rows.  stash2 also has PIPE at intermediate
+    # lane 1 for gap-bridge continuity.
     assert stash1.cells[2].cell_type == CellType.COMMIT
     assert stash2.cells[4].cell_type == CellType.COMMIT
-    # stash2 has PIPE at the intermediate lane 1 for gap-bridge continuity.
     assert stash2.cells[2].cell_type == CellType.PIPE
 
     # HEAD's row carries the connector: TEE_RIGHT at lane 0,
