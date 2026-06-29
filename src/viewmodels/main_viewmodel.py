@@ -732,6 +732,50 @@ class MainViewModel(QObject):
         if clipboard is not None:
             clipboard.setText(path)
 
+    def copy_file_diff(self, path: str, *, staged: bool = False) -> None:
+        """Copy the unified diff of a single file to the system clipboard.
+
+        Used by the *Copy Diff* right-click action in the right panel's
+        commit-input view. ``staged=True`` produces the index-vs-HEAD
+        diff (what ``git commit`` would pick up); ``staged=False`` (the
+        default) produces the working-tree-vs-HEAD diff.
+
+        On any failure (no repository open, Git error) the clipboard is
+        left untouched and :attr:`error_occurred` is emitted — never a
+        raw exception.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        try:
+            text = self._commit_panel_view_model.build_diff_text(path, staged=staged)
+        except GitError as exc:
+            self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
+            return
+        self.copy_to_clipboard(text)
+
+    def copy_files_diff(self, paths: list[str], *, staged: bool = False) -> None:
+        """Copy the concatenated diffs of *paths* to the system clipboard.
+
+        Multi-file counterpart of :meth:`copy_file_diff`. Each per-file
+        patch is preceded by a ``# path: <p>`` comment header so the
+        result stays readable when pasted. An empty list is a no-op.
+        """
+        if not paths:
+            return
+        pieces: list[str] = []
+        for path in paths:
+            try:
+                text = self._commit_panel_view_model.build_diff_text(path, staged=staged)
+            except GitError as exc:
+                self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
+                return
+            if text:
+                pieces.append(f"# path: {path}\n{text}")
+        if not pieces:
+            return
+        self.copy_to_clipboard("\n".join(pieces))
+
     def copy_to_clipboard(self, text: str) -> None:
         """Copy arbitrary *text* to the system clipboard."""
         from PySide6.QtWidgets import QApplication

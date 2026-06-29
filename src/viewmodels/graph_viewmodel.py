@@ -26,6 +26,7 @@ from src.core.graph_v2 import (
 )
 from src.core.models import CommitInfo, StashInfo
 from src.core.repository import RepositoryManager
+from src.utils.debug_mode import dump_graph, is_debug_mode
 
 WIP_SHA = "WIP"
 WIP_MESSAGE = "WIP: Uncommitted changes"
@@ -149,6 +150,10 @@ class GraphViewModel(QObject):
                                  head_commit_sha=head_target)
         except GitError as exc:
             return [], str(exc)
+
+        if is_debug_mode():
+            stash_sha_set = {e.sha for e in stash_entries}
+            dump_graph(layout, stash_sha_set)
 
         rows = graph_to_dicts(layout)
 

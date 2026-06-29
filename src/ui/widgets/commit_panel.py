@@ -20,7 +20,7 @@ selects the WIP state). Structure (top-to-bottom):
 
 Both the unstaged and staged file lists have right-click context menus
 with actions: Stage/Unstage, Discard Changes, Ignore (with sub-menu),
-Stash File, Show in Folder, Copy File Path, Delete File.
+Stash File, Show in Folder, Copy File Path, Copy Diff, Delete File.
 
 The widget is bound to :class:`MainViewModel` for verbs
 (``stage_file`` / ``unstage_file`` / ``stage_all_unstaged`` /
@@ -512,6 +512,8 @@ class CommitPanel(QWidget):
             self._main_vm.show_in_folder(path)
         elif action == "copy":
             self._main_vm.copy_file_path(path)
+        elif action == "copy_diff":
+            self._main_vm.copy_file_diff(path, staged=False)
         elif action == "delete":
             self._main_vm.delete_file_from_disk(path)
 
@@ -540,14 +542,22 @@ class CommitPanel(QWidget):
             self._main_vm.show_in_folder(path)
         elif action == "copy":
             self._main_vm.copy_file_path(path)
+        elif action == "copy_diff":
+            self._main_vm.copy_file_diff(path, staged=True)
         elif action == "delete":
             self._main_vm.delete_file_from_disk(path)
 
     def _on_unstaged_batch_context_action(self, action: str, paths: list[str]) -> None:
+        if action == "copy_diff":
+            self._main_vm.copy_files_diff(paths, staged=False)
+            return
         for path in paths:
             self._on_unstaged_context_action(action, path)
 
     def _on_staged_batch_context_action(self, action: str, paths: list[str]) -> None:
+        if action == "copy_diff":
+            self._main_vm.copy_files_diff(paths, staged=True)
+            return
         for path in paths:
             self._on_staged_context_action(action, path)
 
@@ -688,6 +698,22 @@ class FileListView(QListView):
             )
             selected = [clicked_change.path]
 
+        menu = self._build_context_menu(selected)
+        if menu is None:
+            return
+        menu.exec(self.viewport().mapToGlobal(position))
+
+    def _build_context_menu(self, selected: list[str]) -> QMenu | None:
+        """Build (but do not exec) the right-click menu for *selected*.
+
+        Returns ``None`` if the selection is empty. Exposed for tests:
+        splitting menu construction from ``QMenu.exec()`` lets the test
+        suite inspect the actions synchronously without a modal
+        dialog.
+        """
+        if not selected:
+            return None
+
         is_multi = len(selected) > 1
 
         menu = QMenu(self)
@@ -737,6 +763,13 @@ class FileListView(QListView):
             act.triggered.connect(
                 lambda checked=False, paths=selected: self.batch_context_action_requested.emit(
                     "stash", paths,
+                ),
+            )
+
+            act = menu.addAction(f"Copy Diff ({n} Files)")
+            act.triggered.connect(
+                lambda checked=False, paths=selected: self.batch_context_action_requested.emit(
+                    "copy_diff", paths,
                 ),
             )
         else:
@@ -810,14 +843,18 @@ class FileListView(QListView):
                 lambda checked=False, p=path: _emit("copy", p),
             )
 
+            copy_diff_action = menu.addAction("Copy Diff")
+            copy_diff_action.triggered.connect(
+                lambda checked=False, p=path: _emit("copy_diff", p),
+            )
+
             menu.addSeparator()
 
             delete_action = menu.addAction("Delete File")
             delete_action.triggered.connect(
                 lambda checked=False, p=path: _emit("delete", p),
             )
-
-        menu.exec(self.viewport().mapToGlobal(position))
+        return menu
 
     # -- hover forwarding to delegate -------------------------------------
 
