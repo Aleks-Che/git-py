@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from hashlib import md5
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QPointF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -824,10 +824,11 @@ class GraphTableWidget(QWidget):
 
         if is_uncommitted:
             radius = self._cfg.wip_node_radius
-            painter.setPen(QPen(color, 1.5, Qt.PenStyle.SolidLine))
-            fill = QColor(self._cfg.background_color)
-            fill.setAlpha(80)
-            painter.setBrush(fill)
+            wip_c = color if color.isValid() else QColor(self._cfg.wip_color)
+            if is_selected:
+                wip_c = _lighten_color(wip_c, 0.4)
+            painter.setPen(QPen(wip_c, 1.5, Qt.PenStyle.DashLine))
+            painter.setBrush(QColor(self._cfg.background_color))
             painter.drawEllipse(
                 int(cx - radius), int(y_center - radius),
                 int(radius * 2), int(radius * 2),
@@ -857,8 +858,8 @@ class GraphTableWidget(QWidget):
                 painter.drawRoundedRect(bx, by, w, bar_h, 2, 2)
         elif is_selected:
             radius = self._cfg.node_radius
-            painter.setBrush(color)
-            painter.setPen(QPen(QColor(self._cfg.selection_color), self._cfg.selection_ring_width))
+            painter.setBrush(_lighten_color(color, 0.4))
+            painter.setPen(QPen(color, 0))
             painter.drawEllipse(
                 int(cx - radius), int(y_center - radius),
                 int(radius * 2), int(radius * 2),
@@ -875,12 +876,12 @@ class GraphTableWidget(QWidget):
         painter.restore()
 
         if not is_uncommitted and not is_stash:
-            av_size = max(6, int(radius * 2.6 - 8))
+            av_size = max(6, radius * 2 - 3)
             av_pix = self._avatar_for(
                 _row_author(row_data), av_size, shape="circle",
             )
             painter.drawPixmap(
-                int(cx - av_size / 2), int(y_center - av_size / 2), av_pix,
+                QPointF(cx - av_size / 2.0, y_center - av_size / 2.0), av_pix,
             )
 
         chip_y = y_center - self._cfg.ref_chip_height / 2 - 1
