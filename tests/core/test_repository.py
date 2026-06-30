@@ -429,3 +429,48 @@ def test_get_stash_diff_text_handles_unknown_sha(
 ) -> None:
     with pytest.raises(InvalidRefError):
         committed_repo.get_stash_diff_text("deadbeef" * 5)
+
+
+def test_get_commit_file_diff_text_returns_patch_for_path(
+    committed_repo: RepositoryManager,
+    tmp_git_repo: Path,
+) -> None:
+    """Asking for a specific path returns just that file's patch, not
+    the full multi-file diff."""
+    # Add a second file and commit it together with a modification of
+    # hello.txt so the multi-file diff is non-trivial.
+    (tmp_git_repo / "extra.txt").write_text("extra\n")
+    (tmp_git_repo / "hello.txt").write_text("hello, world!\n")
+    committed_repo.repo.index.add("extra.txt")
+    committed_repo.repo.index.add("hello.txt")
+    committed_repo.repo.index.write()
+    tree = committed_repo.repo.index.write_tree()
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    head_sha = committed_repo.head_commit.sha
+    new_oid = committed_repo.repo.create_commit(
+        "refs/heads/main", sig, sig, "two files", tree, [head_sha],
+    )
+
+    text = committed_repo.get_commit_file_diff_text(str(new_oid), "hello.txt")
+    assert "diff --git a/hello.txt b/hello.txt" in text
+    assert "+hello, world!" in text
+    # The other file's patch is filtered out.
+    assert "diff --git a/extra.txt b/extra.txt" not in text
+    assert "+extra" not in text
+
+
+def test_get_commit_file_diff_text_returns_empty_for_untouched_path(
+    committed_repo: RepositoryManager,
+) -> None:
+    """A path the commit did not touch yields an empty string."""
+    head_sha = committed_repo.head_commit.sha
+    assert committed_repo.get_commit_file_diff_text(
+        head_sha, "does_not_exist.txt",
+    ) == ""
+
+
+def test_get_commit_file_diff_text_handles_unknown_sha(
+    committed_repo: RepositoryManager,
+) -> None:
+    with pytest.raises(InvalidRefError):
+        committed_repo.get_commit_file_diff_text("deadbeef" * 5, "hello.txt")

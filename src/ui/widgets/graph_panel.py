@@ -955,7 +955,6 @@ class GraphTableWidget(QWidget):
                         grid[row][col] = True
                         grid[row][4 - col] = True
 
-            cell = size / 5.0
             pix = QPixmap(size, size)
             pix.fill(Qt.GlobalColor.transparent)
             painter = QPainter(pix)
@@ -974,11 +973,28 @@ class GraphTableWidget(QWidget):
             painter.setPen(QPen(Qt.PenStyle.NoPen))
             painter.drawRect(0, 0, size, size)
 
+            # Snap identicon cells to integer pixel boundaries so the
+            # mirrored 5x5 pattern stays symmetric after AA. With cell =
+            # size/5 = 3.8 (size=19), the leftmost column ends with a
+            # partial-coverage pixel while the rightmost does not, which
+            # the eye reads as a leftward shift of the pattern. Drawing
+            # the grid inside the largest 5-aligned square that fits in
+            # the clip (e.g. 15x15 with 3px cells for size=19) keeps
+            # every cell edge on a pixel boundary.
+            grid_diameter = max(5, int(d) // 5 * 5)
+            cell_px = grid_diameter // 5
+            grid_offset = (size - grid_diameter) / 2.0
+
             painter.setBrush(QBrush(fg))
             for row in range(5):
                 for col in range(5):
                     if grid[row][col]:
-                        painter.drawRect(col * cell, row * cell, cell, cell)
+                        painter.drawRect(
+                            int(col * cell_px + grid_offset),
+                            int(row * cell_px + grid_offset),
+                            cell_px,
+                            cell_px,
+                        )
 
             painter.setClipping(False)
             painter.end()

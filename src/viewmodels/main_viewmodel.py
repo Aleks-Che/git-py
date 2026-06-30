@@ -585,6 +585,49 @@ class MainViewModel(QObject):
         except GitError:
             return ""
 
+    def get_commit_file_diff_text(self, sha: str, path: str) -> str:
+        """Return the unified diff of ``path`` in commit (or stash) ``sha``.
+
+        Works for both regular commits and stash entries — both are
+        commits whose tree diffs against their first parent's tree.
+
+        Returns the empty string when no repository is open, the SHA
+        cannot be resolved, the file was not touched by the commit, or
+        computing the diff fails for any other reason. Used by the
+        commit-detail panel's "Copy Diff" right-click action.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            return ""
+        try:
+            return self._repo_manager.get_commit_file_diff_text(sha, path)
+        except GitError:
+            return ""
+
+    def copy_commit_file_diff(self, sha: str, path: str) -> None:
+        """Copy the per-file diff of ``path`` in commit (or stash) ``sha``.
+
+        Used by the *Copy Diff* right-click action on a file row in the
+        commit-detail panel — the read-only view shown for regular
+        commits and stash entries alike. Routes through
+        :meth:`get_commit_file_diff_text` so the result is the same
+        unified-diff text the user would get by selecting the file in
+        the diff view.
+
+        On failure (no repository open, unknown SHA, Git error) the
+        clipboard is left untouched and :attr:`error_occurred` is
+        emitted — never a raw exception.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        text = self.get_commit_file_diff_text(sha, path)
+        if not text:
+            self.error_occurred.emit(
+                f"No diff available for {path!r} in {sha[:7]}",
+            )
+            return
+        self.copy_to_clipboard(text)
+
     def get_workdir_diff_text(self) -> str:
         """Return the full unified diff of the working tree vs HEAD.
 

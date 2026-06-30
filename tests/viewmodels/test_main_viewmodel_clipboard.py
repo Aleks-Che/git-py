@@ -140,3 +140,89 @@ def test_copy_files_diff_staged_uses_index(
     text = _clipboard_text()
     assert "hello, world!" in text
     assert "path: hello.txt" in text
+
+
+# ----- copy_commit_file_diff (commit-detail right-click) -----------------
+
+
+def test_copy_commit_file_diff_writes_per_file_patch(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """For a regular commit, the per-file patch goes onto the clipboard."""
+    _ensure_app()
+    head_sha = committed_repo.head_commit.sha
+    vm = MainViewModel()
+    vm.set_repository(committed_repo)
+
+    vm.copy_commit_file_diff(head_sha, "hello.txt")
+    text = _clipboard_text()
+    # The second commit (head) modified ``hello.txt`` from ``hello\n``
+    # to ``hello, world\n`` — the per-file diff is exactly that
+    # modification.
+    assert "diff --git a/hello.txt b/hello.txt" in text
+    assert "-hello" in text
+    assert "+hello, world" in text
+
+
+def test_copy_commit_file_diff_for_stash(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """*Copy Diff* works the same way for stash entries: it puts the
+    file-level diff (stash tree vs the commit the stash was taken from)
+    onto the clipboard."""
+    _ensure_app()
+    root = Path(committed_repo.path)
+    (root / "hello.txt").write_text("hello, stash\n")
+    vm = MainViewModel()
+    vm.set_repository(committed_repo)
+    ok = vm.stash_push("wip")
+    assert ok is True
+    stash = committed_repo.stash_list
+    assert stash
+    stash_sha = stash[0].sha
+
+    vm.copy_commit_file_diff(stash_sha, "hello.txt")
+    text = _clipboard_text()
+    assert "diff --git a/hello.txt b/hello.txt" in text
+    assert "-hello, world" in text
+    assert "+hello, stash" in text
+
+
+def test_copy_commit_file_diff_without_repo_emits_error(qtbot) -> None:
+    _ensure_app()
+    vm = MainViewModel()
+    with qtbot.waitSignal(vm.error_occurred, timeout=500) as blocker:
+        vm.copy_commit_file_diff("deadbeef" * 5, "f.txt")
+    assert "No repository open" in blocker.args[0]
+
+
+def test_copy_commit_file_diff_unknown_sha_emits_error(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    _ensure_app()
+    QApplication.clipboard().setText("sentinel")
+    vm = MainViewModel()
+    vm.set_repository(committed_repo)
+
+    with qtbot.waitSignal(vm.error_occurred, timeout=500) as blocker:
+        vm.copy_commit_file_diff("deadbeef" * 5, "hello.txt")
+    assert "No diff available" in blocker.args[0]
+    # Clipboard was not touched.
+    assert _clipboard_text() == "sentinel"
+
+
+def test_copy_commit_file_diff_untouched_path_emits_error(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """A path that the commit did not touch produces no diff and the
+    clipboard must stay untouched."""
+    _ensure_app()
+    QApplication.clipboard().setText("sentinel")
+    head_sha = committed_repo.head_commit.sha
+    vm = MainViewModel()
+    vm.set_repository(committed_repo)
+
+    with qtbot.waitSignal(vm.error_occurred, timeout=500) as blocker:
+        vm.copy_commit_file_diff(head_sha, "does_not_exist.txt")
+    assert "No diff available" in blocker.args[0]
+    assert _clipboard_text() == "sentinel"

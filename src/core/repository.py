@@ -542,6 +542,42 @@ class RepositoryManager:
             raise GitError(f"Failed to diff stash {sha!r}: {exc}") from exc
         return diff.patch or ""
 
+    def get_commit_file_diff_text(
+        self, sha: str, path: str, context_lines: int = 3,
+    ) -> str:
+        """Return the unified diff for a single file in ``sha``.
+
+        Works for regular commits and for stash entries — both are
+        commits whose tree diffs against their first parent's tree.
+
+        Returns the empty string when the commit has no changes for
+        ``path`` (the file was not touched by the commit, or the
+        per-file patch is empty for any other reason). Raises
+        :class:`InvalidRefError` if ``sha`` does not resolve to a
+        commit, and :class:`GitError` if computing the diff fails.
+        """
+        try:
+            obj = self.repo.revparse_single(sha).peel(pygit2.Commit)
+        except (KeyError, pygit2.GitError, ValueError) as exc:
+            raise InvalidRefError(f"Unknown revision: {sha!r}") from exc
+        if obj.parent_ids:
+            try:
+                parent_tree = obj.parents[0].tree
+            except (KeyError, ValueError):
+                parent_tree = self.repo.TreeBuilder().write()
+        else:
+            parent_tree = self.repo.TreeBuilder().write()
+        try:
+            diff = self.repo.diff(parent_tree, obj.tree, context_lines=context_lines)
+        except (pygit2.GitError, KeyError, ValueError) as exc:
+            raise GitError(f"Failed to diff {sha!r}: {exc}") from exc
+        pieces: list[str] = []
+        for patch in diff:
+            delta = patch.delta
+            if (delta.new_file.path == path) or (delta.old_file.path == path):
+                pieces.append(patch.text or "")
+        return "".join(pieces)
+
     def get_workdir_diff_text(self, context_lines: int = 3) -> str:
         """Return the full unified diff of the working tree vs HEAD.
 
