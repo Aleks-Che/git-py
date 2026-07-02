@@ -500,6 +500,30 @@ class MainWindow(QMainWindow):
         self._graph_table.stash_pop_requested.connect(self._on_stash_pop_graph)
         self._graph_table.stash_drop_requested.connect(self._on_stash_drop_graph)
 
+        # Branch chip gestures: double-click on a chip checks the
+        # branch out; the context menu on a chip can issue a merge or
+        # rebase into the current HEAD.  Both signals carry the bare
+        # ref name (e.g. ``"main"`` for the local branch, ``"origin/main"``
+        # for a remote-tracking ref) and the right pane / merge verb
+        # handle the resolution.
+        self._graph_table.checkout_branch_requested.connect(
+            self._on_graph_branch_checkout,
+        )
+        self._graph_table.merge_branch_requested.connect(
+            self._on_graph_branch_merge,
+        )
+        self._graph_table.rebase_branch_requested.connect(
+            self._on_graph_branch_rebase,
+        )
+        # Drag-and-drop on a branch chip: dropping one chip on
+        # another surfaces a context menu with the same merge / rebase
+        # actions, but with the *drop target* as the integration
+        # branch (instead of the current HEAD).  Mirrors the left
+        # panel's drag-and-drop semantics.
+        self._graph_table.branch_dropped_on_branch.connect(
+            self._on_graph_branch_dropped,
+        )
+
         # When the VM clears the selection (toggle-off) the graph
         # widget must also remove its highlight ring.  The reverse
         # direction (VM → graph) for a *new* selection is redundant
@@ -713,6 +737,149 @@ class MainWindow(QMainWindow):
         idx = self._stash_index_for_sha(sha)
         if idx >= 0:
             self._main_vm.stash_drop(idx)
+
+    def _on_graph_branch_checkout(self, name: str) -> None:
+        """Checkout the branch whose chip the user double-clicked on the graph.
+
+        ``name`` is the ref name as stored on the chip — local branches
+        come through as bare ``"main"``, remote-tracking refs as
+        ``"origin/main"``.  The VM's :meth:`checkout_branch` handles
+        the local case directly; remote refs check whether a local
+        tracking branch exists — if not, the safe fetch+create+checkout
+        is used; if it does, the user gets a confirmation dialog asking
+        whether to hard-reset the local branch to the remote tip
+        (matching the left panel's double-click behaviour).
+        """
+        if "/" not in name:
+            self._main_vm.checkout_branch(name)
+            return
+        local_name = name.split("/", 1)[1]
+        if not self._main_vm.local_branch_exists(local_name):
+            self._main_vm.fetch_and_checkout_remote_branch(name)
+            return
+        from PySide6.QtWidgets import QMessageBox
+        confirm = QMessageBox.question(
+            self,
+            "Reset Local Branch",
+            f"Reset local '{local_name}' to match the remote?\n\n"
+            f"This will discard any unpushed commits on '{local_name}' "
+            f"(including the merge that is not yet on the remote). "
+            f"Working-tree changes will also be lost.\n\n"
+            f"Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._main_vm.reset_local_branch_to_remote(name)
+
+    def _on_graph_branch_merge(self, source: str, target: str) -> None:
+        """Merge ``source`` into ``target`` from the graph chip context menu.
+
+        Empty ``source`` or ``target`` (which can happen on an unborn
+        HEAD or a stale chip cache) is a no-op — the VM would just
+        emit its own error otherwise.
+
+        ``no_ff=True`` is passed so the merge commit is always
+        visible in the graph, even on a fast-forward. The user
+        asked for a merge by right-clicking a branch chip; the
+        history should reflect that explicitly instead of
+        silently moving the ref.
+        """
+        if not source or not target:
+            return
+        self._main_vm.merge_branch(source, target=target, no_ff=True)
+
+    def _on_graph_branch_rebase(self, source: str, target: str) -> None:
+        """Rebase ``source`` onto ``target`` from the graph chip context menu.
+
+        The two-command sequence (checkout ``source`` then rebase onto
+        ``target``) is built into the VM's ``rebase_branch`` verb, but
+        here we issue them through the same path the left panel's
+        drop handler uses to keep undo and logging consistent.
+        """
+        if not source or not target:
+            return
+        # Switch to the source first so rebase can move the user's
+        # working branch.  When the user is already on ``source`` the
+        # checkout is a no-op (HEAD unchanged) and the rebase still
+        # works correctly.  Both commands are pushed onto the undo
+        # stack independently, so undo restores the previous HEAD even
+        # if the rebase gets partway through.
+        if self._current_branch_shorthand() != source:
+            if not self._main_vm.checkout_branch(source):
+                return
+        self._main_vm.rebase_branch(target)
+
+    def _on_graph_branch_dropped(self, source: str, target: str) -> None:
+        """Handle a branch-chip drag-and-drop on the graph.
+
+        Mirrors the left panel's drop handler: opens a small
+        :class:`QMenu` next to the cursor with **Merge {source}
+        into {target}** and **Rebase {source} onto {target}**.
+        The menu is positioned at the current cursor position; the
+        widget does not pass an explicit drop point through the
+        signal because the chip rect itself is small enough that
+        the cursor is a reliable anchor.
+        """
+        if not source or not target or source == target:
+            return
+        from PySide6.QtGui import QCursor
+        from PySide6.QtWidgets import QMenu
+
+        actions = self._build_branch_drop_actions(source, target)
+        menu = QMenu(self)
+        for action in actions:
+            menu.addAction(action)
+        menu.exec(QCursor.pos())
+
+    def _build_branch_drop_actions(
+        self, source: str, target: str,
+    ) -> list[QAction]:
+        """Build the :class:`QAction` list for a chip-on-chip drop.
+
+        Exposed (single-underscore) so tests can inspect the
+        actions synchronously. ``_on_graph_branch_dropped`` uses
+        the same builder to populate the actual menu, splitting
+        the action construction from the menu lifecycle so the
+        tests do not have to spin up a real ``QMenu.exec`` (which
+        would block on user input).
+
+        ``source == target`` and empty inputs are filtered out by
+        the caller — the builder assumes the input is sane.
+
+        The merge action passes ``no_ff=True`` so the merge commit
+        is always visible in the graph, even when the source is a
+        fast-forward of the target.  The user explicitly asked for
+        a merge by dropping one branch onto another, so the
+        history should show a merge — not silently move the ref.
+        """
+        actions: list[QAction] = []
+        merge_label = f"Merge {source} into {target}"
+        merge_action = QAction(merge_label, self)
+        merge_action.triggered.connect(
+            lambda checked=False, s=source, t=target: (
+                self._main_vm.merge_branch(s, target=t, no_ff=True)
+            ),
+        )
+        actions.append(merge_action)
+
+        rebase_label = f"Rebase {source} onto {target}"
+        rebase_action = QAction(rebase_label, self)
+        rebase_action.triggered.connect(
+            lambda checked=False, s=source, t=target: (
+                self._on_graph_branch_rebase(s, t)
+            ),
+        )
+        actions.append(rebase_action)
+        return actions
+
+    def _current_branch_shorthand(self) -> str:
+        """Return the current branch shorthand, or ``""`` when no repo / unborn."""
+        mgr = self._main_vm.repository_manager()
+        if mgr is None or not mgr.is_open or mgr.repo.head_is_unborn:
+            return ""
+        return mgr.repo.head.shorthand
 
     def _stash_index_for_sha(self, sha: str) -> int:
         repos = self._main_vm.repository_manager()

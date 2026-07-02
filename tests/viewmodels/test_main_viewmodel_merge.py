@@ -62,6 +62,40 @@ def test_merge_branch_clean_three_way_updates_views(
     assert vm.conflict_state() is None
 
 
+def test_merge_branch_no_ff_creates_merge_commit_on_fast_forward(
+    committed_repo: RepositoryManager,
+) -> None:
+    """``no_ff=True`` keeps the merge visible in the graph.
+
+    The user reported: when a fast-forward merge happens (source
+    is a descendant of HEAD), the user sees "no merge commit" in
+    the graph. The fix is the ``no_ff`` parameter on
+    :meth:`MainViewModel.merge_branch`. The test pins the
+    parameter at the VM layer so the user-facing behaviour is
+    locked in.
+    """
+    _ensure_app()
+    from src.core.operations import checkout_branch, commit_changes, create_branch
+
+    main_sha = committed_repo.head_commit.sha
+    create_branch(committed_repo, "feature", target_sha=main_sha)
+    checkout_branch(committed_repo, "feature")
+    (Path(committed_repo.path) / "f.txt").write_text("f\n")
+    feat_sha = commit_changes(committed_repo, "add f").sha
+    checkout_branch(committed_repo, "main")
+
+    vm = MainViewModel()
+    vm.set_repository(committed_repo)
+
+    vm.merge_branch("feature", no_ff=True)
+    new_head_sha = committed_repo.head_commit.sha
+    # The merge commit is a brand new commit with two parents —
+    # not the fast-forward tip and not the original main tip.
+    assert new_head_sha != feat_sha
+    assert new_head_sha != main_sha
+    assert set(committed_repo.head_commit.parents) == {main_sha, feat_sha}
+
+
 def test_merge_branch_conflict_emits_conflict_state(
     committed_repo: RepositoryManager,
 ) -> None:
@@ -106,6 +140,30 @@ def test_merge_branch_unknown_source_emits_error(
     assert errors
     assert not vm.command_processor().can_undo
     assert vm.conflict_state() is None
+
+
+def test_merge_branch_unknown_remote_source_hint_includes_fetch(
+    committed_repo: RepositoryManager,
+) -> None:
+    """A user-friendly fetch hint must reach the user-facing error signal.
+
+    The user reported: dropping a remote branch on a local one
+    produced "Unknown source: 'renovate/npm-vite-vulnerability'"
+    with no hint that the branch needed fetching.  The error
+    surfaced by the VM is what reaches the status bar / log, so
+    the test pins the hint at the VM layer.
+    """
+    _ensure_app()
+    vm = MainViewModel()
+    vm.set_repository(committed_repo)
+    errors: list[str] = []
+    vm.error_occurred.connect(errors.append)
+    vm.merge_branch("renovate/npm-vite-vulnerability")
+    assert errors
+    # The fetch hint must survive the trip through the VM error
+    # signal — the test would catch a regression that wrapped the
+    # message in something less helpful.
+    assert any("fetch" in e.lower() for e in errors)
 
 
 # ----- abort_merge / resolve_conflict -------------------------------------

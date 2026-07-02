@@ -90,6 +90,43 @@ def test_merge_command_fast_forward_moves_head(
     assert committed_repo.head_commit.sha == main_sha
 
 
+def test_merge_command_no_ff_creates_merge_commit_on_fast_forward(
+    committed_repo: RepositoryManager,
+) -> None:
+    """``no_ff=True`` keeps the merge visible in the graph.
+
+    The user reported: when a fast-forward merge happens (source
+    is a descendant of HEAD), the user sees "no merge commit" in
+    the graph. The fix is the ``no_ff`` flag on
+    :class:`MergeCommand` (matches ``git merge --no-ff``). The
+    test pins the flag at the command layer so the user-facing
+    behaviour is locked in.
+    """
+    _ensure_app()
+    main_sha = committed_repo.head_commit.sha
+    create_branch(committed_repo, "feature", target_sha=main_sha)
+    checkout_branch(committed_repo, "feature")
+    (Path(committed_repo.path) / "f.txt").write_text("f\n")
+    from src.core.operations import commit_changes
+
+    feat_sha = commit_changes(committed_repo, "add f").sha
+    checkout_branch(committed_repo, "main")
+
+    cmd = MergeCommand(committed_repo, "feature", no_ff=True)
+    cmd.execute()
+    # A *new* commit was created on top of main.  The branch ref
+    # is no longer at the fast-forward tip — the user can see the
+    # merge in the graph.
+    new_head_sha = committed_repo.head_commit.sha
+    assert new_head_sha != feat_sha
+    assert new_head_sha != main_sha
+    assert set(committed_repo.head_commit.parents) == {main_sha, feat_sha}
+
+    cmd.undo()
+    # Undo restores main to its pre-merge position.
+    assert committed_repo.head_commit.sha == main_sha
+
+
 def test_merge_command_three_way_creates_merge_commit(
     committed_repo: RepositoryManager,
 ) -> None:

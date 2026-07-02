@@ -11,6 +11,31 @@ per-repository.
 Uses the cell-based layout from :mod:`src.core.graph_v2` — each row
 carries a ``cells`` list of :class:`CellInfo` dicts that describe the
 exact geometry to draw.
+
+Branch chip interaction
+-----------------------
+The leftmost column carries the branch chips (one per ref pointing
+at the row's commit). Clicks **on** a chip are routed to the branch
+verbs (double-click → checkout, right-click → context menu with
+"Merge X into Y" + "Rebase X onto Y"); clicks elsewhere in the row
+keep the historical commit-selection behaviour. The hit-test lives
+in :meth:`_branch_chip_at` and relies on the rect cache populated
+during :meth:`_draw_branch_chips`.
+
+Branch chip drag-and-drop
+-------------------------
+A press-and-drag on a branch chip starts a native :class:`QDrag` that
+carries the chip's full ref name as text payload. Dropping the chip
+on **another** branch chip opens a context menu with "Merge
+{source} into {target}" and "Rebase {source} onto {target}"; this
+mirrors the left panel's drag-and-drop semantics and is the
+graph-side counterpart to the chip right-click menu (which always
+targets the current HEAD). ``drag_start_threshold_px`` defines how
+far the cursor has to move before a press is promoted to a drag —
+this keeps short clicks on chips from accidentally starting a
+drag. ``chip_drag_mime`` is the custom MIME type the chip uses so
+the drop handler can distinguish branch drags from any other drop
+the widget might one day accept.
 """
 from __future__ import annotations
 
@@ -19,10 +44,15 @@ from dataclasses import dataclass
 from datetime import datetime
 from hashlib import md5
 
-from PySide6.QtCore import QPointF, Qt, Signal
+from PySide6.QtCore import QMimeData, QPoint, QPointF, QRect, Qt, Signal
 from PySide6.QtGui import (
+    QAction,
     QBrush,
     QColor,
+    QDrag,
+    QDragEnterEvent,
+    QDragMoveEvent,
+    QDropEvent,
     QPainter,
     QPainterPath,
     QPen,
@@ -39,6 +69,23 @@ from PySide6.QtWidgets import (
 from src.core.graph_v2 import BRANCH_PALETTE, UNCOMMITTED_COLOR_INDEX
 from src.utils.theme import DARK_THEME, Theme
 from src.viewmodels.graph_viewmodel import GraphViewModel
+
+# Custom MIME type for branch-chip drags. Using a non-empty custom
+# type alongside the plain-text fallback lets the drop handler tell a
+# chip drag from any other drag the widget might one day accept (a
+# future "drag a file from a commit row to the terminal" gesture, for
+# example). The plain text is also set so external consumers — the
+# OS clipboard, an ``xdnd`` listener in another app — still get a
+# useful payload.
+_CHIP_MIME = "application/x-git-py-branch-chip"
+
+# Press-to-drag promotion threshold, in widget pixels. Anything
+# shorter is treated as a click (single / double), anything longer
+# starts a :class:`QDrag`. ``QStyle`` exposes ``startDragDistance``
+# which is the platform default, but the cell-sized chips benefit
+# from a slightly lower threshold so the user does not have to
+# fling the cursor to start a drag.
+_DRAG_START_THRESHOLD_PX = 6
 
 
 @dataclass(frozen=True)
@@ -149,6 +196,23 @@ class GraphTableWidget(QWidget):
     stash_pop_requested = Signal(str)
     stash_drop_requested = Signal(str)
     discard_changes_requested = Signal(str)
+    # Branch chip signals — emitted from clicks on the leftmost column's
+    # branch chips. ``name`` is the ref name as the user sees it
+    # (``"main"`` for ``refs/heads/main``, ``"base_features"`` for
+    # ``refs/remotes/origin/base_features``). ``checkout_branch_requested``
+    # fires on double-click; ``merge_branch_requested`` and
+    # ``rebase_branch_requested`` fire from the context menu and carry
+    # the source branch (``name``) and the current HEAD as the target.
+    checkout_branch_requested = Signal(str)
+    merge_branch_requested = Signal(str, str)  # source, target
+    rebase_branch_requested = Signal(str, str)  # source, target
+    # Drop signal — fires when the user drops one branch chip on
+    # another.  Both ``source`` and ``target`` carry the chip's
+    # *display* name (the user-visible label) so the ``MainWindow``
+    # wiring can pass them straight to ``merge_branch`` /
+    # ``rebase_branch`` without having to resolve ``refs/heads/`` or
+    # ``refs/remotes/`` prefixes first.
+    branch_dropped_on_branch = Signal(str, str)  # source, target
 
     _AVATAR_COLORS: tuple[str, ...] = (
         "#C44A2B", "#B85C8C", "#9A6E3A", "#5B7FA5",
@@ -173,6 +237,33 @@ class GraphTableWidget(QWidget):
         self._h_scrolls: list[int] = [0, 0, 0]
         self._active_col: int = 1
         self._avatar_cache: dict[str, QPixmap] = {}
+        # Branch chip geometry cache, repopulated on every paint.  Keyed
+        # by ``(row_sha, display)`` so two commits can each have a
+        # branch with the same display name (e.g. ``main`` at HEAD and
+        # ``main`` at an older commit that a feature branch forked
+        # from) without colliding; within a single row the
+        # local-vs-remote suppression in :meth:`_draw_branch_chips`
+        # guarantees at most one entry per display name, so callers
+        # that look up by ``(sha, display)`` always get the chip the
+        # user can actually see and click on.
+        #
+        # Each value is a dict with the chip's :class:`QRect` (in
+        # content coordinates — x needs ``_h_scrolls[0]`` added back
+        # at hit-test time) plus a few flags (``is_remote``,
+        # ``is_head``) for callers that want to customise the menu
+        # per branch kind.
+        self._branch_chip_rects: dict[tuple[str, str], dict] = {}
+
+        # Drag state for press-and-drag on a branch chip. The widget
+        # only starts a :class:`QDrag` once the cursor has moved more
+        # than ``_DRAG_START_THRESHOLD_PX`` from the press point, so
+        # short clicks are still treated as clicks.  When a drag is
+        # in flight, ``_drag_active_chip`` carries the chip dict
+        # (display + full_name + flags) so the drop handler can read
+        # the source without re-running the hit-test.
+        self._drag_press_chip: dict | None = None
+        self._drag_press_pos: QPoint | None = None
+        self._drag_active_chip: dict | None = None
 
         self._dividers: list[int] = [180, 500]
         self._dragging_divider: int = -1
@@ -196,6 +287,17 @@ class GraphTableWidget(QWidget):
         self.setMouseTracking(True)
         self.setMinimumHeight(100)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        # Accept drag-and-drop payloads. ``QWidget`` defaults to
+        # ``acceptDrops=False``; without this call Qt's drag pipeline
+        # never delivers ``dragEnterEvent`` / ``dropEvent`` to the
+        # widget, so the press on a branch chip starts a drag but
+        # the drop is silently ignored — the user sees the cursor
+        # change but no menu appears on release.  ``setAcceptDrops``
+        # must be called before the first drag enters the widget's
+        # bounds for the very first time; the constructor is the
+        # right place.
+        self.setAcceptDrops(True)
 
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_context_menu)
@@ -318,6 +420,11 @@ class GraphTableWidget(QWidget):
 
     def _on_graph_updated(self, rows: list[dict]) -> None:
         self._rows = rows
+        # The chip rect cache is repopulated by ``_draw_branch_chips``
+        # during the next paint; the old entries are stale because
+        # the row count, lane order and the chips themselves change
+        # whenever the graph is rebuilt.
+        self._branch_chip_rects.clear()
         self._update_scrollbar()
         self.update()
 
@@ -450,7 +557,12 @@ class GraphTableWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _on_context_menu(self, position) -> None:
-        sha = self._hit_test_commit(position.x(), position.y())
+        x, y = position.x(), position.y()
+        chip = self._branch_chip_at(x, y)
+        if chip is not None:
+            self._show_branch_context_menu(chip, position)
+            return
+        sha = self._hit_test_commit(x, y)
         if sha is None:
             return
         row_data = self._row_by_sha(sha)
@@ -489,6 +601,77 @@ class GraphTableWidget(QWidget):
                 lambda checked=False, s=sha: self.copy_diff_requested.emit(s),
             )
         menu.exec(self.mapToGlobal(position))
+
+    def _show_branch_context_menu(self, chip: dict, position) -> None:
+        """Build and show the context menu for a branch chip.
+
+        The menu is the branch-verb equivalent of the left panel's
+        local-branch menu: double-click is not the only way to act on
+        a branch, the user can also right-click and pick from a list.
+        ``Checkout`` and ``Merge X into current`` are always present;
+        ``Rebase X onto current`` is added as the symmetric counter-
+        operation since the user could plausibly want either.  Actions
+        on the current branch are disabled (merging / rebasing a
+        branch onto itself is a no-op).
+        """
+        actions = self._build_branch_menu_actions(chip)
+        menu = QMenu(self)
+        for action in actions:
+            menu.addAction(action)
+        menu.exec(self.mapToGlobal(position))
+
+    def _build_branch_menu_actions(self, chip: dict) -> list[QAction]:
+        """Build the :class:`QAction` list for a branch chip's context menu.
+
+        Exposed (single-underscore) so tests can inspect the actions
+        synchronously without running ``QMenu.exec()`` (which would
+        block on user input).
+
+        The same builder is used by :meth:`_show_branch_context_menu`
+        for the actual menu; splitting the two lets the tests pin the
+        exact label / enabled-state / signal-payload contract without
+        poking at the menu lifecycle.
+        """
+        name = chip["display"]
+        full_name = chip["full_name"]
+        is_remote = chip["is_remote"]
+        current = self._current_branch_name()
+        is_current = bool(current) and name == current and not is_remote
+
+        actions: list[QAction] = []
+
+        if is_remote:
+            checkout_label = f"Checkout {name} (from {full_name.split('/', 1)[0]})"
+        else:
+            checkout_label = f"Checkout {name}"
+        checkout_action = QAction(checkout_label, self)
+        checkout_action.triggered.connect(
+            lambda checked=False, n=full_name: self.checkout_branch_requested.emit(n),
+        )
+        actions.append(checkout_action)
+
+        if not is_remote:
+            merge_label = f"Merge {name} into {current}" if current else f"Merge {name}"
+            merge_action = QAction(merge_label, self)
+            merge_action.setEnabled(bool(current) and not is_current)
+            merge_action.triggered.connect(
+                lambda checked=False, s=name, t=current: (
+                    self.merge_branch_requested.emit(s, t) if t else None
+                ),
+            )
+            actions.append(merge_action)
+
+            rebase_label = f"Rebase {name} onto {current}" if current else f"Rebase {name}"
+            rebase_action = QAction(rebase_label, self)
+            rebase_action.setEnabled(bool(current) and not is_current)
+            rebase_action.triggered.connect(
+                lambda checked=False, s=name, t=current: (
+                    self.rebase_branch_requested.emit(s, t) if t else None
+                ),
+            )
+            actions.append(rebase_action)
+
+        return actions
 
     # ------------------------------------------------------------------
     # painting
@@ -724,14 +907,31 @@ class GraphTableWidget(QWidget):
         chip_text_color = QColor("#FFFFFF")
         cursor_x = col_left + 6
 
+        # When a local branch and a remote-tracking branch share the
+        # same display name (e.g. ``main`` and ``origin/main`` both
+        # pointing at HEAD), the remote chip is suppressed entirely
+        # — the local one already conveys the "this branch is here"
+        # information and the monitor icon on it makes the "local"
+        # side obvious. Drawing both would be redundant *and* it
+        # would break hit-testing: the chip-rect cache is keyed by
+        # display name, so the second chip would overwrite the
+        # first, making the menu work on only one of the two
+        # visual chips. Compute the set of local display names up
+        # front so the per-branch loop can skip the duplicates in
+        # O(1).
+        local_display_names: set[str] = {
+            _branch_display_name(b) for b in branch_refs if not b.get("is_remote")
+        }
+
         for branch in branch_refs:
             is_head = branch.get("is_head")
             is_remote = branch.get("is_remote")
-            display = branch["name"]
-            if is_remote:
-                parts = display.split("/", 1)
-                if len(parts) == 2:
-                    display = parts[1]
+            display = _branch_display_name(branch)
+            if is_remote and display in local_display_names:
+                # Suppressed — the local variant already covers this
+                # name. Skip both the draw and the rect-cache update
+                # so the local chip is the only hit-test target.
+                continue
 
             text_w = fm.horizontalAdvance(display)
             text_h = fm.height()
@@ -750,6 +950,32 @@ class GraphTableWidget(QWidget):
             chip_path = QPainterPath()
             chip_path.addRoundedRect(cursor_x, chip_top, content_w, chip_h, 4, 4)
             painter.fillPath(chip_path, QBrush(commit_color))
+
+            # Record the chip geometry for hit-testing.  The x coordinate
+            # is in content (post-translation) space because the painter
+            # is translated by ``-_h_scrolls[0]`` before this draw runs;
+            # :meth:`_branch_chip_at` undoes the translation by adding
+            # the current scroll value back to the click x.
+            #
+            # The cache is keyed by ``(row_sha, display)`` rather than
+            # ``display`` alone: two different rows can have a branch
+            # with the same display name (e.g. ``main`` at HEAD and
+            # ``main`` at an older commit that a feature branch was
+            # forked from), and each row's chip needs its own entry.
+            # Within a single row the suppression above guarantees at
+            # most one entry per display name.
+            row_sha = _row_sha(row_data)
+            self._branch_chip_rects[(row_sha, display)] = {
+                "rect": QRect(
+                    int(cursor_x), int(chip_top),
+                    int(content_w), int(chip_h),
+                ),
+                "is_remote": bool(is_remote),
+                "is_head": bool(is_head),
+                "full_name": branch["name"],
+                "display": display,
+                "row_sha": row_sha,
+            }
 
             inner_x = cursor_x + pad
             inner_cy = y_center
@@ -1021,6 +1247,18 @@ class GraphTableWidget(QWidget):
             event.accept()
             return
 
+        # A click on a branch chip must not be interpreted as a commit
+        # selection — the branch and commit gestures live in different
+        # widgets conceptually, even though they share a row.  Stash
+        # the press state so :meth:`mouseMoveEvent` can promote a
+        # longer move into a branch-chip drag.
+        chip = self._branch_chip_at(x, y) if y >= hh else None
+        if chip is not None:
+            self._drag_press_chip = chip
+            self._drag_press_pos = event.pos()
+            event.accept()
+            return
+
         if y >= hh:
             sha = self._hit_test_commit(x, y)
             if sha is not None:
@@ -1033,6 +1271,28 @@ class GraphTableWidget(QWidget):
 
         super().mousePressEvent(event)
 
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        """Double-click on a branch chip → checkout the branch.
+
+        Mirrors the left panel's behaviour: a quick double-click on a
+        branch label is the conventional way to switch to it.  A
+        double-click anywhere else falls through to the default
+        press/release pair (commit selection).
+        """
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mouseDoubleClickEvent(event)
+            return
+        x, y = event.pos().x(), event.pos().y()
+        if y < self._cfg.header_height:
+            super().mouseDoubleClickEvent(event)
+            return
+        chip = self._branch_chip_at(x, y)
+        if chip is None:
+            super().mouseDoubleClickEvent(event)
+            return
+        self.checkout_branch_requested.emit(chip["full_name"])
+        event.accept()
+
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         if self._dragging_divider >= 0:
             dx = event.pos().x() - self._drag_start_x
@@ -1042,6 +1302,28 @@ class GraphTableWidget(QWidget):
             event.accept()
             return
 
+        # Promote a chip press into a drag once the cursor has moved
+        # far enough.  Doing the threshold check here (rather than
+        # relying on ``QDrag.start()`` alone) keeps short clicks
+        # cheap and ensures the user gets a clear "this is now a
+        # drag" affordance before :class:`QDrag` locks the mouse.
+        if (
+            self._drag_press_chip is not None
+            and self._drag_press_pos is not None
+            and self._drag_active_chip is None
+        ):
+            moved = (
+                (event.pos() - self._drag_press_pos).manhattanLength()
+                >= _DRAG_START_THRESHOLD_PX
+            )
+            if moved:
+                self._begin_chip_drag(self._drag_press_chip, self._drag_press_pos)
+                # ``QDrag.exec`` blocks until the drag finishes; once
+                # it returns, fall through so the rest of the move
+                # handler can finish its bookkeeping.  We don't
+                # ``return`` early because the ``exec`` already
+                # handled the drag cursor / hotspot.
+
         x, y = event.pos().x(), event.pos().y()
         hh = self._cfg.header_height
 
@@ -1049,6 +1331,10 @@ class GraphTableWidget(QWidget):
 
         if self._divider_at(x) >= 0:
             self.setCursor(Qt.CursorShape.SplitHCursor)
+        elif y >= hh and self._branch_chip_at(x, y) is not None:
+            # Branch chips are actionable (double-click / context menu);
+            # advertise that with a pointer cursor.
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
         else:
             self.setCursor(Qt.CursorShape.ArrowCursor)
 
@@ -1065,8 +1351,113 @@ class GraphTableWidget(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         self._dragging_divider = -1
+        # A press that did not turn into a drag (i.e. a short click
+        # on a branch chip) leaves the press state in place; clear it
+        # here so the next press starts fresh.
+        self._drag_press_chip = None
+        self._drag_press_pos = None
+        self._drag_active_chip = None
         self.setCursor(Qt.CursorShape.ArrowCursor)
         super().mouseReleaseEvent(event)
+
+    # ------------------------------------------------------------------
+    # branch chip drag-and-drop
+    # ------------------------------------------------------------------
+
+    def _begin_chip_drag(self, chip: dict, press_pos: QPoint) -> None:
+        """Start a :class:`QDrag` carrying the chip's ref name.
+
+        The drag payload is a :class:`QMimeData` with both a custom
+        ``application/x-git-py-branch-chip`` type and the plain-text
+        branch name; the custom type lets the drop handler tell a
+        chip drag from any other drop the widget might one day
+        accept, while the plain text keeps the drag useful when
+        dropped onto a different widget that only knows text.
+
+        ``exec`` is called synchronously (the call blocks until the
+        drag finishes) so the cursor stays grabbed and the user's
+        next move is delivered to the drop target. The post-drag
+        cleanup resets the press state so the next press starts
+        fresh.
+        """
+        mime = QMimeData()
+        mime.setData(_CHIP_MIME, chip["display"].encode("utf-8"))
+        mime.setText(chip["display"])
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        # The pixmap is what the user sees dragged under the cursor.
+        # ``render`` paints the chip's repainted region into a small
+        # pixmap; a transparent ``QPixmap`` would also work but the
+        # drag looks weird without feedback.
+        pix = self.grab(
+            QRect(
+                chip["rect"].x() - self._h_scrolls[0],
+                chip["rect"].y(),
+                chip["rect"].width(),
+                chip["rect"].height(),
+            ),
+        )
+        if not pix.isNull():
+            drag.setPixmap(pix)
+            drag.setHotSpot(QPoint(pix.width() // 2, pix.height() // 2))
+
+        self._drag_active_chip = chip
+        # ``Qt.DropAction.CopyAction`` is the standard action for
+        # payload-only drags where the source is not consumed by
+        # the drop.  The user can still move the mouse freely and
+        # cancel the drag with Esc.
+        drag.exec(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)
+        # After the drag returns the user has released the mouse —
+        # treat the press as fully consumed.  ``mouseReleaseEvent``
+        # will fire too but the state is already cleared, so the
+        # double-clear is a no-op.
+        self._drag_press_chip = None
+        self._drag_press_pos = None
+        self._drag_active_chip = None
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
+        """Accept the drag if it carries a branch-chip payload."""
+        if event.mimeData().hasFormat(_CHIP_MIME):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # noqa: N802
+        """Accept the move so Qt shows the drop indicator."""
+        if event.mimeData().hasFormat(_CHIP_MIME):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
+        """Resolve the drop target and either act on it or ignore.
+
+        Only drops that land on **another** branch chip produce a
+        menu. Drops on the commit graph, the commit message or empty
+        space are accepted (so Qt stops showing the "no drop" cursor)
+        but produce no action — the user has to drop on a chip to
+        indicate a target branch. The signal ``branch_dropped_on_branch``
+        carries ``(source, target)`` so the ``MainWindow`` can wire
+        it to the merge / rebase verbs without the widget having to
+        know the VM's API.
+        """
+        mime = event.mimeData()
+        if not mime.hasFormat(_CHIP_MIME):
+            super().dropEvent(event)
+            return
+        source = mime.text()
+        target_chip = self._branch_chip_at(event.pos().x(), event.pos().y())
+        if target_chip is None or not source:
+            event.acceptProposedAction()
+            return
+        if source == target_chip["display"]:
+            # Dropping a chip on itself is a no-op — merging a
+            # branch into itself never makes sense and showing a
+            # menu would just confuse the user.
+            event.acceptProposedAction()
+            return
+        self.branch_dropped_on_branch.emit(source, target_chip["display"])
+        event.acceptProposedAction()
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         mods = event.modifiers()
@@ -1139,6 +1530,52 @@ class GraphTableWidget(QWidget):
             if row_top <= scroll_y < row_top + dh:
                 return _row_sha(row_data)
         return None
+
+    def _branch_chip_at(self, x: int, y: int) -> dict | None:
+        """Return the branch chip under widget coordinates ``(x, y)``.
+
+        Returns ``None`` when the click is outside column 0 (the
+        branch column) or did not land on a chip's rounded rect.  The
+        chip dict has the keys ``rect`` (content-space :class:`QRect`),
+        ``is_remote`` (bool), ``is_head`` (bool), ``full_name`` (the
+        original ref name — e.g. ``"origin/main"`` for a remote ref),
+        ``display`` (the chip's visible label — e.g. ``"main"``) and
+        ``row_sha`` (the commit the chip is attached to).
+
+        The hit-test iterates the cache values rather than looking up
+        a key, because the cache is keyed by ``(row_sha, display)``
+        but a click position is a point in widget coordinates — the
+        only field that matters for "is the point in this chip's
+        rect?" is the rect itself, which is identical regardless of
+        the key.
+
+        The hit-test converts the click x from widget coordinates to
+        content coordinates by adding the current horizontal scroll
+        of column 0; the rects stored by :meth:`_draw_branch_chips`
+        are in content space (the painter is translated by
+        ``-self._h_scrolls[0]`` before the chip is drawn).
+        """
+        col_left, col_right = self._col_ranges()[0]
+        if x < col_left or x >= col_right:
+            return None
+        content_x = x + self._h_scrolls[0]
+        for chip_info in self._branch_chip_rects.values():
+            if chip_info["rect"].contains(content_x, y):
+                return chip_info
+        return None
+
+    def _current_branch_name(self) -> str:
+        """Return the current HEAD's branch shorthand, or ``""`` if unborn.
+
+        Used by the branch-chip context menu to fill in the "into
+        current…" target.  Goes through the bound
+        :class:`GraphViewModel`'s repository so it picks up the same
+        view the rest of the UI sees.
+        """
+        repo = self._view_model.repository()
+        if repo is None or not repo.is_open or repo.repo.head_is_unborn:
+            return ""
+        return repo.repo.head.shorthand
 
     def _row_by_sha(self, sha: str) -> dict | None:
         for row_data in self._rows:
@@ -1402,6 +1839,23 @@ def _row_color(row: dict) -> QColor:
         return QColor(DARK_THEME.graph_wip)
     ci = row.get("color_index", 0)
     return _cell_color(ci)
+
+
+def _branch_display_name(branch: dict) -> str:
+    """Return the user-visible chip label for a branch ref dict.
+
+    Local branches keep their bare name (``"main"``); remote-
+    tracking refs have the ``origin/``-style prefix stripped so
+    the chip matches what the user sees in the left panel. The
+    display name is the same key the chip-rect cache uses, so any
+    caller that needs to look up a chip rect should go through
+    this helper rather than re-implementing the prefix-stripping
+    logic.
+    """
+    name = branch.get("name", "")
+    if branch.get("is_remote") and "/" in name:
+        return name.split("/", 1)[1]
+    return name
 
 
 __all__ = ["GraphTableWidget", "RenderConfig"]

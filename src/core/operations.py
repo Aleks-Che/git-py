@@ -353,15 +353,30 @@ def merge_branch(
     source: str,
     target: str | None = None,
     message: str | None = None,
+    no_ff: bool = False,
 ) -> bool:
     """Merge ``source`` (branch name, SHA, or ref) into the current HEAD.
 
-    - If ``source`` is a fast-forward of ``HEAD``, the ref is simply moved
-      and the function returns ``False``.
+    - If ``source`` is a fast-forward of ``HEAD`` **and** ``no_ff`` is
+      ``False`` (the default), the ref is simply moved and the
+      function returns ``False``.
     - If the merge is up-to-date, returns ``False`` and does nothing.
+    - If ``source`` is a fast-forward **and** ``no_ff`` is ``True``, the
+      merge is forced through the three-way path so a real merge
+      commit with two parents is created (matches
+      ``git merge --no-ff``).
     - Otherwise a three-way merge is performed and (when there are no
       conflicts) a merge commit is created with two parents: HEAD and
       ``source``. The function returns ``True``.
+
+    The ``no_ff`` flag is what the user invokes through the UI: when
+    a branch is dragged onto another, or when the left-panel
+    "Merge X into current…" / drag-and-drop menu is used, the user
+    expects to see a merge commit in the history even if the
+    branches haven't diverged — that's the only way the merge is
+    visible in the graph. Without ``no_ff``, fast-forwards silently
+    move the ref and the user sees "no commit" on the target
+    branch.
 
     Raises :class:`MergeConflictError` if conflicts were left in the
     index; in that case no merge commit is created — the caller is
@@ -373,13 +388,18 @@ def merge_branch(
         try:
             source_oid = r.revparse_single(source).peel(pygit2.Commit).id
         except (KeyError, pygit2.GitError, ValueError) as exc:
-            raise InvalidRefError(f"Unknown source: {source!r}") from exc
+            raise InvalidRefError(
+                f"Unknown source: {source!r}. "
+                f"If this is a remote branch, fetch it first "
+                f"(Push/Pull toolbar → Fetch, or right-click the remote branch in the left panel).",
+            ) from exc
+        target_name = target or r.head.shorthand
         analysis, _ = r.merge_analysis(source_oid)
         if analysis & pygit2.GIT_MERGE_ANALYSIS_UP_TO_DATE:
             return False
-        if analysis & pygit2.GIT_MERGE_ANALYSIS_FASTFORWARD:
+        is_fastforward = bool(analysis & pygit2.GIT_MERGE_ANALYSIS_FASTFORWARD)
+        if is_fastforward and not no_ff:
             try:
-                target_name = target or r.head.shorthand
                 ref = r.lookup_reference(f"refs/heads/{target_name}")
                 ref.set_target(source_oid)
                 r.head.set_target(source_oid)
@@ -387,22 +407,42 @@ def merge_branch(
             except pygit2.GitError as exc:
                 raise GitError(f"Fast-forward merge failed: {exc}") from exc
             return False
-        # Real three-way merge.
+        # Real three-way merge — either because the branches diverged
+        # or because the caller asked for ``no_ff`` and forced a
+        # merge commit even on a fast-forwardable history.
         head_oid = r.head.target
+        if is_fastforward:
+            # ``r.merge`` is a no-op on a fast-forward: the working
+            # tree already matches ``source_oid``. The merge commit
+            # carries the *source*'s tree (which is what a fast-
+            # forward would have done), with two parents so it
+            # shows up in the graph as a real merge. Fast-forward
+            # trees are clean by definition (no conflicts to
+            # resolve), so we can skip the conflict check.
+            try:
+                tree_oid = r[source_oid].tree.id
+            except pygit2.GitError as exc:
+                raise GitError(f"Fast-forward no-ff merge failed: {exc}") from exc
+        else:
+            try:
+                r.merge(source_oid)
+            except pygit2.GitError as exc:
+                raise GitError(f"Merge failed: {exc}") from exc
+            conflicts = _collect_conflicts(r)
+            if conflicts:
+                raise MergeConflictError(
+                    f"Merge of {source!r} produced conflicts in {len(conflicts)} file(s).",
+                    conflicting_paths=conflicts,
+                )
+            try:
+                tree_oid = r.index.write_tree()
+            except pygit2.GitError as exc:
+                raise GitError(f"Failed to write merge tree: {exc}") from exc
+        # Clean merge: create the merge commit and point the
+        # target ref at it. The two-parent shape is what makes
+        # the commit a real merge in the history — a single-parent
+        # commit would just look like a fast-forward.
         try:
-            r.merge(source_oid)
-        except pygit2.GitError as exc:
-            raise GitError(f"Merge failed: {exc}") from exc
-        conflicts = _collect_conflicts(r)
-        if conflicts:
-            raise MergeConflictError(
-                f"Merge of {source!r} produced conflicts in {len(conflicts)} file(s).",
-                conflicting_paths=conflicts,
-            )
-        # Clean merge: write the index tree and create the merge commit.
-        try:
-            tree_oid = r.index.write_tree()
-            target_name = target or r.head.shorthand
             merge_msg = message or f"Merge {source} into {target_name}"
             merge_oid = r.create_commit(
                 "HEAD",
@@ -609,7 +649,11 @@ def complete_merge(
         try:
             source_oid = r.revparse_single(source).peel(pygit2.Commit).id
         except (KeyError, pygit2.GitError, ValueError) as exc:
-            raise InvalidRefError(f"Unknown source: {source!r}") from exc
+            raise InvalidRefError(
+                f"Unknown source: {source!r}. "
+                f"If this is a remote branch, fetch it first "
+                f"(Push/Pull toolbar → Fetch, or right-click the remote branch in the left panel).",
+            ) from exc
         conflicts = _collect_conflicts(r)
         if conflicts:
             raise MergeConflictError(

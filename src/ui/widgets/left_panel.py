@@ -287,7 +287,23 @@ class LeftPanel(QTreeWidget):
     # ----- user actions ------------------------------------------------
 
     def _on_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
-        """Double-click: local branch → checkout; remote → fetch + checkout; tag → create branch."""
+        """Double-click: local branch → checkout; remote → reset-or-create + checkout; tag → create branch.
+
+        Double-clicking a remote-tracking branch is the conventional
+        "switch to the remote" gesture. When a local tracking
+        branch already exists, the user almost always wants to
+        abandon any unpushed local work (e.g. an unmerged merge
+        commit) and land on whatever the remote is currently
+        pointing at — that is the destructive "Reset Local to
+        Here?" action.  The local panel pops a confirmation dialog
+        for that path because ``reset --hard`` cannot be undone
+        through the normal ``CommandProcessor`` undo stack.
+
+        When the local branch does not exist yet, there is nothing
+        to lose, so the dialog is skipped and the
+        :meth:`MainViewModel.fetch_and_checkout_remote_branch`
+        path is used directly (fetch + create + checkout).
+        """
         kind = item.data(0, _ROLE_KIND)
         name = item.data(0, _ROLE_NAME)
         if kind is None:
@@ -301,9 +317,59 @@ class LeftPanel(QTreeWidget):
         if kind == _KIND_LOCAL_BRANCH and name:
             self._main_vm.checkout_branch(name)
         elif kind == _KIND_REMOTE_BRANCH and name:
-            self._main_vm.fetch_and_checkout_remote_branch(name)
+            self._handle_remote_double_click(name)
         elif kind == _KIND_TAG and name:
             self._main_vm.create_branch(name)
+
+    def _handle_remote_double_click(self, remote_branch_name: str) -> None:
+        """Switch to ``remote_branch_name`` — confirm if a local branch exists.
+
+        Splits out the double-click dispatch from
+        :meth:`_on_double_clicked` so the test suite can target the
+        confirmation flow without going through the whole
+        ``itemDoubleClicked`` event channel.  The
+        :class:`QMessageBox` is the conventional "are you sure"
+        dialog for destructive actions: it shows the user the
+        name of the local branch that will be reset and a clear
+        statement of the consequence, with ``No`` as the default
+        button so an accidental Enter does not discard work.
+        """
+        # ``origin/feature`` → local branch is ``feature``.
+        local_name = remote_branch_name.split("/", 1)[1]
+        if not self._local_branch_exists(local_name):
+            # No local work to lose — just create it.
+            self._main_vm.fetch_and_checkout_remote_branch(remote_branch_name)
+            return
+        from PySide6.QtWidgets import QMessageBox
+        confirm = QMessageBox.question(
+            self,
+            "Reset Local Branch",
+            f"Reset local '{local_name}' to match the remote?\n\n"
+            f"This will discard any unpushed commits on '{local_name}' "
+            f"(including the merge that is not yet on the remote). "
+            f"Working-tree changes will also be lost.\n\n"
+            f"Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._main_vm.reset_local_branch_to_remote(remote_branch_name)
+
+    def _local_branch_exists(self, name: str) -> bool:
+        """Return ``True`` if a local branch named ``name`` exists.
+
+        Used by :meth:`_handle_remote_double_click` to decide
+        whether the destructive reset path needs a confirmation
+        dialog.  The check is name-only — we do not verify the
+        upstream config because a local branch with the right
+        name is what the user would reset regardless of where its
+        upstream points.
+        """
+        mgr = self._main_vm.repository_manager()
+        if mgr is None:
+            return False
+        return any(b.name == name and not b.is_remote for b in mgr.branches)
 
     def _on_item_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
         """Single-click on a group header toggles its expanded state.
@@ -561,7 +627,7 @@ class LeftPanel(QTreeWidget):
 
         checkout = QAction(f"Checkout {name} as local branch", self)
         checkout.triggered.connect(
-            lambda: self._main_vm.fetch_and_checkout_remote_branch(name),
+            lambda n=name: self._handle_remote_double_click(n),
         )
         actions.append(checkout)
 
@@ -616,6 +682,12 @@ class LeftPanel(QTreeWidget):
         If ``name`` *is* the current branch the actions are added but
         disabled — merging a branch into itself is a no-op. Cherry-pick
         is a placeholder for now; the real dialog is in Stage 5+.
+
+        The merge action passes ``no_ff=True`` so the merge commit
+        is always visible in the graph, even on a fast-forward.
+        The user explicitly asked for a merge through the context
+        menu; the history should reflect that explicitly instead of
+        silently moving the ref.
         """
         actions: list[QAction] = []
         mgr = self._main_vm.repository_manager()
@@ -626,7 +698,9 @@ class LeftPanel(QTreeWidget):
         )
         merge = QAction(f"Merge {name} into current…", self)
         merge.triggered.connect(
-            lambda: self._main_vm.merge_branch(name, target=self._current_branch_name()),
+            lambda: self._main_vm.merge_branch(
+                name, target=self._current_branch_name(), no_ff=True,
+            ),
         )
         merge.setEnabled(not is_current)
         actions.append(merge)
@@ -745,11 +819,17 @@ class LeftPanel(QTreeWidget):
         return self._drop_actions(source_name, target_name)
 
     def _drop_actions(self, source: str, target: str) -> list[QAction]:
-        """Build the list of actions for a drop on ``target`` of ``source``."""
+        """Build the list of actions for a drop on ``target`` of ``source``.
+
+        The merge action passes ``no_ff=True`` so the merge commit
+        is always visible in the graph, even on a fast-forward.
+        The user asked for a merge by dragging one branch onto
+        another; the history should reflect that explicitly.
+        """
         actions: list[QAction] = []
         merge = QAction(f"Merge {source} into {target}", self)
         merge.triggered.connect(
-            lambda: self._main_vm.merge_branch(source, target=target),
+            lambda: self._main_vm.merge_branch(source, target=target, no_ff=True),
         )
         actions.append(merge)
         rebase = QAction(f"Rebase {source} onto {target}", self)

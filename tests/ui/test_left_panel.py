@@ -272,9 +272,73 @@ def test_double_click_on_local_branch_checks_it_out(
 def test_double_click_on_remote_branch_fetches_and_checks_it_out(
     qtbot, committed_repo: RepositoryManager, monkeypatch,
 ) -> None:
-    """Double-click on a remote-tracking branch should trigger the new
-    fetch+checkout verb (not the bare :meth:`checkout_remote_branch`).
+    """Double-click on a remote-tracking branch with no local counterpart
+    should trigger the non-destructive fetch+create+checkout verb
+    (no confirmation dialog — there is nothing to lose).
     """
+    _set_up_repo_with_remotes(committed_repo)
+    # ``_set_up_repo_with_remotes`` pushes and fetches ``main``,
+    # so the local has a tracking branch with the same name. To
+    # exercise the no-confirmation path we look at a remote branch
+    # whose local counterpart does not exist — create a local
+    # ``feature`` branch, push it, then delete the local copy
+    # so the panel sees the remote but no local tracking branch.
+    from src.core.operations import (
+        checkout_branch,
+        create_branch,
+        delete_branch,
+    )
+    from src.core.operations import (
+        push as core_push,
+    )
+    head_sha = committed_repo.head_commit.sha
+    create_branch(committed_repo, "feature", target_sha=head_sha)
+    checkout_branch(committed_repo, "feature")
+    core_push(committed_repo, "origin", "refs/heads/feature:refs/heads/feature")
+    # Delete the local copy so the panel sees only ``origin/feature``.
+    checkout_branch(committed_repo, "main")
+    delete_branch(committed_repo, "feature", force=True)
+
+    # Refresh the local panel's branch view so the new ``feature``
+    # shows up under Remote.
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+    vm.branch_panel_view_model().refresh()
+
+    branches = _top_level(panel, "Branches")
+    remote = _child(branches, "Remote")
+    origin_feature = _child(remote, "origin/feature")
+    assert origin_feature is not None
+
+    captured: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        vm,
+        "fetch_and_checkout_remote_branch",
+        lambda name: captured.append((name,)),
+    )
+    # Ensure the destructive verb is NOT called.
+    monkeypatch.setattr(
+        vm,
+        "reset_local_branch_to_remote",
+        lambda name: captured.append(("RESET", name)),
+    )
+
+    panel.itemDoubleClicked.emit(origin_feature, 0)
+    assert captured == [("origin/feature",)]
+
+
+def test_double_click_on_remote_branch_with_local_confirms_reset(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    """When a local branch with the same name already exists, the
+    double-click shows a "Reset Local to Here?" confirmation dialog.
+    Accepting the dialog triggers the destructive reset verb;
+    cancelling leaves the repository untouched.
+    """
+    from PySide6.QtWidgets import QMessageBox
     _set_up_repo_with_remotes(committed_repo)
 
     vm = MainViewModel()
@@ -288,21 +352,37 @@ def test_double_click_on_remote_branch_fetches_and_checks_it_out(
     origin_main = _child(remote, "origin/main")
     assert origin_main is not None
 
-    captured: list[tuple[str, ...]] = []
+    reset_called: list[str] = []
+    fetch_called: list[str] = []
     monkeypatch.setattr(
-        vm,
-        "fetch_and_checkout_remote_branch",
-        lambda name: captured.append((name,)),
+        vm, "reset_local_branch_to_remote",
+        lambda name: reset_called.append(name),
     )
-    # Ensure the old verb is NOT called.
     monkeypatch.setattr(
-        vm,
-        "checkout_remote_branch",
-        lambda name: captured.append(("OLD", name)) or True,
+        vm, "fetch_and_checkout_remote_branch",
+        lambda name: fetch_called.append(name),
     )
 
+    # Accept the confirmation dialog — expect the destructive
+    # reset verb, not the non-destructive fetch+checkout.
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        classmethod(lambda cls, *a, **kw: QMessageBox.StandardButton.Yes),
+    )
     panel.itemDoubleClicked.emit(origin_main, 0)
-    assert captured == [("origin/main",)]
+    assert reset_called == ["origin/main"]
+    assert fetch_called == []
+
+    # Cancel the confirmation dialog — nothing should happen.
+    reset_called.clear()
+    fetch_called.clear()
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        classmethod(lambda cls, *a, **kw: QMessageBox.StandardButton.No),
+    )
+    panel.itemDoubleClicked.emit(origin_main, 0)
+    assert reset_called == []
+    assert fetch_called == []
 
 
 def test_double_click_on_tag_creates_branch_from_it(
@@ -795,15 +875,20 @@ def test_context_menu_merge_into_current_invokes_vm(
     local = _find_child(branches, "Local")
     feature = _find_child(local, "feature")
 
-    captured: list[tuple[str, str | None]] = []
+    captured: list[tuple[str, str | None, bool]] = []
     monkeypatch.setattr(
         vm, "merge_branch",
-        lambda source, target=None: captured.append((source, target)),
+        lambda source, target=None, *, no_ff=False: captured.append(
+            (source, target, no_ff),
+        ),
     )
     actions = panel._context_menu_actions(feature)  # noqa: SLF001
     merge = next(a for a in actions if a.text() == "Merge feature into current…")
     merge.trigger()
-    assert captured == [("feature", "main")]
+    # The context-menu merge always requests a merge commit
+    # (``no_ff=True``) so the user sees the merge in the graph even
+    # on a fast-forward.
+    assert captured == [("feature", "main", True)]
 
 
 # ----- drag-and-drop --------------------------------------------------
@@ -908,15 +993,19 @@ def test_drop_actions_trigger_correct_vm_methods(
     local = _child(branches, "Local")
     main = _child(local, "main  (HEAD)")
 
-    captured: list[tuple[str, str | None]] = []
+    captured: list[tuple[str, str | None, bool]] = []
     monkeypatch.setattr(
         vm, "merge_branch",
-        lambda source, target=None: captured.append((source, target)),
+        lambda source, target=None, *, no_ff=False: captured.append(
+            (source, target, no_ff),
+        ),
     )
     actions = panel._on_drop("feature", main)  # noqa: SLF001
     merge_action = next(a for a in actions if a.text() == "Merge feature into main")
     merge_action.trigger()
-    assert captured == [("feature", "main")]
+    # Drag-and-drop merge also forces a merge commit
+    # (``no_ff=True``) so the user sees the merge in the graph.
+    assert captured == [("feature", "main", True)]
 
 
 def test_drop_rebase_action_triggers_checkout_then_rebase(
