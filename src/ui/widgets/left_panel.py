@@ -90,6 +90,12 @@ _KIND_REMOTE_BRANCH = "remote_branch"
 _KIND_TAG = "tag"
 _KIND_STASH = "stash"
 
+# Custom MIME type carrying the discriminator of a drag source.
+# ``application/x-git-py-branch-kind`` holds the bare ``_KIND_*`` value
+# so the drop handler knows whether the drag came from a local or
+# remote branch row (the two paths produce different menus).
+_BRANCH_KIND_MIME = "application/x-git-py-branch-kind"
+
 # Group header labels.
 _GROUP_BRANCHES = "Branches"
 _GROUP_LOCAL = "Local"
@@ -224,15 +230,27 @@ class LeftPanel(QTreeWidget):
         self._update_drag_state()
 
     def _update_drag_state(self) -> None:
-        """Enable drag on local-branch leaves; the drop handler is a Stage 5 stub."""
+        """Enable drag on local and remote-branch leaves; the drop handler is the Stage 5 stub.
+
+        Both groups get :attr:`Qt.ItemFlag.ItemIsDragEnabled` because
+        the user may want to drag a remote-tracking branch onto a
+        local branch just like they would in the graph chip column.
+        The drop handler is the gate that decides whether the source
+        + target combination is meaningful (e.g. ``feature`` →
+        ``main`` produces a merge/rebase menu; ``origin/main`` →
+        ``main`` produces a fetch+checkout dialog).
+        """
         # QTreeWidget is drag-enabled wholesale when any item has
         # ItemIsDragEnabled. We toggle that flag on individual items in
-        # the local-branch group.
-        if self._group_local is None:
-            return
-        for i in range(self._group_local.childCount()):
-            leaf = self._group_local.child(i)
-            leaf.setFlags(leaf.flags() | Qt.ItemFlag.ItemIsDragEnabled)
+        # the local- and remote-branch groups.
+        groups = [
+            g for g in (self._group_local, self._group_remote)
+            if g is not None
+        ]
+        for group in groups:
+            for i in range(group.childCount()):
+                leaf = group.child(i)
+                leaf.setFlags(leaf.flags() | Qt.ItemFlag.ItemIsDragEnabled)
 
     def _set_expand_icon(self, item: QTreeWidgetItem) -> None:
         """Set the chevron icon on a group item from its expansion state.
@@ -546,6 +564,18 @@ class LeftPanel(QTreeWidget):
 
         actions.extend(self._merge_rebase_against_current(name))
 
+        # ``Merge into…`` / ``Rebase onto…`` submenus mirroring the
+        # graph drag-and-drop UX: a one-shot target picker so the user
+        # does not have to first ``checkout`` the target branch.
+        merge_into = self._merge_into_submenu(name, _KIND_LOCAL_BRANCH)
+        if merge_into is not None:
+            actions.append(merge_into)
+        rebase_onto = self._merge_into_submenu(
+            name, _KIND_LOCAL_BRANCH, rebase=True,
+        )
+        if rebase_onto is not None:
+            actions.append(rebase_onto)
+
         actions.append(QAction(self))
         actions[-1].setSeparator(True)
 
@@ -639,6 +669,20 @@ class LeftPanel(QTreeWidget):
         )
         actions.append(checkout)
 
+        # ``Merge into…`` / ``Rebase onto…`` submenus so the user can
+        # merge a remote-tracking tip straight into any local branch
+        # without first checking it out. :meth:`_merge_drop` /
+        # :meth:`_rebase_drop` transparently run fetch+checkout for
+        # the remote source before the actual merge/rebase.
+        merge_into = self._merge_into_submenu(name, _KIND_REMOTE_BRANCH)
+        if merge_into is not None:
+            actions.append(merge_into)
+        rebase_onto = self._merge_into_submenu(
+            name, _KIND_REMOTE_BRANCH, rebase=True,
+        )
+        if rebase_onto is not None:
+            actions.append(rebase_onto)
+
         actions.append(QAction(self))
         actions[-1].setSeparator(True)
 
@@ -727,6 +771,72 @@ class LeftPanel(QTreeWidget):
         actions.append(cherry)
         return actions
 
+    def _merge_into_submenu(
+        self,
+        source_name: str,
+        source_kind: str = _KIND_LOCAL_BRANCH,
+        rebase: bool = False,
+    ) -> QAction | None:
+        """Build a ``QAction`` whose submenu merges ``source_name`` into each local branch.
+
+        Returns ``None`` if there is no other local branch to merge
+        *into* (the one branch repo never gets a submenu — there's
+        nothing to choose from). The returned action carries a
+        :class:`QMenu` set via :meth:`QAction.setMenu` so the parent
+        context menu (built in :meth:`_on_context_menu`) shows a
+        proper submenu arrow.
+
+        ``source_kind`` matches the drag-MIME payload and supports
+        both local and remote sources. The actual normalisation
+        (fetch + checkout tracking branch for remote sources) is
+        deferred to the click handler so the menu still builds even
+        when the network is offline.
+        """
+        mgr = self._main_vm.repository_manager()
+        if mgr is None:
+            return None
+        local_names = sorted(
+            b.name for b in mgr.branches if not b.is_remote
+        )
+        candidates = [n for n in local_names if n != source_name]
+        if not candidates:
+            return None
+        label = (
+            f"Rebase {source_name} onto..." if rebase
+            else f"Merge {source_name} into..."
+        )
+        parent_action = QAction(label, self)
+        submenu = QMenu(self)
+        verb = "rebase_drop" if rebase else "merge_drop"
+        for target in candidates:
+            action = QAction(target, submenu)
+            action.triggered.connect(
+                lambda checked=False, t=target, v=verb, s=source_name, k=source_kind: (
+                    self._invoke_drop_action(v, s, t, k)
+                ),
+            )
+            submenu.addAction(action)
+        parent_action.setMenu(submenu)
+        return parent_action
+
+    def _invoke_drop_action(
+        self,
+        verb: str,
+        source: str,
+        target: str,
+        source_kind: str,
+    ) -> None:
+        """Dispatch a submenu selection to the matching drop helper.
+
+        ``verb`` is one of ``"merge_drop"`` / ``"rebase_drop"`` — the
+        routing is just two calls but keeping the verb string around
+        makes the menu builder above easier to read.
+        """
+        if verb == "merge_drop":
+            self._merge_drop(source, target, source_kind)
+        elif verb == "rebase_drop":
+            self._rebase_drop(source, target, source_kind)
+
     def _current_branch_name(self) -> str:
         mgr = self._main_vm.repository_manager()
         if mgr is None or mgr.repo.head_is_unborn:
@@ -758,37 +868,53 @@ class LeftPanel(QTreeWidget):
         item's display text — which for the current branch is
         ``"name  (HEAD)"``. Overriding here gives the drop handler
         a clean identifier to work with.
+
+        Both local and remote branches are eligible as drag sources;
+        the source kind discriminator is carried in a custom MIME
+        (``_BRANCH_KIND_MIME``) so :meth:`_on_drop` can tell whether
+        the source is a local branch (drag → merge/rebase menu) or a
+        remote-tracking ref (drag → fetch+merge dialog).
+
+        The plain-text field still receives the bare branch name so
+        downstream consumers that only know how to read text (e.g.
+        another ``QTreeWidget`` accepting the same drag) keep working.
         """
         data = super().mimeData(items)
-        if not items or self._group_local is None:
+        if not items:
             return data
         item = items[0]
-        if item.parent() is not self._group_local:
+        kind = item.data(0, _ROLE_KIND)
+        if kind not in (_KIND_LOCAL_BRANCH, _KIND_REMOTE_BRANCH):
             return data
         name = item.data(0, _ROLE_NAME)
         if isinstance(data, QMimeData) and name:
             data.setText(str(name))
+            data.setData(_BRANCH_KIND_MIME, str(kind).encode("utf-8"))
         return data
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
-        if event.mimeData().hasText():
+        mime = event.mimeData()
+        if mime.hasText() and mime.hasFormat(_BRANCH_KIND_MIME):
             event.acceptProposedAction()
         else:
             super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # noqa: N802
-        if event.mimeData().hasText():
+        mime = event.mimeData()
+        if mime.hasText() and mime.hasFormat(_BRANCH_KIND_MIME):
             event.acceptProposedAction()
         else:
             super().dragMoveEvent(event)
 
     def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802 - Qt override
-        if not event.mimeData().hasText():
+        mime = event.mimeData()
+        if not mime.hasText() or not mime.hasFormat(_BRANCH_KIND_MIME):
             super().dropEvent(event)
             return
-        source_name = event.mimeData().text()
+        source_name = mime.text()
+        source_kind = bytes(mime.data(_BRANCH_KIND_MIME)).decode("utf-8")
         target_item = self.itemAt(event.position().toPoint())
-        actions = self._on_drop(source_name, target_item)
+        actions = self._on_drop(source_name, source_kind, target_item)
         if not actions:
             event.ignore()
             return
@@ -801,6 +927,7 @@ class LeftPanel(QTreeWidget):
     def _on_drop(
         self,
         source_name: str,
+        source_kind: str,
         target_item: QTreeWidgetItem | None,
     ) -> list[QAction]:
         """Return the menu actions a drop would show, or ``[]`` to ignore.
@@ -812,7 +939,14 @@ class LeftPanel(QTreeWidget):
         * No target or invalid target → ``[]`` (ignore).
         * ``source == target`` → ``[]`` (merging a branch into itself).
         * Target is not a local branch → ``[]`` (we only allow
-          dropping on local branches for now).
+          dropping on local branches — merge/rebase rebases history
+          onto a working-tree branch).
+
+        ``source_kind`` (``"local_branch"`` or ``"remote_branch"``)
+        is read from the :data:`_BRANCH_KIND_MIME` payload that
+        :meth:`mimeData` attaches; the resulting menu is the same in
+        both cases — a fetch helper transparently takes care of
+        upgrading a remote source to its local tracking branch.
         """
         if not source_name or target_item is None:
             return []
@@ -820,32 +954,88 @@ class LeftPanel(QTreeWidget):
         target_name = target_item.data(0, _ROLE_NAME)
         if not target_kind or not target_name:
             return []
+        if source_kind not in (_KIND_LOCAL_BRANCH, _KIND_REMOTE_BRANCH):
+            return []
         if source_name == target_name:
             return []
         if target_kind != _KIND_LOCAL_BRANCH:
             return []
-        return self._drop_actions(source_name, target_name)
+        return self._drop_actions(source_name, target_name, source_kind)
 
-    def _drop_actions(self, source: str, target: str) -> list[QAction]:
+    def _drop_actions(
+        self,
+        source: str,
+        target: str,
+        source_kind: str = _KIND_LOCAL_BRANCH,
+    ) -> list[QAction]:
         """Build the list of actions for a drop on ``target`` of ``source``.
 
         The merge action passes ``no_ff=True`` so the merge commit
         is always visible in the graph, even on a fast-forward.
         The user asked for a merge by dragging one branch onto
         another; the history should reflect that explicitly.
+
+        ``source_kind`` carries the discriminator (``local_branch`` /
+        ``remote_branch``) from the drag source item — needed so a
+        remote source is first fetched into a local tracking branch
+        before any merge or rebase is attempted. The merge/rebase
+        actions themselves only ever speak local branch names.
         """
         actions: list[QAction] = []
         merge = QAction(f"Merge {source} into {target}", self)
+        # ``QAction.triggered`` emits a single ``bool`` argument (the
+        # ``checked`` flag); accepting it positionally with a default
+        # of ``False`` lets the closure stay pure (no ``checked``
+        # leak into our source/target args).
         merge.triggered.connect(
-            lambda: self._main_vm.merge_branch(source, target=target, no_ff=True),
+            lambda checked=False, s=source, t=target, k=source_kind: (
+                self._merge_drop(s, t, k)
+            ),
         )
         actions.append(merge)
         rebase = QAction(f"Rebase {source} onto {target}", self)
         rebase.triggered.connect(
-            lambda: self._rebase_source_onto_target(source, target),
+            lambda checked=False, s=source, t=target, k=source_kind: (
+                self._rebase_drop(s, t, k)
+            ),
         )
         actions.append(rebase)
         return actions
+
+    def _merge_drop(self, source: str, target: str, source_kind: str) -> None:
+        """Run a drop-initiated merge, normalising a remote source first.
+
+        The actual ``merge_branch(source, target)`` call needs a local
+        branch — merging ``origin/main`` directly into ``main`` is not
+        a meaningful ref in pygit2's terms (remote-tracking refs are
+        read-only mirrors). For a remote source we first fetch+create
+        a local tracking branch via
+        :meth:`MainViewModel.fetch_and_checkout_remote_branch` and
+        only then merge with ``no_ff=True``. Failures bubble up
+        through ``error_occurred`` as usual; we don't gate this on a
+        dialog because dropping a remote branch is an explicit
+        ``"merge this remote tip into my local branch"`` action.
+        """
+        local_source = source
+        if source_kind == _KIND_REMOTE_BRANCH:
+            self._main_vm.fetch_and_checkout_remote_branch(source)
+            local_source = source.split("/", 1)[1]
+        self._main_vm.merge_branch(local_source, target=target, no_ff=True)
+
+    def _rebase_drop(self, source: str, target: str, source_kind: str) -> None:
+        """Run a drop-initiated rebase, normalising a remote source first.
+
+        Same normalisation logic as :meth:`_merge_drop` — for a
+        remote source we fetch and create the local tracking branch
+        first. After that the existing
+        :meth:`_rebase_source_onto_target` helper does the
+        checkout + rebase sequence as a two-step undo stack.
+        """
+        local_source = source
+        if source_kind == _KIND_REMOTE_BRANCH:
+            self._main_vm.fetch_and_checkout_remote_branch(source)
+            local_source = source.split("/", 1)[1]
+        self._rebase_source_onto_target(local_source, target)
 
     def _rebase_source_onto_target(self, source: str, target: str) -> None:
         """Issue the two-command sequence: checkout ``source`` then rebase onto ``target``.

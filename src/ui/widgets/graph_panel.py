@@ -232,6 +232,16 @@ class GraphTableWidget(QWidget):
     checkout_branch_requested = Signal(str)
     merge_branch_requested = Signal(str, str)  # source, target
     rebase_branch_requested = Signal(str, str)  # source, target
+    # "Copy branch name" / "Copy commit sha" — emitted from the
+    # branch-chip context menu. ``name`` is the chip's *full* ref
+    # name (``"main"`` for a local chip, ``"origin/main"`` for a
+    # remote chip) so the receiving slot can route the value to
+    # ``MainViewModel.copy_to_clipboard`` without having to re-derive
+    # the prefix. ``sha`` is the commit the chip points at (the
+    # row's SHA); the slot forwards it through the same clipboard
+    # helper. Mirrors the equivalent actions on the left panel.
+    copy_branch_name_requested = Signal(str)
+    copy_commit_sha_requested = Signal(str)
     # Drop signal — fires when the user drops one branch chip on
     # another.  Both ``source`` and ``target`` carry the chip's
     # *display* name (the user-visible label) so the ``MainWindow``
@@ -828,6 +838,27 @@ class GraphTableWidget(QWidget):
             )
             actions.append(create_action)
 
+        # ----- copy (matches the left panel's section) -------------------
+
+        actions.append(self._make_separator())
+        copy_name = QAction("Copy branch name", self)
+        copy_name.triggered.connect(
+            lambda checked=False, n=full_name: (
+                self.copy_branch_name_requested.emit(n)
+            ),
+        )
+        actions.append(copy_name)
+
+        row_sha = chip.get("row_sha") or ""
+        if row_sha:
+            copy_sha = QAction("Copy commit sha", self)
+            copy_sha.triggered.connect(
+                lambda checked=False, s=row_sha: (
+                    self.copy_commit_sha_requested.emit(s)
+                ),
+            )
+            actions.append(copy_sha)
+
         return actions
 
     def _make_separator(self) -> QAction:
@@ -1099,6 +1130,13 @@ class GraphTableWidget(QWidget):
         branches = self._branches_at_row_visible(row_sha)
         if not branches:
             return
+        # A popup with a single entry is redundant — the chip
+        # itself already shows that one branch. Skipping the
+        # popup here also avoids a flash of an empty-feeling
+        # dropdown when the filter collapses
+        # ``[main, origin/main]`` down to ``[main]``.
+        if len(branches) < 2:
+            return
         popup = BranchStackPopup(
             parent=self,
             branches=branches,
@@ -1158,6 +1196,13 @@ class GraphTableWidget(QWidget):
         # The chip's row might have been replaced by a new graph
         # update — confirm the row still exists before opening.
         if self._branch_group_size(row_sha) < 2:
+            return
+        # No hidden siblings *after* the same-name / ``*/HEAD``
+        # filter — the popup would just list the single visible
+        # branch the chip already shows. ``hidden_count`` is
+        # written by :meth:`_draw_branch_chips` against the
+        # filtered list, so it is the right value to consult.
+        if chip.get("hidden_count", 0) <= 0:
             return
         # Already showing a popup for the same row — nothing to do.
         if self._branch_popup_row_sha == row_sha:

@@ -11,6 +11,8 @@
 - Объект команды получает всё необходимое для выполнения и отката.
 - Все команды проходят через `CommandProcessor`, который хранит стек выполненных команд и вызывает `execute()` / `undo()`.
 - Тулбар Undo/Redo связан именно с `CommandProcessor`, а не напрямую с операциями.
+- **Destructive операции, которые нельзя откатить через undo** (например, `reset_local_branch_to_remote` — `git reset --hard` обрезает reflog path так, что CommProcessor уже не восстановит утраченные коммиты) **обязаны** идти в обход `CommandProcessor`. Вместо undo через стек они gated'ятся на confirmation dialog (`QMessageBox.question` с дефолтной кнопкой `No` для защиты от случайного Enter). UI вызывает `QMessageBox.question` перед destructive VM-методом; VM-метод сам по себе не показывает диалогов.
+- **UI merge-пути передают `no_ff=True`.** Программные вызовы `merge_branch()` сохраняют git-совместимое поведение (fast-forward когда возможен). Drag-and-drop и контекстное меню на графе и в `LeftPanel` форсируют merge-коммит через `no_ff=True` — иначе FF молча перемещает ref и в графе ничего не появляется.
 
 ## 3. Асинхронность
 - Любая операция, работающая с сетью (push/pull/fetch/clone) или потенциально долгая (rebase, большой merge), выполняется в фоновом потоке (`QThread` или `QRunnable`).

@@ -251,3 +251,66 @@ def test_main_window_routes_create_branch_here_to_viewmodel(
     assert captured == [("hotfix", head_sha)]
 
     window.close()
+
+
+# ----- Branch-chip copy wiring -----------------------------------------
+
+
+def test_graph_copy_branch_name_routes_to_clipboard(
+    qtbot, committed_repo, monkeypatch,
+) -> None:
+    """`copy_branch_name_requested` from the graph routes to ``MainViewModel.copy_to_clipboard``.
+
+    Right-clicking a branch chip surfaces a 'Copy branch name' item;
+    the :class:`MainWindow` handler must forward the chip's full
+    ref name to :meth:`MainViewModel.copy_to_clipboard` (which in
+    turn writes to ``QApplication.clipboard()``). Empty payloads
+    are silently ignored so a stale graph rebuild cannot clear the
+    clipboard.
+    """
+    from src.ui.main_window import MainWindow
+
+    window = MainWindow(config_path=None)
+    qtbot.addWidget(window)
+    window.set_repository(committed_repo)
+
+    captured: list[str] = []
+    monkeypatch.setattr(
+        window._main_vm, "copy_to_clipboard",
+        lambda text: captured.append(text),
+    )
+
+    window._on_copy_branch_name("main")  # noqa: SLF001
+    window._on_copy_branch_name("")  # noqa: SLF001 — empty is a no-op
+    assert captured == ["main"]
+
+    window.close()
+
+
+def test_graph_copy_commit_sha_routes_to_clipboard(
+    qtbot, committed_repo, monkeypatch,
+) -> None:
+    """`copy_commit_sha_requested` from the graph routes to the clipboard helper.
+
+    Same contract as the branch-name variant: the handler forwards
+    the chip's row SHA to :meth:`MainViewModel.copy_to_clipboard`,
+    skipping empty payloads.
+    """
+    from src.ui.main_window import MainWindow
+
+    window = MainWindow(config_path=None)
+    qtbot.addWidget(window)
+    window.set_repository(committed_repo)
+
+    captured: list[str] = []
+    monkeypatch.setattr(
+        window._main_vm, "copy_to_clipboard",
+        lambda text: captured.append(text),
+    )
+
+    sha = committed_repo.head_commit.sha
+    window._on_copy_commit_sha(sha)  # noqa: SLF001
+    window._on_copy_commit_sha("")  # noqa: SLF001 — empty is a no-op
+    assert captured == [sha]
+
+    window.close()

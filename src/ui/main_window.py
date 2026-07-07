@@ -530,6 +530,18 @@ class MainWindow(QMainWindow):
         self._graph_table.branch_dropped_on_branch.connect(
             self._on_graph_branch_dropped,
         )
+        # "Copy branch name" / "Copy commit sha" — emitted from the
+        # branch-chip context menu (right-click on a chip in the
+        # leftmost column). Mirrors the equivalent wiring on the
+        # left panel, which calls ``MainViewModel.copy_to_clipboard``
+        # directly; here the widget stays passive and the slot
+        # below forwards the value.
+        self._graph_table.copy_branch_name_requested.connect(
+            self._on_copy_branch_name,
+        )
+        self._graph_table.copy_commit_sha_requested.connect(
+            self._on_copy_commit_sha,
+        )
 
         # When the VM clears the selection (toggle-off) the graph
         # widget must also remove its highlight ring.  The reverse
@@ -722,6 +734,29 @@ class MainWindow(QMainWindow):
             return
         QApplication.clipboard().setText(text)
         self._status.showMessage(f"Diff of {label} copied to clipboard", 3000)
+
+    def _on_copy_branch_name(self, name: str) -> None:
+        """Copy a branch ref name from the graph chip context menu.
+
+        ``name`` arrives as the chip's *full* ref (``"main"`` for a
+        local chip, ``"origin/main"`` for a remote-tracking one) so
+        the clipboard receives a value the user can paste straight
+        into a ``git checkout <name>`` command. The empty-string
+        guard mirrors the defensive copy in the left panel — a stale
+        graph rebuild can in principle deliver an empty chip, and
+        silently clearing the clipboard would be surprising.
+        """
+        if not name:
+            return
+        self._main_vm.copy_to_clipboard(name)
+        self._status.showMessage(f"Copied branch name '{name}'", 3000)
+
+    def _on_copy_commit_sha(self, sha: str) -> None:
+        """Copy a commit SHA from the graph chip context menu."""
+        if not sha:
+            return
+        self._main_vm.copy_to_clipboard(sha)
+        self._status.showMessage(f"Copied commit {sha[:7]}", 3000)
 
     def _on_discard_changes(self, sha: str) -> None:
         """Discard all uncommitted changes (from graph WIP context menu)."""

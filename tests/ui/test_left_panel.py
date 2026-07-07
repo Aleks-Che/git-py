@@ -899,7 +899,7 @@ def test_drop_event_filters_same_source_and_target(
     feature = _child(local, "feature")
     assert feature is not None
 
-    actions = panel._on_drop("feature", feature)  # noqa: SLF001
+    actions = panel._on_drop("feature", "local_branch", feature)  # noqa: SLF001
     assert actions == []  # source == target → no actions
 
 
@@ -919,7 +919,7 @@ def test_drop_event_filters_non_branch_target(
     tags = _top_level(panel, "Tags")
     assert tags is not None
     # Even on an empty tags group, the drop should be ignored (kind is None).
-    actions = panel._on_drop("feature", tags)  # noqa: SLF001
+    actions = panel._on_drop("feature", "local_branch", tags)  # noqa: SLF001
     assert actions == []
 
 
@@ -941,7 +941,7 @@ def test_drop_actions_have_merge_and_rebase(
     feature = _child(local, "feature")
     assert main is not None and feature is not None
 
-    actions = panel._on_drop("feature", main)  # noqa: SLF001
+    actions = panel._on_drop("feature", "local_branch", main)  # noqa: SLF001
     labels = [a.text() for a in actions]
     assert "Merge feature into main" in labels
     assert "Rebase feature onto main" in labels
@@ -971,7 +971,7 @@ def test_drop_actions_trigger_correct_vm_methods(
             (source, target, no_ff),
         ),
     )
-    actions = panel._on_drop("feature", main)  # noqa: SLF001
+    actions = panel._on_drop("feature", "local_branch", main)  # noqa: SLF001
     merge_action = next(a for a in actions if a.text() == "Merge feature into main")
     merge_action.trigger()
     # Drag-and-drop merge also forces a merge commit
@@ -1002,7 +1002,7 @@ def test_drop_rebase_action_triggers_checkout_then_rebase(
     )
     monkeypatch.setattr(vm, "rebase_branch", lambda upstream: calls.append(("rebase", (upstream,))))
 
-    actions = panel._on_drop("feature", main)  # noqa: SLF001
+    actions = panel._on_drop("feature", "local_branch", main)  # noqa: SLF001
     rebase_action = next(a for a in actions if a.text() == "Rebase feature onto main")
     rebase_action.trigger()
     # We're currently on main, so the panel checks out feature first,
@@ -1035,7 +1035,7 @@ def test_drop_rebase_skips_checkout_when_already_on_source(
     monkeypatch.setattr(vm, "checkout_branch", lambda name: calls.append(("checkout", (name,))))
     monkeypatch.setattr(vm, "rebase_branch", lambda upstream: calls.append(("rebase", (upstream,))))
 
-    actions = panel._on_drop("feature", main)  # noqa: SLF001
+    actions = panel._on_drop("feature", "local_branch", main)  # noqa: SLF001
     rebase_action = next(a for a in actions if a.text() == "Rebase feature onto main")
     rebase_action.trigger()
     # No checkout — already on feature.
@@ -1063,6 +1063,265 @@ def test_mime_data_uses_bare_branch_name(
     assert data is not None
     assert data.hasText()
     assert data.text() == "feature"
+
+
+def test_mime_data_carries_branch_kind_for_remote(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """MIME for a remote-branch row carries the ``remote_branch`` discriminator."""
+    _set_up_repo_with_remotes(committed_repo)
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+    vm.branch_panel_view_model().refresh()
+
+    branches = _top_level(panel, "Branches")
+    remote = _child(branches, "Remote")
+    assert remote is not None
+    # ``_set_up_repo_with_remotes`` returns ``"from-upstream"`` (the
+    # ref pushed from local HEAD); it does *not* collide with any
+    # local branch so the same-name suppression keeps it visible.
+    remote_item = _child(remote, "origin/from-upstream")
+    assert remote_item is not None
+
+    data = panel.mimeData([remote_item])
+    assert data is not None
+    # Custom MIME format used by the drop handler to discriminate
+    # the drag source kind — see ``LeftPanel._BRANCH_KIND_MIME``.
+    formats = data.formats()
+    assert any("branch-kind" in f for f in formats)
+    assert data.hasText()
+    assert data.text() == "origin/from-upstream"
+
+
+def test_drop_from_remote_branch_fetches_then_merges(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    """Dropping ``origin/feature`` onto local ``topic`` first fetches+checkouts
+    the tracking branch, then merges with ``no_ff=True``.
+    """
+    from src.core.operations import (
+        checkout_branch,
+        create_branch,
+        delete_branch,
+    )
+    from src.core.operations import (
+        push as core_push,
+    )
+
+    _set_up_repo_with_remotes(committed_repo)
+    # Push ``feature`` to origin as a remote-only ref so the
+    # same-name suppression filter keeps ``origin/feature`` visible
+    # in the left panel (it would otherwise hide behind the local
+    # ``feature`` branch — see ``BranchPanelViewModel._suppress_
+    # same_name_remotes``).
+    create_branch(
+        committed_repo, "feature",
+        target_sha=committed_repo.head_commit.sha,
+    )
+    checkout_branch(committed_repo, "feature")
+    core_push(committed_repo, "origin", "refs/heads/feature:refs/heads/feature")
+    checkout_branch(committed_repo, "main")
+    delete_branch(committed_repo, "feature", force=True)
+    create_branch(
+        committed_repo, "topic",
+        target_sha=committed_repo.head_commit.sha,
+    )
+
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+    vm.branch_panel_view_model().refresh()
+
+    captured: list[tuple[str, str | None, bool]] = []
+    monkeypatch.setattr(
+        vm, "merge_branch",
+        lambda source, target=None, *, no_ff=False: captured.append(
+            (source, target, no_ff),
+        ),
+    )
+    monkeypatch.setattr(
+        vm, "fetch_and_checkout_remote_branch",
+        lambda remote_branch: captured.append(("fetch_checkout", remote_branch, None)),
+    )
+
+    branches = _top_level(panel, "Branches")
+    remote = _child(branches, "Remote")
+    origin_feature = _child(remote, "origin/feature")
+    local = _child(branches, "Local")
+    topic = _child(local, "topic")
+    assert origin_feature is not None and topic is not None
+
+    actions = panel._on_drop(  # noqa: SLF001
+        "origin/feature", "remote_branch", topic,
+    )
+    merge_action = next(
+        a for a in actions
+        if a.text() == "Merge origin/feature into topic"
+    )
+    merge_action.trigger()
+
+    # First the fetch+checkout of the tracking branch, then the merge.
+    assert len(captured) >= 2
+    fetch_call = next(c for c in captured if c[0] == "fetch_checkout")
+    assert fetch_call[1] == "origin/feature"
+    merge_call = next(c for c in captured if c[0] != "fetch_checkout")
+    # After normalisation, source is the bare local branch.
+    assert merge_call == ("feature", "topic", True)
+
+
+def test_merge_into_submenu_lists_other_local_branches(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """The ``Merge <name> into...`` submenu lists every local branch except ``self``."""
+    from src.core.operations import create_branch
+
+    create_branch(
+        committed_repo, "feature",
+        target_sha=committed_repo.head_commit.sha,
+    )
+    create_branch(
+        committed_repo, "topic",
+        target_sha=committed_repo.head_commit.sha,
+    )
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    actions = panel._local_branch_actions("feature")  # noqa: SLF001
+    merge_into = next(
+        a for a in actions if a.menu() is not None and a.text() == "Merge feature into..."
+    )
+    candidates = [a.text() for a in merge_into.menu().actions()]
+    # ``feature`` itself is excluded, current branch + the other one
+    # are listed — the submenu is the same regardless of cursor
+    # position over the row.
+    assert "feature" not in candidates
+    assert set(candidates) == {"main", "topic"}
+
+
+def test_rebase_onto_submenu_in_local_context_menu(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """Mirror of :func:`test_merge_into_submenu_lists_other_local_branches` for rebase."""
+    from src.core.operations import create_branch
+
+    create_branch(
+        committed_repo, "feature",
+        target_sha=committed_repo.head_commit.sha,
+    )
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    actions = panel._local_branch_actions("feature")  # noqa: SLF001
+    rebase_onto = next(
+        a for a in actions if a.menu() is not None and a.text() == "Rebase feature onto..."
+    )
+    candidates = [a.text() for a in rebase_onto.menu().actions()]
+    assert "feature" not in candidates
+    assert "main" in candidates
+
+
+def test_submenu_pick_triggers_drop_merge(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    """Selecting a target in the ``Merge into…`` submenu fires the merge helper."""
+    from src.core.operations import create_branch
+
+    create_branch(
+        committed_repo, "feature",
+        target_sha=committed_repo.head_commit.sha,
+    )
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+
+    captured: list[tuple[str, str, bool]] = []
+    monkeypatch.setattr(
+        vm, "merge_branch",
+        lambda source, target=None, *, no_ff=False: captured.append(
+            (source, target or "", no_ff),
+        ),
+    )
+
+    actions = panel._local_branch_actions("feature")  # noqa: SLF001
+    merge_into = next(a for a in actions if a.text() == "Merge feature into...")
+    main_pick = next(a for a in merge_into.menu().actions() if a.text() == "main")
+    main_pick.trigger()
+    assert captured == [("feature", "main", True)]
+
+
+def test_submenu_pick_for_remote_source_fetches_first(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    """Selecting a target in the remote branch ``Merge into...`` submenu
+    fetches+checkouts the local tracking branch, then merges.
+    """
+    _set_up_repo_with_remotes(committed_repo)
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+    vm.branch_panel_view_model().refresh()
+
+    captured: list[tuple] = []
+    monkeypatch.setattr(
+        vm, "merge_branch",
+        lambda source, target=None, *, no_ff=False: captured.append(
+            ("merge", source, target or "", no_ff),
+        ),
+    )
+    monkeypatch.setattr(
+        vm, "fetch_and_checkout_remote_branch",
+        lambda name: captured.append(("fetch", name)),
+    )
+
+    actions = panel._remote_branch_actions("origin/from-upstream")  # noqa: SLF001
+    merge_into = next(a for a in actions if a.text() == "Merge origin/from-upstream into...")
+    main_pick = next(a for a in merge_into.menu().actions() if a.text() == "main")
+    main_pick.trigger()
+    fetch_calls = [c for c in captured if c[0] == "fetch"]
+    merge_calls = [c for c in captured if c[0] == "merge"]
+    assert len(fetch_calls) == 1
+    assert fetch_calls[0] == ("fetch", "origin/from-upstream")
+    assert merge_calls == [("merge", "from-upstream", "main", True)]
+
+
+def test_local_branch_drag_flag_enabled_for_remote_rows_too(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """``ItemIsDragEnabled`` is set on remote branch rows so they
+    can be picked up by the user like a local branch.
+    """
+    from PySide6.QtCore import Qt
+
+    _set_up_repo_with_remotes(committed_repo)
+    vm = MainViewModel()
+    panel = LeftPanel(vm.branch_panel_view_model(), vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.set_repository(committed_repo)
+    vm.branch_panel_view_model().refresh()
+
+    branches = _top_level(panel, "Branches")
+    remote = _child(branches, "Remote")
+    assert remote is not None
+    remote_item = _child(remote, "origin/from-upstream")
+    assert remote_item is not None
+    flags = remote_item.flags()
+    assert flags & Qt.ItemFlag.ItemIsDragEnabled
 
 
 # ----- fetch context menu on remote branches ------------------------------

@@ -2135,6 +2135,171 @@ def test_branch_menu_omits_create_branch_here_for_remote(
     assert chip["is_remote"] is True
 
 
+# ----- Copy branch name / Copy commit sha --------------------------------
+
+
+def test_branch_menu_has_copy_branch_name_for_local(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Right-clicking a local branch chip exposes 'Copy branch name'.
+
+    Mirrors the left-panel behaviour: every branch chip (local or
+    remote) must offer a copy action so the user can paste the
+    name straight into a ``git checkout`` command. The local chip
+    has ``full_name == display == "feature"`` here.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "feature")]
+    actions = widget._build_branch_menu_actions(chip)
+    labels = [a.text() for a in actions if not a.isSeparator()]
+    assert "Copy branch name" in labels
+    assert "Copy commit sha" in labels
+
+
+def test_branch_menu_copy_branch_name_emits_full_ref(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Triggering 'Copy branch name' emits the chip's full ref name.
+
+    Local chip: ``full_name == display == "feature"`` so the
+    payload is just the bare branch name.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "feature")]
+    actions = widget._build_branch_menu_actions(chip)
+    copy_name = next(a for a in actions if a.text() == "Copy branch name")
+
+    with qtbot.waitSignal(
+        widget.copy_branch_name_requested, timeout=1000,
+    ) as blocker:
+        copy_name.trigger()
+    assert blocker.args == ["feature"]
+
+
+def test_branch_menu_copy_commit_sha_emits_row_sha(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Triggering 'Copy commit sha' emits the row's commit SHA.
+
+    The chip cache carries ``row_sha`` (the commit the chip
+    points at), so the slot receives the same SHA the row
+    already exposes on click.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "feature")]
+    actions = widget._build_branch_menu_actions(chip)
+    copy_sha = next(a for a in actions if a.text() == "Copy commit sha")
+
+    with qtbot.waitSignal(
+        widget.copy_commit_sha_requested, timeout=1000,
+    ) as blocker:
+        copy_sha.trigger()
+    assert blocker.args == [mgr.head_commit.sha]
+
+
+def test_branch_menu_has_copy_branch_name_for_remote(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Remote-tracking chips also expose 'Copy branch name'.
+
+    The chip renders ``base_features`` (the ``origin/`` prefix is
+    stripped for display) but the action must hand the user the
+    full ref name so they can paste ``origin/base_features``
+    straight into a checkout command.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    mgr.repo.references.create(
+        "refs/remotes/origin/base_features", mgr.repo.head.target, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "base_features")]
+    assert chip["is_remote"] is True
+    actions = widget._build_branch_menu_actions(chip)
+    labels = [a.text() for a in actions if not a.isSeparator()]
+    assert "Copy branch name" in labels
+
+
+def test_branch_menu_copy_branch_name_uses_full_ref_for_remote(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The remote chip's 'Copy branch name' emits the full ref (e.g. ``origin/main``).
+
+    Critical for the UX: the chip *displays* the bare branch name
+    (with the remote prefix stripped) but the clipboard payload
+    must include the prefix — that is what the user pastes into
+    ``git checkout`` and what every other remote-aware UI surfaces.
+    Mirrors the left panel's ``_remote_branch_actions`` policy.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    mgr.repo.references.create(
+        "refs/remotes/origin/base_features", mgr.repo.head.target, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "base_features")]
+    actions = widget._build_branch_menu_actions(chip)
+    copy_name = next(a for a in actions if a.text() == "Copy branch name")
+
+    with qtbot.waitSignal(
+        widget.copy_branch_name_requested, timeout=1000,
+    ) as blocker:
+        copy_name.trigger()
+    # Full ref, not the display label.
+    assert blocker.args == ["origin/base_features"]
+
+
 def test_create_branch_here_action_opens_inline_editor(
     qtbot, tmp_git_repo: Path,
 ) -> None:
@@ -2662,6 +2827,12 @@ def test_branch_popup_filters_origin_main_and_origin_head(
     (synthetic fetch marker) — exactly the "main, HEAD, main"
     symptom. Both should disappear from the popup the same way
     they disappeared from the chip column.
+
+    The repo also carries ``origin/feature`` so the popup has at
+    least two *visible* rows to enumerate (otherwise the
+    skip-when-single rule kicks in and there is nothing to
+    inspect). The asserted set is still just the two we care
+    about — ``main`` and ``origin/feature``.
     """
     from src.ui.widgets.graph_panel import BranchStackPopup, GraphTableWidget
 
@@ -2672,6 +2843,58 @@ def test_branch_popup_filters_origin_main_and_origin_head(
     )
     mgr.repo.references.create(
         "refs/remotes/origin/HEAD", head_sha, force=True,
+    )
+    mgr.repo.references.create(
+        "refs/remotes/origin/feature", head_sha, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    head_sha = str(mgr.head_commit.sha)
+    chip = widget._branch_chip_rects[(head_sha, "main")]
+    widget._show_branch_popup(head_sha, chip["rect"])
+    QApplication.processEvents()
+    popup: BranchStackPopup = widget._branch_popup
+    assert popup is not None
+    row_cls = BranchStackPopup._Row
+    rows = popup.findChildren(row_cls)
+    names = {r._branch["name"] for r in rows}
+    # ``origin/main`` and ``origin/HEAD`` are filtered out, but
+    # ``origin/feature`` (no local counterpart) survives. The
+    # result must never include the duplicate or the synthetic
+    # fetch marker.
+    assert "origin/main" not in names
+    assert "origin/HEAD" not in names
+    assert "main" in names
+    assert "origin/feature" in names
+
+
+def test_branch_popup_skipped_when_only_one_branch_visible(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A popup listing exactly one branch is pointless — skip it.
+
+    When the same-name-remote filter collapses a multi-branch row
+    down to a single chip (e.g. ``[main, origin/main]`` → ``[main]``),
+    the hover-popup used to open anyway and show ``main`` alone —
+    which is just what the chip already shows. Skipping the popup
+    keeps the UX consistent with the ``▼`` indicator (which is
+    only drawn when ``hidden_count > 0``).
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = str(mgr.head_commit.sha)
+    # Two refs at HEAD, but they collapse to one after the filter.
+    mgr.repo.references.create(
+        "refs/remotes/origin/main", head_sha, force=True,
     )
     vm = GraphViewModel(mgr)
     widget = GraphTableWidget(vm)
@@ -2686,13 +2909,52 @@ def test_branch_popup_filters_origin_main_and_origin_head(
     chip = widget._branch_chip_rects[(head_sha, "main")]
     widget._show_branch_popup(head_sha, chip["rect"])
     QApplication.processEvents()
-    popup: BranchStackPopup = widget._branch_popup
-    row_cls = BranchStackPopup._Row
-    rows = popup.findChildren(row_cls)
-    names = {r._branch["name"] for r in rows}
-    # Only the local ``main`` is exposed. ``origin/main`` and
-    # ``origin/HEAD`` would otherwise leak into the popup.
-    assert names == {"main"}
+    # ``_show_branch_popup`` must early-return when the filtered
+    # branch list has fewer than two entries.
+    assert widget._branch_popup is None  # noqa: SLF001
+
+
+def test_branch_popup_hover_timer_skipped_for_single_visible(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The hover debounce timer must not open a popup when no
+    siblings would be revealed.
+
+    Without this guard ``_on_hover_popup_timer`` happily schedules
+    the popup call only for ``_show_branch_popup`` to silently
+    bail out — wasteful and noisy in logs. The timer slot should
+    consult ``chip['hidden_count']`` (post-filter) before opening.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = str(mgr.head_commit.sha)
+    mgr.repo.references.create(
+        "refs/remotes/origin/main", head_sha, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(head_sha, "main")]
+    # Pre-condition: the primary chip records zero hidden siblings
+    # because the duplicate got filtered out.
+    assert chip["hidden_count"] == 0  # noqa: SLF001
+
+    # Drive the timer path the way the widget does: stash the
+    # chip + row, fire the debounce slot, and confirm nothing
+    # was opened.
+    widget._popup_hover_chip = chip  # noqa: SLF001
+    widget._popup_hover_row_sha = head_sha  # noqa: SLF001
+    widget._on_hover_popup_timer()  # noqa: SLF001
+    QApplication.processEvents()
+    assert widget._branch_popup is None  # noqa: SLF001
 
 
 def test_branch_popup_closes_on_global_mouse_move_outside(
