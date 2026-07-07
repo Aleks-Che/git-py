@@ -35,6 +35,18 @@ _STATUS_BADGE: dict[FileStatus, tuple[str, str]] = {
     FileStatus.IGNORED: ("I", "#8B8B8B"),
 }
 
+# File path text colour by status. Green = file is being added to the
+# next commit (NEW = freshly staged, UNTRACKED = will be added on
+# ``git add``); red = file is being deleted; everything else keeps
+# the neutral default. Brighter than the badge palette so the path
+# stays readable on the row's dark backgrounds.
+_PATH_TEXT_COLOR: dict[FileStatus, str] = {
+    FileStatus.NEW: "#7CE38B",
+    FileStatus.UNTRACKED: "#7CE38B",
+    FileStatus.DELETED: "#F08A7E",
+}
+_DEFAULT_PATH_TEXT_COLOR = "#D4D4D4"
+
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
@@ -125,6 +137,16 @@ class FileListDelegate(QStyledItemDelegate):
         if self._button_row != row:
             self._button_row = row
 
+    @staticmethod
+    def path_text_color(status: FileStatus) -> str:
+        """Return the file-path text colour for the given *status*.
+
+        ``NEW`` and ``UNTRACKED`` files paint green (file is being
+        added to the next commit); ``DELETED`` paints red; every
+        other status falls back to the neutral default.
+        """
+        return _PATH_TEXT_COLOR.get(status, _DEFAULT_PATH_TEXT_COLOR)
+
     # -- QStyledItemDelegate interface ------------------------------------
 
     def sizeHint(  # noqa: N802
@@ -173,7 +195,7 @@ class FileListDelegate(QStyledItemDelegate):
         )
         path_rect = QRect(x, rect.top(), max(path_width, 0), self.ROW_HEIGHT)
 
-        painter.setPen(QColor("#D4D4D4"))
+        painter.setPen(QColor(self.path_text_color(change.status)))
         path_font = QFont("Segoe UI", 9)
         painter.setFont(path_font)
         fm = QFontMetrics(path_font)

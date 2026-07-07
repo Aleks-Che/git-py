@@ -12,10 +12,13 @@ from pathlib import Path
 
 import pygit2
 from PySide6.QtCore import QItemSelectionModel, QPoint, Qt
+from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QStyleOptionViewItem
+from src.core.models import FileChange, FileStatus
 from src.core.repository import RepositoryManager
 from src.ui.widgets.commit_panel import CommitPanel, FileListView
-from src.ui.widgets.file_list_model import FileListDelegate
+from src.ui.widgets.file_list_model import FileListDelegate, FileListModel
 from src.viewmodels.main_viewmodel import MainViewModel
 
 
@@ -595,4 +598,129 @@ def test_unstaged_menu_copy_diff_action_emits_signal(
     ) as blocker:
         copy_diff_action.trigger()
     assert blocker.args == ["copy_diff", "f.txt"]
+
+
+# ----- File path text colour by status ------------------------------
+
+
+def test_path_text_color_added_statuses_are_green() -> None:
+    """NEW and UNTRACKED paint green: the file will be added to the commit."""
+    green = FileListDelegate.path_text_color(FileStatus.NEW)
+    assert green == "#7CE38B"
+    assert FileListDelegate.path_text_color(FileStatus.UNTRACKED) == green
+
+
+def test_path_text_color_deleted_status_is_red() -> None:
+    """DELETED paints red: the file will be removed from the commit."""
+    assert FileListDelegate.path_text_color(FileStatus.DELETED) == "#F08A7E"
+
+
+def test_path_text_color_other_statuses_keep_neutral_default() -> None:
+    """Statuses that are neither 'added' nor 'deleted' stay neutral gray."""
+    neutral = "#D4D4D4"
+    for status in (
+        FileStatus.MODIFIED,
+        FileStatus.RENAMED,
+        FileStatus.COPIED,
+        FileStatus.TYPE_CHANGED,
+        FileStatus.CONFLICTED,
+        FileStatus.IGNORED,
+    ):
+        assert FileListDelegate.path_text_color(status) == neutral
+
+
+def _render_row_to_image(status: FileStatus, path: str = "added.txt") -> QImage:
+    """Render a single file-list row to a :class:`QImage`.
+
+    Used by the colour-by-status integration tests below.  The
+    returned image is exactly one row tall, fully painted, and
+    ready for pixel probing.
+    """
+    model = FileListModel()
+    model.set_changes([FileChange(path=path, status=status)])
+    delegate = FileListDelegate(staged=False)
+
+    width = 600
+    height = FileListDelegate.ROW_HEIGHT
+    img = QImage(width, height, QImage.Format.Format_ARGB32)
+    img.fill(0)
+
+    option = QStyleOptionViewItem()
+    option.rect = img.rect()
+    index = model.index(0, 0)
+
+    painter = QPainter(img)
+    try:
+        delegate.paint(painter, option, index)
+    finally:
+        painter.end()
+    return img
+
+
+def _path_text_pixels(img: QImage) -> list[QColor]:
+    """Return every pixel of *img* that lies inside the path text area.
+
+    The path starts at ``MARGIN + BADGE_SIZE + MARGIN`` and is drawn
+    left-aligned, vertically centred.  We sample a 200-px wide band
+    — long enough to cover a real filename regardless of its first
+    character — to keep the test robust against antialiasing and
+    character choice.
+    """
+    m = FileListDelegate.MARGIN
+    bs = FileListDelegate.BADGE_SIZE
+    x0 = m + bs + m
+    y_centre = img.height() // 2
+    pixels: list[QColor] = []
+    for dx in range(0, 200):
+        for dy in range(-6, 7):
+            x = x0 + dx
+            y = y_centre + dy
+            if 0 <= x < img.width() and 0 <= y < img.height():
+                pixels.append(img.pixelColor(QPoint(x, y)))
+    return pixels
+
+
+def _greenish(pixels: list[QColor]) -> int:
+    return sum(
+        1 for px in pixels
+        if px.green() > px.red() + 25 and px.green() > px.blue() + 25
+    )
+
+
+def _reddish(pixels: list[QColor]) -> int:
+    return sum(
+        1 for px in pixels
+        if px.red() > px.green() + 25 and px.red() > px.blue() + 25
+    )
+
+
+def test_paint_uses_green_for_added_file() -> None:
+    """The rendered path of a NEW file is visibly green."""
+    img = _render_row_to_image(FileStatus.NEW)
+    pixels = _path_text_pixels(img)
+    assert _greenish(pixels) > 0, "NEW path should render with green pixels"
+    assert _reddish(pixels) == 0, "NEW path should not be red"
+
+
+def test_paint_uses_green_for_untracked_file() -> None:
+    """UNTRACKED files also render green (will be added on ``git add``)."""
+    img = _render_row_to_image(FileStatus.UNTRACKED, path="untracked.txt")
+    pixels = _path_text_pixels(img)
+    assert _greenish(pixels) > 0, "UNTRACKED path should render with green pixels"
+
+
+def test_paint_uses_red_for_deleted_file() -> None:
+    """The rendered path of a DELETED file is visibly red."""
+    img = _render_row_to_image(FileStatus.DELETED, path="deleted.txt")
+    pixels = _path_text_pixels(img)
+    assert _reddish(pixels) > 0, "DELETED path should render with red pixels"
+    assert _greenish(pixels) == 0, "DELETED path should not be green"
+
+
+def test_paint_uses_neutral_color_for_modified_file() -> None:
+    """MODIFIED files keep the default neutral gray, not green or red."""
+    img = _render_row_to_image(FileStatus.MODIFIED, path="modified.txt")
+    pixels = _path_text_pixels(img)
+    assert _greenish(pixels) == 0, "MODIFIED path should not be green"
+    assert _reddish(pixels) == 0, "MODIFIED path should not be red"
 
