@@ -347,9 +347,26 @@ class CommitDetailPanel(QWidget):
         if not path:
             return
 
-        is_stash = self._main_vm.is_stash_sha(self._current_sha)
-        if not is_stash:
+        menu = self._build_file_context_menu(path)
+        if menu is None:
             return
+        menu.exec(self._files.viewport().mapToGlobal(position))
+
+    def _build_file_context_menu(self, path: str) -> QMenu | None:
+        """Return the right-click menu for ``path`` in the current commit.
+
+        Always exposes *Copy Diff* (works for regular commits and stash
+        entries alike). For stash entries it also exposes
+        *Apply stashed file*. Returns ``None`` when no menu is
+        appropriate (e.g. no commit selected).
+
+        Factored out of :meth:`_on_file_context_menu` so tests can
+        inspect the menu structure without going through
+        :meth:`QMenu.exec`.
+        """
+        if self._current_sha is None:
+            return None
+        is_stash = self._main_vm.is_stash_sha(self._current_sha)
 
         menu = QMenu(self)
         menu.setStyleSheet(
@@ -359,12 +376,22 @@ class CommitDetailPanel(QWidget):
             "QMenu::item:selected { background-color: #094771; }",
         )
 
-        apply_action = menu.addAction("Apply stashed file")
-        apply_action.triggered.connect(
-            lambda checked=False, p=path: self._main_vm.apply_stash_file(self._current_sha, p),
+        copy_action = menu.addAction("Copy Diff")
+        copy_action.triggered.connect(
+            lambda checked=False, p=path: self._main_vm.copy_commit_file_diff(
+                self._current_sha, p,
+            ),
         )
 
-        menu.exec(self._files.viewport().mapToGlobal(position))
+        if is_stash:
+            apply_action = menu.addAction("Apply stashed file")
+            apply_action.triggered.connect(
+                lambda checked=False, p=path: self._main_vm.apply_stash_file(
+                    self._current_sha, p,
+                ),
+            )
+
+        return menu
 
     def _on_files_item_clicked(self, item: QListWidgetItem) -> None:
         """Toggle the file selection for diff view.

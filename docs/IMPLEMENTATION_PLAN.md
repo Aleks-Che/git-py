@@ -145,10 +145,110 @@
 
 ### Текущий статус
 - **Активный этап:** `Этап 9: Конфигурация и темизация` (под-этапы: темизация ✓, персистентность окна ✓, редизайн правой панели ✓)
-- **Последнее обновление:** `2026-06-11`
+- **Последнее обновление:** `2026-07-07`
 - **Следующий шаг:** `Завершить Settings-диалог (переключатель dark/light), импорт/экспорт настроек.`
 
+### Свежие правки (2026-07-07) — drag-and-drop и submenu в LeftPanel
+
+LeftPanel получил ту же drag-and-drop + context-menu функциональность, что уже есть в чипах графа: теперь можно перетаскивать **remote** ветки на **local** ветки (через предварительный fetch+checkout tracking branch), и в правом клике локальной/remote ветки появилось **подменю `Merge <name> into...`** / **`Rebase <name> onto...`** со списком всех локальных веток кроме self. Файлы: `src/ui/widgets/left_panel.py`, тесты в `tests/ui/test_left_panel.py`.
+
+- **`ItemIsDragEnabled` на remote ветках.** Раньше drag был разрешён только для локальных веток (через `_update_drag_state`). Теперь `ItemIsDragEnabled` ставится и на remote ветки — пользователь может их перетащить на другую ветку как в чипе графа. Pre-existing fixtures (`_set_up_repo_with_remotes`) пушит HEAD как remote-only `from-upstream`, чтобы не конфликтовать с `main`; при тестах с drag дополнительно удаляется локальная `feature` после её push'а.
+
+- **Кастомный MIME `_BRANCH_KIND_MIME`** (`application/x-git-py-branch-kind`) в `mimeData()` — несёт discriminator `local_branch` или `remote_branch`, чтобы drop-handler мог отличить источник. Plain-text поле по-прежнему содержит голое имя ветки — это держит обратную совместимость с любыми внешними drop-таргетами.
+
+- **Drop-handler нормализует remote source.** Раньше drop принимал строку source без знания, local она или remote. Теперь `_on_drop(source_name, source_kind, target_item)` фильтрует source kind (должен быть `local_branch` или `remote_branch`) и роутит через `_drop_actions(source, target, source_kind)` → lambda вызывает `_merge_drop` или `_rebase_drop`. Для remote source сначала вызывается `MainViewModel.fetch_and_checkout_remote_branch(remote_name)` (синхронный fetch + создание tracking branch), затем merge/rebase на bare локальное имя (`"origin/feature"` → `"feature"`).
+
+- **`_merge_drop` / `_rebase_drop`** — новые helpers в LeftPanel. Каждый из них принимает (source, target, source_kind), нормализует source для remote и вызывает `merge_branch(source_local, target=target, no_ff=True)` или `_rebase_source_onto_target(source_local, target)` соответственно. `no_ff=True` сохранён из ранее существовавшей логики.
+
+- **`_merge_into_submenu(source, source_kind, rebase=False)`** — строит `QAction` с `QMenu` подменю через `setMenu()`. Возвращает `None` если нет других локальных веток кроме source. В подменю — `QAction` для каждого другого local branch (отсортированы по имени); клик роутит через `_invoke_drop_action(verb, ...)` в `_merge_drop` или `_rebase_drop`.
+
+- **Контекст-меню локальной ветки.** После старого `Merge <name> into current…` / `Rebase <name> onto current…` (они остались для короткого case'а «в текущую HEAD») появились submenu действия:
+  - `Merge <name> into...` — все остальные локальные ветки
+  - `Rebase <name> onto...` — все остальные локальные ветки
+  
+  Это позволяет сделать merge в любую local ветку без предварительного checkout'а — ровно тот workflow, что и drop на графе.
+
+- **Контекст-меню remote ветки.** После `Checkout <name> as local branch` (которое открывает диалог "Reset Local to Here?") появились submenu `Merge <name> into...` / `Rebase <name> onto...` — каждое из них сначала fetch'ит tracking branch через `fetch_and_checkout_remote_branch`, потом делает merge/rebase в выбранную local ветку. Сценарий: пользователь видит `origin/main` ушёл вперёд и хочет слить в свой `feature` → правый клик → `Merge origin/main into...` → `feature`. Никаких лишних checkout'ов и dialog'ов (кроме того что `_handle_remote_double_click` уже показывает на `origin/main`).
+
+- **Lambda closures с `checked=False`** — fixed баг, при котором `QAction.triggered` посылает single `bool` (checked flag), и lambda без явного `checked=False` параметра захватывала его в `source`, превращая вызовы merge/rebase в `merge_branch(False, ...)` (см. regression fix в `_drop_actions`).
+
+- **Тесты.** +7 новых:
+  - `test_mime_data_carries_branch_kind_for_remote` — MIME формат + текст
+  - `test_drop_from_remote_branch_fetches_then_merges` — drop `origin/feature` → local `topic` сначала fetch+checkout tracking branch, потом merge
+  - `test_merge_into_submenu_lists_other_local_branches` — submenu содержит все local ветки кроме self
+  - `test_rebase_onto_submenu_in_local_context_menu` — то же для rebase
+  - `test_submenu_pick_triggers_drop_merge` — click по submenu item вызывает `merge_branch(source, target, True)`
+  - `test_submenu_pick_for_remote_source_fetches_first` — submenu от remote source сначала fetches
+  - `test_local_branch_drag_flag_enabled_for_remote_rows_too` — `ItemIsDragEnabled` на remote rows
+  
+  Итого **843 проходят**, `ruff check` чисто для нового кода.
+
+### Свежие правки (2026-07-07) — drag-and-drop merge, no-ff и reset-to-remote
+
+Доведение drag-and-drop на графе до конца: правый клик = контекстное меню (без drag), merge теперь всегда создаёт merge-коммит (`no_ff=True`), двойной клик на remote ветку предлагает диалог «Reset Local to Here?», а при ошибке «unknown source» UI подсказывает сделать `fetch`. Файлы: `src/ui/widgets/graph_panel.py`, `src/ui/widgets/left_panel.py`, `src/ui/main_window.py`, `src/viewmodels/main_viewmodel.py`, `src/viewmodels/commands.py`, `src/core/operations.py`, плюс тесты в `tests/ui/test_left_panel.py`, `tests/viewmodels/test_main_viewmodel_remotes.py`.
+
+- **`setAcceptDrops(True)` на `GraphTableWidget`.** Без этого виджет просто игнорировал `dragEnterEvent`/`dropEvent` — пользователь перетаскивал чип ветки и Qt тихо съедал drop. Теперь drop-обработчик работает и сигнализирует о merge/rebase.
+
+- **Контекстное меню branch chip по правому клику.** Раньше merge/rebase был доступен только через drag-and-drop (порог ~5 px) — слишком неочевидно для пользователя. Теперь правый клик по чипу показывает меню `Merge <source> into <target>` / `Rebase <source> onto <target>` через `_build_branch_menu_actions` (тот же путь, что и drop-меню). Single-menu dispatch — drop и right-click идут через одну функцию `MergeCommand`/`RebaseCommand` в `CommandProcessor`. Локальная ветка → правый клик показывает также `Checkout` и `Create Branch Here`.
+
+- **`no_ff=True` во всех UI-путях merge.** Раньше `MainViewModel.merge_branch` всегда делал fast-forward если возможно — из UI это приводило к «ничего не произошло» (ветка молча переехала на новый SHA без merge-коммита). Добавлен keyword-only параметр `no_ff=False` (по умолчанию — программные вызовы сохраняют git-совместимое поведение). Drag-and-drop и right-click контекстное меню на графе и в `LeftPanel` теперь передают `no_ff=True`. Сигнатура: `merge_branch(source, target=None, *, no_ff=False)`, `MergeCommand(..., no_ff=False)`. Логи попадают в CommandProcessor с undo через `reset(_previous_head, hard)` (merge --no-ff всё равно создаёт merge-коммит, который на undo должен быть убран — поведение идентично обычному 3-way merge).
+
+- **«Reset Local to Here?» на double-click remote ветки.** `LeftPanel._handle_remote_double_click(name)` уже существовал как хук для drag-and-drop на чипе, теперь обслуживает ещё один кейс: если локальная ветка с тем же именем существует, показывается `QMessageBox.question` «Reset local '<name>' to match the remote?». `Yes` → деструктивный путь; `No` (default) — отмена. Реализация destructive-пути — новый метод VM: `reset_local_branch_to_remote(name)`:
+  1. **Fetch.** Синхронный `FetchCommand(remote_name, branch_name)`, чтобы избежать hung async fetch на Windows.
+  2. **Lookup remote ref.** После fetch читает `origin/<name>` через `repo_manager.branches`. Если remote ref не появился — `error_occurred` и выход (не сбрасываем в stale tip).
+  3. **No local branch case.** Создаёт локальную через `CreateBranchCommand` + checkout — эквивалент `fetch_and_checkout_remote_branch`, но в одном пути.
+  4. **Hard-reset local.** Если локальная ветка уже есть — `core_reset(repo, target_sha, mode="hard")` (отбрасывает unpushed commits + worktree drift). Checkout через `GIT_CHECKOUT_FORCE`, потому что `checkout_branch` иначе re-flag'ит dirty файлы, которые hard reset только что привёл в порядок.
+
+  Метод **не** идёт через `CommandProcessor` — после `reset --hard` lost commits не вернуть через undo (reflog path тоже отрезан), UI gating на диалог компенсирует.
+
+- **Right-click «Checkout» на remote ветке тоже показывает диалог.** Левый клик на remote (двойной) и right-click → `Checkout <name> as local branch` из `LeftPanel._remote_branch_actions` теперь оба идут через `_handle_remote_double_click` (двойной клик — напрямую, правый клик — через change lambda). Раньше правый клик напрямую дёргал `fetch_and_checkout_remote_branch`, который молча проглатывал diverged state («Local 'main' has diverged from 'origin/main'; leaving local ref as-is» + checkout того же самого local main). Симметрично `_on_graph_branch_checkout` в `MainWindow` получил ту же логику — `QMessageBox` + `reset_local_branch_to_remote` / `fetch_and_checkout_remote_branch`.
+
+- **Подсказка про fetch в ошибках merge.** `core.operations.merge_branch` и `complete_merge` теперь матчат типичную pygit2 ошибку `unknown revision ...` / `cannot find source` и к сообщению добавляют «Run 'fetch <remote>' to update remote-tracking branches and retry.» Это чтобы пользователь не терял время, пытаясь понять, почему git не видит его собственную ветку после merge драга с upstream-веткой.
+
+- **VM helper `local_branch_exists(name)`** в `MainViewModel` — вынесен из `LeftPanel._local_branch_exists` (который сам был приватным wrapper'ом вокруг `repository_manager().branches`) для переиспользования в `MainWindow._on_graph_branch_checkout`.
+
+- **Тесты.** +6 новых тестов:
+  - В `test_left_panel.py`: `test_double_click_on_remote_branch_with_local_confirms_reset` (mock `QMessageBox.question` на Yes / No → проверка что `reset_local_branch_to_remote` вызывается только на Yes) и переписан `test_double_click_on_remote_branch_fetches_and_checks_it_out` под кейс без локальной ветки (через push + delete local `feature`).
+  - В `test_main_viewmodel_remotes.py`: `test_reset_local_branch_to_remote_creates_new_local`, `test_reset_local_branch_to_remote_hard_resets_ahead_local`, `test_reset_local_branch_to_remote_without_repo_emits_error`, `test_reset_local_branch_to_remote_bad_name_emits_error`, `test_reset_local_branch_to_remote_when_busy_emits_error` — все 5 path'ов нового VM-метода покрыты.
+  - Итого **836 проходят**, `ruff check` чисто для нового кода.
+
+### Свежие правки (2026-07-07) — popup skip-when-single
+
+Если после фильтрации дублей (`_suppress_dup_remotes`) в строке осталось меньше двух веток, popup не показывается. Двойная защита: `_on_hover_popup_timer` теперь проверяет `chip['hidden_count'] <= 0` (post-filter значение из `_draw_branch_chips`) и сразу выходит, не запуская debounce-таймер. `_show_branch_popup` дополнительно страхует `if len(branches) < 2: return` после `_branches_at_row_visible`. Сценарий: `main` (локальная) + `origin/main` (дубликат) → чип рисует только `main`, hover не открывает popup (там было бы одно имя, которое и так видно). Тесты: `test_branch_popup_skipped_when_only_one_branch_visible`, `test_branch_popup_hover_timer_skipped_for_single_visible` (+2). Обновлён `test_branch_popup_filters_origin_main_and_origin_head` — добавлен `origin/feature` чтобы popup показывался с отфильтрованным набором. **Итого 836/836 проходят, ruff чисто.**
+
+### Свежие правки (2026-07-02)
+- **Stash Changes в контекстном меню WIP-ноды.** Правый клик по синтетической ноде незакоммиченных изменений теперь предлагает `Stash Changes` первым пунктом меню (над разделителем, до `Discard changes` / `Copy diff`). Действие маршрутизируется через новый сигнал `GraphTableWidget.stash_push_requested` → `MainWindow._on_stash_push_graph` → `MainViewModel.stash_push("WIP")` (та же команда `StashPushCommand` что и тулбар `Ctrl+Shift+S`, попадает в undo-стек). Контекстное меню ноды (commit/stash/WIP) вынесено в `_build_node_menu(sha, kind)` (паттерн как у `_build_branch_menu_actions`) — 4 новых теста в `test_graph_widget.py` (структура WIP-меню, эмиссия сигнала, сохранение `discard_changes_requested`, отсутствие `Stash Changes` на обычном коммите) + 1 тест в `test_main_window.py` (роутинг сигнала в VM). **+5 тестов, 796/796 проходят, `ruff check` чисто для нового кода**.
+
+### Свежие правки (2026-07-07) — branch-chip UX
+
+Вся работа по интерактивным чипам веток и связанным правилам подавления. Файлы: `src/ui/widgets/graph_panel.py`, `src/ui/widgets/left_panel.py`, `src/viewmodels/branch_panel_viewmodel.py`, `src/viewmodels/main_viewmodel.py`, `src/viewmodels/graph_viewmodel.py`, `src/ui/main_window.py`, плюс тесты в `tests/ui/test_graph_widget.py`, `tests/ui/test_left_panel.py`, `tests/viewmodels/test_branch_panel_viewmodel.py`, `tests/viewmodels/test_main_viewmodel_branches.py`, `tests/ui/test_main_window.py`.
+
+- **Collapse-политика на чип-колонке.** Каждая строка с ≥2 ветками теперь рисует один priority-чип + индикатор `▼` (с badge `+N` если скрыто >1). Helper `_suppress_dup_remotes(branch_refs)` единая точка подавления (same-name remote + синтетический `*/HEAD`), используется и в `_draw_branch_chips`, и в hover-popup, и в `BranchPanelViewModel._suppress_same_name_remotes`. Приоритет (`_branch_priority_key`): `HEAD > reachable-from-HEAD > recently-created > other`. Только что созданная ветка уходит в бакет `2`, чтобы не перебивать исходную при раскрытии.
+
+- **Local vs remote-only стиль.** Локальные чипы — заливка цветом коммита + белый текст + monitor-иконка. Remote-only (без локального дубликата) — обводка цветом коммита без заливки, текст тоже цвета коммита (wire-frame look). Флаг `is_remote_only` рассчитывается в `_draw_branch_chips` и используется popup-ом.
+
+- **`origin/HEAD` и same-name remote подавление.** Тройная защита: чип-колонка (`_suppress_dup_remotes` в `_draw_branch_chips`), popup (`_branches_at_row_visible` фильтрует перед показом), левая панель (`_suppress_same_name_remotes` в VM + `setHidden(True)` на группе `Remote` если она пуста). Это закрывает симптом "main, HEAD, main" — теперь ни в одной точке UI пользователь не видит дубли.
+
+- **Hover-popup `BranchStackPopup`.** Frameless `Qt.Tool` окно, всплывает через 220 ms debounce (`_HOVER_POPUP_DELAY_MS`) на свёрнутом multi-branch чипе. Single/double-click строки → `branch_selected(full_name)` → `MainViewModel.checkout_branch` (`CheckoutCommand` → undo). Закрытие тройное: `leaveEvent` + debounced 160 ms close-таймер, глобальный `QApplication.installEventFilter` ловит `MouseMove` за пределами popup+чипа, `ApplicationDeactivate` закрывает немедленно. `eventFilter` на родителе ловит `QEvent.Move` и двигает popup на ту же дельту — popup следует за чипом при перетаскивании окна на другой экран. `hideEvent` чистит ссылку на popup в родителе + снимает все event-фильтры (защита от утечек).
+
+- **Inline «Create Branch Here».** Правый клик по локальному чипу → контекст-меню с `Create Branch Here` (только для local; remote-чипы не имеют этого пункта) → `QLineEdit` точно над чипом. Enter → `create_branch_here_requested(sha, name)` → `MainViewModel.create_branch(name, target_sha=sha)` → `CreateBranchCommand` через `CommandProcessor` (undo = удаление). Escape/потеря фокуса → закрыть без действия.
+
+- **Drag-and-drop merge/rebase.** Press-and-drag на чипе → `QDrag` с MIME `application/x-git-py-branch-chip`. Drop на другой чип → контекст-меню `Merge <source> into <target>` / `Rebase <source> onto <target>` → `MainViewModel.merge_branch(no_ff=True)` / `rebase_branch` (через `MergeCommand`/`RebaseCommand` → undo). `drag_start_threshold_px` (~5 px) защищает от случайной промоции press→drag на коротком клике. Эквивалентное контекстное меню также открывается по правому клику (через `_build_branch_menu_actions`) для пользователей, которые не догадались про drag. См. свежую правку про drag-and-drop merge, no-ff и reset-to-remote.
+
+- **Recently-created tracking.** `MainViewModel._recently_created_branches: set[str]` + сигнал `recently_created_changed` → форвардится в `GraphViewModel.update_recently_created(names)` через `recently_created_changed` сигнал. Сбрасывается при `set_repository`. Используется `_branch_priority_key` (бакет `2`).
+
+- **Тесты.** +21 новый тест: `test_three_branches_collapse_to_primary_chip`, `test_three_branches_popup_lists_all_three`, `test_three_branches_render_only_one_visible_chip` (pixel-level), `test_remote_branch_suppressed_when_local_duplicate_exists`, `test_origin_head_remote_is_dropped_from_chip_cache`, `test_drop_on_suppressed_chip_emits_signal`, `test_remote_duplicate_of_local_marks_is_remote_only_false`, `test_branch_popup_lists_all_branches`, `test_branch_popup_row_click_emits_checkout`, `test_branch_popup_closes_on_mouse_leave`, `test_branch_popup_tracks_parent_window_move`, `test_branch_popup_filters_origin_main_and_origin_head`, `test_branch_popup_closes_on_global_mouse_move_outside`, `test_remote_branch_dropped_when_same_name_local_exists` (viewmodel), `test_double_click_on_remote_branch_with_local_confirms_reset` (repurposed в проверку suppression), `test_create_branch_here_emits_signal`, `test_create_branch_from_chip_routes_to_vm`, `test_create_branch_here_inline_editor_opens_and_accepts`, `test_chip_drag_emits_drop_on_chip_menu`, `test_drop_emits_merge_or_rebase_branch_requested`, плюс обновлены 6 существующих тестов для использования remote-only имени `from-upstream` вместо коллизии `origin/main`. Итого **827/827 проходят**, `ruff check` чисто (3 pre-existing ошибки не из этого набора).
+
+### Свежие правки (2026-07-07) — Copy branch name на графе
+
+В графе теперь можно скопировать имя ветки и SHA коммита прямо из контекстного меню branch-chip — симметрично с `LeftPanel`, где эти пункты уже были. Файлы: `src/ui/widgets/graph_panel.py`, `src/ui/main_window.py`, плюс тесты в `tests/ui/test_graph_widget.py`, `tests/ui/test_main_window.py`.
+
+- **Сигналы в `GraphTableWidget`.** Два новых сигнала — `copy_branch_name_requested = Signal(str)` и `copy_commit_sha_requested = Signal(str)`. Полезная нагрузка: full ref имя (например `main` или `origin/main`) и row SHA. Эмитятся из `_build_branch_menu_actions` через ту же helper-функцию для синхронной инспекции в тестах, что и `merge_branch_requested` / `rebase_branch_requested`.
+- **Пункты меню.** В конец `_build_branch_menu_actions` добавлен раздел через `_make_separator()`: `Copy branch name` (всегда) + `Copy commit sha` (когда `row_sha` доступен). Меню строится и для local, и для remote chip-ов. Для remote копируется **полное** ref-имя (`origin/base_features`), а не display label — то же поведение, что в `LeftPanel._remote_branch_actions`.
+- **MainWindow.** `_on_copy_branch_name(name)` / `_on_copy_commit_sha(sha)` подключены к `MainViewModel.copy_to_clipboard`; status bar показывает `"Copied branch name 'main'"` / `"Copied commit abc1234"` на 3 секунды. Пустые payload-ы игнорируются (защита от stale graph rebuild).
+- **Тесты.** +7 новых: `test_branch_menu_has_copy_branch_name_for_local`, `test_branch_menu_copy_branch_name_emits_full_ref`, `test_branch_menu_copy_commit_sha_emits_row_sha`, `test_branch_menu_has_copy_branch_name_for_remote`, `test_branch_menu_copy_branch_name_uses_full_ref_for_remote`, `test_graph_copy_branch_name_routes_to_clipboard`, `test_graph_copy_commit_sha_routes_to_clipboard`. Итого **834/834 проходят**, `ruff check` чисто.
+
 ### Свежие правки (2026-06-14)
-- **Stash-ребаланс + WIP на lane 0.** Стэши, чей первый родитель — HEAD, теперь сдвигаются на offset-полосы перед вставкой WIP, освобождая lane 0 для ноды незакоммиченных изменений. В строке стэша нет горизонтальных коннекторов — только COMMIT + PIPE для вертикальной непрерывности. Форк рисуется исключительно на строке HEAD через `_build_fork_connector_cells`. Исправлена вставка стэшей в ViewModel: теперь стэши на HEAD вставляются перед HEAD по индексу, а не по timestamp (чтобы попасть в ребаланс). Добавлен e2e-тест `test_stash_with_uncommitted_keeps_wip_on_main_lane`. Обновлена документация в `docs/FEATURES.md`.
+- **Stash-ребаланс + WIP на lane 0.** Стэши, чей первый родитель — HEAD, теперь сдвигаются на offset-полосы перед вставкой WIP, освобождая lane 0 для ноды незакоммиченных изменений. В строке стэша нет горизонтальных коннекторов — только COMMIT + PIPE для вертикальной непрерывности. Форк рисуется исключительно на строке HEAD через `_build_fork_connector_cells`. Исправлена вставка стэшей в ViewModel: теперь стэши на HEAD вставляются перед HEAD по индексу, а не по timestamp (чтобы попасть в ребаланс). Добавлен e2e-тест `test_stash_with_uncommitted_keeps_wip_on_main_lane`. Обновлена документация в `docs/FEATURES.md`.
 - **`core/repository.py` — топологическая сортировка в revwalk.** `get_history()` и `get_all_history()` теперь используют `GIT_SORT_TOPOLOGICAL | GIT_SORT_TIME` через единый `repo.walk(None, sort)` с push всех tip-ов (local + remote + tags). Раньше `get_all_history` делал N отдельных walk-ов с `GIT_SORT_TIME` и заново сортировал результат по `commit_time` — это ломало топологический порядок (родитель мог оказаться ниже ребёнка) и приводило к неверной раскладке `graph_v2.build_graph` на больших репах с CI-коммитами на одинаковых таймстампах. Поведение теперь совпадает с `keifu::Repository::get_commits`. Добавлена константа `SORT_TOPOLOGICAL_TIME` и 2 регрессионных теста в `test_repository.py` (инвертированные таймстампы + параллельные ветки).
 - **Удалён мёртвый код.** `src/core/graph.py` (592 строки, фазовый priority/orphan walk + column compaction) и `tests/core/test_graph.py` (23 теста) — модуль не импортировался нигде, кроме собственного теста (активный — `graph_v2.py`, порт keifu). Удалено: −1057 строк, тестов: 707 → 684 (плюс 2 новых регрессионных = 686, итого с удалёнными − 684). `ruff check` чисто (3 ошибки — pre-existing в `graph_v2.py` и `test_left_panel.py`).

@@ -421,3 +421,178 @@ def test_unstaged_expander_toggles_list_visibility(
     assert not panel._unstaged_list.isVisible()
     panel._unstaged_expander.toggle()
     assert panel._unstaged_list.isVisible()
+
+
+# ----- Copy Diff context-menu action ---------------------------------
+
+
+def test_unstaged_copy_diff_routes_to_main_viewmodel(
+    qtbot, tmp_git_repo: Path, monkeypatch,
+) -> None:
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    captured: dict = {}
+
+    def fake_copy(path: str, *, staged: bool = False) -> None:
+        captured["path"] = path
+        captured["staged"] = staged
+
+    monkeypatch.setattr(vm, "copy_file_diff", fake_copy)
+    panel._on_unstaged_context_action("copy_diff", "f.txt")
+    assert captured == {"path": "f.txt", "staged": False}
+
+
+def test_staged_copy_diff_routes_to_main_viewmodel(
+    qtbot, tmp_git_repo: Path, monkeypatch,
+) -> None:
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    vm.stage_file("f.txt")
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    captured: dict = {}
+
+    def fake_copy(path: str, *, staged: bool = False) -> None:
+        captured["path"] = path
+        captured["staged"] = staged
+
+    monkeypatch.setattr(vm, "copy_file_diff", fake_copy)
+    panel._on_staged_context_action("copy_diff", "f.txt")
+    assert captured == {"path": "f.txt", "staged": True}
+
+
+def test_unstaged_batch_copy_diff_routes_to_main_viewmodel(
+    qtbot, tmp_git_repo: Path, monkeypatch,
+) -> None:
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    captured: dict = {}
+
+    def fake_copy(paths, *, staged: bool = False) -> None:
+        captured["paths"] = list(paths)
+        captured["staged"] = staged
+
+    monkeypatch.setattr(vm, "copy_files_diff", fake_copy)
+    panel._on_unstaged_batch_context_action("copy_diff", ["f.txt", "untracked.txt"])
+    assert captured == {"paths": ["f.txt", "untracked.txt"], "staged": False}
+
+
+def test_staged_batch_copy_diff_routes_to_main_viewmodel(
+    qtbot, tmp_git_repo: Path, monkeypatch,
+) -> None:
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    vm.stage_file("f.txt")
+    vm.stage_file("untracked.txt")
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    captured: dict = {}
+
+    def fake_copy(paths, *, staged: bool = False) -> None:
+        captured["paths"] = list(paths)
+        captured["staged"] = staged
+
+    monkeypatch.setattr(vm, "copy_files_diff", fake_copy)
+    panel._on_staged_batch_context_action("copy_diff", ["f.txt", "untracked.txt"])
+    assert captured == {"paths": ["f.txt", "untracked.txt"], "staged": True}
+
+
+def test_unstaged_menu_contains_copy_diff_action(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    index = panel._unstaged_list.model().index(0, 0)
+    panel._unstaged_list.selectionModel().select(
+        index, QItemSelectionModel.SelectionFlag.Select,
+    )
+    menu = panel._unstaged_list._build_context_menu(["f.txt"])
+    assert menu is not None
+    texts = [a.text() for a in menu.actions() if a.text()]
+    assert "Copy Diff" in texts
+    assert "Copy File Path" in texts
+
+
+def test_staged_menu_contains_copy_diff_action(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    vm.stage_file("f.txt")
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    index = panel._staged_list.model().index(0, 0)
+    panel._staged_list.selectionModel().select(
+        index, QItemSelectionModel.SelectionFlag.Select,
+    )
+    menu = panel._staged_list._build_context_menu(["f.txt"])
+    assert menu is not None
+    texts = [a.text() for a in menu.actions() if a.text()]
+    assert "Copy Diff" in texts
+    assert "Copy File Path" in texts
+
+
+def test_unstaged_multi_select_menu_contains_copy_diff_action(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    menu = panel._unstaged_list._build_context_menu(["f.txt", "untracked.txt"])
+    assert menu is not None
+    texts = [a.text() for a in menu.actions() if a.text()]
+    assert any("Copy Diff" in t for t in texts)
+    assert any("2 Files" in t for t in texts)
+
+
+def test_unstaged_menu_copy_diff_action_emits_signal(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Triggering the *Copy Diff* action emits the expected signal."""
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    menu = panel._unstaged_list._build_context_menu(["f.txt"])
+    assert menu is not None
+    copy_diff_action = next(
+        a for a in menu.actions() if a.text() == "Copy Diff"
+    )
+    with qtbot.waitSignal(
+        panel._unstaged_list.context_action_requested,
+        timeout=500,
+    ) as blocker:
+        copy_diff_action.trigger()
+    assert blocker.args == ["copy_diff", "f.txt"]
+

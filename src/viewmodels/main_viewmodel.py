@@ -58,6 +58,7 @@ class MainViewModel(QObject):
     conflict_state_changed = Signal(object)  # dict
     busy_changed = Signal(bool)
     log_message = Signal(str)  # human-readable timestamped log line
+    recently_created_changed = Signal(object)  # set[str] — branches newly created in this session
     selection_changed = Signal(object)  # str | None — currently selected SHA, or WIP_SHA, or None
 
     def __init__(
@@ -113,6 +114,14 @@ class MainViewModel(QObject):
         # view; any other value means the commit-detail view.
         self._selected_commit_sha: str | None = None
 
+        # Branches created in this session — used by the graph widget to
+        # keep the just-created branch visually secondary when several
+        # branches share a commit (the user asked for the *source*
+        # branch to keep the prominent chip). Cleared on every
+        # ``set_repository`` and refreshed via
+        # :attr:`recently_created_changed` so widgets can re-pull it.
+        self._recently_created_branches: set[str] = set()
+
     # ----- child ViewModels / processor (read-only accessors) ---------
 
     def command_processor(self) -> CommandProcessor:
@@ -131,6 +140,23 @@ class MainViewModel(QObject):
     def repository_manager(self) -> RepositoryManager | None:
         """Return the currently bound :class:`RepositoryManager`, or ``None``."""
         return self._repo_manager
+
+    def local_branch_exists(self, name: str) -> bool:
+        """Return ``True`` if a local branch named ``name`` exists in the open repo."""
+        mgr = self._repo_manager
+        if mgr is None or not mgr.is_open:
+            return False
+        return any(b.name == name and not b.is_remote for b in mgr.branches)
+
+    def recently_created_branches(self) -> set[str]:
+        """Snapshot of branches created in this session (since last repo change).
+
+        The graph widget uses this set to rank branches that share a
+        commit: a branch in this set is treated as "newly created"
+        and gets a lower priority for the prominent chip — matching
+        the source-branch-first UX requirement.
+        """
+        return set(self._recently_created_branches)
 
     # ----- repository binding -----------------------------------------
 
@@ -192,6 +218,11 @@ class MainViewModel(QObject):
         self._command_processor.clear()
         self._clear_conflict_state()
         self._update_auto_fetch_timer()
+        # A new repository means a brand new history — forget the
+        # previous run's "newly created" set so the chip-priority
+        # logic doesn't carry stale state across repositories.
+        self._recently_created_branches = set()
+        self.recently_created_changed.emit(self._recently_created_branches)
         if self._selected_commit_sha is not None:
             self._selected_commit_sha = None
             self.selection_changed.emit(None)
@@ -585,6 +616,49 @@ class MainViewModel(QObject):
         except GitError:
             return ""
 
+    def get_commit_file_diff_text(self, sha: str, path: str) -> str:
+        """Return the unified diff of ``path`` in commit (or stash) ``sha``.
+
+        Works for both regular commits and stash entries — both are
+        commits whose tree diffs against their first parent's tree.
+
+        Returns the empty string when no repository is open, the SHA
+        cannot be resolved, the file was not touched by the commit, or
+        computing the diff fails for any other reason. Used by the
+        commit-detail panel's "Copy Diff" right-click action.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            return ""
+        try:
+            return self._repo_manager.get_commit_file_diff_text(sha, path)
+        except GitError:
+            return ""
+
+    def copy_commit_file_diff(self, sha: str, path: str) -> None:
+        """Copy the per-file diff of ``path`` in commit (or stash) ``sha``.
+
+        Used by the *Copy Diff* right-click action on a file row in the
+        commit-detail panel — the read-only view shown for regular
+        commits and stash entries alike. Routes through
+        :meth:`get_commit_file_diff_text` so the result is the same
+        unified-diff text the user would get by selecting the file in
+        the diff view.
+
+        On failure (no repository open, unknown SHA, Git error) the
+        clipboard is left untouched and :attr:`error_occurred` is
+        emitted — never a raw exception.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        text = self.get_commit_file_diff_text(sha, path)
+        if not text:
+            self.error_occurred.emit(
+                f"No diff available for {path!r} in {sha[:7]}",
+            )
+            return
+        self.copy_to_clipboard(text)
+
     def get_workdir_diff_text(self) -> str:
         """Return the full unified diff of the working tree vs HEAD.
 
@@ -731,6 +805,50 @@ class MainViewModel(QObject):
         clipboard = QApplication.clipboard()
         if clipboard is not None:
             clipboard.setText(path)
+
+    def copy_file_diff(self, path: str, *, staged: bool = False) -> None:
+        """Copy the unified diff of a single file to the system clipboard.
+
+        Used by the *Copy Diff* right-click action in the right panel's
+        commit-input view. ``staged=True`` produces the index-vs-HEAD
+        diff (what ``git commit`` would pick up); ``staged=False`` (the
+        default) produces the working-tree-vs-HEAD diff.
+
+        On any failure (no repository open, Git error) the clipboard is
+        left untouched and :attr:`error_occurred` is emitted — never a
+        raw exception.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        try:
+            text = self._commit_panel_view_model.build_diff_text(path, staged=staged)
+        except GitError as exc:
+            self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
+            return
+        self.copy_to_clipboard(text)
+
+    def copy_files_diff(self, paths: list[str], *, staged: bool = False) -> None:
+        """Copy the concatenated diffs of *paths* to the system clipboard.
+
+        Multi-file counterpart of :meth:`copy_file_diff`. Each per-file
+        patch is preceded by a ``# path: <p>`` comment header so the
+        result stays readable when pasted. An empty list is a no-op.
+        """
+        if not paths:
+            return
+        pieces: list[str] = []
+        for path in paths:
+            try:
+                text = self._commit_panel_view_model.build_diff_text(path, staged=staged)
+            except GitError as exc:
+                self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
+                return
+            if text:
+                pieces.append(f"# path: {path}\n{text}")
+        if not pieces:
+            return
+        self.copy_to_clipboard("\n".join(pieces))
 
     def copy_to_clipboard(self, text: str) -> None:
         """Copy arbitrary *text* to the system clipboard."""
@@ -972,6 +1090,189 @@ class MainViewModel(QObject):
 
         self.checkout_branch(local_name)
 
+    def reset_local_branch_to_remote(self, remote_branch_name: str) -> None:
+        """Hard-reset the local tracking branch to ``remote_branch_name`` and check it out.
+
+        This is the destructive counterpart to
+        :meth:`fetch_and_checkout_remote_branch`: the user explicitly
+        asked to abandon any unpushed local work on the tracking
+        branch (e.g. to roll back an unmerged merge commit) and
+        switch HEAD to whatever the remote currently points at. The
+        method is **not** undoable through the normal
+        ``CommandProcessor`` — the lost commits are gone from the
+        reflog path too once ``reset --hard`` is run, so the UI
+        gates this on a confirmation dialog.
+
+        ``remote_branch_name`` is in the form ``origin/feature``;
+        the local tracking branch is the part after the ``/``.
+        Behaviour:
+
+        * Fetches the remote first so the remote tracking ref is
+          up-to-date (otherwise we'd reset to a stale tip).
+        * If the local branch does not exist, this is equivalent to
+          a normal fetch+create+checkout — no confirmation is
+          needed because there is no local work to lose.
+        * If the local branch exists, hard-resets it to the remote's
+          tip and checks it out. Uncommitted working-tree changes
+          would also be lost; the caller is expected to have
+          already verified the user is OK with that (the left-panel
+          double-click is the only caller today).
+
+        On error the issue is surfaced via :attr:`error_occurred`
+        and the repository state is left untouched.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            self._log(
+                "reset",
+                f"Reset to {remote_branch_name!r} failed: no repo",
+                level="error",
+            )
+            return
+        if self._is_busy:
+            self.error_occurred.emit("Another operation is already in progress.")
+            return
+        if "/" not in remote_branch_name:
+            self.error_occurred.emit(f"Not a remote branch: {remote_branch_name!r}")
+            return
+
+        remote_name, branch_name = remote_branch_name.split("/", 1)
+        self._log(
+            "reset",
+            f"Fetch {remote_name}/{branch_name} and reset local "
+            f"{branch_name!r} to {remote_branch_name!r}",
+        )
+
+        # Step 1: fetch the remote so the local tracking ref is
+        # current.  We deliberately share the sync-fetch strategy
+        # with ``fetch_and_checkout_remote_branch`` — the
+        # network round-trip is short and a hung async fetch on
+        # Windows is a worse user experience than a brief UI
+        # freeze for a one-shot user action.
+        from src.viewmodels.commands import FetchCommand
+
+        self._is_busy = True
+        self.busy_changed.emit(True)
+        from PySide6.QtCore import QEventLoop
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+        try:
+            self._command_processor.execute(
+                FetchCommand(self._repo_manager, remote_name, branch_name),
+            )
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("fetch", f"Fetch failed: {exc}", level="error")
+            return
+        finally:
+            self._is_busy = False
+            self.busy_changed.emit(False)
+
+        # Step 2: look up the (now-updated) remote tracking ref. If
+        # the fetch did not produce one, bail out — the remote
+        # either does not have the branch or the fetch silently
+        # failed and we do not want to reset to a stale tip.
+        remote_info = next(
+            (b for b in self._repo_manager.branches
+             if b.name == remote_branch_name and b.is_remote),
+            None,
+        )
+        if remote_info is None:
+            self.error_occurred.emit(
+                f"Unknown remote branch: {remote_branch_name!r}",
+            )
+            self._log(
+                "reset",
+                f"Cannot find {remote_branch_name!r} after fetch",
+                level="error",
+            )
+            return
+        target_sha = remote_info.target_sha
+
+        # Step 3: detect whether the local branch already tracks
+        # this remote.  ``origin/feature`` and ``feature`` are
+        # matched by the ``upstream_name`` on the local branch —
+        # if upstream points at a different branch (e.g. another
+        # fork's ``upstream/feature``) we still want the user's
+        # ``feature`` ref to land on the tip the user double-
+        # clicked, so we fall back to the bare name when the
+        # upstream is missing or different.
+        local_branch = next(
+            (b for b in self._repo_manager.branches
+             if b.name == branch_name and not b.is_remote),
+            None,
+        )
+        if local_branch is None:
+            # No local work to lose — just create the local
+            # tracking branch at the freshly fetched tip and check
+            # it out.  This path is the non-destructive equivalent
+            # of the existing ``fetch_and_checkout_remote_branch``
+            # and is the correct behaviour when the user has not
+            # set up a local branch yet.
+            self._log(
+                "reset",
+                f"Creating local branch {branch_name!r} at {target_sha[:7]}",
+            )
+            from src.viewmodels.commands import CreateBranchCommand
+
+            try:
+                self._command_processor.execute(
+                    CreateBranchCommand(self._repo_manager, branch_name, target_sha),
+                )
+            except GitError as exc:
+                self.error_occurred.emit(str(exc))
+                self._log("reset", f"Create branch failed: {exc}", level="error")
+                return
+            self._refresh_all_views()
+            self.checkout_branch(branch_name)
+            return
+
+        # Step 4: hard-reset the local branch to the remote's tip
+        # and check it out.  Hard reset is the right mode here: the
+        # user asked to abandon unpushed commits (and any index /
+        # worktree drift) so the local matches the remote
+        # exactly.  A soft or mixed reset would leave the lost
+        # commits in the index / worktree, which is the opposite
+        # of what the user is trying to do.
+        local_before = local_branch.target_sha
+        self._log(
+            "reset",
+            f"Hard-reset local {branch_name!r} from {local_before[:7]} "
+            f"to {target_sha[:7]} (remote {remote_name})",
+        )
+        from src.core.operations import reset as core_reset
+        try:
+            core_reset(self._repo_manager, target_sha, mode="hard")
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("reset", f"Reset failed: {exc}", level="error")
+            return
+
+        # Step 5: the local branch ref now points at the remote's
+        # tip. Check it out so the working tree follows.  We use
+        # ``GIT_CHECKOUT_FORCE`` because the hard reset has already
+        # brought the index and worktree in line with the target —
+        # the post-checkout dirty check inside ``checkout_branch``
+        # would otherwise re-flag the files we just rewrote.
+        from pygit2 import GIT_CHECKOUT_FORCE  # noqa: PLC0415
+
+        from src.core.operations import checkout_branch as core_checkout
+        try:
+            core_checkout(
+                self._repo_manager, branch_name, strategy=GIT_CHECKOUT_FORCE,
+            )
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("checkout", f"Checkout failed: {exc}", level="error")
+            return
+
+        self._refresh_all_views()
+        self._log(
+            "reset",
+            f"Local {branch_name!r} is now at {target_sha[:7]} "
+            f"(reset to {remote_branch_name})",
+        )
+
     def _is_fast_forward(self, old_sha: str, new_sha: str) -> bool:
         """Return ``True`` if ``new_sha`` is a descendant of ``old_sha``.
 
@@ -1036,6 +1337,18 @@ class MainViewModel(QObject):
             self.error_occurred.emit(str(exc))
             self._log("branch", f"Create branch {name!r} failed: {exc}", level="error")
             return
+        # Mark the new branch as a session creation so the graph
+        # widget can keep it visually secondary when several
+        # branches share a commit (the source branch keeps the
+        # prominent chip until a later operation re-orders them).
+        self._recently_created_branches.add(name)
+        self.recently_created_changed.emit(self._recently_created_branches)
+        # The GraphViewModel forwards the same payload to the graph
+        # widget. We emit on both so direct subscribers of either
+        # signal observe the update without depending on the chain.
+        self._graph_view_model.update_recently_created(
+            self._recently_created_branches,
+        )
         self._refresh_all_views()
         self._log("branch", f"Branch {name!r} created")
 
@@ -1050,6 +1363,15 @@ class MainViewModel(QObject):
             self.error_occurred.emit(str(exc))
             self._log("branch", f"Create branch {name!r} failed: {exc}", level="error")
             return False
+        # Mirror the bookkeeping done by :meth:`create_branch`: internal
+        # callers (e.g. fetch→create) should also mark the new branch
+        # as a session creation so the chip-priority logic stays
+        # consistent regardless of which entry point built the branch.
+        self._recently_created_branches.add(name)
+        self.recently_created_changed.emit(self._recently_created_branches)
+        self._graph_view_model.update_recently_created(
+            self._recently_created_branches,
+        )
         self._log("branch", f"Branch {name!r} created at {target_sha[:7]}")
         return True
 
@@ -1158,12 +1480,20 @@ class MainViewModel(QObject):
 
     # ----- merge / rebase / cherry-pick / revert -----------------------
 
-    def merge_branch(self, source: str, target: str | None = None) -> None:
+    def merge_branch(
+        self, source: str, target: str | None = None, *, no_ff: bool = False,
+    ) -> None:
         """Merge ``source`` into HEAD (or ``target``) via :class:`MergeCommand`.
 
         On a conflict the command is **not** pushed onto the undo
         stack and the VM transitions into the conflict state — the
         UI can then drive the user through conflict resolution.
+
+        ``no_ff=True`` forces a merge commit even when the source
+        is a fast-forward of HEAD.  The UI uses this for drag-and-
+        drop and context-menu merges so the merge is visible in
+        the graph (a fast-forward would silently move the ref and
+        leave the user with "no commit" on the target branch).
 
         Large merges (more than ``merge_async_threshold`` files
         between HEAD and ``source``) are routed through
@@ -1181,9 +1511,12 @@ class MainViewModel(QObject):
         self._log(
             "merge",
             f"Merge {source!r}"
-            + (f" into {target!r}" if target else " into current"),
+            + (f" into {target!r}" if target else " into current")
+            + (" (no-ff)" if no_ff else ""),
         )
-        command = MergeCommand(self._repo_manager, source, target=target)
+        command = MergeCommand(
+            self._repo_manager, source, target=target, no_ff=no_ff,
+        )
         if self._async_enabled and self._estimate_merge_size(source) > self._merge_async_threshold:
             self._run_async(
                 command,

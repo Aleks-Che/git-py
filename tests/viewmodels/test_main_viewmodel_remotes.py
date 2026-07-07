@@ -623,3 +623,137 @@ def test_auto_fetch_set_interval_zero_disables(committed_repo: RepositoryManager
     vm.set_auto_fetch_interval_ms(0)
     assert not vm.is_auto_fetch_enabled()
     assert not vm._auto_fetch_timer.isActive()  # noqa: SLF001
+
+
+# ----- reset_local_branch_to_remote ----------------------------------------
+
+
+def test_reset_local_branch_to_remote_creates_new_local(origin_and_clone) -> None:
+    """When there is no local branch yet, reset = create + checkout.
+
+    Pushing a new branch to origin, then calling
+    ``reset_local_branch_to_remote`` on the subject clone (which has
+    no local branch for it) should fetch, create, and check it out.
+    """
+    _ensure_app()
+    _origin, clone = origin_and_clone
+    assert clone.path is not None
+    clone_root = Path(clone.path)
+
+    from src.core.operations import (
+        checkout_branch,
+        commit_changes,
+        create_branch,
+    )
+    from src.core.operations import (
+        push as core_push,
+    )
+    create_branch(clone, "feature", target_sha=clone.head_commit.sha)
+    checkout_branch(clone, "feature")
+    (clone_root / "f2.txt").write_text("from feature\n")
+    commit_changes(clone, "feature: second commit")
+    core_push(clone, "origin", "refs/heads/feature")
+
+    subject = clone_root.parent / "subject_clone"
+    if subject.exists():
+        import shutil
+        shutil.rmtree(subject)
+    pygit2.clone_repository(str(clone_root.parent / "origin.git"), str(subject))
+    subject_mgr = RepositoryManager(str(subject))
+    assert "feature" not in {b.name for b in subject_mgr.branches if not b.is_remote}
+
+    vm = MainViewModel(async_enabled=False)
+    vm.set_repository(subject_mgr)
+    vm.reset_local_branch_to_remote("origin/feature")
+
+    local_names = {b.name for b in subject_mgr.branches if not b.is_remote}
+    assert "feature" in local_names
+    assert subject_mgr.repo.head.shorthand == "feature"
+    assert subject_mgr.head_commit.message.strip() == "feature: second commit"
+
+
+def test_reset_local_branch_to_remote_hard_resets_ahead_local(origin_and_clone) -> None:
+    """When the local branch is ahead of the remote, hard-reset to match.
+
+    Push a commit to origin, then push a *second* local commit that is
+    *not* pushed.  Calling ``reset_local_branch_to_remote`` should
+    discard that unpushed commit and land HEAD on the remote tip.
+    """
+    _ensure_app()
+    _origin, clone = origin_and_clone
+    assert clone.path is not None
+    clone_root = Path(clone.path)
+
+    # Push an additional commit to origin so the remote is ahead of
+    # the default local clone-base.
+    cloned_branch = next(b.name for b in clone.branches if b.is_head)
+    (clone_root / "push_me.txt").write_text("pushed\n")
+    from src.core.operations import commit_changes
+    from src.core.operations import push as core_push
+    commit_changes(clone, "pushed to remote")
+    core_push(clone, "origin", f"refs/heads/{cloned_branch}")
+    pushed_sha = clone.head_commit.sha
+
+    # Subject clone starts at the pushed commit. Then make its local
+    # branch *ahead* by one more commit that never gets pushed.
+    subject = clone_root.parent / "subject_clone"
+    if subject.exists():
+        import shutil
+        shutil.rmtree(subject)
+    pygit2.clone_repository(str(clone_root.parent / "origin.git"), str(subject))
+    subject_mgr = RepositoryManager(str(subject))
+    (subject / "local_only.txt").write_text("local ahead\n")
+    commit_changes(subject_mgr, "local ahead")
+
+    local_before = next(
+        b for b in subject_mgr.branches
+        if b.name == cloned_branch and not b.is_remote
+    )
+    assert local_before.target_sha != pushed_sha
+
+    vm = MainViewModel(async_enabled=False)
+    vm.set_repository(subject_mgr)
+    vm.reset_local_branch_to_remote(f"origin/{cloned_branch}")
+
+    local_after = next(
+        b for b in subject_mgr.branches
+        if b.name == cloned_branch and not b.is_remote
+    )
+    assert local_after.target_sha == pushed_sha
+    assert subject_mgr.head_commit.message.strip() == "pushed to remote"
+
+
+def test_reset_local_branch_to_remote_without_repo_emits_error() -> None:
+    _ensure_app()
+    vm = MainViewModel()
+    errors: list[str] = []
+    vm.error_occurred.connect(errors.append)
+    vm.reset_local_branch_to_remote("origin/main")
+    assert errors
+
+
+def test_reset_local_branch_to_remote_bad_name_emits_error(
+    committed_repo: RepositoryManager,
+) -> None:
+    _ensure_app()
+    vm = MainViewModel()
+    vm.set_repository(committed_repo)
+    errors: list[str] = []
+    vm.error_occurred.connect(errors.append)
+    vm.reset_local_branch_to_remote("not-a-remote-name")
+    assert errors
+    assert any("Not a remote branch" in e for e in errors)
+
+
+def test_reset_local_branch_to_remote_when_busy_emits_error(
+    committed_repo: RepositoryManager,
+) -> None:
+    _ensure_app()
+    vm = MainViewModel()
+    vm.set_repository(committed_repo)
+    vm._is_busy = True  # noqa: SLF001
+    errors: list[str] = []
+    vm.error_occurred.connect(errors.append)
+    vm.reset_local_branch_to_remote("origin/main")
+    assert any("in progress" in e for e in errors)
+    vm._is_busy = False  # noqa: SLF001

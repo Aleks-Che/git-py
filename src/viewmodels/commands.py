@@ -465,8 +465,13 @@ class MergeCommand(GitCommand):
     move the ref back. Handles three outcomes:
 
     * **Up-to-date** — no SHA change; undo is a no-op.
-    * **Fast-forward** — the current branch ref is moved to
-      ``source_oid``; undo is ``reset(_previous_head_sha, hard)``.
+    * **Fast-forward** (``no_ff=False``) — the current branch ref
+      is moved to ``source_oid``; undo is
+      ``reset(_previous_head_sha, hard)``.
+    * **Fast-forward forced through the merge path**
+      (``no_ff=True``) — a merge commit with two parents is
+      created even on a fast-forwardable history, so the merge is
+      visible in the graph.
     * **Three-way merge** — a merge commit with two parents is
       created; undo is ``reset(_previous_head_sha, hard)``.
 
@@ -482,11 +487,18 @@ class MergeCommand(GitCommand):
         source: str,
         target: str | None = None,
         message: str | None = None,
+        no_ff: bool = False,
     ) -> None:
         self._repo = repo
         self._source = source
         self._target = target
         self._message = message
+        # ``no_ff`` mirrors ``git merge --no-ff``: when the source
+        # is a fast-forward of HEAD, force a real merge commit
+        # instead of silently moving the ref. The UI uses this for
+        # drag-and-drop and context-menu merges — the user asked
+        # for a merge, so the history should show one.
+        self._no_ff = no_ff
         self._previous_head: str | None = None
         self._head_moved = False
 
@@ -501,6 +513,7 @@ class MergeCommand(GitCommand):
             self._source,
             target=self._target,
             message=self._message,
+            no_ff=self._no_ff,
         )
         if self._previous_head is None:
             self._head_moved = False

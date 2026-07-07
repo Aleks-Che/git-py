@@ -358,3 +358,49 @@ def test_stage_unknown_file_emits_error(
     with qtbot.waitSignal(vm.error_occurred, timeout=500) as blocker:
         vm.stage_file(bad_path)
     assert "Failed to stage" in blocker.args[0]
+
+
+# ----- build_diff_text (public, used by Copy Diff) ---------------------
+
+
+def test_build_diff_text_unstaged_tracked(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    _ensure_app()
+    from pathlib import Path
+    (Path(committed_repo.path) / "hello.txt").write_text("hello, world!\n")
+    vm = CommitPanelViewModel()
+    vm.set_repository(committed_repo)
+
+    text = vm.build_diff_text("hello.txt", staged=False)
+    assert "hello, world!" in text
+    assert "+hello, world!" in text
+
+
+def test_build_diff_text_staged_tracked(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    _ensure_app()
+    from pathlib import Path
+    (Path(committed_repo.path) / "hello.txt").write_text("hello, world!\n")
+    vm = CommitPanelViewModel()
+    vm.set_repository(committed_repo)
+    vm.stage_file("hello.txt")
+
+    text = vm.build_diff_text("hello.txt", staged=True)
+    assert "hello, world!" in text
+
+
+def test_build_diff_text_untracked(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    _ensure_app()
+    (tmp_git_repo / "fresh.txt").write_text("alpha\nbeta\n")
+    vm = CommitPanelViewModel()
+    vm.set_repository(RepositoryManager(str(tmp_git_repo)))
+
+    text = vm.build_diff_text("fresh.txt", staged=False)
+    assert "new file" in text
+    assert "+alpha" in text
+    assert "+beta" in text
+

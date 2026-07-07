@@ -125,6 +125,78 @@ def test_create_branch_undo_removes_it(committed_repo: RepositoryManager) -> Non
     assert not any(b.name == "topic" for b in committed_repo.branches)
 
 
+def test_create_branch_tracks_recently_created(
+    committed_repo: RepositoryManager,
+) -> None:
+    """``create_branch`` records the new name in ``recently_created_branches``.
+
+    The set is consumed by the graph widget's chip-priority logic to
+    keep the just-created branch visually secondary when several
+    branches share a commit (the user-requested "source branch
+    first" UX). Pinning the bookkeeping here means a future
+    refactor that drops the notification would surface here.
+    """
+    _ensure_app()
+    vm = MainViewModel()
+    vm.set_repository(committed_repo)
+    assert vm.recently_created_branches() == set()
+    vm.create_branch("topic", target_sha=committed_repo.head_commit.sha)
+    assert "topic" in vm.recently_created_branches()
+
+
+def test_create_branch_emits_recently_created_changed(
+    committed_repo: RepositoryManager,
+) -> None:
+    """The :attr:`recently_created_changed` signal fires on every new branch.
+
+    Carries the *full* (snapshot) set rather than the added name
+    because the widgets that consume it refresh their entire
+    priority map on every emission; deltas would force them to
+    play catch-up. The signal is also re-emitted via
+    :attr:`GraphViewModel.recently_created_changed` so the graph
+    widget does not need a direct reference to the
+    :class:`MainViewModel`.
+    """
+    _ensure_app()
+    vm = MainViewModel()
+    vm.set_repository(committed_repo)
+    seen: list[set[str]] = []
+    vm.recently_created_changed.connect(lambda names: seen.append(set(names)))
+    gv = vm.graph_view_model()
+    seen_via_gv: list[set[str]] = []
+    gv.recently_created_changed.connect(lambda names: seen_via_gv.append(set(names)))
+    vm.create_branch("alpha", target_sha=committed_repo.head_commit.sha)
+    QCoreApplication.processEvents()
+    vm.create_branch("beta", target_sha=committed_repo.head_commit.sha)
+    QCoreApplication.processEvents()
+
+    assert set(seen[-1]) == {"alpha", "beta"}
+    assert set(seen_via_gv[-1]) == {"alpha", "beta"}
+
+
+def test_set_repository_clears_recently_created(
+    committed_repo: RepositoryManager,
+) -> None:
+    """Switching repositories forgets the previous run's tracking set.
+
+    Across different repos the priority ordering must not carry
+    stale state - a branch tagged "newly created" in repo A might
+    be ancient in repo B. The signal is also re-emitted with an
+    empty set so widgets drop any cached names.
+    """
+    _ensure_app()
+    vm = MainViewModel()
+    vm.set_repository(committed_repo)
+    vm.create_branch("topic", target_sha=committed_repo.head_commit.sha)
+    assert "topic" in vm.recently_created_branches()
+
+    seen: list[set[str]] = []
+    vm.recently_created_changed.connect(lambda names: seen.append(set(names)))
+    vm.set_repository(None)
+    assert vm.recently_created_branches() == set()
+    assert seen[-1] == set()
+
+
 # ----- delete_branch --------------------------------------------------
 
 

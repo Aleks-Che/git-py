@@ -303,6 +303,147 @@ def test_commit_detail_panel_showing_new_commit_clears_selection(
     assert detail.selected_file() is None
 
 
+# ----- commit-detail file context menu (right-click) -------------------
+
+
+def _make_repo_with_stash(path: Path) -> tuple[RepositoryManager, str, str]:
+    """A repo with one committed file and a stash holding a modified copy.
+
+    Returns ``(manager, head_sha, stash_sha)``. The committed file is
+    ``f.txt``; the stash rewrites it so the changed-files list for the
+    stash entry is non-empty.
+    """
+    mgr = _make_committed_repo(path)
+    head_sha = mgr.head_commit.sha
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    (path / "f.txt").write_text("v2-stashed\n")
+    mgr.repo.stash(sig, "wip", include_untracked=False)
+    stash = mgr.stash_list
+    assert stash, "stash list should contain the entry we just created"
+    return mgr, head_sha, stash[0].sha
+
+
+def test_commit_detail_context_menu_contains_copy_diff_for_regular_commit(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Right-clicking a file row on a regular commit exposes *Copy Diff*."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = RightPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    vm.select_commit(head_sha)
+    detail = panel._commit_detail
+
+    menu = detail._build_file_context_menu("f.txt")
+    assert menu is not None
+    texts = [a.text() for a in menu.actions() if a.text()]
+    assert "Copy Diff" in texts
+    # "Apply stashed file" only appears for stash entries.
+    assert "Apply stashed file" not in texts
+
+
+def test_commit_detail_context_menu_copy_diff_routes_to_main_viewmodel(
+    qtbot, tmp_git_repo: Path, monkeypatch,
+) -> None:
+    """Triggering the *Copy Diff* action on a regular commit calls the VM."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = RightPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    vm.select_commit(head_sha)
+    detail = panel._commit_detail
+
+    captured: dict = {}
+
+    def fake_copy(sha: str, path: str) -> None:
+        captured["sha"] = sha
+        captured["path"] = path
+
+    monkeypatch.setattr(vm, "copy_commit_file_diff", fake_copy)
+
+    menu = detail._build_file_context_menu("f.txt")
+    assert menu is not None
+    copy_action = next(a for a in menu.actions() if a.text() == "Copy Diff")
+    copy_action.trigger()
+    assert captured == {"sha": head_sha, "path": "f.txt"}
+
+
+def test_commit_detail_context_menu_for_stash_has_both_actions(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Right-clicking a file on a stash entry exposes *Copy Diff* and
+    *Apply stashed file*."""
+    mgr, _, stash_sha = _make_repo_with_stash(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = RightPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    vm.select_commit(stash_sha)
+    detail = panel._commit_detail
+
+    menu = detail._build_file_context_menu("f.txt")
+    assert menu is not None
+    texts = [a.text() for a in menu.actions() if a.text()]
+    assert "Copy Diff" in texts
+    assert "Apply stashed file" in texts
+
+
+def test_commit_detail_context_menu_copy_diff_for_stash_routes_to_main_viewmodel(
+    qtbot, tmp_git_repo: Path, monkeypatch,
+) -> None:
+    """*Copy Diff* on a stash entry also routes through the VM with the
+    stash SHA, so the VM can pick the right diff source."""
+    mgr, _, stash_sha = _make_repo_with_stash(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = RightPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    vm.select_commit(stash_sha)
+    detail = panel._commit_detail
+
+    captured: dict = {}
+
+    def fake_copy(sha: str, path: str) -> None:
+        captured["sha"] = sha
+        captured["path"] = path
+
+    monkeypatch.setattr(vm, "copy_commit_file_diff", fake_copy)
+
+    menu = detail._build_file_context_menu("f.txt")
+    assert menu is not None
+    copy_action = next(a for a in menu.actions() if a.text() == "Copy Diff")
+    copy_action.trigger()
+    assert captured == {"sha": stash_sha, "path": "f.txt"}
+
+
+def test_commit_detail_context_menu_returns_none_without_commit(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A freshly-constructed detail panel has no commit selected, so the
+    right-click menu must be a no-op (``None``)."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = RightPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    detail = panel._commit_detail
+    assert detail._build_file_context_menu("f.txt") is None
+
+
 # ----- stage_all_unstaged verb ----------------------------------------
 
 

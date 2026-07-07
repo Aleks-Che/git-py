@@ -184,6 +184,58 @@ def test_merge_fast_forward_moves_ref(committed_repo: RepositoryManager) -> None
     assert committed_repo.head_commit.sha == feat_head
 
 
+def test_merge_no_ff_creates_commit_on_fast_forward(
+    committed_repo: RepositoryManager,
+) -> None:
+    """``no_ff=True`` forces a merge commit even on a fast-forward.
+
+    The user reported: dropping a branch on another left them with
+    "no merge commit" on the target — a fast-forward silently moves
+    the ref and the user sees nothing in the graph. The fix is a
+    ``no_ff`` flag on :func:`merge_branch` (matches ``git merge
+    --no-ff``); the test pins the flag at the core layer so the
+    user-facing behaviour is not lost in a future refactor.
+    """
+    # Same setup as the fast-forward test: feature is a strict
+    # descendant of main, so a plain merge would be a fast-forward.
+    # We need to create feature AT the current HEAD so the two
+    # branches share the same starting point; otherwise
+    # ``create_branch(committed_repo, "feature")`` would create
+    # feature at HEAD (no extra commit on feature, so feature
+    # and main are the same ref).
+    before_main = str(committed_repo.head_commit.sha)
+    create_branch(committed_repo, "feature", target_sha=before_main)
+    checkout_branch(committed_repo, "feature")
+    (Path(committed_repo.path) / "f.txt").write_text("f\n")
+    feat_head = commit_changes(committed_repo, "add f").sha
+    assert feat_head != before_main  # sanity: feature actually has a new commit
+    checkout_branch(committed_repo, "main")
+    before_history = len(committed_repo.get_history())
+
+    # ``no_ff=True`` forces a merge commit. The function still
+    # reports success (``True``) because the merge happened — it
+    # just chose to leave a non-empty history.
+    result = merge_branch(committed_repo, "feature", no_ff=True)
+    assert result is True
+
+    # A brand new commit was created.  Its tree is the same as
+    # ``feat_head``'s (fast-forward content), but the SHA is
+    # different and it has two parents.
+    new_head = committed_repo.head_commit
+    assert new_head.sha != feat_head
+    # ``get_history`` walks both parents of the merge commit, so
+    # the post-merge count is ``before_history + 1`` (feature's
+    # extra commit) plus the new merge commit. That's
+    # ``before_history + 2`` total.
+    assert len(committed_repo.get_history()) == before_history + 2
+    new_head_tree = committed_repo.repo[new_head.sha].tree.id
+    feat_head_tree = committed_repo.repo[feat_head].tree.id
+    assert new_head_tree == feat_head_tree
+    # Parent order is implementation-defined (pygit2 / libgit2 may
+    # return the parents in any order); check the set.
+    assert set(new_head.parents) == {before_main, feat_head}
+
+
 def test_merge_three_way_returns_true(committed_repo: RepositoryManager) -> None:
     # Two diverging branches: feature and main each add a different file,
     # then merge -> a real three-way merge creates one extra commit.
@@ -212,6 +264,26 @@ def test_merge_conflict_raises(committed_repo: RepositoryManager) -> None:
     with pytest.raises(MergeConflictError) as exc_info:
         merge_branch(committed_repo, "feature")
     assert exc_info.value.conflicting_paths == ["hello.txt"]
+
+
+def test_merge_unknown_source_suggests_fetch(
+    committed_repo: RepositoryManager,
+) -> None:
+    """Unknown source error must hint at fetching remote branches.
+
+    The user reported: dropping a remote branch on a local one
+    (e.g. ``renovate/npm-vite-vulnerability`` onto ``main``) failed
+    with a bare "Unknown source" message. The most common cause is
+    that the remote-tracking ref has not been fetched yet, so the
+    error message now nudges the user towards the Fetch action
+    instead of leaving them guessing why their "merge" is
+    unmergeable.
+    """
+    with pytest.raises(InvalidRefError) as exc_info:
+        merge_branch(committed_repo, "renovate/npm-vite-vulnerability")
+    message = str(exc_info.value)
+    assert "renovate/npm-vite-vulnerability" in message
+    assert "fetch" in message.lower()
 
 
 def test_cherry_pick_copies_commit_onto_head(
@@ -691,8 +763,11 @@ def test_complete_merge_unknown_source_raises(
     (Path(committed_repo.path) / "hello.txt").write_text("ok\n")
     committed_repo.repo.index.add("hello.txt")
     committed_repo.repo.index.write()
-    with pytest.raises(InvalidRefError):
+    with pytest.raises(InvalidRefError) as exc_info:
         complete_merge(committed_repo, "no-such-source")
+    # Same fetch hint as ``merge_branch`` — the user may have
+    # supplied a remote-tracking ref they have not fetched yet.
+    assert "fetch" in str(exc_info.value).lower()
 
 
 # ----- rebase ----------------------------------------------------------------

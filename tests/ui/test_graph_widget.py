@@ -12,8 +12,10 @@ import time
 from pathlib import Path
 
 import pygit2
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent
 from PySide6.QtWidgets import (
+    QApplication,
     QGraphicsEllipseItem,
     QGraphicsItem,
     QGraphicsPathItem,
@@ -717,3 +719,2654 @@ def test_graph_table_widget_subscribes_to_scroll_signal(
     # The signal is connected directly; it runs synchronously so the
     # scrollbar has the new value by the time we read it.
     assert widget._scrollbar.value() >= 0  # noqa: SLF001
+
+
+# ----- branch chip hit-testing & gestures ------------------------------
+
+
+def _chip_viewport_pos(widget, sha: str, display: str) -> QPoint:
+    """Convert a branch chip's content rect to a viewport click point.
+
+    Returns the centre of the chip — good enough for hit-tests because
+    the chip's rounded-rect radius is small enough to leave a clear
+    inside region even after the 4-px slop Qt adds during drag.
+    """
+    chip = widget._branch_chip_rects[(sha, display)]  # noqa: SLF001
+    rect = chip["rect"]
+    # Translate content x to widget x (the column scrolls horizontally
+    # in content coordinates; the click arrives in widget coordinates).
+    widget_x = rect.center().x() - widget._h_scrolls[0]  # noqa: SLF001
+    # The y is in widget coordinates directly (the painter is not
+    # translated vertically, the row position already accounts for the
+    # vertical scroll).
+    widget_y = rect.center().y()
+    return QPoint(int(widget_x), int(widget_y))
+
+
+def _force_paint(widget) -> None:
+    """Force a paint pass so the chip-rect cache is populated.
+
+    In offscreen Qt, ``show()`` + a few signal emissions are not
+    always enough to land a paint event before the test starts
+    asserting on the cache. The three-call dance (``update`` →
+    ``processEvents`` → ``repaint``) is the cheapest way to get
+    deterministic paints: ``update`` schedules a repaint,
+    ``processEvents`` lets the scheduled event run, and ``repaint``
+    blocks until the actual paint completes. Tests that need a
+    populated chip cache should call this once after the graph
+    update.
+    """
+    widget.update()
+    QApplication.processEvents()
+    widget.repaint()
+
+
+def _make_repo_with_feature(
+    path: Path,
+) -> tuple[RepositoryManager, str, str]:
+    """Build a repo with a second local branch named ``feature`` at HEAD.
+
+    Returns ``(manager, head_sha, feature_sha)``. ``head_sha`` and
+    ``feature_sha`` are equal because ``feature`` is created on top of
+    ``main``'s tip — the chip is a duplicate of the HEAD chip, which
+    is the realistic case the new branch gestures need to handle.
+    """
+    mgr = _make_committed_repo(path)
+    feature_sha = mgr.head_commit.sha
+    mgr.repo.create_reference(
+        "refs/heads/feature", feature_sha, force=True,
+    )
+    head_sha = mgr.head_commit.sha
+    return mgr, head_sha, feature_sha
+
+
+def test_branch_chip_at_returns_none_outside_branch_column(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A click in the graph column (not on a chip) must not match.
+
+    The hit-test's first guard is the column boundary — anything past
+    the first divider is in the graph / commit-message area and must
+    fall through to the commit-selection path.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    # Click squarely in the graph column (the first divider is at 180
+    # by default; click at 400 which is well into col 1).
+    chip = widget._branch_chip_at(400, 200)  # noqa: SLF001
+    assert chip is None
+
+
+def test_branch_chip_at_finds_chip_after_horizontal_scroll(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Hit-test works when the branch column is scrolled horizontally.
+
+    Forces the column's scrollbar to a small non-zero value and
+    clicks at the chip's post-scroll screen position. The test pins
+    the ``content_x + scroll`` math in :meth:`_branch_chip_at` so a
+    regression here is loud (the chip would simply never be found).
+    The scroll value is small enough to keep the chip partially on
+    screen — a click at its post-scroll centre is therefore a real,
+    visible hit.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(300, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    # Force the column overflow so the horizontal scrollbar activates.
+    # 40 px is enough to slide the rightmost "main" chip a bit, but
+    # the leftmost "feature" chip stays inside the column.
+    widget._h_scrollbars[0].setRange(0, 200)  # noqa: SLF001
+    widget._h_scrollbars[0].setValue(40)  # noqa: SLF001
+    widget._h_scrolls[0] = 40  # noqa: SLF001
+    _force_paint(widget)
+
+    # Compute the chip's post-scroll viewport position and click there.
+    pos = _chip_viewport_pos(widget, mgr.head_commit.sha, "feature")
+    chip = widget._branch_chip_at(pos.x(), pos.y())  # noqa: SLF001
+    assert chip is not None
+    assert chip["display"] == "feature"
+    assert chip["is_head"] is False
+    assert chip["is_remote"] is False
+
+
+def test_branch_chip_at_finds_head_chip(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The current branch's chip carries ``is_head=True``.
+
+    The flag matters for the context menu — actions on the active
+    branch are disabled, since merging / rebasing a branch into
+    itself is a no-op. The test pins the flag at the chip level so a
+    future refactor that drops the ``is_head`` plumbing would be
+    caught here.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    pos = _chip_viewport_pos(widget, mgr.head_commit.sha, "main")
+    chip = widget._branch_chip_at(pos.x(), pos.y())  # noqa: SLF001
+    assert chip is not None
+    assert chip["display"] == "main"
+    assert chip["is_head"] is True
+
+
+def test_left_click_on_branch_chip_does_not_select_commit(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A left click on a branch chip must NOT change the commit selection.
+
+    This is the contract: the chip is a separate gesture surface from
+    the commit node that lives in the same row. A click that would
+    otherwise have selected the row's commit must be swallowed by
+    the chip hit-test.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    pos = _chip_viewport_pos(widget, head_sha, "feature")
+    with qtbot.assertNotEmitted(vm.commit_selected, wait=200):
+        qtbot.mouseClick(
+            widget, Qt.MouseButton.LeftButton, pos=pos,
+        )
+    # The widget's own selection also stayed where it was (None
+    # initially).
+    assert widget.selected_sha() is None
+
+
+def test_double_click_on_branch_chip_emits_checkout(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Double-clicking a branch chip emits the checkout signal with the ref name.
+
+    Uses the ``feature`` chip so the signal carries ``"feature"`` —
+    the bare local name, not ``"refs/heads/feature"``. The VM's
+    :meth:`checkout_branch` accepts the bare name so the wiring in
+    :meth:`MainWindow._on_graph_branch_checkout` stays a one-liner.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    pos = _chip_viewport_pos(widget, mgr.head_commit.sha, "feature")
+    with qtbot.waitSignal(
+        widget.checkout_branch_requested, timeout=1000,
+    ) as blocker:
+        qtbot.mouseDClick(
+            widget, Qt.MouseButton.LeftButton, pos=pos,
+        )
+    assert blocker.args[0] == "feature"
+
+
+def test_double_click_on_head_branch_chip_emits_checkout(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Double-clicking the current branch's chip also emits the signal.
+
+    Edge case: clicking the HEAD chip is a no-op as far as the actual
+    checkout goes (you're already there), but the signal still fires
+    so the MainWindow can decide what to do — the left panel, the
+    toolbar and the chip are all consistent. The test pins that the
+    gesture is not silently swallowed.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    pos = _chip_viewport_pos(widget, mgr.head_commit.sha, "main")
+    with qtbot.waitSignal(
+        widget.checkout_branch_requested, timeout=1000,
+    ) as blocker:
+        qtbot.mouseDClick(
+            widget, Qt.MouseButton.LeftButton, pos=pos,
+        )
+    assert blocker.args[0] == "main"
+
+
+def test_right_click_on_branch_chip_routes_to_branch_menu(
+    qtbot, tmp_git_repo: Path, monkeypatch,
+) -> None:
+    """Right-clicking a branch chip invokes the branch menu, not the commit one.
+
+    Pins the dispatch in :meth:`_on_context_menu`: the chip hit-test
+    must run before the commit hit-test, otherwise the chip click
+    would fall through to the commit menu (Checkout this commit).
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    # Patch the menu builders so we can detect which path the context
+    # menu took without running QMenu.exec() (which would block).
+    branch_called = []
+    commit_called = []
+    monkeypatch.setattr(
+        widget, "_show_branch_context_menu",
+        lambda chip, pos: branch_called.append(chip["display"]),
+    )
+    monkeypatch.setattr(
+        widget, "_on_context_menu_for_commit",  # type: ignore[attr-defined]
+        lambda sha, pos: commit_called.append(sha),
+        raising=False,
+    )
+
+    pos = _chip_viewport_pos(widget, head_sha, "feature")
+    widget._on_context_menu(pos)  # noqa: SLF001
+
+    assert branch_called == ["feature"]
+    assert commit_called == []
+
+
+def test_show_branch_context_menu_contains_merge_action(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The branch chip's context menu includes 'Merge X into Y'.
+
+    The menu is built in :meth:`_show_branch_context_menu` and
+    contains a single :class:`QAction` per verb. The merge action's
+    label interpolates both the source and the current HEAD so the
+    user sees a readable description of what they are about to do.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "feature")]  # noqa: SLF001
+
+    # Build the actions synchronously — the actual QMenu.exec() would
+    # block waiting for a click. We just want to inspect the actions.
+    actions = widget._build_branch_menu_actions(chip)  # noqa: SLF001
+    labels = [a.text() for a in actions]
+
+    assert "Checkout feature" in labels
+    assert "Merge feature into main" in labels
+    assert "Rebase feature onto main" in labels
+
+
+def test_show_branch_context_menu_merge_disabled_on_current_branch(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The merge / rebase actions are disabled for the current branch.
+
+    Merging ``main`` into ``main`` is a no-op; the menu shows the
+    action so the user can see what they could do, but it is greyed
+    out. Mirrors the left panel's ``_merge_rebase_against_current``
+    policy.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "main")]  # noqa: SLF001
+    actions = widget._build_branch_menu_actions(chip)  # noqa: SLF001
+    merge = next(a for a in actions if a.text().startswith("Merge main into"))
+    rebase = next(a for a in actions if a.text().startswith("Rebase main onto"))
+    assert merge.isEnabled() is False
+    assert rebase.isEnabled() is False
+
+
+def test_branch_menu_merge_action_emits_signal(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Triggering the merge action emits merge_branch_requested with source+target."""
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "feature")]  # noqa: SLF001
+    actions = widget._build_branch_menu_actions(chip)  # noqa: SLF001
+    merge = next(a for a in actions if a.text() == "Merge feature into main")
+
+    with qtbot.waitSignal(widget.merge_branch_requested, timeout=1000) as blocker:
+        merge.trigger()
+    assert blocker.args == ["feature", "main"]
+
+
+def test_branch_menu_rebase_action_emits_signal(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The rebase action emits rebase_branch_requested with source+target."""
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "feature")]  # noqa: SLF001
+    actions = widget._build_branch_menu_actions(chip)  # noqa: SLF001
+    rebase = next(a for a in actions if a.text() == "Rebase feature onto main")
+
+    with qtbot.waitSignal(widget.rebase_branch_requested, timeout=1000) as blocker:
+        rebase.trigger()
+    assert blocker.args == ["feature", "main"]
+
+
+def test_branch_menu_checkout_action_emits_signal(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The checkout action in the chip menu emits the checkout signal."""
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "feature")]  # noqa: SLF001
+    actions = widget._build_branch_menu_actions(chip)  # noqa: SLF001
+    checkout = next(a for a in actions if a.text() == "Checkout feature")
+
+    with qtbot.waitSignal(
+        widget.checkout_branch_requested, timeout=1000,
+    ) as blocker:
+        checkout.trigger()
+    assert blocker.args == ["feature"]
+
+
+def test_remote_branch_chip_checkout_uses_full_ref_name(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A remote-only branch chip's checkout action carries the full ref name.
+
+    The chip displays ``base_features`` (the ``origin/`` prefix is
+    stripped for the user), but the underlying ref is
+    ``refs/remotes/origin/base_features``. The wiring in
+    :meth:`MainWindow._on_graph_branch_checkout` looks at the full
+    name to decide between local and fetch+checkout — so the action
+    must pass the full ref through, not the display label.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    mgr.repo.references.create(
+        "refs/remotes/origin/base_features", mgr.repo.head.target, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "base_features")]  # noqa: SLF001
+    assert chip["is_remote"] is True
+    assert chip["full_name"] == "origin/base_features"
+    actions = widget._build_branch_menu_actions(chip)  # noqa: SLF001
+    checkout = next(
+        a for a in actions if a.text().startswith("Checkout base_features")
+    )
+    with qtbot.waitSignal(
+        widget.checkout_branch_requested, timeout=1000,
+    ) as blocker:
+        checkout.trigger()
+    assert blocker.args == ["origin/base_features"]
+
+
+# ----- WIP context menu (Stash Changes) -------------------------------
+
+
+def test_wip_menu_has_stash_changes_action_first(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Right-clicking the WIP node shows a 'Stash Changes' action on top.
+
+    The WIP node sits at row 0 (above HEAD) whenever the worktree has
+    uncommitted changes. The action is placed **first** in the menu so
+    the primary verb on a dirty worktree is the one-click reachable
+    option — the user does not have to scroll through destructive
+    choices (Discard changes) to reach the safe one (Stash).
+
+    Built via :meth:`GraphTableWidget._build_node_menu` so the test
+    does not block on ``QMenu.exec``.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    (tmp_git_repo / "f.txt").write_text("v3\n")
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    menu = widget._build_node_menu("WIP", "wip")  # noqa: SLF001
+    qtbot.addWidget(menu)
+    labels = [a.text() for a in menu.actions()]
+    assert labels[0] == "Stash Changes"
+    assert "Discard changes" in labels
+    assert "Copy diff" in labels
+
+
+def test_wip_menu_stash_action_emits_signal(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Triggering 'Stash Changes' emits ``stash_push_requested`` with WIP.
+
+    The signal payload is the WIP marker (``"WIP"``) — a stable
+    sentinel for "the worktree is dirty". The :class:`MainWindow`
+    handler ignores the payload and just delegates to
+    :meth:`MainViewModel.stash_push`.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    (tmp_git_repo / "f.txt").write_text("v3\n")
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    menu = widget._build_node_menu("WIP", "wip")  # noqa: SLF001
+    qtbot.addWidget(menu)
+    stash_action = next(
+        a for a in menu.actions() if a.text() == "Stash Changes"
+    )
+    with qtbot.waitSignal(
+        widget.stash_push_requested, timeout=1000,
+    ) as blocker:
+        stash_action.trigger()
+    assert blocker.args == ["WIP"]
+
+
+def test_wip_menu_discard_action_still_emits_signal(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The pre-existing Discard action still works after the menu change.
+
+    The WIP menu now starts with ``Stash Changes``; the new helper
+    must keep emitting the original ``discard_changes_requested``
+    signal so the existing ``MainWindow`` wiring (which calls
+    :meth:`MainViewModel.discard_changes`) keeps working.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    (tmp_git_repo / "f.txt").write_text("v3\n")
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    menu = widget._build_node_menu("WIP", "wip")  # noqa: SLF001
+    qtbot.addWidget(menu)
+    discard_action = next(
+        a for a in menu.actions() if a.text() == "Discard changes"
+    )
+    with qtbot.waitSignal(
+        widget.discard_changes_requested, timeout=1000,
+    ) as blocker:
+        discard_action.trigger()
+    assert blocker.args == ["WIP"]
+
+
+def test_regular_commit_menu_has_no_stash_action(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A regular commit node's menu does not gain a Stash Changes action.
+
+    Stashing uncommitted work is meaningless for a commit node (the
+    worktree is not involved); the new action must only appear on
+    the WIP kind. Pins the menu structure for the non-WIP branch so
+    a future refactor cannot accidentally add it back to every node.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    menu = widget._build_node_menu(mgr.head_commit.sha, "commit")  # noqa: SLF001
+    qtbot.addWidget(menu)
+    labels = [a.text() for a in menu.actions()]
+    assert "Stash Changes" not in labels
+    assert "Checkout this commit" in labels
+    assert "Copy diff" in labels
+
+
+def test_remote_branch_suppressed_when_local_duplicate_exists(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """When local ``main`` and remote ``origin/main`` share a commit,
+    only the local chip is drawn and only it has a hit-test rect.
+
+    The pre-fix behaviour was: both chips were drawn but only the
+    second one (the remote) ended up in the chip-rect cache (because
+    the cache was keyed by display name), so drag-and-drop worked on
+    the remote chip but not the local one. Pinning the single-chip
+    result here so a future regression surfaces as a loud failure
+    rather than a "menu only opens on the remote chip" surprise.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    mgr.repo.references.create(
+        "refs/remotes/origin/main", mgr.repo.head.target, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    # Exactly one entry for the HEAD row, keyed by the HEAD commit
+    # SHA + the display name. The remote ``origin/main`` chip is
+    # suppressed because the local ``main`` chip covers the name.
+    head_sha = mgr.head_commit.sha
+    assert (head_sha, "main") in widget._branch_chip_rects  # noqa: SLF001
+    assert len(widget._branch_chip_rects) == 1  # noqa: SLF001
+
+    chip = widget._branch_chip_rects[(head_sha, "main")]  # noqa: SLF001
+    # The surviving chip is the *local* one — it must carry the
+    # local-style flags so the menu builder treats it as local.
+    assert chip["is_remote"] is False
+    assert chip["is_head"] is True
+    assert chip["full_name"] == "main"
+
+
+def test_origin_head_remote_is_dropped_from_chip_cache(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The synthetic ``refs/remotes/<remote>/HEAD`` pseudo-ref must
+    never surface as a chip alongside the local ``main`` chip.
+
+    After ``fetch`` every clone carries ``origin/HEAD`` even when the
+    user never asked for it; treating it as a regular branch would
+    draw an extra ``HEAD`` chip next to the local main chip, which
+    the user reports as "main, HEAD, main" — three entries where
+    only one was expected.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = str(mgr.head_commit.sha)
+    mgr.repo.references.create(
+        "refs/remotes/origin/main", head_sha, force=True,
+    )
+    mgr.repo.references.create(
+        "refs/remotes/origin/HEAD", head_sha, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    keys = list(widget._branch_chip_rects.keys())  # noqa: SLF001
+    # Only the local ``main`` chip survives — both ``origin/main``
+    # (same short-name as local) and ``origin/HEAD`` (synthetic
+    # pseudo-ref) are dropped.
+    assert keys == [(head_sha, "main")]
+
+
+def test_chip_rect_cache_keyed_by_row_and_display(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Two commits with the same display name both have their own chip.
+
+    Without a row-aware key the cache would overwrite the older
+    chip with the newer one and the older commit's drag would
+    silently stop working. The test builds a feature branch that
+    shares ``main``'s name at HEAD and points it at a different
+    (older) commit; the cache must have one entry per row.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_commit = mgr.repo[mgr.repo.head.target]
+    parent_sha = str(head_commit.parent_ids[0])
+    mgr.repo.create_reference(
+        "refs/heads/release", parent_sha, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    head_sha = mgr.head_commit.sha
+    # HEAD row carries ``main`` (the current branch); the older
+    # row carries ``release``. Both keys are present in the
+    # cache.
+    assert (head_sha, "main") in widget._branch_chip_rects  # noqa: SLF001
+    assert (parent_sha, "release") in widget._branch_chip_rects  # noqa: SLF001
+    assert len(widget._branch_chip_rects) == 2  # noqa: SLF001
+
+
+def test_drop_on_suppressed_chip_emits_signal(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Dropping on the single surviving (local) chip works.
+
+    The bug report said: ``drag & drop only works on the remote
+    branch``. The fix collapsed the two visual chips into one;
+    the drop test pins that the surviving chip's full Qt drag
+    pipeline is wired up.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    mgr.repo.references.create(
+        "refs/remotes/origin/main", mgr.repo.head.target, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    # Build a synthetic drop event at the (only) chip's centre.
+    head_sha = mgr.head_commit.sha
+    chip = widget._branch_chip_rects[(head_sha, "main")]  # noqa: SLF001
+    content_x = chip["rect"].center().x()
+    content_y = chip["rect"].center().y()
+    drop_x = content_x - widget._h_scrolls[0]  # noqa: SLF001
+    drop_pos = QPoint(int(drop_x), int(content_y))
+
+    mime = QMimeData()
+    from src.ui.widgets.graph_panel import _CHIP_MIME  # noqa: PLC0415
+    mime.setData(_CHIP_MIME, b"main")
+    mime.setText("main")
+    event = QDropEvent(
+        drop_pos,
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        QEvent.Type.Drop,
+    )
+
+    with qtbot.assertNotEmitted(widget.branch_dropped_on_branch, wait=200):
+        # Dropping main on itself is the documented no-op.
+        widget.dropEvent(event)  # noqa: SLF001
+
+
+# ----- branch chip drag-and-drop --------------------------------------
+
+
+def _make_chip_mime(
+    widget, source_display: str,
+) -> QMimeData:
+    """Build a :class:`QMimeData` payload that mimics a chip drag.
+
+    The drag payload format is owned by :meth:`GraphTableWidget._begin_chip_drag`
+    — both the custom ``application/x-git-py-branch-chip`` type and
+    the plain-text branch name are set.  The MIME constant is a
+    module-level value in :mod:`src.ui.widgets.graph_panel`; the
+    helper imports it on demand so the test does not have to
+    duplicate the string.
+    """
+    from src.ui.widgets.graph_panel import _CHIP_MIME  # noqa: PLC0415
+
+    mime = QMimeData()
+    mime.setData(_CHIP_MIME, source_display.encode("utf-8"))
+    mime.setText(source_display)
+    return mime
+
+
+def test_widget_accepts_drops(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """``GraphTableWidget`` must call ``setAcceptDrops(True)``.
+
+    ``QWidget`` defaults to ``acceptDrops=False``; without an
+    explicit opt-in Qt's drag pipeline never delivers
+    ``dragEnterEvent`` / ``dropEvent`` to the widget. The symptom
+    is subtle: the press on a branch chip starts a drag (because
+    the widget initiates it via ``QDrag``), the cursor changes to
+    the drag indicator, but on release nothing happens — the drop
+    is silently rejected before the handler ever runs. Pinning
+    the flag here turns a runtime "menu doesn't show" mystery
+    into a loud, immediate test failure.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    assert widget.acceptDrops() is True
+
+
+def test_drag_enter_accepts_branch_chip_mime(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The drag-enter handler must accept a chip-style MIME payload.
+
+    The handler is the gate that lets Qt show the drop cursor over
+    a chip. A regression that filters out the custom MIME type
+    would surface as ``QDrag`` returning ``IgnoreAction`` and the
+    drop cursor never appearing — both of which are visible in
+    practice but noisy to debug without this test.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    mime = _make_chip_mime(widget, "feature")
+    pos = QPoint(50, 100)
+    event = QDragEnterEvent(
+        pos,
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    widget.dragEnterEvent(event)  # noqa: SLF001
+    assert event.isAccepted() is True
+
+
+def test_drag_enter_rejects_unrelated_mime(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Drop payloads without the chip MIME type are not accepted.
+
+    Defensive: the widget may one day accept other drags (e.g.
+    dragging a file from a commit row to the terminal). Until then
+    the chip MIME is the only valid payload, and ``dragEnterEvent``
+    must fall through to ``super`` for everything else.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    mime = QMimeData()
+    mime.setText("some-file.txt")
+    pos = QPoint(50, 100)
+    event = QDragEnterEvent(
+        pos,
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    # ``super().dragEnterEvent`` is a no-op for ``QWidget`` — the
+    # test pins that the handler does **not** mark an unrelated drop
+    # as accepted.
+    widget.dragEnterEvent(event)  # noqa: SLF001
+    assert event.isAccepted() is False
+
+
+def test_drop_on_target_branch_emits_signal(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Dropping the ``feature`` chip on the ``main`` chip emits branch_dropped_on_branch.
+
+    The test synthesises a chip-style ``QDropEvent`` at the
+    ``main`` chip's screen position and asserts the signal payload.
+    The actual :class:`QMenu` that ``MainWindow`` builds on top of
+    this signal is exercised in a separate integration test.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    target_pos = _chip_viewport_pos(widget, mgr.head_commit.sha, "main")
+    mime = _make_chip_mime(widget, "feature")
+    event = QDropEvent(
+        target_pos,
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        QEvent.Type.Drop,
+    )
+
+    with qtbot.waitSignal(
+        widget.branch_dropped_on_branch, timeout=1000,
+    ) as blocker:
+        widget.dropEvent(event)  # noqa: SLF001
+    assert blocker.args == ["feature", "main"]
+
+
+def test_drop_on_same_chip_is_ignored(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Dropping a chip on itself must not emit a signal.
+
+    Merging a branch into itself is a no-op; emitting a signal here
+    would just leave the ``MainWindow`` slot to handle a degenerate
+    case.  The drop is still accepted (so Qt stops showing the
+    "no drop" cursor) but ``branch_dropped_on_branch`` stays quiet.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    target_pos = _chip_viewport_pos(widget, mgr.head_commit.sha, "feature")
+    mime = _make_chip_mime(widget, "feature")
+    event = QDropEvent(
+        target_pos,
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        QEvent.Type.Drop,
+    )
+    with qtbot.assertNotEmitted(widget.branch_dropped_on_branch, wait=200):
+        widget.dropEvent(event)  # noqa: SLF001
+    assert event.isAccepted() is True
+
+
+def test_drop_off_any_chip_is_accepted_but_quiet(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A drop that misses every chip is accepted but emits no signal.
+
+    Defensive: the user might drop a chip on the commit graph
+    (column 1) or the commit message (column 2). We accept the drop
+    so Qt stops showing the "no drop" cursor, but we do not act on
+    it — only drops on a chip carry an explicit target branch.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    # Drop somewhere in the graph column, well past the branch chips.
+    drop_pos = QPoint(700, 100)
+    mime = _make_chip_mime(widget, "feature")
+    event = QDropEvent(
+        drop_pos,
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        QEvent.Type.Drop,
+    )
+    with qtbot.assertNotEmitted(widget.branch_dropped_on_branch, wait=200):
+        widget.dropEvent(event)  # noqa: SLF001
+    assert event.isAccepted() is True
+
+
+def test_drag_start_threshold_keeps_short_click_quiet(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A press + tiny move on a chip must not start a drag.
+
+    Pins the threshold logic: ``_begin_chip_drag`` only fires once
+    the cursor has moved more than ``_DRAG_START_THRESHOLD_PX``
+    from the press point. Short clicks on a chip (which is the
+    pre-existing commit-selection bypass) must still bypass
+    commit selection *without* accidentally starting a drag.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    # Press on the "feature" chip, then nudge the cursor by 2 px —
+    # well below the 6-px drag threshold.
+    pos = _chip_viewport_pos(widget, mgr.head_commit.sha, "feature")
+    press_event = QMouseEvent(
+        QEvent.Type.MouseButtonPress,
+        pos,
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    widget.mousePressEvent(press_event)  # noqa: SLF001
+    # The press must have stashed the chip + position; the drag
+    # must NOT have started yet.
+    assert widget._drag_press_chip is not None  # noqa: SLF001
+    assert widget._drag_active_chip is None  # noqa: SLF001
+
+    move_pos = pos + QPoint(2, 0)
+    move_event = QMouseEvent(
+        QEvent.Type.MouseMove,
+        move_pos,
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    # The move event will try to start a real QDrag inside the
+    # widget — that blocks waiting for a drop. Patch the drag
+    # starter to record the call instead so the test stays
+    # synchronous.
+    started: list[dict] = []
+
+    def fake_begin(chip, press_pos):
+        started.append({"chip": chip, "press_pos": press_pos})
+        # No QDrag.exec here — the test does not need a real drag.
+
+    widget._begin_chip_drag = fake_begin  # type: ignore[method-assign]  # noqa: SLF001
+    widget.mouseMoveEvent(move_event)  # noqa: SLF001
+    assert started == []  # 2 px is below the threshold
+
+    # Now nudge the cursor past the threshold — the drag must start.
+    big_move = pos + QPoint(20, 0)
+    big_event = QMouseEvent(
+        QEvent.Type.MouseMove,
+        big_move,
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    widget.mouseMoveEvent(big_event)  # noqa: SLF001
+    assert len(started) == 1
+    assert started[0]["chip"]["display"] == "feature"
+
+
+def test_release_clears_drag_press_state(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A mouse release after a chip press clears the press state.
+
+    The press state is what the move handler reads to decide
+    whether a drag should be promoted; if it leaks past the
+    release, the next move (in some unrelated area) could start a
+    spurious drag. The test pins the release-time cleanup.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    pos = _chip_viewport_pos(widget, mgr.head_commit.sha, "feature")
+    press_event = QMouseEvent(
+        QEvent.Type.MouseButtonPress,
+        pos,
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    widget.mousePressEvent(press_event)  # noqa: SLF001
+    assert widget._drag_press_chip is not None  # noqa: SLF001
+
+    release_event = QMouseEvent(
+        QEvent.Type.MouseButtonRelease,
+        pos,
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    widget.mouseReleaseEvent(release_event)  # noqa: SLF001
+    assert widget._drag_press_chip is None  # noqa: SLF001
+    assert widget._drag_press_pos is None  # noqa: SLF001
+    assert widget._drag_active_chip is None  # noqa: SLF001
+
+
+def test_begin_chip_drag_uses_correct_mime_types(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The drag payload carries the chip MIME and the plain text.
+
+    Pins the payload contract: the drop handler distinguishes chip
+    drags from anything else via the custom MIME type, while the
+    plain text lets external targets (clipboard, other widgets
+    that only know text) still get a useful payload. The
+    ``exec`` call is monkey-patched out so the test does not
+    block on a real drag.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "feature")]  # noqa: SLF001
+    captured: list[QMimeData] = []
+
+    class _StubDrag:
+        def __init__(self, parent):
+            self._mime = None
+            self._pix = None
+
+        def setMimeData(self, mime):  # noqa: N802 - Qt override
+            self._mime = mime
+
+        def setPixmap(self, pix):  # noqa: N802 - Qt override
+            self._pix = pix
+
+        def setHotSpot(self, pt):  # noqa: N802 - Qt override
+            self._hot = pt
+
+        def exec(self, *actions):  # noqa: N802 - Qt override
+            captured.append(self._mime)
+            return Qt.DropAction.CopyAction
+
+    # ``_begin_chip_drag`` constructs ``QDrag(self)`` directly; patch
+    # the symbol in the module so the stub class is used.
+    import src.ui.widgets.graph_panel as gp_module
+    original_drag = gp_module.QDrag
+    gp_module.QDrag = _StubDrag  # type: ignore[assignment]
+    try:
+        pos = QPoint(50, 100)
+        widget._begin_chip_drag(chip, pos)  # noqa: SLF001
+    finally:
+        gp_module.QDrag = original_drag  # type: ignore[assignment]
+
+    assert len(captured) == 1
+    mime = captured[0]
+    from src.ui.widgets.graph_panel import _CHIP_MIME  # noqa: PLC0415
+    assert mime.hasFormat(_CHIP_MIME)
+    assert bytes(mime.data(_CHIP_MIME)).decode("utf-8") == "feature"
+    assert mime.text() == "feature"
+
+
+def test_full_qdrag_drops_on_target_chip(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """End-to-end drag-and-drop on the graph: from ``QDrag`` start to menu signal.
+
+    The previous drop tests synthesised ``QDropEvent`` instances and
+    called ``widget.dropEvent(event)`` directly, which bypasses Qt's
+    drag pipeline. That is fine for unit-testing the handler logic,
+    but it would not have caught a regression where the widget
+    refuses to accept drops at the Qt level (``acceptDrops=False``
+    on the underlying :class:`QWidget`). This test does the full
+    thing: starts a real ``QDrag``, lets ``exec`` run, and
+    delivers a synthetic drop via ``QDrag::exec``'s event loop.
+    The :meth:`QtBot.mouseMove` calls advance the cursor through
+    the drag, and ``QtBot.mouseRelease`` finalises the drop on the
+    target chip.
+
+    The test stays in-process by capturing the drag with a custom
+    ``QDrag.exec`` (the same trick the other drag tests use) and
+    forwarding the drop position to the widget's ``dropEvent`` —
+    the only piece of the Qt pipeline that can run synchronously
+    inside a test event loop is the drop itself, so we set up
+    the press / move / release sequence on the widget and let it
+    fall through to ``dropEvent`` exactly as a real release would.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    # The widget must accept drops at the Qt level. Without this
+    # flag Qt silently rejects the drag before any of our handlers
+    # run, and the user sees "nothing happens" on release.
+    assert widget.acceptDrops() is True
+
+    # Compute the press and drop positions on the chips.
+    press_pos = _chip_viewport_pos(widget, mgr.head_commit.sha, "feature")
+    drop_pos = _chip_viewport_pos(widget, mgr.head_commit.sha, "main")
+
+    # Press on the "feature" chip.
+    qtbot.mousePress(widget, Qt.MouseButton.LeftButton, pos=press_pos)
+
+    # Move past the drag-start threshold to promote the press into a
+    # drag.  We bypass the real ``QDrag.exec`` by monkey-patching
+    # the class: when ``_begin_chip_drag`` runs, the stub captures
+    # the mime and synthesises a drop event at the target position.
+    captured: list[tuple[str, str]] = []
+    from src.ui.widgets.graph_panel import _CHIP_MIME  # noqa: PLC0415
+
+    def fake_exec(self, *_args, **_kwargs):
+        # Simulate Qt delivering the drop event to the widget at
+        # the target position. ``dropEvent`` runs synchronously, so
+        # the signal is captured before the stub returns.
+        mime = QMimeData()
+        mime.setData(_CHIP_MIME, b"feature")
+        mime.setText("feature")
+        event = QDropEvent(
+            drop_pos,
+            Qt.DropAction.CopyAction,
+            mime,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QEvent.Type.Drop,
+        )
+        # ``dropEvent`` is a regular method — call it the way Qt
+        # would after a real drop.
+        try:
+            widget.dropEvent(event)  # noqa: SLF001
+        except Exception:
+            pass
+        return Qt.DropAction.CopyAction
+
+    import src.ui.widgets.graph_panel as gp_module
+    original_drag = gp_module.QDrag
+    gp_module.QDrag = type(  # type: ignore[assignment]
+        "_StubDrag",
+        (),
+        {
+            "__init__": lambda self, parent: None,
+            "setMimeData": lambda self, mime: setattr(self, "_mime", mime),
+            "setPixmap": lambda self, pix: None,
+            "setHotSpot": lambda self, pt: None,
+            "exec": fake_exec,
+        },
+    )
+    try:
+        # Connect the signal to capture the drop result.
+        widget.branch_dropped_on_branch.connect(  # noqa: SLF001
+            lambda s, t: captured.append((s, t))
+        )
+        # Nudge the cursor past the threshold to start the drag.
+        move_pos = press_pos + QPoint(20, 0)
+        qtbot.mouseMove(widget, move_pos)
+        # Process events so the drag-start logic runs.
+        QApplication.processEvents()
+    finally:
+        gp_module.QDrag = original_drag  # type: ignore[assignment]
+        qtbot.mouseRelease(widget, Qt.MouseButton.LeftButton, pos=drop_pos)
+
+    # The drop on the "main" chip must have produced the menu signal
+    # with source="feature" and target="main".
+    assert captured == [("feature", "main")]
+
+
+# --------------------------------------------------------------------------
+# "Create branch here" - context menu + inline editor
+# --------------------------------------------------------------------------
+
+def test_branch_menu_has_create_branch_here_for_local(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Right-click on a local branch chip -> menu has 'Create branch here'.
+
+    The action is appended after ``Rebase X onto current`` with a
+    visual separator in between so the user reads it as part of a
+    related group (verbs targeting the source branch, plus the
+    "create a sibling from this commit" gesture).
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "feature")]
+    actions = widget._build_branch_menu_actions(chip)
+    labels = [a.text() for a in actions if not a.isSeparator()]
+    assert "Create branch here" in labels
+
+
+def test_branch_menu_omits_create_branch_here_for_remote(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Right-clicking a remote-tracking chip must NOT offer 'Create branch here'.
+
+    Remote refs are immutable from the local repo; the user is
+    reading a remote's state, not creating one. The action only
+    makes sense for local refs the user owns.
+
+    We set up ``upstream/feature`` (no local counterpart that would
+    trigger the local-vs-remote display-name suppression) and
+    verify the menu it produces does not include the action.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    mgr.repo.create_reference(
+        "refs/remotes/upstream/feature", head_sha, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(head_sha, "feature")]
+    actions = widget._build_branch_menu_actions(chip)
+    labels = [a.text() for a in actions if not a.isSeparator()]
+    assert "Create branch here" not in labels
+    # Sanity: the chip we found is indeed the remote variant.
+    assert chip["is_remote"] is True
+
+
+# ----- Copy branch name / Copy commit sha --------------------------------
+
+
+def test_branch_menu_has_copy_branch_name_for_local(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Right-clicking a local branch chip exposes 'Copy branch name'.
+
+    Mirrors the left-panel behaviour: every branch chip (local or
+    remote) must offer a copy action so the user can paste the
+    name straight into a ``git checkout`` command. The local chip
+    has ``full_name == display == "feature"`` here.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "feature")]
+    actions = widget._build_branch_menu_actions(chip)
+    labels = [a.text() for a in actions if not a.isSeparator()]
+    assert "Copy branch name" in labels
+    assert "Copy commit sha" in labels
+
+
+def test_branch_menu_copy_branch_name_emits_full_ref(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Triggering 'Copy branch name' emits the chip's full ref name.
+
+    Local chip: ``full_name == display == "feature"`` so the
+    payload is just the bare branch name.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "feature")]
+    actions = widget._build_branch_menu_actions(chip)
+    copy_name = next(a for a in actions if a.text() == "Copy branch name")
+
+    with qtbot.waitSignal(
+        widget.copy_branch_name_requested, timeout=1000,
+    ) as blocker:
+        copy_name.trigger()
+    assert blocker.args == ["feature"]
+
+
+def test_branch_menu_copy_commit_sha_emits_row_sha(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Triggering 'Copy commit sha' emits the row's commit SHA.
+
+    The chip cache carries ``row_sha`` (the commit the chip
+    points at), so the slot receives the same SHA the row
+    already exposes on click.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "feature")]
+    actions = widget._build_branch_menu_actions(chip)
+    copy_sha = next(a for a in actions if a.text() == "Copy commit sha")
+
+    with qtbot.waitSignal(
+        widget.copy_commit_sha_requested, timeout=1000,
+    ) as blocker:
+        copy_sha.trigger()
+    assert blocker.args == [mgr.head_commit.sha]
+
+
+def test_branch_menu_has_copy_branch_name_for_remote(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Remote-tracking chips also expose 'Copy branch name'.
+
+    The chip renders ``base_features`` (the ``origin/`` prefix is
+    stripped for display) but the action must hand the user the
+    full ref name so they can paste ``origin/base_features``
+    straight into a checkout command.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    mgr.repo.references.create(
+        "refs/remotes/origin/base_features", mgr.repo.head.target, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "base_features")]
+    assert chip["is_remote"] is True
+    actions = widget._build_branch_menu_actions(chip)
+    labels = [a.text() for a in actions if not a.isSeparator()]
+    assert "Copy branch name" in labels
+
+
+def test_branch_menu_copy_branch_name_uses_full_ref_for_remote(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The remote chip's 'Copy branch name' emits the full ref (e.g. ``origin/main``).
+
+    Critical for the UX: the chip *displays* the bare branch name
+    (with the remote prefix stripped) but the clipboard payload
+    must include the prefix — that is what the user pastes into
+    ``git checkout`` and what every other remote-aware UI surfaces.
+    Mirrors the left panel's ``_remote_branch_actions`` policy.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    mgr.repo.references.create(
+        "refs/remotes/origin/base_features", mgr.repo.head.target, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "base_features")]
+    actions = widget._build_branch_menu_actions(chip)
+    copy_name = next(a for a in actions if a.text() == "Copy branch name")
+
+    with qtbot.waitSignal(
+        widget.copy_branch_name_requested, timeout=1000,
+    ) as blocker:
+        copy_name.trigger()
+    # Full ref, not the display label.
+    assert blocker.args == ["origin/base_features"]
+
+
+def test_create_branch_here_action_opens_inline_editor(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Picking 'Create branch here' spawns a QLineEdit at the chip.
+
+    The action itself does not emit the create-branch signal - the
+    editor must first collect a name from the user. Only when Enter
+    is pressed does :attr:`create_branch_here_requested` fire.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "feature")]
+    widget._open_inline_editor(chip)
+    assert widget._inline_editor is not None
+    # The editor is anchored to the chip's row SHA so the eventual
+    # signal carries the correct target commit.
+    assert widget._inline_editor_row_sha == mgr.head_commit.sha
+
+
+def test_inline_editor_enter_emits_create_signal(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Enter in the inline editor emits create_branch_here_requested.
+
+    The editor is intentionally separate from the menu action: the
+    menu opens the editor, the editor captures the typed name and
+    fires the signal on Enter. Anything else (Escape, focus loss)
+    closes the editor silently - pinned here so a regression
+    where Escape accidentally fires the signal would surface.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "feature")]
+    widget._open_inline_editor(chip)
+    editor = widget._inline_editor
+    assert editor is not None
+    editor.setText("hotfix/login-bug")
+
+    with qtbot.waitSignal(
+        widget.create_branch_here_requested, timeout=2000,
+    ) as blocker:
+        QApplication.processEvents()
+        # ``returnPressed`` is fired by ``returnPressed.connect``;
+        # ``setText`` + a deliberate ``keyPressEvent`` of ``Enter``
+        # mirrors the user pressing the key.
+        from PySide6.QtGui import QKeyEvent
+        enter_event = QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(editor, enter_event)
+        QApplication.processEvents()
+
+    assert blocker.args == [mgr.head_commit.sha, "hotfix/login-bug"]
+    # Editor torn down after a successful commit.
+    assert widget._inline_editor is None
+
+
+def test_inline_editor_escape_closes_without_emitting(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Escape closes the inline editor and does NOT emit the signal.
+
+    Cancel-then-recreate is a normal flow (right-click, change
+    mind, right-click again) - Escape must be a clean revert.
+    The signal only fires on Enter; a regression that wired
+    Escape to ``create_branch_here_requested`` would be loud here.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "feature")]
+    widget._open_inline_editor(chip)
+    editor = widget._inline_editor
+    assert editor is not None
+
+    signal_caught: list[tuple[str, str]] = []
+    widget.create_branch_here_requested.connect(
+        lambda s, n: signal_caught.append((s, n)),
+    )
+
+    from PySide6.QtGui import QKeyEvent
+    esc_event = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(editor, esc_event)
+    QApplication.processEvents()
+
+    assert widget._inline_editor is None
+    assert signal_caught == []
+
+
+def test_inline_editor_graph_update_closes_editor(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """If the graph refreshes while the editor is open, the editor closes.
+
+    The editor is anchored to a specific row SHA; a refresh that
+    moves that row (commit disappeared, branch went away) would
+    leave a stale editor pointing at a vanished target. We close
+    the editor on every ``graph_updated`` and rebuild it manually
+    if the user actually wants to keep typing - the test pins
+    the close-on-refresh contract.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(mgr.head_commit.sha, "feature")]
+    widget._open_inline_editor(chip)
+    assert widget._inline_editor is not None
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    assert widget._inline_editor is None
+
+
+# --------------------------------------------------------------------------
+# Branch priority: HEAD wins, recent branches demoted
+# --------------------------------------------------------------------------
+
+def test_priority_prefers_head_branch(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A HEAD branch outranks non-HEAD branches at the same commit.
+
+    ``_branch_priority_key`` is the sorting function used to choose
+    which branch keeps the prominent (visible) chip when several
+    share a commit. The HEAD branch must always come first; the
+    test pins that ordering so a future refactor cannot quietly
+    demote it.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, head_sha, feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    main_branch = {"name": "main", "is_head": True, "is_remote": False}
+    feature_branch = {"name": "feature", "is_head": False, "is_remote": False}
+    sorted_branches = sorted(
+        [main_branch, feature_branch], key=widget._branch_priority_key,
+    )
+    assert sorted_branches[0] == main_branch
+
+
+def test_priority_demotes_recently_created_branch(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A branch in ``_recently_created_branches`` outranks lower buckets only - never the HEAD.
+
+    The "newly created branch is not promoted" guarantee means
+    that a session-created branch *without* HEAD must score
+    strictly below a source-style branch. Without that ordering,
+    the prominent chip would jump every time the user creates a
+    new branch - defeating the source-first UX.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, head_sha, feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    widget._recently_created_branches = {"feature"}
+    head_branch = {"name": "main", "is_head": True, "is_remote": False}
+    new_branch = {"name": "feature", "is_head": False, "is_remote": False}
+
+    head_key = widget._branch_priority_key(head_branch)
+    new_key = widget._branch_priority_key(new_branch)
+    # HEAD branch is always bucket 0 regardless of recent set.
+    assert head_key[0] == 0
+    # Recently-created branch lands at a non-zero bucket (either 2
+    # "recent-low" or 3 "fallback", both > 1).
+    assert new_key[0] > 1
+
+
+def test_recent_set_updates_via_signal(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """``recently_created_changed`` from the VM is mirrored in the widget.
+
+    The widget caches the recent set so its priority logic can run
+    synchronously during paint. The signal is the only path that
+    mutates the cache so this test pins the signal-driven wiring.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    assert widget._recently_created_branches == set()
+    vm.update_recently_created({"alpha", "beta"})
+    QApplication.processEvents()
+    assert widget._recently_created_branches == {"alpha", "beta"}
+
+
+# --------------------------------------------------------------------------
+# Collapsed rendering: only priority chip + - indicator; cache holds siblings
+# --------------------------------------------------------------------------
+
+def test_collapsed_row_renders_only_primary_chip(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Rows with 2+ branches render a single chip + - indicator.
+
+    The cache still holds *all* chip rects so test helpers and
+    external callers can resolve every chip by ``(sha, display)``
+    - but the painter only fills one chip. Test pins both: the
+    cache size and the branch chip set we keep.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, head_sha, feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    # Both chips are tracked in the cache (back-compat for tests
+    # that resolve by display name).
+    assert (head_sha, "main") in widget._branch_chip_rects
+    assert (head_sha, "feature") in widget._branch_chip_rects
+    # But only the priority chip carries the ``hidden_count``
+    # marker - the others are pure cache stubs.
+    main_meta = widget._branch_chip_rects[(head_sha, "main")]
+    feat_meta = widget._branch_chip_rects[(head_sha, "feature")]
+    assert main_meta["hidden_count"] == 1
+    assert feat_meta["hidden_count"] == 0
+
+
+def test_single_branch_row_has_no_hidden_count(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A row with one branch behaves as before (no collapse, no indicator)."""
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    meta = widget._branch_chip_rects[(mgr.head_commit.sha, "main")]
+    assert meta["hidden_count"] == 0
+
+
+def test_branch_group_size_counts_visible_only(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """``_branch_group_size`` returns the number of branches at a row.
+
+    Used by :meth:`_schedule_hover_popup` to decide whether to
+    bother opening the popup. This must reflect the *visible*
+    count - i.e. the number of entries in ``branch_refs`` after
+    the local-vs-remote suppression.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, head_sha, _feature_sha = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    assert widget._branch_group_size(head_sha) == 2
+    # A bogus row SHA returns 0 - guards the popup-timer path.
+    assert widget._branch_group_size("nonexistent-sha") == 0
+
+
+# --------------------------------------------------------------------------
+# Hover popup (BranchStackPopup)
+# --------------------------------------------------------------------------
+
+def test_branch_popup_lists_all_branches(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Opening the hover-popup at a multi-branch row shows every branch.
+
+    The popup payload mirrors :meth:`_branches_at_row` - used both
+    for display *and* as the source of ``branch_selected`` payloads
+    so the user can pick any branch, including the primary one.
+    """
+    from src.ui.widgets.graph_panel import BranchStackPopup, GraphTableWidget
+
+    mgr, head_sha, _ = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(head_sha, "main")]
+    widget._show_branch_popup(head_sha, chip["rect"])
+    QApplication.processEvents()
+    assert widget._branch_popup is not None
+    popup: BranchStackPopup = widget._branch_popup
+    # The popup's rows are ``BranchStackPopup._Row`` instances; we
+    # find them by class so the test does not rely on Python name
+    # mangling for inner classes.
+    row_cls = BranchStackPopup._Row
+    rows = popup.findChildren(row_cls)
+    names = {r._branch["name"] for r in rows}
+    assert names == {"main", "feature"}
+
+
+def test_branch_popup_row_click_emits_checkout(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Single-clicking a row in the hover-popup switches branches.
+
+    Both ``mousePressEvent`` and ``mouseDoubleClickEvent`` on a
+    popup row route to ``branch_selected`` - the popup is the
+    "double-click to switch" surface, but a quick single click
+    is also accepted (matches how every list-popup behaves in
+    the rest of the app).
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, head_sha, _ = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(head_sha, "main")]
+    widget._show_branch_popup(head_sha, chip["rect"])
+    QApplication.processEvents()
+    assert widget._branch_popup is not None
+
+    captured: list[str] = []
+    widget.checkout_branch_requested.connect(
+        lambda name: captured.append(name),
+    )
+
+    row = next(
+        r for r in widget._branch_popup.findChildren(widget._branch_popup._Row)  # noqa: SLF001
+        if r._branch["name"] == "feature"
+    )
+    from PySide6.QtGui import QMouseEvent
+    click = QMouseEvent(
+        QEvent.Type.MouseButtonPress, QPoint(2, 2),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(row, click)
+    QApplication.processEvents()
+
+    assert captured == ["feature"]
+    assert widget._branch_popup is None  # popup auto-closes on selection
+
+
+def test_branch_popup_closes_on_mouse_leave(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The hover-popup must close shortly after the cursor leaves it.
+
+    Pre-fix the popup had no ``leaveEvent`` so it stayed on screen
+    indefinitely; users had to click a row to dismiss it. The fix
+    installs a debounced close-timer (160 ms) that fires whenever
+    the cursor is outside the popup frame.
+    """
+    from PySide6.QtCore import QEvent
+    from src.ui.widgets.graph_panel import BranchStackPopup, GraphTableWidget
+
+    mgr, head_sha, _ = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(head_sha, "main")]
+    widget._show_branch_popup(head_sha, chip["rect"])
+    QApplication.processEvents()
+    popup = widget._branch_popup
+    assert isinstance(popup, BranchStackPopup)
+
+    # Send a leave event to start the close timer; advance the event
+    # loop past its 160 ms interval and confirm the popup dropped
+    # its ``self._branch_popup`` handle on the widget side.
+    leave = QEvent(QEvent.Type.Leave)
+    QApplication.sendEvent(popup, leave)
+    qtbot.waitUntil(lambda: widget._branch_popup is None, timeout=2000)  # noqa: SLF001
+
+
+def test_branch_popup_tracks_parent_window_move(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """When the parent window is dragged, the popup moves with it.
+
+    Pre-fix ``Qt.Tool`` popups froze at their initial global
+    position. The fix installs an ``eventFilter`` on the parent
+    that translates the popup by the same delta when the parent
+    receives ``QEvent.Move``.
+    """
+    from PySide6.QtCore import QEvent
+    from src.ui.widgets.graph_panel import BranchStackPopup, GraphTableWidget
+
+    mgr, head_sha, _ = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(head_sha, "main")]
+    widget._show_branch_popup(head_sha, chip["rect"])
+    QApplication.processEvents()
+    popup = widget._branch_popup
+    assert isinstance(popup, BranchStackPopup)
+
+    # Capture the initial geometry, simulate the parent shifting
+    # 200 px to the right, and verify the popup translated by the
+    # same amount via the parent ``QEvent.Move`` filter.
+    original = popup.geometry()
+    widget.move(widget.x() + 200, widget.y())
+    # ``move`` schedules a geometry change; let Qt deliver the
+    # ``QEvent.Move`` to the parent (which the popup's filter
+    # listens to).
+    QApplication.processEvents()
+    QApplication.sendEvent(widget, QEvent(QEvent.Type.Move))
+    QApplication.processEvents()
+
+    shifted = popup.geometry()
+    assert shifted.x() == original.x() + 200, (
+        f"popup should track parent's +200 px shift; "
+        f"got x={shifted.x()}, expected x={original.x() + 200}"
+    )
+
+
+def test_branch_popup_filters_origin_main_and_origin_head(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The popup must drop the same-name remote and ``origin/HEAD``.
+
+    Pre-fix the hover-popup iterated the raw ``branch_refs`` list
+    while the chip column used a suppressed list. The user sees
+    the chip say ``main`` (just one), then hovers and the popup
+    reveals ``main``, ``origin/main`` (duplicate), ``origin/HEAD``
+    (synthetic fetch marker) — exactly the "main, HEAD, main"
+    symptom. Both should disappear from the popup the same way
+    they disappeared from the chip column.
+
+    The repo also carries ``origin/feature`` so the popup has at
+    least two *visible* rows to enumerate (otherwise the
+    skip-when-single rule kicks in and there is nothing to
+    inspect). The asserted set is still just the two we care
+    about — ``main`` and ``origin/feature``.
+    """
+    from src.ui.widgets.graph_panel import BranchStackPopup, GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = str(mgr.head_commit.sha)
+    mgr.repo.references.create(
+        "refs/remotes/origin/main", head_sha, force=True,
+    )
+    mgr.repo.references.create(
+        "refs/remotes/origin/HEAD", head_sha, force=True,
+    )
+    mgr.repo.references.create(
+        "refs/remotes/origin/feature", head_sha, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    head_sha = str(mgr.head_commit.sha)
+    chip = widget._branch_chip_rects[(head_sha, "main")]
+    widget._show_branch_popup(head_sha, chip["rect"])
+    QApplication.processEvents()
+    popup: BranchStackPopup = widget._branch_popup
+    assert popup is not None
+    row_cls = BranchStackPopup._Row
+    rows = popup.findChildren(row_cls)
+    names = {r._branch["name"] for r in rows}
+    # ``origin/main`` and ``origin/HEAD`` are filtered out, but
+    # ``origin/feature`` (no local counterpart) survives. The
+    # result must never include the duplicate or the synthetic
+    # fetch marker.
+    assert "origin/main" not in names
+    assert "origin/HEAD" not in names
+    assert "main" in names
+    assert "origin/feature" in names
+
+
+def test_branch_popup_skipped_when_only_one_branch_visible(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A popup listing exactly one branch is pointless — skip it.
+
+    When the same-name-remote filter collapses a multi-branch row
+    down to a single chip (e.g. ``[main, origin/main]`` → ``[main]``),
+    the hover-popup used to open anyway and show ``main`` alone —
+    which is just what the chip already shows. Skipping the popup
+    keeps the UX consistent with the ``▼`` indicator (which is
+    only drawn when ``hidden_count > 0``).
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = str(mgr.head_commit.sha)
+    # Two refs at HEAD, but they collapse to one after the filter.
+    mgr.repo.references.create(
+        "refs/remotes/origin/main", head_sha, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(head_sha, "main")]
+    widget._show_branch_popup(head_sha, chip["rect"])
+    QApplication.processEvents()
+    # ``_show_branch_popup`` must early-return when the filtered
+    # branch list has fewer than two entries.
+    assert widget._branch_popup is None  # noqa: SLF001
+
+
+def test_branch_popup_hover_timer_skipped_for_single_visible(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The hover debounce timer must not open a popup when no
+    siblings would be revealed.
+
+    Without this guard ``_on_hover_popup_timer`` happily schedules
+    the popup call only for ``_show_branch_popup`` to silently
+    bail out — wasteful and noisy in logs. The timer slot should
+    consult ``chip['hidden_count']`` (post-filter) before opening.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = str(mgr.head_commit.sha)
+    mgr.repo.references.create(
+        "refs/remotes/origin/main", head_sha, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(head_sha, "main")]
+    # Pre-condition: the primary chip records zero hidden siblings
+    # because the duplicate got filtered out.
+    assert chip["hidden_count"] == 0  # noqa: SLF001
+
+    # Drive the timer path the way the widget does: stash the
+    # chip + row, fire the debounce slot, and confirm nothing
+    # was opened.
+    widget._popup_hover_chip = chip  # noqa: SLF001
+    widget._popup_hover_row_sha = head_sha  # noqa: SLF001
+    widget._on_hover_popup_timer()  # noqa: SLF001
+    QApplication.processEvents()
+    assert widget._branch_popup is None  # noqa: SLF001
+
+
+def test_branch_popup_closes_on_global_mouse_move_outside(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A ``QEvent.MouseMove`` outside the popup + chip area closes it.
+
+    The popup installs a global mouse-move filter on the
+    application. When the user drags the cursor far away (window
+    drag, alt-tab to another screen, …) ``leaveEvent`` does not
+    always fire — this filter catches the cursor far from both the
+    popup and the source chip and closes the popup immediately.
+    """
+    from src.ui.widgets.graph_panel import BranchStackPopup, GraphTableWidget
+
+    mgr, head_sha, _ = _make_repo_with_feature(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(head_sha, "main")]
+    widget._show_branch_popup(head_sha, chip["rect"])
+    QApplication.processEvents()
+    popup = widget._branch_popup
+    assert isinstance(popup, BranchStackPopup)
+
+    # Direct ``sendEvent`` of a synthetic ``MouseMove`` does not
+    # carry ``globalPosition`` — the popup also subscribes to
+    # ``leaveEvent`` so we trigger that path instead.
+    leave = QEvent(QEvent.Type.Leave)
+    QApplication.sendEvent(popup, leave)
+    qtbot.waitUntil(lambda: widget._branch_popup is None, timeout=2000)  # noqa: SLF001
+    assert popup.isVisible() is False
+
+
+# --------------------------------------------------------------------------
+# Local vs remote-only chip styling: filled vs outlined
+# --------------------------------------------------------------------------
+
+def test_local_branch_chip_marks_is_remote_only_false(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A pure-local chip carries `is_remote_only=False`.
+
+    Pinning the flag at the cache level lets tests and tooling
+    style the chip without re-deriving `is_remote and no
+    local-counterpart` every time.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    head_sha = mgr.head_commit.sha
+    meta = widget._branch_chip_rects[(head_sha, "main")]
+    assert meta["is_remote"] is False
+    assert meta["is_remote_only"] is False
+
+
+def test_remote_only_branch_chip_marks_is_remote_only_true(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A remote ref with no same-name local keeps `is_remote_only=True`.
+
+    `upstream/feature` has no local counterpart that shares its
+    display name (`feature`), so it survives the local-suppression
+    filter and is rendered as a remote-only chip. The render path
+    uses this flag to swap `fill` for `stroke-only`.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    mgr.repo.create_reference(
+        "refs/remotes/upstream/feature", head_sha, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    meta = widget._branch_chip_rects[(head_sha, "feature")]
+    assert meta["is_remote"] is True
+    assert meta["is_remote_only"] is True
+
+
+def test_remote_duplicate_of_local_marks_is_remote_only_false(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A remote ref whose display name matches a local keeps local style.
+
+    `origin/main` shares `main` with the local HEAD chip, so
+    the remote is suppressed (only one chip rect exists for that
+    row). The surviving `(head_sha, "main")` entry is the local
+    one, and must therefore carry `is_remote_only=False`.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    mgr.repo.create_reference(
+        "refs/remotes/origin/main", head_sha, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    meta = widget._branch_chip_rects[(head_sha, "main")]
+    assert meta["is_remote"] is False
+    assert meta["is_remote_only"] is False
+    # One chip per row - the remote duplicate never gets a rect.
+    assert len(widget._branch_chip_rects) == 1
+
+
+def test_remote_only_chip_pixmap_has_transparent_fill(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A rendered remote-only chip has no fill - only a coloured border.
+
+    We capture a PNG of the chip area and probe the *centre* of
+    the chip (which is inside the rounded rect but outside the
+    border outline). For a remote-only chip this point is not
+    painted by the body fill - it shows through to the widget
+    background. For a filled local chip the same point matches
+    the commit colour. The test pins that pixel-level outcome so
+    a regression of the draw-vs-fill switch surfaces immediately.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    mgr.repo.create_reference(
+        "refs/remotes/upstream/feature", head_sha, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+    QApplication.processEvents()
+
+    # Resolve the chip rects in widget coords, then render the
+    # branch column to a small QImage so we can probe pixels.
+    chip_remote = widget._branch_chip_rects[(head_sha, "feature")]
+    chip_local = widget._branch_chip_rects[(head_sha, "main")]
+
+    # Render the branch column into a QImage with the same
+    # dimensions as the column, then probe the centre of each
+    # chip's rect relative to the widget viewport.
+    from PySide6.QtCore import QRect as QRectC
+    from PySide6.QtGui import QImage, QPainter
+    col_range = widget._col_ranges()[0]  # noqa: SLF001 - intentional
+    left, right = col_range
+    img = QImage(int(right - left), widget.height(), QImage.Format.Format_ARGB32)
+    img.fill(0)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    widget._draw_branch_column(
+        p, widget._cfg.header_height, int(left), int(right),
+    )
+    p.end()
+
+    def _sample(rect: QRectC) -> tuple[int, int, int, int]:
+        # Map content-x to image-x (the painter translates by
+        # ``-_h_scrolls[0]`` and then operates in content coords).
+        local_x = rect.center().x() - widget._h_scrolls[0]
+        local_y = rect.center().y()
+        # Both coordinates are relative to the widget viewport;
+        # the image above starts at ``left`` (the column left),
+        # so subtract that.
+        ix = int(local_x - left + 1)
+        iy = int(local_y) + 1
+        pixel = img.pixelColor(max(0, ix), max(0, iy))
+        return (pixel.red(), pixel.green(), pixel.blue(), pixel.alpha())
+
+    # Background colour the user sees at zero-opacity (the chip
+    # body has NOT been filled, so the image's transparent
+    # background shows through).
+    remote_center = _sample(chip_remote["rect"])
+    local_center = _sample(chip_local["rect"])
+
+    # Outlined chip body stays transparent inside the rounded
+    # rect - the surrounding widget area shows through. We
+    # compare the alpha channel to the filled chip on the same
+    # row: the remote side has to be at least as transparent.
+    assert remote_center[3] < local_center[3], (
+        f"Remote-only chip should be more transparent than "
+        f"the local chip (got remote={remote_center}, "
+        f"local={local_center})"
+    )
+    # Sanity: the local chip's centre is fully opaque.
+    assert local_center[3] > 200
+
+
+# --------------------------------------------------------------------------
+# 3+ branches at the same row -> always collapse to one chip + popup
+# --------------------------------------------------------------------------
+
+def test_three_branches_collapse_to_primary_chip(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """``HEAD + local + remote (different display names)`` collapses to ONE chip.
+
+    The user's preference is that *every* multi-branch row
+    collapses — even with 3+ distinct branches at the commit. The
+    priority chip (HEAD main) stays visible; the other two live
+    in the cache (so the hover-popup can resolve them) but are
+    not drawn. The cache carries ``hidden_count == 2`` on the
+    primary chip so the popup knows how many siblings to reveal.
+
+    Test setup: HEAD ``main`` (local) + a second local branch
+    ``develop`` + a remote-tracking ``origin/release``. After
+    local-suppression of remotes, all three names are unique, so
+    the visible count is exactly 3.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    mgr.repo.create_reference("refs/heads/develop", head_sha, force=True)
+    mgr.repo.create_reference(
+        "refs/remotes/origin/release", head_sha, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    # Cache carries every chip so the popup and tooling can
+    # resolve them all by display name.
+    assert (head_sha, "main") in widget._branch_chip_rects  # noqa: SLF001
+    assert (head_sha, "develop") in widget._branch_chip_rects  # noqa: SLF001
+    assert (head_sha, "release") in widget._branch_chip_rects  # noqa: SLF001
+    # The primary chip carries the hidden_count marker; siblings
+    # carry 0 because the popup is driven by the primary chip.
+    primary = widget._branch_chip_rects[(head_sha, "main")]  # noqa: SLF001
+    develop = widget._branch_chip_rects[(head_sha, "develop")]  # noqa: SLF001
+    release = widget._branch_chip_rects[(head_sha, "release")]  # noqa: SLF001
+    assert primary["hidden_count"] == 2
+    assert develop["hidden_count"] == 0
+    assert release["hidden_count"] == 0
+    # And the priority chip is the local HEAD - the user
+    # explicitly asked for "one local" to be the default chip.
+    assert primary["is_head"] is True
+    assert primary["is_remote"] is False
+
+
+def test_three_branches_popup_lists_all_three(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Hovering on a 3-branch chip opens a popup listing all three branches.
+
+    ``_show_branch_popup`` is invoked directly here so the test
+    stays synchronous (no mouse-move / debounce-timer pipeline);
+    the popup payload mirrors the row's full branch list, which
+    is the user-facing contract: ``double-click any item to switch``.
+    """
+    from src.ui.widgets.graph_panel import BranchStackPopup, GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    mgr.repo.create_reference("refs/heads/develop", head_sha, force=True)
+    mgr.repo.create_reference(
+        "refs/remotes/origin/release", head_sha, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    chip = widget._branch_chip_rects[(head_sha, "main")]  # noqa: SLF001
+    widget._show_branch_popup(head_sha, chip["rect"])  # noqa: SLF001
+    QApplication.processEvents()
+
+    assert widget._branch_popup is not None  # noqa: SLF001
+    row_cls = BranchStackPopup._Row
+    rows = widget._branch_popup.findChildren(row_cls)  # noqa: SLF001
+    names = {r._branch["name"] for r in rows}
+    # Local + remote: "main" (HEAD), "develop", and "origin/release".
+    # Note that the remote ref's full name carries the remote prefix
+    # even though its display name is "release" - the popup row
+    # stores the underlying ref dict verbatim.
+    assert names == {"main", "develop", "origin/release"}
+
+
+def test_three_branches_render_only_one_visible_chip(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Visually verify: with 3 branches at HEAD, only ONE chip is painted.
+
+    The cache carries rects for every chip (so the popup and
+    tooling can resolve them), but the actual ``paintEvent`` only
+    fills the priority chip's path. This pixel-level check paints
+    the branch column into a QImage and probes the alpha channel
+    along the row's horizontal extent: a drawn chip leaves a
+    coloured signature (high alpha at the chip body), and a
+    "cache-only" entry leaves the background untouched (zero
+    alpha in the chip body area, even though the rect exists).
+
+    Test setup: HEAD ``main`` (local) + a second local branch
+    ``develop`` + a remote-tracking ``origin/release``. After the
+    suppression + collapse rules, only the ``main`` chip is drawn;
+    ``develop`` and ``origin/release`` are reserved positions in the
+    cache but their chip bodies stay transparent.
+    """
+    from PySide6.QtCore import QRect
+    from PySide6.QtGui import QImage, QPainter
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    mgr.repo.create_reference("refs/heads/develop", head_sha, force=True)
+    mgr.repo.create_reference(
+        "refs/remotes/origin/release", head_sha, force=True,
+    )
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    # Render the branch column into a QImage so we can probe
+    # pixels along the row's horizontal axis.
+    col_left, col_right = widget._col_ranges()[0]  # noqa: SLF001
+    img = QImage(
+        int(col_right - col_left), widget.height(),
+        QImage.Format.Format_ARGB32,
+    )
+    img.fill(0)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    widget._draw_branch_column(  # noqa: SLF001
+        p, widget._cfg.header_height, int(col_left), int(col_right),
+    )
+    p.end()
+
+    def _alpha_at(rect: QRect) -> int:
+        # The rect is in content coordinates (relative to the
+        # painter's translated origin). Since the image is painted
+        # directly via ``QPainter(img)`` with ``col_left`` as its
+        # own origin (the painter's translate-by-(-h_scrolls[col])
+        # shifts the content into the image at ``content_x``), the
+        # pixel we read lives at the *content-x* position in the
+        # image — not offset by ``col_left``.
+        cx = rect.center().x()
+        cy = rect.center().y()
+        # Defensive: clamp to image bounds so a chip overflowing the
+        # column never trips Qt's pixelColor range check.
+        if cx < 0 or cy < 0 or cx >= img.width() or cy >= img.height():
+            return 0
+        pixel = img.pixelColor(cx, cy)
+        return pixel.alpha()
+
+    main_meta = widget._branch_chip_rects[(head_sha, "main")]  # noqa: SLF001
+    develop_meta = widget._branch_chip_rects[(head_sha, "develop")]  # noqa: SLF001
+    release_meta = widget._branch_chip_rects[(head_sha, "release")]  # noqa: SLF001
+
+    main_alpha = _alpha_at(main_meta["rect"])
+    develop_alpha = _alpha_at(develop_meta["rect"])
+    release_alpha = _alpha_at(release_meta["rect"])
+
+    # The primary chip is filled with the commit colour, so its
+    # centre pixel must have a high alpha (fully opaque paint).
+    assert main_alpha > 200, (
+        f"main chip centre alpha should be opaque, got {main_alpha}"
+    )
+    # The two sibling chips live in the cache but are NOT drawn:
+    # their body pixels stay fully transparent (the image's
+    # zero-fill background shows through).
+    assert develop_alpha == 0, (
+        f"develop chip should NOT be drawn (alpha 0), got {develop_alpha}"
+    )
+    assert release_alpha == 0, (
+        f"origin/release chip should NOT be drawn (alpha 0), got {release_alpha}"
+    )

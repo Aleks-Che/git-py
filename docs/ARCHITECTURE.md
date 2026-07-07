@@ -21,19 +21,20 @@
 ### 2. Application Logic (ViewModel-слой)
 Хранит состояние UI, обрабатывает команды пользователя, вызывает Core и управляет undo/redo.
 **Модули:**
-- `viewmodels/main_viewmodel.py` – центральный диспетчер, владеет `RepositoryManager`, `CommandProcessor`, предоставляет свойства/сигналы для всех панелей.
+- `viewmodels/main_viewmodel.py` – центральный диспетчер, владеет `RepositoryManager`, `CommandProcessor`, предоставляет свойства/сигналы для всех панелей. verb-методы: `commit_changes`, `checkout_branch`, `merge_branch(no_ff=False)`, `rebase_branch`, `cherry_pick`, `revert`, `reset_local_branch_to_remote(name)` (деструктивный hard-reset, **минует** `CommandProcessor` — диалог в UI компенсирует), `fetch_and_checkout_remote_branch`, `push_changes`, `pull_changes`, `fetch_changes`, `clone_repository`, `stash_push/pop/apply/drop`, `create_branch`/`delete_branch`/`rename_branch`, `add_remote`/`remove_remote`. Helpers: `repository_manager()`, `local_branch_exists(name)`.
 - `viewmodels/graph_viewmodel.py` – вычисление структуры графа коммитов (DAG), маппинг веток и тегов, обновление при fetch/изменениях.
 - `viewmodels/commit_panel_viewmodel.py` – состояние WIP (изменённые/индексированные файлы), управление staging/unstaging, сообщение коммита.
 - `viewmodels/branch_panel_viewmodel.py` – список локальных/удалённых веток, контекстные операции.
-- `commands.py` – иерархия классов команд: CommitCommand, MergeCommand, RebaseCommand, CheckoutCommand, StashCommand и т.д., наследующих от базового `GitCommand`.
+- `commands.py` – иерархия классов команд: `CommitCommand`, `MergeCommand(no_ff=False)`, `RebaseCommand`, `CheckoutCommand`, `StashCommand` и т.д., наследующих от базового `GitCommand`.
 
 ### 3. UI / View (Qt Widgets)
 Полностью пассивные компоненты, только отображают данные из ViewModel и передают пользовательские действия.
 **Модули:**
 - `ui/main_window.py` – главное окно: меню, тулбар, размещение основных панелей (левая, граф, правая, нижний терминал).
 - `ui/widgets/graph_widget.py` – кастомный виджет на `QGraphicsView/QGraphicsScene`, рендерит коммиты как узлы, ветки как цветные линии, позволяет клик, перетаскивание (drag&drop для merge/rebase).
-- `ui/widgets/commit_panel.py` – панель коммита: список файлов с галочками, просмотр диффа выбранного файла, поле сообщения, кнопка commit.
-- `ui/widgets/left_panel.py` – дерево ссылок (QTreeWidget) с группировкой по типам: локальные ветки, удалённые, теги, stash.
+- `ui/widgets/graph_panel.py` – `GraphTableWidget` (активный рендер графа), `BranchStackPopup` (frameless hover-popup со списком веток на multi-branch чипе). Каждая multi-branch строка сворачивается в один priority-чип + `▼`-индикатор (`_branch_priority_key`, `_suppress_dup_remotes`); popup поднимается через debounce `_HOVER_POPUP_DELAY_MS`; тройная защита закрытия (`leaveEvent` + глобальный event-filter + `ApplicationDeactivate`); eventFilter на родителе ловит `Move` для следования за окном.
+- `ui/widgets/commit_panel.py` – панель коммита: список файлов с чекбоксами, просмотр диффа выбранного файла, поле сообщения, кнопка commit.
+- `ui/widgets/left_panel.py` – дерево ссылок (QTreeWidget) с группировкой по типам: локальные ветки, удалённые, теги, stash. Группа `Remote` скрывается целиком (`setHidden(True)`) если `BranchPanelViewModel._suppress_same_name_remotes` оставила её пустой.
 - `ui/widgets/terminal_widget.py` – встроенный терминал (на основе QTermWidget или эмуляция через QProcess).
 - `ui/dialogs/` – диалоги: разрешения конфликтов, настройки, клонирования, создания репозитория и т.д.
 

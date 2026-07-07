@@ -378,7 +378,7 @@ class CommitPanelViewModel(QObject):
             self.diff_ready.emit("")
             return
         try:
-            text = self._build_diff_text(path, staged=self._selected_file_staged)
+            text = self.build_diff_text(path, staged=self._selected_file_staged)
         except GitError as exc:
             self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
             self._current_diff = ""
@@ -387,13 +387,17 @@ class CommitPanelViewModel(QObject):
         self._current_diff = text
         self.diff_ready.emit(text)
 
-    def _build_diff_text(self, path: str, staged: bool = False) -> str:
+    def build_diff_text(self, path: str, staged: bool = False) -> str:
         """Return the unified diff for ``path``.
 
         When ``staged=False`` (default) shows the working-tree diff
         (worktree vs HEAD).  When ``staged=True`` shows the index diff
         (index vs HEAD) — what would be committed if you ran ``git
         commit`` right now.
+
+        Public — the *Copy Diff* context-menu action in the right
+        panel's commit-input view calls this to grab the text that
+        gets pushed onto the system clipboard.
         """
         repo = self._repo.repo
         if not staged and self._is_untracked(path):
