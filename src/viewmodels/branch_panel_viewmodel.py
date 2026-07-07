@@ -33,6 +33,13 @@ from src.core.models import BranchInfo, RemoteInfo, StashInfo, TagInfo
 from src.core.repository import RepositoryManager
 
 
+def _short_name(ref_name: str) -> str:
+    """Return the part after ``remote/`` for a remote branch."""
+    if "/" in ref_name:
+        return ref_name.split("/", 1)[1]
+    return ref_name
+
+
 class BranchPanelViewModel(QObject):
     """Read-only ViewModel feeding the left panel's tree widget."""
 
@@ -95,6 +102,33 @@ class BranchPanelViewModel(QObject):
         if refresh:
             self.refresh()
 
+    @staticmethod
+    def _suppress_same_name_remotes(
+        local: list[BranchInfo], remote: list[BranchInfo],
+    ) -> list[BranchInfo]:
+        """Filter remote branches whose ``display-name`` exists as a local.
+
+        A remote branch like ``origin/release`` is suppressed when a local
+        branch named ``release`` exists in the repository.  This mirrors
+        the graph column's collapse behaviour so the left panel never
+        shows a redundant remote-only entry.
+
+        The special ``refs/remotes/<remote>/HEAD`` pseudo-ref is also
+        dropped unconditionally — it is created by ``fetch`` to mark the
+        remote's default branch and never carries useful information on
+        its own (graph already shows the local HEAD branch).
+        """
+        local_names = {b.name for b in local}
+        kept: list[BranchInfo] = []
+        for b in remote:
+            short = _short_name(b.name)
+            if short in local_names:
+                continue
+            if short == "HEAD":
+                continue
+            kept.append(b)
+        return kept
+
     def refresh(self) -> None:
         """Re-read branches / tags / stash from the bound repository.
 
@@ -114,8 +148,10 @@ class BranchPanelViewModel(QObject):
             return
         try:
             all_branches = self._repo.branches
-            self._local_branches = [b for b in all_branches if not b.is_remote]
-            self._remote_branches = [b for b in all_branches if b.is_remote]
+            local = [b for b in all_branches if not b.is_remote]
+            remote = [b for b in all_branches if b.is_remote]
+            self._local_branches = local
+            self._remote_branches = self._suppress_same_name_remotes(local, remote)
             self._tags = self._repo.tags
             self._stash_list = self._repo.stash_list
             from src.core.operations import list_remotes
@@ -148,6 +184,7 @@ class BranchPanelViewModel(QObject):
         all_branches = repo.branches
         local = [b for b in all_branches if not b.is_remote]
         remote = [b for b in all_branches if b.is_remote]
+        remote = BranchPanelViewModel._suppress_same_name_remotes(local, remote)
         current = None
         if not repo.repo.head_is_unborn:
             current = repo.repo.head.shorthand

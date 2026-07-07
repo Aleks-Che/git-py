@@ -92,7 +92,9 @@ def test_local_branches_filters_out_remotes(
 
     from src.core.operations import fetch, push
 
-    push(clone, "origin", f"refs/heads/{branch}")
+    # Push to a remote-only ref whose short name does not collide
+    # with the local branch, so it survives same-name suppression.
+    push(clone, "origin", f"refs/heads/{branch}:refs/heads/from-upstream")
     mgr = RepositoryManager(str(clone_path))
     fetch(mgr, "origin")
 
@@ -100,9 +102,52 @@ def test_local_branches_filters_out_remotes(
     vm.set_repository(mgr)
     remote_names = {b.name for b in vm.remote_branches()}
     local_names = {b.name for b in vm.local_branches()}
-    # ``origin/<default>`` lives only in the remote list.
-    assert any(n.startswith("origin/") for n in remote_names)
+    # ``origin/from-upstream`` lives only in the remote list.
+    assert "origin/from-upstream" in remote_names
     assert not any(n.startswith("origin/") for n in local_names)
+
+
+def test_remote_branch_dropped_when_same_name_local_exists(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """When a remote ref's short name matches a local branch, it is
+    suppressed from the remote list so the user only sees the local.
+    """
+    _ensure_app()
+    repo = committed_repo.repo
+    head_sha = str(committed_repo.head_commit.sha)
+
+    # Two locals — ``main`` (HEAD) and ``release``.
+    repo.create_reference(
+        "refs/heads/release", head_sha, force=True,
+    )
+    # Three remotes — one duplicates ``main``, one duplicates ``release``,
+    # one has no local counterpart.
+    repo.create_reference(
+        "refs/remotes/origin/main", head_sha, force=True,
+    )
+    repo.create_reference(
+        "refs/remotes/origin/release", head_sha, force=True,
+    )
+    repo.create_reference(
+        "refs/remotes/origin/feature", head_sha, force=True,
+    )
+
+    vm = BranchPanelViewModel()
+    vm.set_repository(committed_repo)
+
+    local_names = {b.name for b in vm.local_branches()}
+    remote_names = {b.name for b in vm.remote_branches()}
+
+    # Locals unchanged.
+    assert "main" in local_names
+    assert "release" in local_names
+
+    # Remotes with same-name locals are suppressed.
+    assert "origin/main" not in remote_names
+    assert "origin/release" not in remote_names
+    # Remote without a local counterpart survives.
+    assert "origin/feature" in remote_names
 
 
 def test_tags_populated(qtbot, committed_repo: RepositoryManager) -> None:

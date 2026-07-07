@@ -333,12 +333,10 @@ def test_double_click_on_remote_branch_fetches_and_checks_it_out(
 def test_double_click_on_remote_branch_with_local_confirms_reset(
     qtbot, committed_repo: RepositoryManager, monkeypatch,
 ) -> None:
-    """When a local branch with the same name already exists, the
-    double-click shows a "Reset Local to Here?" confirmation dialog.
-    Accepting the dialog triggers the destructive reset verb;
-    cancelling leaves the repository untouched.
+    """Verify that a remote branch whose short-name matches a local is
+    *suppressed* from the panel — the scenario is no longer reachable
+    via the remote-tree UI.
     """
-    from PySide6.QtWidgets import QMessageBox
     _set_up_repo_with_remotes(committed_repo)
 
     vm = MainViewModel()
@@ -349,40 +347,13 @@ def test_double_click_on_remote_branch_with_local_confirms_reset(
 
     branches = _top_level(panel, "Branches")
     remote = _child(branches, "Remote")
-    origin_main = _child(remote, "origin/main")
-    assert origin_main is not None
+    assert remote is not None
 
-    reset_called: list[str] = []
-    fetch_called: list[str] = []
-    monkeypatch.setattr(
-        vm, "reset_local_branch_to_remote",
-        lambda name: reset_called.append(name),
-    )
-    monkeypatch.setattr(
-        vm, "fetch_and_checkout_remote_branch",
-        lambda name: fetch_called.append(name),
-    )
+    # ``origin/main`` is suppressed because local ``main`` exists.
+    assert _child(remote, "origin/main") is None
 
-    # Accept the confirmation dialog — expect the destructive
-    # reset verb, not the non-destructive fetch+checkout.
-    monkeypatch.setattr(
-        QMessageBox, "question",
-        classmethod(lambda cls, *a, **kw: QMessageBox.StandardButton.Yes),
-    )
-    panel.itemDoubleClicked.emit(origin_main, 0)
-    assert reset_called == ["origin/main"]
-    assert fetch_called == []
-
-    # Cancel the confirmation dialog — nothing should happen.
-    reset_called.clear()
-    fetch_called.clear()
-    monkeypatch.setattr(
-        QMessageBox, "question",
-        classmethod(lambda cls, *a, **kw: QMessageBox.StandardButton.No),
-    )
-    panel.itemDoubleClicked.emit(origin_main, 0)
-    assert reset_called == []
-    assert fetch_called == []
+    # ``origin/from-upstream`` has no local counterpart → visible.
+    assert _child(remote, "origin/from-upstream") is not None
 
 
 def test_double_click_on_tag_creates_branch_from_it(
@@ -513,8 +484,8 @@ def test_single_click_on_remote_branch_selects_and_scrolls(
 
     branches = _top_level(panel, "Branches")
     remote = _child(branches, "Remote")
-    origin_main = _child(remote, f"origin/{branch_name}")
-    assert origin_main is not None
+    origin_branch = _child(remote, f"origin/{branch_name}")
+    assert origin_branch is not None
 
     # The VM should NOT have called fetch — that is a double-click verb.
     monkeypatch.setattr(
@@ -532,7 +503,7 @@ def test_single_click_on_remote_branch_selects_and_scrolls(
         lambda sha: captured.append(sha),
     )
 
-    panel.itemClicked.emit(origin_main, 0)
+    panel.itemClicked.emit(origin_branch, 0)
     expected_sha = committed_repo.repo.head.target
     assert captured == [str(expected_sha)]
     assert vm.selected_commit_sha() == str(expected_sha)
@@ -1115,8 +1086,8 @@ def test_remote_branch_context_menu_has_fetch_action(
     if origin_path.exists():
         shutil.rmtree(origin_path)
     pygit2.init_repository(str(origin_path), bare=True, initial_head="main")
-    # Push the existing tip to origin and fetch so a remote-tracking
-    # branch materialises.
+    # Push the existing tip to a remote-only ref so the remote-tracking
+    # branch does not get filtered out by the same-name suppression.
     head_ref = committed_repo.repo.references.get("HEAD")
     head_name = head_ref.target if head_ref else "refs/heads/main"
     from src.core.operations import add_remote
@@ -1124,7 +1095,7 @@ def test_remote_branch_context_menu_has_fetch_action(
     from src.core.operations import push as core_push
 
     add_remote(committed_repo, "origin", str(origin_path))
-    core_push(committed_repo, "origin", head_name)
+    core_push(committed_repo, "origin", head_name + ":refs/heads/from-upstream")
     core_fetch(committed_repo, "origin")
 
     vm = MainViewModel()
@@ -1136,7 +1107,7 @@ def test_remote_branch_context_menu_has_fetch_action(
     branches = _top_level(panel, "Branches")
     remote = _child(branches, "Remote")
     assert remote is not None
-    branch_name = head_name.removeprefix("refs/heads/")
+    branch_name = "from-upstream"
     origin_branch = _child(remote, f"origin/{branch_name}")
     assert origin_branch is not None
 
@@ -1169,7 +1140,7 @@ def test_remote_branch_fetch_action_invokes_vm(
     add_remote(committed_repo, "origin", str(origin_path))
     head_ref = committed_repo.repo.references.get("HEAD")
     head_name = head_ref.target if head_ref else "refs/heads/main"
-    core_push(committed_repo, "origin", head_name)
+    core_push(committed_repo, "origin", head_name + ":refs/heads/from-upstream")
     core_fetch(committed_repo, "origin")
 
     vm = MainViewModel()
@@ -1180,7 +1151,7 @@ def test_remote_branch_fetch_action_invokes_vm(
 
     branches = _top_level(panel, "Branches")
     remote = _child(branches, "Remote")
-    branch_name = head_name.removeprefix("refs/heads/")
+    branch_name = "from-upstream"
     origin_branch = _child(remote, f"origin/{branch_name}")
 
     captured: list[tuple[str, str | None]] = []
@@ -1203,7 +1174,10 @@ def _set_up_repo_with_remotes(
 ) -> str:
     """Create a bare origin and push so the Remote group has children.
 
-    Returns the pushed branch name (e.g. ``"main"``).
+    The pushed ref uses a short name that does *not* collide with any
+    local branch so it survives the same-name suppression filter.
+
+    Returns the remote-only short name (``"from-upstream"``).
     """
     import shutil
 
@@ -1220,9 +1194,11 @@ def _set_up_repo_with_remotes(
     add_remote(committed_repo, "origin", str(origin_path))
     head_ref = committed_repo.repo.references.get("HEAD")
     head_name = head_ref.target if head_ref else "refs/heads/main"
-    core_push(committed_repo, "origin", head_name)
+    # Push the local HEAD to a remote-only ref so its short name
+    # (``from-upstream``) does not clash with any local branch name.
+    core_push(committed_repo, "origin", head_name + ":refs/heads/from-upstream")
     core_fetch(committed_repo, "origin")
-    return head_name.removeprefix("refs/heads/")
+    return "from-upstream"
 
 
 def test_single_click_on_remote_group_expands_it(

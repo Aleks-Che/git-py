@@ -58,6 +58,7 @@ class MainViewModel(QObject):
     conflict_state_changed = Signal(object)  # dict
     busy_changed = Signal(bool)
     log_message = Signal(str)  # human-readable timestamped log line
+    recently_created_changed = Signal(object)  # set[str] — branches newly created in this session
     selection_changed = Signal(object)  # str | None — currently selected SHA, or WIP_SHA, or None
 
     def __init__(
@@ -113,6 +114,14 @@ class MainViewModel(QObject):
         # view; any other value means the commit-detail view.
         self._selected_commit_sha: str | None = None
 
+        # Branches created in this session — used by the graph widget to
+        # keep the just-created branch visually secondary when several
+        # branches share a commit (the user asked for the *source*
+        # branch to keep the prominent chip). Cleared on every
+        # ``set_repository`` and refreshed via
+        # :attr:`recently_created_changed` so widgets can re-pull it.
+        self._recently_created_branches: set[str] = set()
+
     # ----- child ViewModels / processor (read-only accessors) ---------
 
     def command_processor(self) -> CommandProcessor:
@@ -138,6 +147,16 @@ class MainViewModel(QObject):
         if mgr is None or not mgr.is_open:
             return False
         return any(b.name == name and not b.is_remote for b in mgr.branches)
+
+    def recently_created_branches(self) -> set[str]:
+        """Snapshot of branches created in this session (since last repo change).
+
+        The graph widget uses this set to rank branches that share a
+        commit: a branch in this set is treated as "newly created"
+        and gets a lower priority for the prominent chip — matching
+        the source-branch-first UX requirement.
+        """
+        return set(self._recently_created_branches)
 
     # ----- repository binding -----------------------------------------
 
@@ -199,6 +218,11 @@ class MainViewModel(QObject):
         self._command_processor.clear()
         self._clear_conflict_state()
         self._update_auto_fetch_timer()
+        # A new repository means a brand new history — forget the
+        # previous run's "newly created" set so the chip-priority
+        # logic doesn't carry stale state across repositories.
+        self._recently_created_branches = set()
+        self.recently_created_changed.emit(self._recently_created_branches)
         if self._selected_commit_sha is not None:
             self._selected_commit_sha = None
             self.selection_changed.emit(None)
@@ -1313,6 +1337,18 @@ class MainViewModel(QObject):
             self.error_occurred.emit(str(exc))
             self._log("branch", f"Create branch {name!r} failed: {exc}", level="error")
             return
+        # Mark the new branch as a session creation so the graph
+        # widget can keep it visually secondary when several
+        # branches share a commit (the source branch keeps the
+        # prominent chip until a later operation re-orders them).
+        self._recently_created_branches.add(name)
+        self.recently_created_changed.emit(self._recently_created_branches)
+        # The GraphViewModel forwards the same payload to the graph
+        # widget. We emit on both so direct subscribers of either
+        # signal observe the update without depending on the chain.
+        self._graph_view_model.update_recently_created(
+            self._recently_created_branches,
+        )
         self._refresh_all_views()
         self._log("branch", f"Branch {name!r} created")
 
@@ -1327,6 +1363,15 @@ class MainViewModel(QObject):
             self.error_occurred.emit(str(exc))
             self._log("branch", f"Create branch {name!r} failed: {exc}", level="error")
             return False
+        # Mirror the bookkeeping done by :meth:`create_branch`: internal
+        # callers (e.g. fetch→create) should also mark the new branch
+        # as a session creation so the chip-priority logic stays
+        # consistent regardless of which entry point built the branch.
+        self._recently_created_branches.add(name)
+        self.recently_created_changed.emit(self._recently_created_branches)
+        self._graph_view_model.update_recently_created(
+            self._recently_created_branches,
+        )
         self._log("branch", f"Branch {name!r} created at {target_sha[:7]}")
         return True
 

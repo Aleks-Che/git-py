@@ -191,3 +191,63 @@ def test_branch_drop_ignores_same_source_and_target(qtbot, tmp_path) -> None:
     assert rebase_calls == []
 
     window.close()
+
+
+# ----- WIP context-menu wiring ----------------------------------------
+
+
+def test_graph_wip_stash_push_invokes_main_vm(
+    qtbot, committed_repo, monkeypatch,
+) -> None:
+    """Emitting ``stash_push_requested`` from the graph routes to the VM.
+
+    The graph's WIP context menu emits ``stash_push_requested`` with
+    the ``"WIP"`` marker; the :class:`MainWindow` handler must
+    ignore the payload and call :meth:`MainViewModel.stash_push`
+    with the default ``"WIP"`` message so the operation lands on
+    the undo stack.
+    """
+    window = MainWindow(config_path=None)
+    qtbot.addWidget(window)
+    window.set_repository(committed_repo)
+
+    captured: list[str] = []
+    monkeypatch.setattr(
+        window._main_vm, "stash_push",
+        lambda message="WIP": captured.append(message),
+    )
+
+    window._on_stash_push_graph("WIP")  # noqa: SLF001
+    assert captured == ["WIP"]
+
+    window.close()
+
+
+def test_main_window_routes_create_branch_here_to_viewmodel(
+    qtbot, committed_repo, monkeypatch,
+) -> None:
+    """`create_branch_here_requested` from the graph routes to the VM.
+
+    The graph's branch-chip context menu spawns an inline editor;
+    on Enter, the signal `(sha, name)` fires. The
+    :class:MainWindow handler must forward both arguments to
+    :meth:MainViewModel.create_branch so the new branch lands
+    on the undo stack (`CreateBranchCommand`).
+    """
+    from src.ui.main_window import MainWindow
+
+    window = MainWindow(config_path=None)
+    qtbot.addWidget(window)
+    window.set_repository(committed_repo)
+
+    captured: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        window._main_vm, "create_branch",
+        lambda name, target_sha=None: captured.append((name, target_sha)),
+    )
+
+    head_sha = committed_repo.head_commit.sha
+    window._on_create_branch_here(head_sha, "hotfix")  # noqa: SLF001
+    assert captured == [("hotfix", head_sha)]
+
+    window.close()

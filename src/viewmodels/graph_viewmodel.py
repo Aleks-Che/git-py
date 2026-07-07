@@ -59,6 +59,14 @@ class GraphViewModel(QObject):
     (vertically and horizontally) so the user lands on it. Decoupled from
     :attr:`commit_selected` so the view can suppress the visual highlight
     ring (e.g. when the user only navigates from the left panel)."""
+    recently_created_changed = Signal(object)
+    """Proxy for :attr:`MainViewModel.recently_created_changed`. The
+    graph widget listens here so it can demote just-created branches
+    (the user-requested "source-branch-first" behaviour for collapse/
+    expand). The view model forwards the signal directly; it does not
+    own the data — the snapshot lives on the MainViewModel and is
+    re-emitted via :meth:`update_recently_created` whenever the
+    MainViewModel's bookkeeping changes."""
 
     def __init__(self, repo_manager: RepositoryManager | None = None, parent=None) -> None:
         super().__init__(parent)
@@ -230,6 +238,18 @@ class GraphViewModel(QObject):
             return self._repo.get_commit(sha)
         except GitError:
             return None
+
+    def update_recently_created(self, names: set[str]) -> None:
+        """Forward the MainViewModel's session-creation set to listeners.
+
+        Called by :meth:`MainViewModel.create_branch` (and the
+        equivalent ``_create_branch_internal``) after the underlying
+        Git command succeeds. The graph widget uses this to demote
+        the just-created branch in the chip-priority ordering, so the
+        "source" branch (the one the user was on when they issued
+        the create) keeps the prominent chip.
+        """
+        self.recently_created_changed.emit(set(names))
 
     def search_commits(self, query: str) -> list[str]:
         """Case-insensitive search by SHA / message / author."""

@@ -175,6 +175,14 @@ class LeftPanel(QTreeWidget):
             item.setData(0, _ROLE_NAME, branch.name)
             self._group_remote.addChild(item)
 
+        # Hide the ``Remote`` group entirely when the suppression filter
+        # emptied it (every remote matches a local). Otherwise the user
+        # sees a visible-but-empty group header — which reads as "remote
+        # branches are still listed" and contradicts the intended single
+        # local entry.
+        if self._group_remote.childCount() == 0:
+            self._group_remote.setHidden(True)
+
         self._group_tags = QTreeWidgetItem([_GROUP_TAGS])
         self._group_tags.setData(0, _ROLE_IS_GROUP, True)
         self.addTopLevelItem(self._group_tags)

@@ -41,6 +41,19 @@
 - **Undo коммита:** после коммита нажимаем Ctrl+Z, убеждаемся, что коммит исчез (через `git log`).
 - **Drag-and-drop ветки:** перетаскиваем ветку B на A, появляется меню выбора действия, после выполнения проверяем результат в истории.
 
+### Branch-чипы и popup (`tests/ui/test_graph_widget.py`)
+- **Collapse:** 3 ветки на одном коммите → 1 priority-чип + `▼ +N` badge; проверка через `_branch_chip_rects` (cache ровно на N записей, primary — нужного имени) + pixel-level тест `_draw_branch_column` (только один чип закрашен).
+- **Приоритеты:** HEAD-ветка побеждает reachable; recently-created уходит в бакет `2` и не перебивает исходную. Проверяется через `MainViewModel.create_branch` + перерисовку графа.
+- **Local vs remote-only стиль:** заливка для локальных, outline для remote-only (без локального дубликата) — проверка пикселей внутри `_branch_chip_rects`.
+- **Same-name remote подавление:** `origin/main` не появляется в `branch_refs` если локальный `main` есть (проверка `_branch_chip_rects.keys()`).
+- **`origin/HEAD` подавление:** `refs/remotes/origin/HEAD` не появляется в cache чипов и не показывается в popup.
+- **Hover-popup:** debounce 220 ms → список всех веток; клик → `checkout_branch_requested` с full ref name; double-click — то же самое (autocomplete-style).
+- **Авто-закрытие popup:** `leaveEvent` → таймер 160 ms → `widget._branch_popup is None` + `popup.isVisible() is False`.
+- **Popup следует за окном:** `widget.move(+200, 0)` + `QEvent.Move` → popup.x смещается на ту же дельту.
+- **Глобальный фильтр мыши:** `QApplication.installEventFilter` ловит `MouseMove` за пределами popup+чипа → закрытие.
+- **Drag-and-drop:** `QDrag` с MIME `application/x-git-py-branch-chip` → drop на другой чип → сигнал `branch_dropped_on_branch`; тест проверяет, что эмитятся `merge_branch_requested`/`rebase_branch_requested`.
+- **Inline «Create Branch Here»:** правый клик на локальном чипе → `QLineEdit` появляется над чипом; Enter → `create_branch_here_requested(sha, name)`; Escape/потеря фокуса → закрытие без действия.
+
 ## 4. Производительность
 - Синтетический тест: генерируем репозиторий с 5000 коммитов (линейная история + множественные ветвления), замеряем время построения раскладки графа (должно быть < 1 секунды) и FPS при прокрутке.
 - Мониторинг потребления памяти при открытии крупного репозитория.

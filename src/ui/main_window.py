@@ -499,6 +499,13 @@ class MainWindow(QMainWindow):
         self._graph_table.stash_apply_requested.connect(self._on_stash_apply_graph)
         self._graph_table.stash_pop_requested.connect(self._on_stash_pop_graph)
         self._graph_table.stash_drop_requested.connect(self._on_stash_drop_graph)
+        self._graph_table.stash_push_requested.connect(self._on_stash_push_graph)
+        # "Create branch here" — emitted after the inline editor
+        # commits (Enter pressed); routes to MainViewModel which
+        # owns the CreateBranchCommand and undo/redo bookkeeping.
+        self._graph_table.create_branch_here_requested.connect(
+            self._on_create_branch_here,
+        )
 
         # Branch chip gestures: double-click on a chip checks the
         # branch out; the context menu on a chip can issue a merge or
@@ -719,6 +726,39 @@ class MainWindow(QMainWindow):
     def _on_discard_changes(self, sha: str) -> None:
         """Discard all uncommitted changes (from graph WIP context menu)."""
         self._main_vm.discard_changes()
+
+    def _on_stash_push_graph(self, sha: str) -> None:
+        """Push WIP onto the stash list (from graph WIP context menu).
+
+        Mirrors the toolbar's :meth:`_on_stash_push` so the right-click
+        path and the ``Ctrl+Shift+S`` path share the same default
+        message and the same underlying command. ``sha`` is the WIP
+        marker (``"WIP"``) carried by the signal and is ignored —
+        ``stash_push`` reads the live worktree state, so nothing else
+        is needed.
+        """
+        del sha
+        self._main_vm.stash_push("WIP")
+
+    def _on_create_branch_here(self, sha: str, name: str) -> None:
+        """Create a branch at *sha* with the user-supplied *name*.
+
+        Fired from the graph's "Create branch here" context-menu
+        action after the inline ``QLineEdit`` collects the name.
+        Routing through :meth:`MainViewModel.create_branch` means
+        the operation goes through ``CreateBranchCommand`` and
+        therefore onto the undo stack, matching every other branch
+        creation in the app.
+
+        We do not validate the name here — ``create_branch`` (via
+        the ``pygit2`` checkout wrapper) raises a ``GitError`` that
+        the VM surfaces through ``error_occurred``; the graph is
+        auto-refreshed on success and the new chip collapses into
+        the existing branch column (the row already had at least
+        one branch, so the just-created branch is the second chip
+        the user sees when they hover).
+        """
+        self._main_vm.create_branch(name=name, target_sha=sha)
 
     def _on_stash_apply_graph(self, sha: str) -> None:
         """Apply stash by OID (from graph context menu)."""

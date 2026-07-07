@@ -25,6 +25,62 @@
 - **Branch-рефы** — на левой панели рядом с коммитом показываются метки веток (HEAD, `main`, `feature/…`). Одна и та же ветка показывается для каждого коммита, где она останавливается.
 - **Производительность** — синтетический репозиторий на 5000 коммитов рендерится менее чем за 1 секунду.
 
+## Branch-чипы (chip column) — интерактивность
+
+В самой левой колонке графа (`Branches` column) рядом с каждым коммитом рисуется набор цветных «чипов» — по одному на каждую ссылку (HEAD, локальная/удалённая ветка), указывающую на этот коммит. Это самое компактное представление «что сейчас стоит на коммите». Реализовано в `src/ui/widgets/graph_panel.py::_draw_branch_chips`.
+
+### Collapse-политика
+Каждая строка с несколькими ветками сворачивается в **один priority-чип** плюс индикатор `▼` (стрелка свёрнутой группы). Остальные ветки не теряются — они прячутся в cache и показываются в hover-popup (см. ниже). Правила:
+
+- **1 ветка на коммите** — 1 чип, без свёртывания, без popup.
+- **2+ веток** — 1 priority-чип + `▼`. Число `+N` (badge) добавляется, если скрыто больше одной ветки.
+
+### Priority-ключ (`_branch_priority_key`)
+Какой из нескольких чипов станет видимым — решает приоритет (меньше = выше):
+
+| Бакет | Источник |
+|-------|----------|
+| `0` | текущая HEAD-ветка (`is_head=True`) |
+| `1` | ветка, достижимая по first-parent от HEAD (source-branch для только что созданных) |
+| `2` | ветка, созданная в текущей сессии (`_recently_created_branches`) |
+| `3` | всё остальное (remote-only, unreachable, detached) |
+
+При равенстве бакетов порядок лексикографический по имени — детерминировано между запусками. Недавно созданные ветки намеренно уходят в бакет `2`, чтобы только что сделанная ветка не «перебила» исходную — пользователь хочет остаться на той ветке, с которой создавал.
+
+### Визуальная дифференциация local vs remote-only
+Один и тот же display-name может быть как у локальной ветки (например, `main`), так и у её remote-трекера (`origin/main`). Чтобы рисовать одно название дважды, но в разных стилях:
+
+- **Filled** (локальные + remote-с-локальным-дублёкатом) — rect залит цветом коммита, текст/иконки белые, монитор-иконка справа от имени.
+- **Outlined** (remote-only, без локального дубликата) — обводка цветом коммита без заливки, текст/иконки тоже цвета коммита, без монитор-иконки. Контрастный wire-frame-look, явно отличается «удалённое».
+
+Признак `is_remote_only` (есть remote-чип, но локального на этом коммите нет) считается в `_draw_branch_chips` и используется и для колонки чипов, и для hover-popup.
+
+### Подавление дублей same-name remote и `origin/HEAD`
+В репозитории после `fetch` всегда присутствует служебный `refs/remotes/origin/HEAD` (маркер дефолтной ветки удалённого) — он не несёт полезной информации, только мусорит в списке. Плюс `origin/main` дублирует локальный `main`. Helper `_suppress_dup_remotes(branch_refs, local_display_names=None)` (`src/ui/widgets/graph_panel.py`) применяется **в трёх местах**, чтобы пользователь никогда не видел дубли:
+
+1. **`_draw_branch_chips`** — фильтрует `branch_refs` перед отрисовкой колонки.
+2. **`_branches_at_row_visible`** — обёртка над `_branches_at_row`, используется hover-popup.
+3. **`BranchPanelViewModel._suppress_same_name_remotes`** — фильтрует список в левой панели (`Branches → Remote`), плюс скрывает всю группу `Remote`, если после фильтра она пуста (`left_panel.py` ставит `setHidden(True)`).
+
+Реализация — единая точка `_suppress_dup_remotes`, чтобы чип-колонка и popup никогда не разъезжались.
+
+### Hover-popup `BranchStackPopup`
+Когда пользователь наводит курсор на свёрнутый multi-branch чип, через 220 ms debounce (`_HOVER_POPUP_DELAY_MS`) всплывает frameless `Qt.Tool`-окно со списком всех веток на этом коммите. Каждая строка — кликабельный чип того же стиля, что и в основной колонке. Single- и double-click эмитят `branch_selected` (полное ref-имя) → `MainViewModel.checkout_branch` (через `CheckoutCommand` → undo/redo).
+
+**Закрытие** — тройная страховка от «призрачных» popup, остающихся на экране:
+
+1. `leaveEvent`/`mouseMoveEvent` на самом popup — debounced close-таймер 160 ms.
+2. Глобальный `QApplication.installEventFilter(popup)` — ловит `MouseMove` за пределами popup-а и исходного чипа (на случай, если `leaveEvent` не сработал при перетаскивании окна или alt-tab).
+3. `QEvent.ApplicationDeactivate` — закрытие при потере фокуса.
+
+Дополнительно `eventFilter` на родителе ловит `QEvent.Move` родительского окна и перемещает popup на ту же дельту — чтобы при перетаскивании основного окна popup следовал за чипом, а не застывал на экране, где его открыли.
+
+### Inline-редактор «Create Branch Here»
+Правый клик по чипу открывает контекстное меню ветки. Пункт `Create Branch Here` (только для локальных чипов) поднимает inline `QLineEdit` ровно над чипом. Enter → `create_branch_here_requested(sha, name)` → `MainViewModel.create_branch(name, target_sha=sha)`. Escape или потеря фокуса → закрыть без действия. Команда `CreateBranchCommand` через `CommandProcessor` (undo = удаление только что созданной ветки).
+
+### Drag-and-drop merge/rebase
+Press-and-drag на чипе → `QDrag` с custom MIME `application/x-git-py-branch-chip`. Drop на другой чип → контекстное меню `Merge <source> into <target>` или `Rebase <source> onto <target>` → `MainViewModel.merge_branch(source, target)` / `rebase_branch(target)` (через `MergeCommand`/`RebaseCommand`). Порог промоции press→drag = `drag_start_threshold_px` (по умолчанию ~5 px), чтобы короткие клики случайно не начинали перетаскивание.
+
 ## Core-ограничения
 
 - Модуль `core/graph_v2.py` не импортирует PySide6.
