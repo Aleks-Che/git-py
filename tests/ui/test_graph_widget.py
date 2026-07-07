@@ -240,6 +240,136 @@ def test_widget_renders_wip_node_when_worktree_dirty(
     assert wip_node.data(0) == "WIP"
 
 
+# ----- top-commit stub guard (no uncommitted) -------------------------
+
+
+def _make_merge_repo(path: Path) -> RepositoryManager:
+    """Build a repo where HEAD is a merge commit.
+
+    The merge puts HEAD at lane 0 (main) and the merged-in branch on
+    lane 1, which is the only layout that triggers the
+    ``TEE_RIGHT`` / ``TEE_LEFT`` / ``HORIZONTAL_PIPE`` cell types at
+    HEAD's lane. Those cells previously extended their vertical
+    segment by ``row_height / 2`` above the commit, leaving a stub
+    dangling into the empty area above the topmost row.
+    """
+    mgr = RepositoryManager(str(path))
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+
+    (path / "f.txt").write_text("a\n")
+    mgr.repo.index.add("f.txt")
+    mgr.repo.index.write()
+    tree = mgr.repo.index.write_tree()
+    c1 = mgr.repo.create_commit("refs/heads/main", sig, sig, "first", tree, [])
+
+    mgr.repo.create_branch("feature", mgr.repo.head.peel())
+    mgr.repo.checkout("refs/heads/feature")
+    (path / "g.txt").write_text("g\n")
+    mgr.repo.index.add("g.txt")
+    mgr.repo.index.write()
+    tree = mgr.repo.index.write_tree()
+    mgr.repo.create_commit("refs/heads/feature", sig, sig, "feat", tree, [c1])
+
+    mgr.repo.checkout("refs/heads/main")
+    (path / "h.txt").write_text("h\n")
+    mgr.repo.index.add("h.txt")
+    mgr.repo.index.write()
+    tree = mgr.repo.index.write_tree()
+    mgr.repo.create_commit("refs/heads/main", sig, sig, "main2", tree, [c1])
+
+    # ``merge_branch`` from ``src.core.operations`` would have been
+    # cleaner, but it rejects message strings that contain spaces in
+    # the reference name. Doing the merge with ``pygit2.merge``
+    # directly keeps the test self-contained.
+    feat_branch = mgr.repo.lookup_branch("feature")
+    mgr.repo.merge(feat_branch.peel())
+    # ``pygit2.merge`` updates the index but does NOT auto-commit.
+    # The merge must be materialised as a commit before the index
+    # matches HEAD and ``get_status()`` returns ``[]`` — otherwise
+    # the test repo would carry an untracked file and the WIP
+    # node would mask the layout we want to inspect.
+    merge_tree = mgr.repo.index.write_tree()
+    merge_parents = [mgr.repo.head.target, feat_branch.target]
+    mgr.repo.create_commit(
+        "refs/heads/main", sig, sig, "merge", merge_tree, merge_parents,
+    )
+    return mgr
+
+
+def test_topmost_commit_does_not_draw_line_stub_into_empty_space(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The top commit must not extend its connector above the commit area.
+
+    ``TEE_RIGHT`` / ``TEE_LEFT`` / ``HORIZONTAL_PIPE`` cells at the
+    topmost row used to draw their vertical segment with
+    ``half_h = row_height / 2`` extending above ``y_center``. The
+    cell's commit ellipse only occupies ``y_center ± node_radius``
+    (smaller than ``half_h``), so the extra 5 px ended up as a stub
+    dangling into the empty area above HEAD. The guard runs by
+    sampling the column directly above the topmost commit and
+    asserting the background colour shows through - no edge colour
+    should be present.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_merge_repo(tmp_git_repo)
+    # Working tree must be clean so the WIP node is NOT inserted.
+    assert mgr.get_status() == []
+
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    head_row = widget._rows[0]
+    # Sanity-check: the fix is only meaningful when the top row
+    # actually has a fork-connector cell. ``_make_merge_repo`` is
+    # shaped to guarantee that, but pin the precondition so a future
+    # refactor that strips the merge structure surfaces here rather
+    # than as a "test passes for the wrong reason" false positive.
+    head_cell_types = {c["t"] for c in head_row["cells"]}
+    assert any(
+        t in (9, 10, 8)  # _T_TEE_RIGHT / _T_TEE_LEFT / _T_HORIZONTAL_PIPE
+        for t in head_cell_types
+    ), f"merge setup did not produce a fork-connector cell: {head_cell_types}"
+
+    cfg = widget._cfg
+    head_y_center = cfg.header_height + cfg.row_height // 2
+    # Just above the commit ellipse - 3 px above the top edge.
+    probe_y = head_y_center - cfg.node_radius - 3
+    # Lane 0 centre x. The widget's first divider is at 180 px,
+    # the graph column starts at ``divider + graph_left_padding``,
+    # and lane 0 sits at that x.
+    probe_x = widget._dividers[0] + cfg.graph_left_padding
+
+    pix = widget.grab()
+    # ``widget.grab()`` returns a pixmap whose pixel grid is
+    # scaled by the device pixel ratio. Convert the widget-space
+    # probe point to image-space before reading the colour, otherwise
+    # the assertion silently samples the wrong pixel and the bug
+    # slips through.
+    dpr = pix.devicePixelRatio()
+    img = pix.toImage()
+    color = img.pixelColor(int(probe_x * dpr), int(probe_y * dpr))
+    # The background colour is the dark theme's ``bg``; the line
+    # colour is one of the branch palette entries which are all
+    # significantly brighter. Background RGB is roughly (30, 30, 30)
+    # - branch palette entries start at ~(80, 80, 80) for the WIP
+    # grey and brighter from there. A channel above 50 is a safe
+    # lower bound for "not background".
+    assert max(color.red(), color.green(), color.blue()) < 50, (
+        f"stub above top commit: probe pixel {color.name()} "
+        f"at ({probe_x}, {probe_y}) should be background, got "
+        f"rgb=({color.red()}, {color.green()}, {color.blue()})"
+    )
+
+
 # ----- branch label column --------------------------------------------
 
 

@@ -2418,31 +2418,52 @@ def _draw_cell_row(
         elif t == _T_HORIZONTAL:
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
         elif t == _T_HORIZONTAL_PIPE:
-            _draw_vert_line(painter, x, y_center, half_h, edge_width, p_color)
+            _draw_vert_line(
+                painter, x, y_center, half_h, edge_width, p_color,
+                top_half_h=node_radius,
+            )
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
         elif t == _T_TEE_RIGHT:
             vert_color = p_color if p else color
-            _draw_vert_line(painter, x, y_center, half_h, edge_width, vert_color)
+            _draw_vert_line(
+                painter, x, y_center, half_h, edge_width, vert_color,
+                top_half_h=node_radius,
+            )
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
         elif t == _T_TEE_LEFT:
             vert_color = p_color if p else color
-            _draw_vert_line(painter, x, y_center, half_h, edge_width, vert_color)
+            _draw_vert_line(
+                painter, x, y_center, half_h, edge_width, vert_color,
+                top_half_h=node_radius,
+            )
             _draw_horiz_line(painter, x, y_center, -lane_w, edge_width, color)
         elif t == _T_TEE_UP:
             vert_color = p_color if p else color
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
-            _draw_vert_line(painter, x, y_center, half_h, edge_width, vert_color, upward_only=True)
+            _draw_vert_line(
+                painter, x, y_center, half_h, edge_width, vert_color,
+                upward_only=True, top_half_h=node_radius,
+            )
 
 
 def _draw_vert_line(
     painter: QPainter, x: float, y_center: float,
     half_h: float, width: float, color: QColor, *, upward_only: bool = False,
+    top_half_h: float | None = None,
 ) -> None:
     """Draw a vertical line segment centred at *y_center*, spanning *half_h*
-    pixels above and below (or only above when *upward_only*)."""
+    pixels above and below (or only above when *upward_only*).
+
+    *top_half_h* overrides the upward span: pass a smaller value when the
+    cell has no row above (or the lane above is empty) so the line stops
+    at the commit edge instead of leaving a stub that dangles into the
+    empty space above the topmost commit.
+    """
     pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
     painter.setPen(pen)
-    top = y_center - half_h
+    if top_half_h is None:
+        top_half_h = half_h
+    top = y_center - top_half_h
     bot = y_center + half_h
     if upward_only:
         bot = y_center
