@@ -145,7 +145,7 @@
 
 ### Текущий статус
 - **Активный этап:** `Этап 9: Конфигурация и темизация` (под-этапы: темизация ✓, персистентность окна ✓, редизайн правой панели ✓)
-- **Последнее обновление:** `2026-07-07`
+- **Последнее обновление:** `2026-07-09`
 - **Следующий шаг:** `Завершить Settings-диалог (переключатель dark/light), импорт/экспорт настроек.`
 
 ### Свежие правки (2026-07-07) — drag-and-drop и submenu в LeftPanel
@@ -252,3 +252,29 @@ LeftPanel получил ту же drag-and-drop + context-menu функцион
 - **Stash-ребаланс + WIP на lane 0.** Стэши, чей первый родитель — HEAD, теперь сдвигаются на offset-полосы перед вставкой WIP, освобождая lane 0 для ноды незакоммиченных изменений. В строке стэша нет горизонтальных коннекторов — только COMMIT + PIPE для вертикальной непрерывности. Форк рисуется исключительно на строке HEAD через `_build_fork_connector_cells`. Исправлена вставка стэшей в ViewModel: теперь стэши на HEAD вставляются перед HEAD по индексу, а не по timestamp (чтобы попасть в ребаланс). Добавлен e2e-тест `test_stash_with_uncommitted_keeps_wip_on_main_lane`. Обновлена документация в `docs/FEATURES.md`.
 - **`core/repository.py` — топологическая сортировка в revwalk.** `get_history()` и `get_all_history()` теперь используют `GIT_SORT_TOPOLOGICAL | GIT_SORT_TIME` через единый `repo.walk(None, sort)` с push всех tip-ов (local + remote + tags). Раньше `get_all_history` делал N отдельных walk-ов с `GIT_SORT_TIME` и заново сортировал результат по `commit_time` — это ломало топологический порядок (родитель мог оказаться ниже ребёнка) и приводило к неверной раскладке `graph_v2.build_graph` на больших репах с CI-коммитами на одинаковых таймстампах. Поведение теперь совпадает с `keifu::Repository::get_commits`. Добавлена константа `SORT_TOPOLOGICAL_TIME` и 2 регрессионных теста в `test_repository.py` (инвертированные таймстампы + параллельные ветки).
 - **Удалён мёртвый код.** `src/core/graph.py` (592 строки, фазовый priority/orphan walk + column compaction) и `tests/core/test_graph.py` (23 теста) — модуль не импортировался нигде, кроме собственного теста (активный — `graph_v2.py`, порт keifu). Удалено: −1057 строк, тестов: 707 → 684 (плюс 2 новых регрессионных = 686, итого с удалёнными − 684). `ruff check` чисто (3 ошибки — pre-existing в `graph_v2.py` и `test_left_panel.py`).
+
+### Свежие правки (2026-07-09) — Цвета bridge pipe и fork connector
+
+Исправлены два дефекта раскладки графа, связанных с цветами соединительных линий. Файлы: `src/ui/widgets/graph_panel.py`, `src/core/graph_v2.py` (без изменений — откатил ошибочную правку), плюс тесты в `tests/ui/test_graph_widget.py` и `tests/core/test_graph_v2.py`.
+
+**Проблема 1 — Bridge pipe наследует цвет текущей строки вместо предыдущей.** Вертикальная соединительная линия между двумя соседними строками (например, от стэша вниз к корневому коммиту, или от HEAD вниз к WIP-узлу) рисовалась в цвете `TEE_RIGHT` текущей строки (то есть цвет корневого коммита), а должна была наследовать цвет предыдущей строки на том же lane. Симптом: при наличии стэша (или WIP-узла) над корневым коммитом линия от стэша к корню шла синим (цвет main), а должна была идти серым (цвет стэша/WIP).
+
+**Проблема 2 — попытка исправить 1 сломала 2.** Первая итерация правки в `_draw_cells` трогала только нижнюю строку (last row), а не все bridge pipes. После этого была попытка исправить проблему 1 через замену цвета fork connector на `main_color` в `src/core/graph_v2.py::_build_fork_connector_cells`. Это сломало стэш-форки: форк-коннектор от форк-точки (например, коммита, от которого ответвляется стэш) стал рисоваться в цвете корневого коммита вместо цвета стэша, разрывая визуальную связь «форк-коннектор ↔ стэш-узел».
+
+**Решение.** Правка ограничена widget-layer'ом (один файл — `src/ui/widgets/graph_panel.py`), в `_draw_cells` цикл bridge pipes теперь смотрит на `prev_cells = self._rows[row_idx - 1].get("cells", [])` для **всех** строк, а не только для последней. Для каждой ячейки bridge pipe (TEE_RIGHT, TEE_LEFT, HORIZONTAL_PIPE, TEE_UP) ищется ячейка предыдущей строки на том же lane и наследуется её цвет (`p` для tee-типов, иначе `c`). Если предыдущей строки нет или ячейка пустая — fallback на текущую строку (`row_data["color_index"]`).
+
+**Что не менялось.** `src/core/graph_v2.py::_build_fork_connector_cells` остаётся как было до моих изменений: `TEE_RIGHT.color_index = first_merge_color` (цвет merging lane), `pipe_color_index = main_color` (вертикаль у корня остаётся в его цвете), `MERGE_LEFT.color_index = merge_color`, горизонтальные сегменты — в цвете merging lane. То есть **fork connector читается как цвет lane-приёмника** (стейш или ветка, которая входит в форк-точку), а не как цвет корневого коммита.
+
+**Тесты.** +9 регрессионных (4 core + 5 UI), все проверяют инварианты раскладки независимо от конкретных palette-индексов:
+
+- `test_topmost_commit_does_not_draw_line_stub_into_empty_space` — нет stub-а наверху корневого коммита.
+- `test_no_pipe_between_sibling_stash_and_unrelated_row_above` — sibling-стэш не рисует вертикаль в несвязанную строку выше.
+- `test_no_pipe_from_horizontal_into_stash_below` — горизонтальный сегмент в строке над стэшем не утекает в стэш.
+- `test_lane_above_root_stays_in_root_branch_colour` — pixel-level: bridge pipe от стэша к корню = WIP-grey (не main-blue); PIPE в строке стэша на lane 0 = WIP-grey.
+- `test_root_commit_does_not_draw_stub_below_itself` — нет stub-а вниз от корневого коммита.
+- `test_stash_fork_connector_uses_merging_branch_colour` (UI) — клетки форк-коннектора в строке корня используют `stash_color_index`, не `root_color_index`.
+- `test_fork_connector_uses_merging_branch_colour` (core) — прямой unit на `_build_fork_connector_cells`: `TEE_RIGHT.color_index == first_merge_color`, `pipe_color_index == main_color`, `MERGE_LEFT.color_index == merge_color`, горизонтальные сегменты = `merge_color`.
+- `test_fork_connector_multiple_merges_keeps_tee_in_first_merge_colour` (core) — multi-merge: `TEE_RIGHT` остаётся в цвете первого merge, промежуточный `TEE_UP` — в цвете следующего merge, правый `MERGE_LEFT` — в цвете своего merge.
+- `test_fork_connector_main_lane_uses_main_colour_when_no_merges` (core) — без форков main-lane = простой PIPE в `main_color`.
+
+Итого **9 регрессионных тестов** на инварианты раскладки и цвета; pre-existing 47 failures в `tests/ui/test_graph_widget.py` (branch popup, drag-drop edge-кейсы) к этой правке не относятся.

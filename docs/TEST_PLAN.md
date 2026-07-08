@@ -73,6 +73,22 @@
 - **Submenu `Rebase <name> onto...`:** симметрично для rebase, click триггерит `_rebase_drop(source, target, _KIND_LOCAL_BRANCH)`.
 - **Submenu от remote source:** `panel._remote_branch_actions("origin/from-upstream")` содержит `Merge origin/from-upstream into...` submenu. Click по `main` в нём → mock `fetch_and_checkout_remote_branch("origin/from-upstream")` первый, потом `merge_branch("from-upstream", "main", True)`. Тест: `test_submenu_pick_for_remote_source_fetches_first`.
 
+### Цвета bridge pipe и fork connector (`tests/ui/test_graph_widget.py`, `tests/core/test_graph_v2.py`)
+Эти два правила независимы и тестируются раздельно — иначе одна правка ломает другую (как уже было).
+
+**Fork connector — цвет merging lane.** Тесты пиныруют инвариант: ячейки `TEE_RIGHT` / `HORIZONTAL` / `HORIZONTAL_PIPE` / `MERGE_LEFT` на строке форк-точки используют `stash_color_index` (или color merging lane), а не `root_color_index`.
+- `test_stash_fork_connector_uses_merging_branch_colour` (UI): строит репо с root + стэш, проверяет что у всех fork-cells в root row `c == stash_color_index`.
+- `test_fork_connector_uses_merging_branch_colour` (core): прямой unit на `_build_fork_connector_cells(main_lane=0, main_color=1, merging_lanes=[(2, 2)])` — `TEE_RIGHT.color_index == 2` (merging), `pipe_color_index == 1` (main), `MERGE_LEFT.color_index == 2`.
+- `test_fork_connector_multiple_merges_keeps_tee_in_first_merge_colour` (core): `merging_lanes=[(2, 2), (4, 3)]` — `TEE_RIGHT` в первом merge-color, `TEE_UP` в следующем, правый `MERGE_LEFT` — в своём.
+- `test_fork_connector_main_lane_uses_main_colour_when_no_merges` (core): без форков main-lane = PIPE в `main_color`.
+
+**Bridge pipe — цвет предыдущей строки.** Тесты пиныруют что вертикаль между строками наследует цвет ячейки предыдущей строки на том же lane, а не текущей.
+- `test_lane_above_root_stays_in_root_branch_colour` (UI, pixel-level): репо root + стэш + WIP. Pixel-проба между bottom-of-stash и top-of-root показывает WIP-grey `(80, 80, 80)`, не main-blue. Внутри stash row lane 0 PIPE — WIP-grey (не main-blue).
+- `test_topmost_commit_does_not_draw_line_stub_into_empty_space` (UI, pixel-level): выше topmost коммита нет пиксельных артефактов в его lane.
+- `test_no_pipe_between_sibling_stash_and_unrelated_row_above` (UI, pixel-level): sibling-стэш не рисует вертикаль в несвязанную строку выше (после rebalance стэшей).
+- `test_no_pipe_from_horizontal_into_stash_below` (UI, pixel-level): горизонтальный сегмент в строке над стэшем не утекает в стэш.
+- `test_root_commit_does_not_draw_stub_below_itself` (UI, pixel-level): под корневым коммитом нет stub-а в пустое пространство.
+
 ## 4. Производительность
 - Синтетический тест: генерируем репозиторий с 5000 коммитов (линейная история + множественные ветвления), замеряем время построения раскладки графа (должно быть < 1 секунды) и FPS при прокрутке.
 - Мониторинг потребления памяти при открытии крупного репозитория.

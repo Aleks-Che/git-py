@@ -851,3 +851,156 @@ def test_build_branch_refs_map_filters_invalid_sha_keys() -> None:
     # Every key must be a valid 40-char hex SHA
     for sha in result:
         assert len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)
+
+
+def test_fork_connector_uses_merging_branch_colour() -> None:
+    """The fork connector at a fork-point commit must use the
+    merging branch's colour (the colour of the lane joining in),
+    not the root's own colour.
+
+    Regression guard: a previous attempt to keep bridge-pipe
+    colours consistent also rewrote :func:`_build_fork_connector_cells`
+    in :mod:`src.core.graph_v2` so that the horizontal connector
+    at the root row used ``main_color`` (the root's own colour)
+    instead of ``first_merge_color`` (the merging branch's
+    colour). That broke the visual link between the connector
+    and the merging lane — the connector is supposed to read as
+    the lane that's *entering* the fork point, not the lane
+    that's being joined into.
+
+    This test pins the cell-colour contract:
+
+    * ``TEE_RIGHT`` / ``HORIZONTAL`` / ``HORIZONTAL_PIPE`` at the
+      root row use the *first* merging branch's colour so the
+      connector reads as the merging lane.
+    * ``MERGE_LEFT`` at the merging lane uses the merging
+      branch's colour so the join point matches the lane.
+    * ``pipe_color_index`` on the root's ``TEE_RIGHT`` keeps
+      using ``main_color`` so the vertical line above/below the
+      root still belongs to the root's own branch.
+    """
+    from src.core.graph_v2 import _build_fork_connector_cells
+
+    main_color = 1  # blue (main/master)
+    merge_color = 2  # red (a sibling branch like m2)
+    main_lane = 0
+    merge_lane = 2
+
+    cells = _build_fork_connector_cells(
+        main_lane=main_lane,
+        main_color=main_color,
+        merging_lanes=[(merge_lane, merge_color)],
+        active_lanes=["root-sha", None, "merge-sha"],
+        oid_color_index={"root-sha": main_color, "merge-sha": merge_color},
+        lane_color_index={0: main_color, 1: main_color, 2: merge_color},
+        max_lane=2,
+    )
+
+    # main lane: TEE_RIGHT — colour_index must be the merging
+    # colour so the horizontal reads as the merging lane.
+    tee = cells[main_lane * 2]
+    assert tee.cell_type == CellType.TEE_RIGHT
+    assert tee.color_index == merge_color, (
+        f"TEE_RIGHT at root row must use merging colour "
+        f"{merge_color}, got {tee.color_index} (the fork connector "
+        f"must read as the merging lane's colour, not the root's "
+        f"own colour {main_color})"
+    )
+    # vertical line of TEE_RIGHT stays in the root's colour
+    assert tee.pipe_color_index == main_color, (
+        f"TEE_RIGHT pipe_color_index must stay as root colour "
+        f"{main_color}, got {tee.pipe_color_index}"
+    )
+
+    # cells at intermediate active lanes carry the connector
+    # segments (HORIZONTAL_PIPE over an existing vertical PIPE).
+    # Only lane-centre columns (col = lane*2 + 1 between two
+    # active lanes) carry an explicit connector cell — the
+    # empty cells between them are just spacers.
+    # We probe the centre of each intermediate lane between
+    # main_lane+1 and merge_lane.
+    for lane_idx in range(main_lane + 1, merge_lane):
+        col = lane_idx * 2
+        cell = cells[col]
+        if cell.cell_type == CellType.EMPTY:
+            continue
+        assert cell.cell_type in (CellType.HORIZONTAL, CellType.HORIZONTAL_PIPE), (
+            f"unexpected cell at col {col} (lane {lane_idx}): "
+            f"{cell.cell_type.name}"
+        )
+        assert cell.color_index == merge_color, (
+            f"{cell.cell_type.name} at col {col} (lane {lane_idx}) "
+            f"must use merging colour {merge_color}, got "
+            f"{cell.color_index}"
+        )
+
+    # MERGE_LEFT at the merging lane uses the merging colour.
+    merge_left = cells[merge_lane * 2]
+    assert merge_left.cell_type == CellType.MERGE_LEFT
+    assert merge_left.color_index == merge_color
+
+
+def test_fork_connector_multiple_merges_keeps_tee_in_first_merge_colour() -> None:
+    """When two branches merge into the fork point, the root's
+    ``TEE_RIGHT`` and the intermediate ``HORIZONTAL`` cells stay
+    in the *first* merge's colour, while the ``TEE_UP`` at the
+    intermediate merge lane carries the next merge's colour.
+    """
+    from src.core.graph_v2 import _build_fork_connector_cells
+
+    main_color = 1
+    first_merge_color = 2
+    second_merge_color = 3
+
+    cells = _build_fork_connector_cells(
+        main_lane=0,
+        main_color=main_color,
+        merging_lanes=[(2, first_merge_color), (4, second_merge_color)],
+        active_lanes=["root", None, "m1", None, "m2"],
+        oid_color_index={
+            "root": main_color, "m1": first_merge_color, "m2": second_merge_color,
+        },
+        lane_color_index={
+            0: main_color, 1: main_color, 2: first_merge_color,
+            3: main_color, 4: second_merge_color,
+        },
+        max_lane=4,
+    )
+
+    tee = cells[0]
+    assert tee.cell_type == CellType.TEE_RIGHT
+    assert tee.color_index == first_merge_color
+    assert tee.pipe_color_index == main_color
+
+    # intermediate merge lane gets TEE_UP in next_merge colour,
+    # pipe in own merge colour
+    intermediate = cells[4]
+    assert intermediate.cell_type == CellType.TEE_UP
+    assert intermediate.color_index == second_merge_color
+    assert intermediate.pipe_color_index == first_merge_color
+
+    # rightmost merge keeps MERGE_LEFT in its own colour
+    rightmost = cells[8]
+    assert rightmost.cell_type == CellType.MERGE_LEFT
+    assert rightmost.color_index == second_merge_color
+
+
+def test_fork_connector_main_lane_uses_main_colour_when_no_merges() -> None:
+    """When ``merging_lanes`` is empty, the main lane cell is a
+    plain ``PIPE`` in the root's own colour.
+    """
+    from src.core.graph_v2 import _build_fork_connector_cells
+
+    main_color = 1
+    cells = _build_fork_connector_cells(
+        main_lane=0,
+        main_color=main_color,
+        merging_lanes=[],
+        active_lanes=["root-sha"],
+        oid_color_index={"root-sha": main_color},
+        lane_color_index={0: main_color},
+        max_lane=0,
+    )
+
+    assert cells[0].cell_type == CellType.PIPE
+    assert cells[0].color_index == main_color

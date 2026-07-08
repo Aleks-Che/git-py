@@ -1365,17 +1365,35 @@ class GraphTableWidget(QWidget):
             if row_idx > 0:
                 prev_y_center = self._row_y(row_idx - 1) + dh / 2
                 common = prev_occupied & cur_occupied
+                # The bridge pipe inherits its colour from the lane
+                # *above* — the cell in the previous row at the same
+                # lane — so a WIP/stash colour that the lane tracks
+                # near HEAD flows down toward the root rather than
+                # being overwritten by the root's fork-connector
+                # colour.  Falls back to the current row's cell
+                # colour when the previous row has no cell at this
+                # lane (should not happen in practice, but defensive).
+                prev_cells = self._rows[row_idx - 1].get("cells", [])
                 for li in common:
                     x = self._lane_x(li, lane_w)
                     clr_idx = 0
-                    for ci, cell in enumerate(cells):
-                        if ci // 2 == li and cell.get("t", _T_EMPTY) != _T_EMPTY:
-                            t = cell.get("t", _T_EMPTY)
-                            if t in (_T_HORIZONTAL_PIPE, _T_TEE_RIGHT, _T_TEE_LEFT, _T_TEE_UP):
-                                clr_idx = cell.get("p", cell.get("c", 0))
+                    for ci, pc in enumerate(prev_cells):
+                        if ci // 2 == li and pc.get("t", _T_EMPTY) != _T_EMPTY:
+                            pt = pc.get("t", _T_EMPTY)
+                            if pt in (_T_HORIZONTAL_PIPE, _T_TEE_RIGHT, _T_TEE_LEFT, _T_TEE_UP):
+                                clr_idx = pc.get("p", pc.get("c", 0))
                             else:
-                                clr_idx = cell.get("c", 0)
+                                clr_idx = pc.get("c", 0)
                             break
+                    if clr_idx == 0:
+                        for ci, cell in enumerate(cells):
+                            if ci // 2 == li and cell.get("t", _T_EMPTY) != _T_EMPTY:
+                                t = cell.get("t", _T_EMPTY)
+                                if t in (_T_HORIZONTAL_PIPE, _T_TEE_RIGHT, _T_TEE_LEFT, _T_TEE_UP):
+                                    clr_idx = cell.get("p", cell.get("c", 0))
+                                else:
+                                    clr_idx = cell.get("c", 0)
+                                break
                     if clr_idx == 0 and li == lane:
                         clr_idx = row_data.get("color_index", 0)
                     clr = _cell_color(clr_idx)

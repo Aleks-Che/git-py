@@ -712,6 +712,239 @@ def test_no_pipe_from_horizontal_into_stash_below(
         )
 
 
+def _make_root_with_stash_and_wip_repo(
+    path: Path,
+) -> tuple[RepositoryManager, str, str]:
+    """Build a single-commit repo with a stash on top and a WIP node above.
+
+    Timeline (chronological):
+
+    1. ``root`` — only commit on ``main``.
+
+    Then on top of the root we drop a stash of staged changes plus an
+    uncommitted ``WIP`` node above the stash.  In the rendered graph
+    (newest first): ``WIP`` (lane 0), then ``stash`` (offset lane
+    because the WIP node claims lane 0), then ``root`` (back on lane
+    0 — its own branch).
+
+    The bug this test pins: lane 0 — which is the *root's* own lane
+    — has a PIPE cell at the stash row whose default colour is the
+    WIP/stash lane's colour (UNCOMMITTED).  Visually that makes the
+    vertical line above the root start in WIP-grey, switch to main-
+    blue at the stash row, then connect to the root.  The fork-
+    connector at the root is drawn in main-blue so the line *should*
+    be main-blue all the way up to where the WIP node interrupts it.
+    """
+    mgr = RepositoryManager(str(path))
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+
+    (path / "f.txt").write_text("a\n")
+    mgr.repo.index.add("f.txt")
+    mgr.repo.index.write()
+    tree = mgr.repo.index.write_tree()
+    c_root = mgr.repo.create_commit("refs/heads/main", sig, sig, "root", tree, [])
+
+    time.sleep(1)
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    (path / "f.txt").write_text("b\n")
+    mgr.repo.index.add("f.txt")
+    mgr.repo.index.write()
+
+    from src.core.operations import stash_push
+    stash_push(mgr, "WIP", include_untracked=False)
+
+    # Touch a tracked file so the worktree reports uncommitted changes
+    # and the WIP node is inserted above the stash.
+    time.sleep(1)
+    (path / "f.txt").write_text("c\n")
+
+    return mgr, str(c_root), "WIP"
+
+
+def test_stash_fork_connector_uses_merging_branch_colour(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The fork connector at the root row must read as the colour
+    of the merging lane (the stash), not the root's own colour.
+
+    Regression guard for a previous attempt to fix the bridge
+    pipe above a root commit. That attempt also rewrote
+    :func:`_build_fork_connector_cells` in :mod:`src.core.graph_v2`
+    so the fork connector picked up ``main_color`` everywhere —
+    which meant the connector going from the root commit to a
+    offset stash node rendered in the *root's* colour, severing
+    the visual link to the stash's own colour.
+
+    The cell-level invariant below says: every fork-connector
+    cell at the root row carries the merging lane's colour
+    (the stash's colour index), not the root commit's colour.
+    """
+    from src.core.graph_v2 import CellType
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _root_sha, _ = _make_root_with_stash_and_wip_repo(tmp_git_repo)
+
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    root_row_idx = next(
+        i for i, r in enumerate(widget._rows)
+        if r.get("commit") and r["commit"]["subject"] == "root"
+    )
+    stash_row_idx = next(
+        i for i, r in enumerate(widget._rows)
+        if r.get("commit") and r["commit"]["kind"] == "stash"
+    )
+    assert stash_row_idx == root_row_idx - 1, (
+        f"test setup broken — stash (idx {stash_row_idx}) is not "
+        f"directly above the root (idx {root_row_idx})"
+    )
+
+    root_row = widget._rows[root_row_idx]
+    stash_row = widget._rows[stash_row_idx]
+    root_color_index = root_row.get("color_index", -1)
+    stash_color_index = stash_row.get("color_index", -1)
+
+    cells = root_row.get("cells", [])
+    fork_cells = [
+        c for c in cells if c.get("t") in (
+            CellType.TEE_RIGHT, CellType.HORIZONTAL,
+            CellType.HORIZONTAL_PIPE, CellType.MERGE_LEFT,
+        )
+    ]
+    assert fork_cells, (
+        "test setup broken — root row has no fork connector cells: "
+        + repr(cells)
+    )
+
+    bad = [
+        c for c in fork_cells
+        if c.get("c") != stash_color_index
+    ]
+    assert not bad, (
+        f"fork connector cells at root row should use the merging "
+        f"lane's colour {stash_color_index} (the stash), not the "
+        f"root's own colour {root_color_index}. Cells with the "
+        f"wrong colour: "
+        + ", ".join(
+            f"{CellType(c['t']).name} c={c.get('c')}" for c in bad
+        )
+    )
+
+
+def test_lane_above_root_stays_in_root_branch_colour(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Lane 0 transitions WIP-grey → main-blue at the bottom of the
+    stash row, so the line above the root commit reads as main-blue
+    while the line just under the WIP node reads as WIP-grey.
+
+    Companion to :func:`test_root_commit_does_not_draw_stub_below_itself`:
+    that test pins the *bottom* of the root (no stub dangling into
+    the empty area below); this one pins the *above* — the lane the
+    root commit sits on must read as a continuous main-blue line from
+    the bottom of the stash row down into the root commit's circle,
+    and as a WIP-grey line from the WIP node down to the bottom of
+    the stash row.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _root_sha, _stash_msg = _make_root_with_stash_and_wip_repo(tmp_git_repo)
+
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    root_row_idx = next(
+        i for i, r in enumerate(widget._rows)
+        if r.get("commit") and r["commit"]["subject"] == "root"
+    )
+    stash_row_idx = next(
+        i for i, r in enumerate(widget._rows)
+        if r.get("commit") and r["commit"]["subject"].startswith("Stash @")
+    )
+    assert stash_row_idx == root_row_idx - 1, (
+        f"test setup broken — stash (idx {stash_row_idx}) is not "
+        f"directly above the root (idx {root_row_idx})"
+    )
+
+    cfg = widget._cfg
+    dpr = widget.devicePixelRatio()
+    img = widget.grab().toImage()
+    lane_w = cfg.node_radius * 2 + 8
+    stash_y = widget._row_y(stash_row_idx) + cfg.row_height / 2
+    root_y = widget._row_y(root_row_idx) + cfg.row_height / 2
+    lane0_x = widget._lane_x(0, lane_w)
+
+    wip_grey = (80, 80, 80)  # DARK_THEME.graph_wip
+
+    def _bad_pixels(
+        probe_y_start: int, probe_y_end: int, expected: tuple[int, int, int],
+    ) -> list[tuple[int, int, int, int, str]]:
+        bad: list[tuple[int, int, int, int, str]] = []
+        for py in range(probe_y_start, probe_y_end + 1):
+            ix = int(lane0_x * dpr)
+            iy = int(py * dpr)
+            if not (0 <= ix < img.width() and 0 <= iy < img.height()):
+                continue
+            color = img.pixelColor(ix, iy)
+            if max(color.red(), color.green(), color.blue()) < 30:
+                continue
+            if (
+                abs(color.red() - expected[0]) > 30
+                or abs(color.green() - expected[1]) > 30
+                or abs(color.blue() - expected[2]) > 30
+            ):
+                bad.append((py, color.red(), color.green(), color.blue(), color.name()))
+        return bad
+
+    # (a) The gap between the bottom of the stash circle and the top
+    #     of the root circle must read as WIP-grey — the bridge pipe
+    #     inherits the colour of the lane above (the WIP/stash PIPE
+    #     at lane 0 in the stash row), not the root's TEE_RIGHT.
+    gap_start = int(stash_y + cfg.node_radius + 1)
+    gap_end = int(root_y - cfg.node_radius - 1)
+    assert gap_end > gap_start, (
+        "test geometry broken — stash and root are too close together"
+    )
+    bad_gap = _bad_pixels(gap_start, gap_end, wip_grey)
+    assert not bad_gap, (
+        "bridge pipe from stash to root at lane 0 is not WIP-grey: "
+        + ", ".join(
+            f"y={py} rgb=({r},{g},{b}) #{name}"
+            for py, r, g, b, name in bad_gap[:5]
+        )
+    )
+
+    # (b) Inside the stash row, lane 0 carries a passing-through PIPE
+    #     which inherits the lane's tracking colour — in this layout
+    #     that is the WIP-grey above the stash. The PIPE is therefore
+    #     grey, not main-blue.
+    stash_inner_start = int(stash_y - cfg.node_radius + 1)
+    stash_inner_end = int(stash_y + cfg.node_radius - 1)
+    bad_stash = _bad_pixels(stash_inner_start, stash_inner_end, wip_grey)
+    assert not bad_stash, (
+        "PIPE at stash row lane 0 should be WIP-grey, not main-blue: "
+        + ", ".join(
+            f"y={py} rgb=({r},{g},{b}) #{name}"
+            for py, r, g, b, name in bad_stash[:5]
+        )
+    )
+
+
 def _make_root_with_forked_child_repo(
     path: Path,
 ) -> tuple[RepositoryManager, str]:
