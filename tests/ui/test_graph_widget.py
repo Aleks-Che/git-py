@@ -370,6 +370,348 @@ def test_topmost_commit_does_not_draw_line_stub_into_empty_space(
     )
 
 
+def _make_stash_around_commit_repo(path: Path) -> RepositoryManager:
+    """Build a repo with two stashes separated by a regular commit.
+
+    Timeline (chronological):
+
+    1. Commit X
+    2. Stash 1 ("stash1")  — first parent is Commit X
+    3. Apply stash 1, then Commit Y  — first parent is Commit X
+    4. Stash 2 ("stash2")  — first parent is Commit Y
+
+    In the graph (newest first):
+
+    * Stash 2  (top)
+    * Commit Y
+    * Stash 1
+    * Commit X
+
+    Stash 1 and Commit Y share Commit X as their first parent, so
+    Commit X is a fork point with two children (Stash 1 on the
+    offset lane, Commit Y on the main lane). Commit Y additionally
+    has Stash 2 as a child on the offset lane.
+
+    The bug this test pins: ``_draw_cells`` used to draw a vertical
+    inter-row pipe at the offset lane between Commit Y (which has a
+    ``MERGE_LEFT`` cell there) and Stash 1 (which sits on the offset
+    lane). The pipe is wrong because Stash 1 is not a child of
+    Commit Y — it is a sibling that joins Commit X from above.
+    """
+    mgr = RepositoryManager(str(path))
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+
+    (path / "f.txt").write_text("a\n")
+    mgr.repo.index.add("f.txt")
+    mgr.repo.index.write()
+    tree = mgr.repo.index.write_tree()
+    c_x = mgr.repo.create_commit("refs/heads/main", sig, sig, "first", tree, [])
+
+    time.sleep(1)
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    (path / "f.txt").write_text("b\n")
+    from src.core.operations import stash_push
+    stash_push(mgr, "stash1", include_untracked=False)
+
+    time.sleep(1)
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    from src.core.operations import stash_apply
+    stash_apply(mgr, 0)
+    (path / "f.txt").write_text("b\n")
+    mgr.repo.index.add("f.txt")
+    mgr.repo.index.write()
+    tree = mgr.repo.index.write_tree()
+    mgr.repo.create_commit(
+        "refs/heads/main", sig, sig, "second", tree, [c_x],
+    )
+
+    time.sleep(1)
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    (path / "f.txt").write_text("c\n")
+    stash_push(mgr, "stash2", include_untracked=False)
+
+    return mgr
+
+
+def test_no_pipe_between_sibling_stash_and_unrelated_row_above(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A ``MERGE_LEFT`` at a row must not produce a pipe to the row below.
+
+    Reproduces the scenario from
+    ``fix: Prevent vertical line stubs at topmost commit`` plus a
+    sibling stash: with a stash above HEAD and another stash inserted
+    into the history, the older stash used to render with a stub
+    going up to the in-between commit. The cause was the
+    ``_draw_cells`` pipe check that treated every non-empty cell at
+    a lane as evidence that the lane "continues" into the next row
+    — but a ``MERGE_LEFT`` / ``MERGE_RIGHT`` / ``TEE_UP`` cell only
+    extends upward and terminates at that row.
+    """
+    from src.core.graph_v2 import CellType
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_stash_around_commit_repo(tmp_git_repo)
+    assert mgr.get_status() == []
+    assert len(mgr.stash_list) == 2
+
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    # Sanity: four rows laid out newest-first as Stash 2, Commit Y,
+    # Stash 1, Commit X. The bug requires Stash 1 and Commit Y to
+    # both have something at the offset lane (lane 1 in our setup) —
+    # pin those preconditions so a future refactor that strips the
+    # shape surfaces here rather than as a "passes for the wrong
+    # reason" false positive.
+    stash1_row = next(
+        r for r in widget._rows
+        if r.get("commit") and r["commit"]["kind"] == "stash"
+        and r["commit"]["subject"].startswith("Stash @{1}")
+    )
+    commit_y_row = next(
+        r for r in widget._rows
+        if r.get("commit") and r["commit"]["subject"].startswith("second")
+    )
+    stash1_lanes = {
+        c["t"]
+        for ci, c in enumerate(stash1_row["cells"])
+        if c.get("t", 0) != CellType.EMPTY
+    }
+    commit_y_lanes = {
+        c["t"]
+        for ci, c in enumerate(commit_y_row["cells"])
+        if c.get("t", 0) != CellType.EMPTY
+    }
+    assert CellType.COMMIT in stash1_lanes, f"stash 1 missing COMMIT cell: {stash1_lanes}"
+    assert CellType.MERGE_LEFT in commit_y_lanes, (
+        f"commit Y missing MERGE_LEFT cell: {commit_y_lanes}"
+    )
+
+    cfg = widget._cfg
+    dpr = widget.devicePixelRatio()
+    img = widget.grab().toImage()
+
+    # The offset lane (lane 1) is at dividers[0] + graph_left_padding
+    # + 1 * lane_w. The gap between Stash 1 (row 2) and Commit Y
+    # (row 1) at lane 1 is the segment that should be background
+    # after the fix — before the fix, a coloured pipe ran through it.
+    offset_lane_x = widget._dividers[0] + cfg.graph_left_padding + (cfg.node_radius * 2 + 8)
+    # The bug drew the inter-row pipe at lane 1 from the bottom of
+    # Commit Y's ellipse (y_center + node_radius) to the top of
+    # Stash 1's ellipse (y_center - node_radius). Probe the middle of
+    # that band; a stray pipe shows up as a coloured pixel there.
+    # Skip a few pixels at each end to avoid ellipse antialiasing.
+    stash1_y_center = cfg.header_height + cfg.row_height * 2 + cfg.row_height // 2
+    commit_y_y_center = cfg.header_height + cfg.row_height * 1 + cfg.row_height // 2
+    probe_y_start = commit_y_y_center + cfg.node_radius + 4
+    probe_y_end = stash1_y_center - cfg.node_radius - 4
+    assert probe_y_end > probe_y_start, (
+        "test geometry broken — probe range collapsed"
+    )
+
+    for probe_y in range(probe_y_start, probe_y_end + 1):
+        ix = int(offset_lane_x * dpr)
+        iy = int(probe_y * dpr)
+        if not (0 <= ix < img.width() and 0 <= iy < img.height()):
+            continue
+        color = img.pixelColor(ix, iy)
+        # Background rgb is ~(30, 30, 30); pipe colours are branch
+        # palette entries that are clearly brighter (>= ~50 on at
+        # least one channel). A stray pipe at this probe point
+        # therefore shows up as a high channel value.
+        assert max(color.red(), color.green(), color.blue()) < 50, (
+            f"stray pipe at lane 1 between Stash 1 and Commit Y: "
+            f"probe ({offset_lane_x}, {probe_y}) is {color.name()}, "
+            f"rgb=({color.red()}, {color.green()}, {color.blue()})"
+        )
+
+
+def _make_stash_ladder_repo(path: Path) -> RepositoryManager:
+    """Build a repo with one stash below and three stashes above.
+
+    Timeline (chronological):
+
+    1. Commit X
+    2. Stash 1 (just above Commit X)
+    3. Commit Y
+    4. Stash 2
+    5. Stash 3
+    6. Stash 4 (newest, top)
+
+    In the graph (newest first): Stash 4, 3, 2, Commit Y, Stash 1,
+    Commit X. The ``_rebalance_stashes_for_wip`` step in
+    :mod:`src.core.graph_v2` moves the upper stashes onto offset
+    lanes (1, 2, 3, …) so that Commit Y can sit on lane 0. Commit Y
+    ends up with a multi-step fork connector (``TEE_RIGHT``,
+    ``HORIZONTAL``, ``TEE_UP`` cells) describing the merge of all
+    three upper stashes.
+
+    The bug this test pins: even after the single-stash fix, the
+    presence of a *group* of stashes above Stash 1 made the
+    ``HORIZONTAL`` cells in the fork connector at Commit Y register
+    as "downward continuation" at the offset lane. A pipe was then
+    drawn between Commit Y's ``HORIZONTAL`` and Stash 1's ``COMMIT``
+    at that lane — a red stub going up out of Stash 1.
+    """
+    mgr = RepositoryManager(str(path))
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+
+    (path / "f.txt").write_text("a\n")
+    mgr.repo.index.add("f.txt")
+    mgr.repo.index.write()
+    tree = mgr.repo.index.write_tree()
+    c_x = mgr.repo.create_commit("refs/heads/main", sig, sig, "first", tree, [])
+
+    time.sleep(1)
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    (path / "f.txt").write_text("b\n")
+    from src.core.operations import stash_push
+    stash_push(mgr, "stash1", include_untracked=False)
+
+    time.sleep(1)
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    (path / "f.txt").write_text("c\n")
+    mgr.repo.index.add("f.txt")
+    mgr.repo.index.write()
+    tree = mgr.repo.index.write_tree()
+    mgr.repo.create_commit(
+        "refs/heads/main", sig, sig, "second", tree, [c_x],
+    )
+
+    for label in ("stash2", "stash3", "stash4"):
+        time.sleep(1)
+        sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+        (path / "f.txt").write_text(label + "\n")
+        stash_push(mgr, label, include_untracked=False)
+
+    return mgr
+
+
+def test_no_pipe_from_horizontal_into_stash_below(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A fork-connector ``HORIZONTAL`` at one row must not draw a pipe
+    into a stash sitting on the same lane one row below.
+
+    Companion to :func:`test_no_pipe_between_sibling_stash_and_unrelated_row_above`:
+    that test covers the case where a single fork-connector cell
+    (``MERGE_LEFT``) is the source of the stray pipe. This test
+    covers the case where the source is a plain ``HORIZONTAL`` cell
+    (no vertical at all) at one of the offset lanes — the
+    multi-stash-ladder rendering exercises that path.
+    """
+    from src.core.graph_v2 import CellType
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_stash_ladder_repo(tmp_git_repo)
+    assert mgr.get_status() == []
+    assert len(mgr.stash_list) == 4
+
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 600)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    # Sanity: Stash 1 and Commit Y sit on adjacent rows, and the
+    # commit row has a fork-connector that includes a ``HORIZONTAL``
+    # at the offset lane. Without that fork connector the bug
+    # wouldn't manifest; pin the precondition so a future refactor
+    # surfaces here instead of as a "passes for the wrong reason"
+    # false positive.
+    stash1_row = next(
+        r for r in widget._rows
+        if r.get("commit") and r["commit"]["kind"] == "stash"
+        and r["commit"]["subject"].startswith("Stash @{3}")
+    )
+    commit_y_row = next(
+        r for r in widget._rows
+        if r.get("commit") and r["commit"]["subject"].startswith("second")
+    )
+    stash1_row_idx = widget._rows.index(stash1_row)
+    commit_y_row_idx = widget._rows.index(commit_y_row)
+    assert commit_y_row_idx == stash1_row_idx - 1, (
+        "test setup broken — Stash 1 and Commit Y are not adjacent"
+    )
+    commit_y_cell_types = {c["t"] for c in commit_y_row["cells"]}
+    assert CellType.HORIZONTAL in commit_y_cell_types, (
+        "commit Y missing HORIZONTAL cell — fork connector shape "
+        "changed: " + repr(commit_y_cell_types)
+    )
+    stash1_lanes = {
+        c["t"] for c in stash1_row["cells"] if c.get("t", 0) != CellType.EMPTY
+    }
+    assert CellType.COMMIT in stash1_lanes, (
+        "stash 1 missing COMMIT cell: " + repr(stash1_lanes)
+    )
+
+    # Find the offset lane where Commit Y has HORIZONTAL and Stash 1
+    # has COMMIT — that is the lane where the bug used to draw a pipe.
+    cfg = widget._cfg
+    dpr = widget.devicePixelRatio()
+    img = widget.grab().toImage()
+    lane_w = cfg.node_radius * 2 + 8
+
+    stash1_commit_lane = None
+    for ci, c in enumerate(stash1_row["cells"]):
+        if c.get("t") == CellType.COMMIT and ci % 2 == 0:
+            stash1_commit_lane = ci // 2
+            break
+    assert stash1_commit_lane is not None
+    assert stash1_commit_lane > 0, (
+        "stash 1 sits on the main lane — test layout does not exercise "
+        "the offset-lane bug"
+    )
+
+    commit_y_has_horizontal_at_lane = False
+    for ci, c in enumerate(commit_y_row["cells"]):
+        if (
+            c.get("t") == CellType.HORIZONTAL
+            and ci // 2 == stash1_commit_lane
+        ):
+            commit_y_has_horizontal_at_lane = True
+            break
+    assert commit_y_has_horizontal_at_lane, (
+        "test setup broken — Commit Y has no HORIZONTAL at the "
+        "Stash 1 offset lane"
+    )
+
+    # Probe the gap between Commit Y and Stash 1 at the offset
+    # lane — that is where the bug drew a red pipe.
+    commit_y_y_center = cfg.header_height + commit_y_row_idx * cfg.row_height + cfg.row_height // 2
+    stash1_y_center = cfg.header_height + stash1_row_idx * cfg.row_height + cfg.row_height // 2
+    offset_lane_x = widget._dividers[0] + cfg.graph_left_padding + stash1_commit_lane * lane_w
+    probe_y_start = commit_y_y_center + cfg.node_radius + 4
+    probe_y_end = stash1_y_center - cfg.node_radius - 4
+    assert probe_y_end > probe_y_start, (
+        "test geometry broken — probe range collapsed"
+    )
+
+    for probe_y in range(probe_y_start, probe_y_end + 1):
+        ix = int(offset_lane_x * dpr)
+        iy = int(probe_y * dpr)
+        if not (0 <= ix < img.width() and 0 <= iy < img.height()):
+            continue
+        color = img.pixelColor(ix, iy)
+        assert max(color.red(), color.green(), color.blue()) < 50, (
+            f"stray pipe at lane {stash1_commit_lane} between Stash 1 "
+            f"and Commit Y: probe ({offset_lane_x}, {probe_y}) is "
+            f"{color.name()}, rgb=({color.red()}, {color.green()}, {color.blue()})"
+        )
+
+
 # ----- branch label column --------------------------------------------
 
 
@@ -1479,6 +1821,179 @@ def test_regular_commit_menu_has_no_stash_action(
     assert "Stash Changes" not in labels
     assert "Checkout this commit" in labels
     assert "Copy diff" in labels
+
+
+def test_commit_menu_has_copy_sha_action(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Right-clicking a commit node shows a 'Copy SHA' action.
+
+    The row context menu (``_build_node_menu`` for kind ``commit``)
+    exposes the same 'Copy SHA' verb the branch-chip menu already
+    carries — both copy paths reach the same
+    :attr:`GraphTableWidget.copy_commit_sha_requested` signal so the
+    :class:`MainWindow` wiring is shared.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    menu = widget._build_node_menu(mgr.head_commit.sha, "commit")  # noqa: SLF001
+    qtbot.addWidget(menu)
+    labels = [a.text() for a in menu.actions()]
+    assert "Copy SHA" in labels
+    # 'Copy SHA' sits next to 'Copy diff' — same copy-clipboard section.
+    copy_diff_idx = labels.index("Copy diff")
+    copy_sha_idx = labels.index("Copy SHA")
+    assert copy_sha_idx == copy_diff_idx + 1
+
+
+def test_commit_menu_copy_sha_emits_row_sha(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Triggering 'Copy SHA' emits the commit's full OID.
+
+    The :class:`MainWindow` slot forwards the payload to
+    :meth:`MainViewModel.copy_to_clipboard`, so the SHA on the
+    clipboard is exactly the row SHA passed to the menu builder.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    menu = widget._build_node_menu(mgr.head_commit.sha, "commit")  # noqa: SLF001
+    qtbot.addWidget(menu)
+    action = next(a for a in menu.actions() if a.text() == "Copy SHA")
+    with qtbot.waitSignal(
+        widget.copy_commit_sha_requested, timeout=1000,
+    ) as blocker:
+        action.trigger()
+    assert blocker.args == [mgr.head_commit.sha]
+
+
+def test_stash_menu_has_copy_sha_action(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Right-clicking a stash node also exposes 'Copy SHA'.
+
+    Stash entries are backed by real commits in the object database
+    (``git stash push`` creates a commit per stash), so the row
+    carries a real OID that is meaningful to copy — exactly the
+    same payload the user would get from ``git stash show -p
+    <stash>`` or any external tool that accepts a stash OID.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    (tmp_git_repo / "f.txt").write_text("v3\n")
+    from src.core.operations import stash_push
+
+    stash_push(mgr, "copy-sha-test")
+
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    stash_sha = mgr.stash_list[0].sha
+    menu = widget._build_node_menu(stash_sha, "stash")  # noqa: SLF001
+    qtbot.addWidget(menu)
+    labels = [a.text() for a in menu.actions()]
+    assert "Copy SHA" in labels
+    # Co-located with the other copy verb, between 'Copy diff' and 'Delete Stash'.
+    copy_diff_idx = labels.index("Copy diff")
+    copy_sha_idx = labels.index("Copy SHA")
+    delete_idx = labels.index("Delete Stash")
+    assert copy_diff_idx < copy_sha_idx < delete_idx
+
+
+def test_stash_menu_copy_sha_emits_stash_oid(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The stash node's 'Copy SHA' emits the stash entry's real OID.
+
+    The signal payload is the row's ``sha`` field, which for a
+    stash row is the stash commit's OID (as stored by ``git stash
+    push``). Distinct from the commit the stash was forked from —
+    the user typically wants the stash OID so they can pass it to
+    ``git show`` / ``git stash apply <oid>``.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    (tmp_git_repo / "f.txt").write_text("v3\n")
+    from src.core.operations import stash_push
+
+    stash_push(mgr, "copy-sha-oid")
+
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    stash_sha = mgr.stash_list[0].sha
+    menu = widget._build_node_menu(stash_sha, "stash")  # noqa: SLF001
+    qtbot.addWidget(menu)
+    action = next(a for a in menu.actions() if a.text() == "Copy SHA")
+    with qtbot.waitSignal(
+        widget.copy_commit_sha_requested, timeout=1000,
+    ) as blocker:
+        action.trigger()
+    assert blocker.args == [stash_sha]
+
+
+def test_wip_menu_has_no_copy_sha(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The WIP node's menu does not gain a 'Copy SHA' action.
+
+    The WIP marker is a synthetic sentinel (``"WIP"``) with no
+    backing commit — copying ``"WIP"`` to the clipboard would be
+    useless, and copying the *parent* SHA would silently mislead
+    the user. The verb is intentionally restricted to nodes that
+    have a real OID.
+    """
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    (tmp_git_repo / "f.txt").write_text("v3\n")
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    menu = widget._build_node_menu("WIP", "wip")  # noqa: SLF001
+    qtbot.addWidget(menu)
+    labels = [a.text() for a in menu.actions()]
+    assert "Copy SHA" not in labels
 
 
 def test_remote_branch_suppressed_when_local_duplicate_exists(

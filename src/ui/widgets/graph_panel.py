@@ -700,12 +700,16 @@ class GraphTableWidget(QWidget):
 
         * ``stash`` — :attr:`stash_apply_requested` /
           :attr:`stash_pop_requested` / :attr:`stash_drop_requested` /
-          :attr:`copy_diff_requested`.
+          :attr:`copy_diff_requested` /
+          :attr:`copy_commit_sha_requested` (the row's real OID —
+          stash entries are backed by real commits).
         * ``wip`` — :attr:`stash_push_requested` (new; pushed onto
           the undo stack) / :attr:`discard_changes_requested` /
-          :attr:`copy_diff_requested`.
+          :attr:`copy_diff_requested`. The WIP marker has no real
+          SHA so the "Copy SHA" verb is intentionally absent.
         * ``commit`` — :attr:`checkout_commit_requested` /
-          :attr:`copy_diff_requested`.
+          :attr:`copy_diff_requested` /
+          :attr:`copy_commit_sha_requested` (the row's full SHA).
         """
         menu = QMenu(self)
         if kind == "stash":
@@ -721,6 +725,10 @@ class GraphTableWidget(QWidget):
             copy_diff_action = menu.addAction("Copy diff")
             copy_diff_action.triggered.connect(
                 lambda checked=False, s=sha: self.copy_diff_requested.emit(s),
+            )
+            copy_sha_action = menu.addAction("Copy SHA")
+            copy_sha_action.triggered.connect(
+                lambda checked=False, s=sha: self.copy_commit_sha_requested.emit(s),
             )
             menu.addSeparator()
             drop_action = menu.addAction("Delete Stash")
@@ -749,6 +757,10 @@ class GraphTableWidget(QWidget):
             copy_diff_action = menu.addAction("Copy diff")
             copy_diff_action.triggered.connect(
                 lambda checked=False, s=sha: self.copy_diff_requested.emit(s),
+            )
+            copy_sha_action = menu.addAction("Copy SHA")
+            copy_sha_action.triggered.connect(
+                lambda checked=False, s=sha: self.copy_commit_sha_requested.emit(s),
             )
         return menu
 
@@ -1313,6 +1325,25 @@ class GraphTableWidget(QWidget):
         col_left = self._column_left_x()
         lane_w = nr * 2 + 8
 
+        # Cells that DO NOT contribute a downward vertical segment. They
+        # must be excluded from ``prev_occupied`` (which feeds the next
+        # iteration's pipe-drawing check) — otherwise a sibling in the
+        # next row at the same lane ends up with a stray pipe dangling
+        # into the empty area below.
+        #
+        # * ``MERGE_RIGHT`` / ``MERGE_LEFT`` / ``TEE_UP`` are drawn with
+        #   a vertical segment that goes UP from the commit centre
+        #   only. They terminate a connector that arrived from the row
+        #   above and do not start a continuation into the row below.
+        # * ``HORIZONTAL`` has no vertical at all — it is a pure
+        #   horizontal line that crosses a connector mid-flight.
+        _downward_strip = (
+            _T_MERGE_RIGHT,
+            _T_MERGE_LEFT,
+            _T_TEE_UP,
+            _T_HORIZONTAL,
+        )
+
         prev_occupied: set[int] = set()
 
         for row_idx, row_data in enumerate(self._rows):
@@ -1355,7 +1386,19 @@ class GraphTableWidget(QWidget):
                         int(x), int(y_center - nr),
                     )
 
-            prev_occupied = cur_occupied
+            # ``prev_occupied`` feeds the NEXT iteration's pipe check.
+            # Strip cells that do not produce a downward vertical so a
+            # sibling in the next row at the same lane does not get a
+            # stray pipe.
+            next_prev_occupied: set[int] = set()
+            for ci, cell in enumerate(cells):
+                t = cell.get("t", _T_EMPTY)
+                if t == _T_EMPTY or t in _downward_strip:
+                    continue
+                next_prev_occupied.add(ci // 2)
+            if row_data.get("commit") is not None or row_data.get("is_uncommitted"):
+                next_prev_occupied.add(lane)
+            prev_occupied = next_prev_occupied
 
             _draw_cell_row(painter, cells, col_left, lane_w, y_center, dh, ew, nr)
 
