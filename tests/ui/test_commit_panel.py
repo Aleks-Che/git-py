@@ -750,7 +750,7 @@ def _row_index(view: FileListView, path: str) -> int:
 
 def test_file_list_view_has_1_5s_tooltip_delay() -> None:
     """The view exposes a 1.5 s tooltip delay constant."""
-    assert FileListView.TOOLTIP_DELAY_MS == 1500
+    assert FileListView.TOOLTIP_DELAY_MS == 1000
 
 
 def test_file_list_model_returns_tooltip_role_per_status() -> None:

@@ -21,8 +21,14 @@ import time
 from pathlib import Path
 
 import pygit2
+from PySide6.QtGui import QColor
+from src.core.models import FileStatus
 from src.core.repository import RepositoryManager
 from src.ui.main_window import MainWindow
+from src.ui.widgets.file_list_model import (
+    PATH_TEXT_COLOR,
+    STATUS_BADGE,
+)
 from src.ui.widgets.right_panel import RightPanel
 from src.viewmodels.graph_viewmodel import WIP_SHA
 from src.viewmodels.main_viewmodel import MainViewModel
@@ -250,13 +256,17 @@ def test_commit_detail_panel_renders_message_and_files(
     assert "first" in detail._message.text()
     # The file we committed in the fixture ("f.txt") shows up in the
     # changed-files list. pygit2 reports a freshly-tracked file as
-    # an *add* in the diff, so the badge is "A".
+    # an *add* in the diff, so the row carries a NEW-status
+    # FileChange (the delegate paints the "[A]" badge from it).
     paths = [
         detail._files.item(i).text()  # noqa: SLF001
         for i in range(detail._files.count())  # noqa: SLF001
     ]
     assert any("f.txt" in p for p in paths)
-    assert any("[A]" in p for p in paths)
+    assert all("<span" not in p for p in paths), (
+        "Items must not contain raw HTML markup — the [A] badge is "
+        "painted by _FileRowDelegate from the FileChange payload"
+    )
 
 
 def test_commit_detail_panel_file_click_toggles_selection(
@@ -944,3 +954,184 @@ def test_main_window_close_repository_hides_right_panel(
 
     window.set_repository(None)
     assert not right.isVisible()
+
+
+# ----- commit-detail file row colour sync ------------------------------
+
+
+def _render_row_to_image(panel, row: int):
+    """Render a single changed-files row to a :class:`QImage`.
+
+    Used by the colour-by-status integration tests below. The returned
+    image is exactly one row tall, fully painted, and ready for pixel
+    probing.
+    """
+    from PySide6.QtGui import QImage, QPainter
+    from PySide6.QtWidgets import QStyle, QStyleOptionViewItem
+
+    delegate = panel._files.itemDelegate()
+    index = panel._files.model().index(row, 0)
+    width = max(panel._files.viewport().width(), 200)
+    height = delegate.sizeHint(QStyleOptionViewItem(), index).height()
+    img = QImage(width, height, QImage.Format.Format_ARGB32)
+    img.fill(0)
+
+    option = QStyleOptionViewItem()
+    option.rect = img.rect()
+    option.state = QStyle.StateFlag.State_None
+
+    painter = QPainter(img)
+    try:
+        delegate.paint(painter, option, index)
+    finally:
+        painter.end()
+    return img
+
+
+def _badge_pixels(img) -> list:
+    """Pixels that lie inside the status-badge square."""
+    from PySide6.QtCore import QPoint
+
+    pixels = []
+    m = 4
+    bs = 16
+    for dx in range(bs):
+        for dy in range(bs):
+            x = m + dx
+            y = m + dy
+            if 0 <= x < img.width() and 0 <= y < img.height():
+                pixels.append(img.pixelColor(QPoint(x, y)))
+    return pixels
+
+
+def _path_text_pixels(img) -> list:
+    """Pixels that lie inside the file-path text area."""
+    from PySide6.QtCore import QPoint
+
+    m = 4
+    bs = 16
+    x0 = m + bs + m
+    y_centre = img.height() // 2
+    pixels = []
+    for dx in range(0, 200):
+        for dy in range(-6, 7):
+            x = x0 + dx
+            y = y_centre + dy
+            if 0 <= x < img.width() and 0 <= y < img.height():
+                pixels.append(img.pixelColor(QPoint(x, y)))
+    return pixels
+
+
+def _greenish(pixels) -> int:
+
+    return sum(
+        1 for px in pixels
+        if px.green() > px.red() + 25 and px.green() > px.blue() + 25
+    )
+
+
+def _reddish(pixels) -> int:
+
+    return sum(
+        1 for px in pixels
+        if px.red() > px.green() + 25 and px.red() > px.blue() + 25
+    )
+
+
+def test_commit_detail_new_file_renders_in_green(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """An added file's badge is green and its path is the lighter green —
+    matching the WIP panel's two-tone scheme.
+    """
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = RightPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    panel.resize(800, 600)
+    vm.select_commit(head_sha)
+
+    detail = panel._commit_detail
+    img = _render_row_to_image(detail, 0)
+    badge_pixels = _badge_pixels(img)
+    path_pixels = _path_text_pixels(img)
+
+    _, badge_color_hex = STATUS_BADGE[FileStatus.NEW]
+    path_color_hex = PATH_TEXT_COLOR[FileStatus.NEW]
+    badge_qcolor = QColor(badge_color_hex)
+    path_qcolor = QColor(path_color_hex)
+
+    assert any(
+        abs(px.red() - badge_qcolor.red()) < 10
+        and abs(px.green() - badge_qcolor.green()) < 10
+        and abs(px.blue() - badge_qcolor.blue()) < 10
+        for px in badge_pixels
+    ), f"Badge should render in {badge_color_hex}; got {badge_pixels[:3]}"
+
+    assert any(
+        abs(px.red() - path_qcolor.red()) < 10
+        and abs(px.green() - path_qcolor.green()) < 10
+        and abs(px.blue() - path_qcolor.blue()) < 10
+        for px in path_pixels
+    ), f"Path should render in {path_color_hex}; got {path_pixels[:3]}"
+
+
+def test_commit_detail_modified_file_uses_neutral_path(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Modified files keep the neutral default for the path text."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    parent_oid = mgr.repo.head.target
+    (tmp_git_repo / "f.txt").write_text("v2\n")
+    mgr.repo.index.add("f.txt")
+    mgr.repo.index.write()
+    tree = mgr.repo.index.write_tree()
+    mgr.repo.create_commit(
+        "refs/heads/main", sig, sig, "second", tree, [parent_oid],
+    )
+    head_sha = mgr.head_commit.sha
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = RightPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    panel.resize(800, 600)
+    vm.select_commit(head_sha)
+
+    detail = panel._commit_detail
+    paths = [
+        detail._files.item(i).text() for i in range(detail._files.count())
+    ]
+    assert any("f.txt" in p for p in paths)
+    assert all("<span" not in p for p in paths), (
+        "Items must not contain raw HTML markup — it must be painted by the delegate"
+    )
+
+
+def test_commit_detail_file_item_carries_change_payload(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Each row stores the FileChange under ``_FILE_CHANGE_ROLE`` so the
+    delegate can look up badge / path colours.
+    """
+    from src.ui.widgets.commit_detail_panel import _FILE_CHANGE_ROLE
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = RightPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    vm.select_commit(head_sha)
+
+    detail = panel._commit_detail
+    item = detail._files.item(0)
+    change = item.data(_FILE_CHANGE_ROLE)
+    assert change is not None
+    assert change.path == "f.txt"
+    assert change.status == FileStatus.NEW

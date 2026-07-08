@@ -22,8 +22,8 @@ the list of changed files and the per-file diff.
 from __future__ import annotations
 
 import pygit2
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QBrush, QColor
+from PySide6.QtCore import QRect, QSize, Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter
 from PySide6.QtWidgets import (
     QFrame,
     QLabel,
@@ -33,35 +33,115 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QVBoxLayout,
     QWidget,
 )
 
 from src.core.exceptions import GitError
-from src.core.models import CommitInfo, FileChange, FileStatus
-from src.ui.widgets.file_list_model import STATUS_TOOLTIP as _STATUS_TOOLTIP
+from src.core.models import CommitInfo, FileChange
+from src.ui.widgets.file_list_model import (
+    DEFAULT_PATH_TEXT_COLOR,
+    PATH_TEXT_COLOR,
+    STATUS_BADGE,
+    STATUS_TOOLTIP,
+)
 from src.viewmodels.main_viewmodel import MainViewModel
 
-# Short status letter + colour for the changed-files list. Reused from
-# the old :class:`CommitPanel` so the visual language stays consistent.
-_STATUS_BADGE: dict[FileStatus, tuple[str, str]] = {
-    FileStatus.NEW: ("A", "#43BCCD"),
-    FileStatus.MODIFIED: ("M", "#F5B947"),
-    FileStatus.DELETED: ("D", "#E8685A"),
-    FileStatus.RENAMED: ("R", "#5B8FF9"),
-    FileStatus.COPIED: ("C", "#A371F7"),
-    FileStatus.UNTRACKED: ("U", "#3FB950"),
-    FileStatus.TYPE_CHANGED: ("T", "#F0883E"),
-    FileStatus.CONFLICTED: ("!", "#FF6B6B"),
-    FileStatus.IGNORED: ("I", "#8B8B8B"),
-}
-
-# Per-status tooltip is imported from :mod:`file_list_model` so the
-# vocabulary stays in sync with the WIP panel.
+# Status badge + path colours are imported from :mod:`file_list_model`
+# so the commit-detail view and the WIP panel stay visually identical.
 
 # Selection background colour for the chosen file — matches the WIP
 # panel so the visual language is identical on both sides.
 _SELECTION_BG = "#264F78"
+
+# Default background colour for an unselected row. Matches the WIP
+# panel's :class:`FileListDelegate` so the two panels look identical.
+_ROW_BG = "#1E1E1E"
+
+# Custom role carrying the :class:`FileChange` payload on each row.
+# The :class:`_FileRowDelegate` reads this to paint badge + path.
+_FILE_CHANGE_ROLE = Qt.ItemDataRole.UserRole + 1
+
+
+# ---------------------------------------------------------------------------
+# Per-row painter for the changed-files list
+# ---------------------------------------------------------------------------
+
+
+class _FileRowDelegate(QStyledItemDelegate):
+    """Paint a single changed-file row: badge | path.
+
+    Mirrors :class:`FileListDelegate` so the WIP panel and the
+    commit-detail panel use the same two-tone layout (badge in the
+    strong status colour, path in the lighter / neutral shade).
+    ``QListWidget`` does not parse HTML in ``setText`` by default, so
+    we paint the row ourselves instead of stuffing rich text into the
+    item.
+    """
+
+    ROW_HEIGHT = 24
+    BADGE_SIZE = 16
+    MARGIN = 4
+
+    def sizeHint(  # noqa: N802
+        self, option: QStyleOptionViewItem, index: Qt.ModelIndex,
+    ) -> QSize:
+        return QSize(option.rect.width(), self.ROW_HEIGHT)
+
+    def paint(  # noqa: N802
+        self,
+        painter: QPainter,
+        option: QStyleOptionViewItem,
+        index: Qt.ModelIndex,
+    ) -> None:
+        change = index.data(_FILE_CHANGE_ROLE)
+        if change is None:
+            super().paint(painter, option, index)
+            return
+
+        painter.save()
+        rect = option.rect
+
+        # -- background ---------------------------------------------------
+        if option.state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(rect, QColor(_SELECTION_BG))
+        else:
+            painter.fillRect(rect, QColor(_ROW_BG))
+
+        # -- status badge -------------------------------------------------
+        badge, badge_color = STATUS_BADGE.get(change.status, ("?", "#8B8B8B"))
+        x = rect.left() + self.MARGIN
+        badge_y = rect.top() + (self.ROW_HEIGHT - self.BADGE_SIZE) // 2
+        badge_rect = QRect(x, badge_y, self.BADGE_SIZE, self.BADGE_SIZE)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(badge_color)))
+        painter.drawRoundedRect(badge_rect, 3, 3)
+
+        painter.setPen(QColor("white"))
+        font = QFont("Segoe UI", 8)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge)
+
+        # -- file path ----------------------------------------------------
+        x += self.BADGE_SIZE + self.MARGIN
+        path_color = PATH_TEXT_COLOR.get(change.status, DEFAULT_PATH_TEXT_COLOR)
+        path_width = rect.right() - x - self.MARGIN
+        path_rect = QRect(x, rect.top(), max(path_width, 0), self.ROW_HEIGHT)
+
+        painter.setPen(QColor(path_color))
+        path_font = QFont("Segoe UI", 9)
+        painter.setFont(path_font)
+        fm = QFontMetrics(path_font)
+        elided = fm.elidedText(change.path, Qt.TextElideMode.ElideRight, path_rect.width())
+        painter.drawText(
+            path_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided,
+        )
+
+        painter.restore()
 
 
 class CommitDetailPanel(QWidget):
@@ -153,7 +233,8 @@ class CommitDetailPanel(QWidget):
         self._files = QListWidget(self)
         self._files.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self._files.setUniformItemSizes(True)
-        self._files.setAlternatingRowColors(True)
+        self._files.setAlternatingRowColors(False)
+        self._files.setItemDelegate(_FileRowDelegate(self._files))
         self._files.setStyleSheet(
             f"QListWidget::item:selected {{ background: {_SELECTION_BG}; }}",
         )
@@ -319,11 +400,14 @@ class CommitDetailPanel(QWidget):
         )
 
     def _append_change_item(self, change: FileChange) -> None:
-        badge, color_hex = _STATUS_BADGE.get(change.status, ("?", "#8B8B8B"))
-        item = QListWidgetItem(f"[{badge}]  {change.path}", self._files)
-        item.setForeground(QBrush(QColor(color_hex)))
+        item = QListWidgetItem(self._files)
         item.setData(Qt.ItemDataRole.UserRole, change.path)
-        tip = _STATUS_TOOLTIP.get(change.status, "")
+        # The :class:`_FileRowDelegate` reads the FileChange from a
+        # dedicated role and paints badge + path with the shared
+        # status palette, mirroring the WIP panel.
+        item.setData(_FILE_CHANGE_ROLE, change)
+        item.setText(change.path)
+        tip = STATUS_TOOLTIP.get(change.status, "")
         if tip:
             item.setToolTip(tip)
 

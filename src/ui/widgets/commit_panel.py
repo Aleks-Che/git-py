@@ -636,7 +636,7 @@ class FileListView(QListView):
     user is just gliding the mouse past the row.
     """
 
-    TOOLTIP_DELAY_MS = 1500
+    TOOLTIP_DELAY_MS = 1000
 
     stage_file_requested = Signal(str)
     """Forwarded from :class:`FileListDelegate`."""

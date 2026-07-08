@@ -20,11 +20,13 @@ FileChangeRole = Qt.ItemDataRole.UserRole + 1
 FileStatusRole = Qt.ItemDataRole.UserRole + 2
 
 # ---------------------------------------------------------------------------
-# Status badge colours — shared with CommitDetailPanel
+# Status badge + path-text colours — single source of truth shared with
+# :class:`CommitDetailPanel` so the WIP panel and the commit-detail
+# view use identical visual language.
 # ---------------------------------------------------------------------------
 
-_STATUS_BADGE: dict[FileStatus, tuple[str, str]] = {
-    FileStatus.NEW: ("A", "#43BCCD"),
+STATUS_BADGE: dict[FileStatus, tuple[str, str]] = {
+    FileStatus.NEW: ("A", "#3FB950"),
     FileStatus.MODIFIED: ("M", "#F5B947"),
     FileStatus.DELETED: ("D", "#E8685A"),
     FileStatus.RENAMED: ("R", "#5B8FF9"),
@@ -56,12 +58,12 @@ STATUS_TOOLTIP: dict[FileStatus, str] = {
 # ``git add``); red = file is being deleted; everything else keeps
 # the neutral default. Brighter than the badge palette so the path
 # stays readable on the row's dark backgrounds.
-_PATH_TEXT_COLOR: dict[FileStatus, str] = {
+PATH_TEXT_COLOR: dict[FileStatus, str] = {
     FileStatus.NEW: "#7CE38B",
     FileStatus.UNTRACKED: "#7CE38B",
     FileStatus.DELETED: "#F08A7E",
 }
-_DEFAULT_PATH_TEXT_COLOR = "#D4D4D4"
+DEFAULT_PATH_TEXT_COLOR = "#D4D4D4"
 
 # ---------------------------------------------------------------------------
 # Model
@@ -163,7 +165,7 @@ class FileListDelegate(QStyledItemDelegate):
         added to the next commit); ``DELETED`` paints red; every
         other status falls back to the neutral default.
         """
-        return _PATH_TEXT_COLOR.get(status, _DEFAULT_PATH_TEXT_COLOR)
+        return PATH_TEXT_COLOR.get(status, DEFAULT_PATH_TEXT_COLOR)
 
     # -- QStyledItemDelegate interface ------------------------------------
 
@@ -194,7 +196,7 @@ class FileListDelegate(QStyledItemDelegate):
         badge_y = rect.top() + (self.ROW_HEIGHT - self.BADGE_SIZE) // 2
 
         # -- status badge -------------------------------------------------
-        letter, color_hex = _STATUS_BADGE.get(change.status, ("?", "#8B8B8B"))
+        letter, color_hex = STATUS_BADGE.get(change.status, ("?", "#8B8B8B"))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(QColor(color_hex)))
         badge_rect = QRect(x, badge_y, self.BADGE_SIZE, self.BADGE_SIZE)
