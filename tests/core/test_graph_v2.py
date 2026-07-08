@@ -12,6 +12,7 @@ from src.core.graph_v2 import (
     UNCOMMITTED_COLOR_INDEX,
     CellInfo,
     CellType,
+    _pick_branch_color,
     build_graph,
     graph_to_dicts,
 )
@@ -424,6 +425,33 @@ def test_color_palette_accessible() -> None:
     for c in BRANCH_PALETTE:
         assert c.startswith("#")
         assert len(c) == 7
+
+
+def test_pick_branch_color_is_deterministic_across_runs() -> None:
+    """Branch colours must be stable across process restarts.
+
+    Regression: the previous implementation used ``hash()`` which is
+    seeded randomly at interpreter startup via ``PYTHONHASHSEED``, so
+    the same branch got a different colour on every run. Run the
+    function multiple times in-process to mimic that variability and
+    assert it always returns the same index.
+    """
+    names = ["main-content", "feature/login", "release/1.2", "Bugfix/Auth", "main"]
+    expected = [_pick_branch_color(n) for n in names]
+    # Re-import + re-run, also in a fresh subprocess to be safe.
+    for _ in range(10):
+        assert [_pick_branch_color(n) for n in names] == expected
+    import subprocess
+    import sys
+    out = subprocess.check_output(
+        [sys.executable, "-c",
+         "from src.core.graph_v2 import _pick_branch_color as f;"
+         "print(','.join(str(f(n)) for n in "
+         "['main-content','feature/login','release/1.2','Bugfix/Auth','main']))"],
+        cwd=".",
+        text=True,
+    ).strip()
+    assert out == ",".join(str(i) for i in expected)
 
 
 # ---- CellType / CellInfo -------------------------------------------------

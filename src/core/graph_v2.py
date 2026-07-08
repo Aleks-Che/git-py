@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
+from zlib import crc32
 
 from src.core.models import BranchInfo, CommitInfo
 
@@ -80,13 +81,16 @@ def _pick_branch_color(name: str) -> int:
     """Return a deterministic palette index for *name*.
 
     Hardcoded overrides are checked first (case-insensitive); the
-    remainder are hashed modulo the palette size.
+    remainder are hashed modulo the palette size. ``zlib.crc32`` is
+    used instead of the built-in :func:`hash` because the latter is
+    randomised at interpreter startup via ``PYTHONHASHSEED`` and
+    would give a different colour for the same branch on every run.
     """
     lower = name.lower()
     override = _BRANCH_COLOR_OVERRIDES.get(lower)
     if override is not None:
         return override
-    return abs(hash(lower)) % len(BRANCH_PALETTE)
+    return crc32(lower.encode("utf-8")) % len(BRANCH_PALETTE)
 
 
 # Alias kept for documentation cross-reference.
