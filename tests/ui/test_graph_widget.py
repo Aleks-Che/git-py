@@ -712,6 +712,163 @@ def test_no_pipe_from_horizontal_into_stash_below(
         )
 
 
+def _make_root_with_forked_child_repo(
+    path: Path,
+) -> tuple[RepositoryManager, str]:
+    """Build a repo whose root commit is the branch point of a fork.
+
+    Timeline (chronological):
+
+    1. ``root`` — first commit on ``main``.
+    2. ``second`` — child of ``root`` on ``main``.
+    3. ``feature`` branch created from ``root`` (so ``root`` has TWO
+       children: ``second`` on main and ``feature_child`` on the
+       feature branch).
+    4. ``feature_child`` — child of ``root`` on ``feature``.
+
+    In the graph (newest first): ``feature_child``, ``second``,
+    ``root``. The ``root`` row carries a fork connector
+    (``TEE_RIGHT`` + ``MERGE_LEFT`` + lane-0 ``PIPE`` passing through
+    the ``second`` row) describing the fan-out. ``root`` is the
+    bottommost row — there is no row below it — so any vertical line
+    drawn at ``root``'s lane that extends below ``y_center + node_radius``
+    is a stub dangling into empty space.
+    """
+    mgr = RepositoryManager(str(path))
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+
+    (path / "f.txt").write_text("a\n")
+    mgr.repo.index.add("f.txt")
+    mgr.repo.index.write()
+    tree = mgr.repo.index.write_tree()
+    c_root = mgr.repo.create_commit("refs/heads/main", sig, sig, "root", tree, [])
+
+    time.sleep(1)
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    (path / "f.txt").write_text("b\n")
+    mgr.repo.index.add("f.txt")
+    mgr.repo.index.write()
+    tree = mgr.repo.index.write_tree()
+    mgr.repo.create_commit(
+        "refs/heads/main", sig, sig, "second", tree, [c_root],
+    )
+
+    from src.core.operations import (
+        checkout_branch as op_checkout_branch,
+    )
+    from src.core.operations import (
+        create_branch as op_create_branch,
+    )
+    op_create_branch(mgr, "feature", str(c_root))
+    op_checkout_branch(mgr, "feature")
+
+    time.sleep(1)
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    (path / "g.txt").write_text("feature\n")
+    mgr.repo.index.add("g.txt")
+    mgr.repo.index.write()
+    tree = mgr.repo.index.write_tree()
+    mgr.repo.create_commit(
+        "refs/heads/feature", sig, sig, "feature_child", tree, [c_root],
+    )
+
+    return mgr, str(c_root)
+
+
+def test_root_commit_does_not_draw_stub_below_itself(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The root (bottommost) commit must not draw a vertical stub below.
+
+    Companion to :func:`test_topmost_commit_does_not_draw_line_stub_into_empty_space`:
+    that test pins the upward stub at the topmost commit; this one pins
+    the downward stub at the bottommost commit.
+
+    When ``root`` is a fork point with children on multiple lanes, its
+    row carries ``TEE_RIGHT`` / ``TEE_LEFT`` / ``HORIZONTAL_PIPE`` cells
+    whose vertical extents reach ``y_center + half_h`` so they bridge
+    into the row below. At the bottom of the layout there *is* no row
+    below, so the part of the vertical that lies between
+    ``y_center + node_radius`` and ``y_center + half_h`` is a stub that
+    dangles into the empty space below the root.
+    """
+    from src.core.graph_v2 import CellType as _CellType
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr, _root_sha = _make_root_with_forked_child_repo(tmp_git_repo)
+
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 600)
+    qtbot.addWidget(widget)
+    widget.show()
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    _force_paint(widget)
+
+    # Pin the precondition: there is exactly one root commit, it is
+    # the bottommost row, and its row carries a fork connector at
+    # least. Without those conditions the bug wouldn't manifest, so a
+    # future refactor that reorders lanes must surface here instead
+    # of as a "passes for the wrong reason" false positive.
+    root_row = next(
+        r for r in widget._rows
+        if r.get("commit") and r["commit"]["subject"] == "root"
+    )
+    root_row_idx = widget._rows.index(root_row)
+    assert root_row_idx == len(widget._rows) - 1, (
+        "test setup broken — root commit is not the bottommost row"
+    )
+    root_cell_types = {c.get("t") for c in root_row["cells"]}
+    assert any(
+        t in root_cell_types for t in (
+            _CellType.TEE_RIGHT, _CellType.TEE_LEFT, _CellType.HORIZONTAL_PIPE,
+        )
+    ), (
+        "test setup broken — root row has no fork-connector cell; "
+        f"got cell types {root_cell_types}"
+    )
+
+    cfg = widget._cfg
+    dpr = widget.devicePixelRatio()
+    img = widget.grab().toImage()
+
+    # Probe every non-empty lane at the root row, *below* the commit
+    # circle, looking for pipe-coloured pixels. The clean range is
+    # ``y_center + node_radius + 1`` (just below the circle outline)
+    # to ``y_center + row_height`` (bottom of the row, where the
+    # stub would terminate).
+    y_center = widget._row_y(root_row_idx) + cfg.row_height / 2
+    lane_w = cfg.node_radius * 2 + 8
+    probed: list[tuple[int, int, int, str]] = []
+    for ci, cell in enumerate(root_row["cells"]):
+        if cell.get("t", 0) == _CellType.EMPTY:
+            continue
+        lane = ci // 2
+        x = widget._lane_x(lane, lane_w)
+        for probe_y in range(
+            int(y_center + cfg.node_radius + 1),
+            int(y_center + cfg.row_height),
+        ):
+            ix = int(x * dpr)
+            iy = int(probe_y * dpr)
+            if not (0 <= ix < img.width() and 0 <= iy < img.height()):
+                continue
+            color = img.pixelColor(ix, iy)
+            ch_max = max(color.red(), color.green(), color.blue())
+            if ch_max >= 50:
+                probed.append((lane, probe_y, ch_max, color.name()))
+
+    assert not probed, (
+        "stray stub below root commit (bottommost row): "
+        + ", ".join(
+            f"lane {lane} y={py} channel_max={mx} #{name}"
+            for lane, py, mx, name in probed[:5]
+        )
+    )
+
+
 # ----- branch label column --------------------------------------------
 
 

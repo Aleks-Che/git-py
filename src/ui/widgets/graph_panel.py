@@ -1400,7 +1400,16 @@ class GraphTableWidget(QWidget):
                 next_prev_occupied.add(lane)
             prev_occupied = next_prev_occupied
 
-            _draw_cell_row(painter, cells, col_left, lane_w, y_center, dh, ew, nr)
+            # Bottommost row has no row below; cap the downward
+            # extent of every cell so fork connectors (``TEE_RIGHT``,
+            # ``TEE_LEFT``, ``HORIZONTAL_PIPE``) and branch starts
+            # (``BRANCH_RIGHT``, ``BRANCH_LEFT``) do not draw a stub
+            # dangling into the empty space below the root commit.
+            bot_half_h = nr if row_idx == len(self._rows) - 1 else None
+            _draw_cell_row(
+                painter, cells, col_left, lane_w, y_center, dh, ew, nr,
+                bottom_half_h=bot_half_h,
+            )
 
     def _draw_row_backgrounds(self, painter: QPainter, header_h: int) -> None:
         dh = self._cfg.row_height
@@ -2416,6 +2425,8 @@ def _draw_cell_row(
     row_height: float,
     edge_width: float,
     node_radius: float,
+    *,
+    bottom_half_h: float | None = None,
 ) -> None:
     """Draw one row of graph cells at *y_center*.
 
@@ -2423,6 +2434,7 @@ def _draw_cell_row(
     the centre; the inter-row gap is bridged by ``_draw_cells``.
     """
     half_h = row_height / 2.0
+    bot_half_h = bottom_half_h if bottom_half_h is not None else half_h
 
     for idx, cell in enumerate(cells):
         t = cell.get("t", 0)
@@ -2447,9 +2459,9 @@ def _draw_cell_row(
         elif t == _T_COMMIT:
             _draw_vert_line(painter, x, y_center, node_radius, edge_width, color)
         elif t == _T_BRANCH_RIGHT:
-            _draw_branch_right(painter, x, y_center, half_h, edge_width, color)
+            _draw_branch_right(painter, x, y_center, bot_half_h, edge_width, color)
         elif t == _T_BRANCH_LEFT:
-            _draw_branch_left(painter, x, y_center, half_h, edge_width, color)
+            _draw_branch_left(painter, x, y_center, bot_half_h, edge_width, color)
         elif t == _T_MERGE_RIGHT:
             _draw_merge_right(painter, x, y_center, half_h, edge_width, color)
         elif t == _T_MERGE_LEFT:
@@ -2459,21 +2471,21 @@ def _draw_cell_row(
         elif t == _T_HORIZONTAL_PIPE:
             _draw_vert_line(
                 painter, x, y_center, half_h, edge_width, p_color,
-                top_half_h=node_radius,
+                top_half_h=node_radius, bottom_half_h=bot_half_h,
             )
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
         elif t == _T_TEE_RIGHT:
             vert_color = p_color if p else color
             _draw_vert_line(
                 painter, x, y_center, half_h, edge_width, vert_color,
-                top_half_h=node_radius,
+                top_half_h=node_radius, bottom_half_h=bot_half_h,
             )
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
         elif t == _T_TEE_LEFT:
             vert_color = p_color if p else color
             _draw_vert_line(
                 painter, x, y_center, half_h, edge_width, vert_color,
-                top_half_h=node_radius,
+                top_half_h=node_radius, bottom_half_h=bot_half_h,
             )
             _draw_horiz_line(painter, x, y_center, -lane_w, edge_width, color)
         elif t == _T_TEE_UP:
@@ -2489,6 +2501,7 @@ def _draw_vert_line(
     painter: QPainter, x: float, y_center: float,
     half_h: float, width: float, color: QColor, *, upward_only: bool = False,
     top_half_h: float | None = None,
+    bottom_half_h: float | None = None,
 ) -> None:
     """Draw a vertical line segment centred at *y_center*, spanning *half_h*
     pixels above and below (or only above when *upward_only*).
@@ -2497,13 +2510,20 @@ def _draw_vert_line(
     cell has no row above (or the lane above is empty) so the line stops
     at the commit edge instead of leaving a stub that dangles into the
     empty space above the topmost commit.
+
+    *bottom_half_h* overrides the downward span: pass a smaller value
+    when the cell has no row below (or the lane below is empty) so the
+    line stops at the commit edge instead of leaving a stub dangling
+    into the empty space below the bottommost commit.
     """
     pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
     painter.setPen(pen)
     if top_half_h is None:
         top_half_h = half_h
+    if bottom_half_h is None:
+        bottom_half_h = half_h
     top = y_center - top_half_h
-    bot = y_center + half_h
+    bot = y_center + bottom_half_h
     if upward_only:
         bot = y_center
     painter.drawLine(int(x), int(top), int(x), int(bot))
