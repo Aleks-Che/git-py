@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 import pygit2
-from PySide6.QtCore import QItemSelectionModel, QPoint, Qt
+from PySide6.QtCore import QEvent, QItemSelectionModel, QPoint, Qt
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QStyleOptionViewItem
@@ -723,4 +723,162 @@ def test_paint_uses_neutral_color_for_modified_file() -> None:
     pixels = _path_text_pixels(img)
     assert _greenish(pixels) == 0, "MODIFIED path should not be green"
     assert _reddish(pixels) == 0, "MODIFIED path should not be red"
+
+
+# ----- Status badge tooltips -------------------------------------------
+
+
+def _build_panel_for_tooltip(qtbot, tmp_git_repo: Path):
+    """Helper: build a CommitPanel with one modified + one untracked file."""
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    return panel
+
+
+def _row_index(view: FileListView, path: str) -> int:
+    model = view.model()
+    for i in range(model.count()):
+        change = model.change_at(i)
+        if change and change.path == path:
+            return i
+    raise AssertionError(f"{path!r} not found in view")
+
+
+def test_file_list_view_has_1_5s_tooltip_delay() -> None:
+    """The view exposes a 1.5 s tooltip delay constant."""
+    assert FileListView.TOOLTIP_DELAY_MS == 1500
+
+
+def test_file_list_model_returns_tooltip_role_per_status() -> None:
+    """``Qt::ToolTipRole`` returns the human-readable status name."""
+    model = FileListModel()
+    model.set_changes([
+        FileChange(path="a.txt", status=FileStatus.MODIFIED),
+        FileChange(path="b.txt", status=FileStatus.UNTRACKED),
+        FileChange(path="c.txt", status=FileStatus.NEW),
+        FileChange(path="d.txt", status=FileStatus.DELETED),
+    ])
+    expectations = ["Modified", "Untracked", "Added (new file)", "Deleted"]
+    for row, expected in enumerate(expectations):
+        text = model.data(model.index(row, 0), Qt.ItemDataRole.ToolTipRole)
+        assert text == expected, (row, text, expected)
+
+
+def test_file_list_view_suppresses_default_tooltip_event(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The view swallows ``QEvent::ToolTip`` so Qt's style delay is bypassed."""
+    panel = _build_panel_for_tooltip(qtbot, tmp_git_repo)
+    view = panel._unstaged_list
+
+    event = QEvent(QEvent.Type.ToolTip)
+    assert view.viewportEvent(event) is True, (
+        "viewportEvent must consume ToolTip events"
+    )
+
+
+def test_hovering_a_row_schedules_tooltip_timer(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Scheduling a row starts the 1.5 s single-shot timer."""
+    panel = _build_panel_for_tooltip(qtbot, tmp_git_repo)
+    view = panel._unstaged_list
+
+    row = _row_index(view, "f.txt")
+    idx = view.model().index(row, 0)
+
+    assert not view._tooltip_timer.isActive()
+    view._schedule_tooltip(idx, QPoint(0, 0))
+    assert view._tooltip_timer.isActive()
+    assert view._tooltip_index.row() == row
+    assert view._tooltip_timer.interval() == FileListView.TOOLTIP_DELAY_MS
+
+
+def test_timer_does_not_fire_before_delay_elapses(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Half the delay must not be enough to pop the tooltip up."""
+    panel = _build_panel_for_tooltip(qtbot, tmp_git_repo)
+    view = panel._unstaged_list
+
+    row = _row_index(view, "f.txt")
+    idx = view.model().index(row, 0)
+
+    view._schedule_tooltip(idx, QPoint(0, 0))
+    qtbot.wait(int(FileListView.TOOLTIP_DELAY_MS * 0.5))
+    assert view._tooltip_timer.isActive(), (
+        "Timer must still be pending at half the delay"
+    )
+
+
+def test_tooltip_text_matches_status_after_delay(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """When the timer fires, the tooltip text equals the status name."""
+    panel = _build_panel_for_tooltip(qtbot, tmp_git_repo)
+    view = panel._unstaged_list
+
+    row = _row_index(view, "f.txt")
+    idx = view.model().index(row, 0)
+
+    view._tooltip_timer.setInterval(50)
+    view._schedule_tooltip(idx, QPoint(0, 0))
+    qtbot.wait(100)
+
+    assert idx.data(Qt.ItemDataRole.ToolTipRole) == "Modified"
+    # And the timer fired exactly once (idle afterwards).
+    assert not view._tooltip_timer.isActive()
+
+
+def test_moving_to_a_different_row_restarts_the_timer(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Crossing into another row resets the timer; small jitter does not."""
+    panel = _build_panel_for_tooltip(qtbot, tmp_git_repo)
+    view = panel._unstaged_list
+    view._tooltip_timer.setInterval(10_000)
+
+    f_idx = view.model().index(_row_index(view, "f.txt"), 0)
+    u_idx = view.model().index(_row_index(view, "untracked.txt"), 0)
+
+    view._schedule_tooltip(f_idx, QPoint(0, 0))
+    qtbot.wait(100)
+    assert view._tooltip_index.row() == f_idx.row()
+    assert view._tooltip_timer.isActive()
+
+    view._schedule_tooltip(u_idx, QPoint(0, 0))
+    assert view._tooltip_index.row() == u_idx.row(), (
+        "Tooltip target must follow the row the cursor is over"
+    )
+    assert view._tooltip_timer.isActive()
+
+    view._schedule_tooltip(u_idx, QPoint(2, 0))
+    assert view._tooltip_index.row() == u_idx.row()
+    assert view._tooltip_timer.isActive(), (
+        "Small in-row jitter must not cancel the pending tooltip"
+    )
+
+
+def test_leaving_the_view_cancels_the_timer(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """``leaveEvent`` stops the timer so the tooltip never fires after exit."""
+    panel = _build_panel_for_tooltip(qtbot, tmp_git_repo)
+    view = panel._unstaged_list
+
+    row = _row_index(view, "f.txt")
+    idx = view.model().index(row, 0)
+
+    view._schedule_tooltip(idx, QPoint(0, 0))
+    assert view._tooltip_timer.isActive()
+
+    leave_event = QEvent(QEvent.Type.Leave)
+    view.leaveEvent(leave_event)
+
+    assert not view._tooltip_timer.isActive()
+    assert not view._tooltip_index.isValid()
 

@@ -2052,10 +2052,6 @@ class GraphTableWidget(QWidget):
 
         if self._divider_at(x) >= 0:
             self.setCursor(Qt.CursorShape.SplitHCursor)
-        elif y >= hh and self._branch_chip_at(x, y) is not None:
-            # Branch chips are actionable (double-click / context menu);
-            # advertise that with a pointer cursor.
-            self.setCursor(Qt.CursorShape.PointingHandCursor)
         else:
             self.setCursor(Qt.CursorShape.ArrowCursor)
 
@@ -3001,7 +2997,7 @@ class BranchStackPopup(QFrame):
             self._branch = branch
             self.setObjectName("BranchStackPopup.Row")
             self.setFrameShape(QFrame.Shape.NoFrame)
-            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.setCursor(Qt.CursorShape.ArrowCursor)
             self.setFixedHeight(24)
 
             hbox = QHBoxLayout(self)

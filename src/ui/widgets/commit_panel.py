@@ -32,7 +32,16 @@ from __future__ import annotations
 
 import os as _os
 
-from PySide6.QtCore import QItemSelectionModel, QModelIndex, QPoint, QRect, Qt, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QItemSelectionModel,
+    QModelIndex,
+    QPoint,
+    QRect,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -45,6 +54,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -617,7 +627,16 @@ class FileListView(QListView):
 
     Provides a right-click context menu with actions forwarded through
     :attr:`context_action_requested`.
+
+    After the cursor rests on a row for :data:`TOOLTIP_DELAY_MS`
+    milliseconds, the row's status-badge tooltip (``Qt::ToolTipRole``
+    payload from :class:`FileListModel`) is shown next to the cursor.
+    Qt's built-in style-driven tooltip mechanism is suppressed so the
+    delay is the same on every platform and never fires while the
+    user is just gliding the mouse past the row.
     """
+
+    TOOLTIP_DELAY_MS = 1500
 
     stage_file_requested = Signal(str)
     """Forwarded from :class:`FileListDelegate`."""
@@ -650,6 +669,13 @@ class FileListView(QListView):
         self.entered.connect(self._on_entered)
         self._delegate.stage_file_requested.connect(self.stage_file_requested)
         self.viewport().setMouseTracking(True)
+
+        self._tooltip_timer = QTimer(self)
+        self._tooltip_timer.setSingleShot(True)
+        self._tooltip_timer.setInterval(self.TOOLTIP_DELAY_MS)
+        self._tooltip_timer.timeout.connect(self._on_tooltip_timer)
+        self._tooltip_index = QModelIndex()
+        self._tooltip_pos = QPoint()
 
     # -- public API -------------------------------------------------------
 
@@ -860,6 +886,7 @@ class FileListView(QListView):
 
     def _on_entered(self, index: QModelIndex) -> None:
         self._delegate.set_hovered_index(index)
+        self._schedule_tooltip(index, QPoint())
         self.viewport().update()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
@@ -870,15 +897,67 @@ class FileListView(QListView):
             btn_rect = self._button_rect(item_rect)
             over = btn_rect.contains(event.pos())
             self._delegate.set_button_row(index.row() if over else None)
+            self._schedule_tooltip(index, event.pos())
         else:
             self._delegate.set_button_row(None)
+            self._cancel_tooltip()
         self.viewport().update()
 
     def leaveEvent(self, event) -> None:  # noqa: N802
         super().leaveEvent(event)
         self._delegate.set_hovered_index(QModelIndex())
         self._delegate.set_button_row(None)
+        self._cancel_tooltip()
         self.viewport().update()
+
+    def viewportEvent(self, event) -> bool:  # noqa: N802
+        """Suppress Qt's style-driven tooltip — we manage our own delay."""
+        if event.type() == QEvent.Type.ToolTip:
+            return True
+        return super().viewportEvent(event)
+
+    def event(self, event) -> bool:  # noqa: N802
+        """Dismiss our manual tooltip on focus loss / window hide."""
+        if event.type() in (
+            QEvent.Type.WindowDeactivate,
+            QEvent.Type.Hide,
+            QEvent.Type.FocusOut,
+        ):
+            self._cancel_tooltip()
+        return super().event(event)
+
+    # -- tooltip helpers --------------------------------------------------
+
+    def _schedule_tooltip(self, index: QModelIndex, pos: QPoint) -> None:
+        """Restart the 1.5 s timer for *index*; small movements within the
+        same row do not reset it.
+        """
+        if not index.isValid():
+            self._cancel_tooltip()
+            return
+        same_row = (
+            self._tooltip_index.isValid()
+            and self._tooltip_index.row() == index.row()
+            and self._tooltip_timer.isActive()
+        )
+        if not same_row:
+            self._tooltip_index = QModelIndex(index)
+            self._tooltip_timer.start()
+        self._tooltip_pos = pos
+
+    def _cancel_tooltip(self) -> None:
+        self._tooltip_timer.stop()
+        self._tooltip_index = QModelIndex()
+        QToolTip.hideText()
+
+    def _on_tooltip_timer(self) -> None:
+        if not self._tooltip_index.isValid():
+            return
+        text = self._tooltip_index.data(Qt.ItemDataRole.ToolTipRole)
+        if not text:
+            return
+        global_pos = self.viewport().mapToGlobal(self._tooltip_pos)
+        QToolTip.showText(global_pos, text, self.viewport())
 
     @staticmethod
     def _button_rect(item_rect):

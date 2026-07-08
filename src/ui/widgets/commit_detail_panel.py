@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 
 from src.core.exceptions import GitError
 from src.core.models import CommitInfo, FileChange, FileStatus
+from src.ui.widgets.file_list_model import STATUS_TOOLTIP as _STATUS_TOOLTIP
 from src.viewmodels.main_viewmodel import MainViewModel
 
 # Short status letter + colour for the changed-files list. Reused from
@@ -55,19 +56,8 @@ _STATUS_BADGE: dict[FileStatus, tuple[str, str]] = {
     FileStatus.IGNORED: ("I", "#8B8B8B"),
 }
 
-# Per-status tooltip — matches the WIP panel so the vocabulary
-# is consistent between the two right-panel views.
-_STATUS_TOOLTIP: dict[FileStatus, str] = {
-    FileStatus.NEW: "Added (new file)",
-    FileStatus.MODIFIED: "Modified",
-    FileStatus.DELETED: "Deleted",
-    FileStatus.RENAMED: "Renamed",
-    FileStatus.COPIED: "Copied",
-    FileStatus.UNTRACKED: "Untracked",
-    FileStatus.TYPE_CHANGED: "Type changed",
-    FileStatus.CONFLICTED: "Conflicted",
-    FileStatus.IGNORED: "Ignored",
-}
+# Per-status tooltip is imported from :mod:`file_list_model` so the
+# vocabulary stays in sync with the WIP panel.
 
 # Selection background colour for the chosen file — matches the WIP
 # panel so the visual language is identical on both sides.

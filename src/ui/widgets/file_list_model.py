@@ -35,6 +35,22 @@ _STATUS_BADGE: dict[FileStatus, tuple[str, str]] = {
     FileStatus.IGNORED: ("I", "#8B8B8B"),
 }
 
+# Per-status tooltip text shown when the user hovers a row in a file
+# list. Shared with :class:`CommitDetailPanel` so the vocabulary stays
+# consistent between the WIP panel and the commit-detail view. Empty
+# strings mean "no tooltip" — callers fall back to the row's plain text.
+STATUS_TOOLTIP: dict[FileStatus, str] = {
+    FileStatus.NEW: "Added (new file)",
+    FileStatus.MODIFIED: "Modified",
+    FileStatus.DELETED: "Deleted",
+    FileStatus.RENAMED: "Renamed",
+    FileStatus.COPIED: "Copied",
+    FileStatus.UNTRACKED: "Untracked",
+    FileStatus.TYPE_CHANGED: "Type changed",
+    FileStatus.CONFLICTED: "Conflicted",
+    FileStatus.IGNORED: "Ignored",
+}
+
 # File path text colour by status. Green = file is being added to the
 # next commit (NEW = freshly staged, UNTRACKED = will be added on
 # ``git add``); red = file is being deleted; everything else keeps
@@ -81,6 +97,8 @@ class FileListModel(QAbstractListModel):
             return change
         if role == FileStatusRole:
             return change.status
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return STATUS_TOOLTIP.get(change.status, "")
         return None
 
     # -- Public helpers ---------------------------------------------------
