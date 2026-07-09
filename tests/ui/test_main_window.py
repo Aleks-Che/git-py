@@ -314,3 +314,90 @@ def test_graph_copy_commit_sha_routes_to_clipboard(
     assert captured == [sha]
 
     window.close()
+
+
+# ----- Repo tab context-menu wiring -------------------------------------
+
+
+def test_show_repo_folder_routes_to_main_vm(
+    qtbot, monkeypatch,
+) -> None:
+    """``show_folder_requested`` forwards to ``MainViewModel.show_repo_in_folder``.
+
+    The :class:`MainWindow` handler is a thin wrapper that calls the
+    VM's Explorer-opening helper and shows a status-bar message.
+    Pinning both the routing and the empty-payload guard keeps a
+    refactor of the menu builder from breaking the contract.
+    """
+    from src.ui.main_window import MainWindow
+
+    window = MainWindow(config_path=None)
+    qtbot.addWidget(window)
+
+    captured: list[str] = []
+    monkeypatch.setattr(
+        window._main_vm, "show_repo_in_folder",
+        lambda path: captured.append(path),
+    )
+
+    window._on_show_repo_folder("/repos/sample")  # noqa: SLF001
+    window._on_show_repo_folder("")  # noqa: SLF001 — empty is a no-op
+    assert captured == ["/repos/sample"]
+
+    window.close()
+
+
+def test_copy_repo_path_routes_to_main_vm(
+    qtbot, monkeypatch,
+) -> None:
+    """``copy_path_requested`` from the repo bar forwards to ``MainViewModel.copy_repo_path``.
+
+    The handler must ignore empty payloads so a stale menu cannot
+    silently overwrite the user's clipboard.
+    """
+    from src.ui.main_window import MainWindow
+
+    window = MainWindow(config_path=None)
+    qtbot.addWidget(window)
+
+    captured: list[str] = []
+    monkeypatch.setattr(
+        window._main_vm, "copy_repo_path",
+        lambda path: captured.append(path),
+    )
+
+    window._on_copy_repo_path("/repos/sample")  # noqa: SLF001
+    window._on_copy_repo_path("")  # noqa: SLF001 — empty is a no-op
+    assert captured == ["/repos/sample"]
+
+    window.close()
+
+
+def test_repo_bar_signals_are_wired_to_main_window(qtbot) -> None:
+    """The widget's context-menu signals reach the MainWindow slots.
+
+    Catches a refactor that renames either signal or slot without
+    updating :meth:`MainWindow._build_repo_bar` — both
+    ``show_folder_requested`` and ``copy_path_requested`` must hit
+    their respective handlers when emitted from the widget.
+    """
+    from src.ui.main_window import MainWindow
+
+    window = MainWindow(config_path=None)
+    qtbot.addWidget(window)
+
+    show_calls: list[str] = []
+    copy_calls: list[str] = []
+    window._main_vm.show_repo_in_folder = (  # type: ignore[method-assign]
+        lambda path: show_calls.append(path)
+    )
+    window._main_vm.copy_repo_path = (  # type: ignore[method-assign]
+        lambda path: copy_calls.append(path)
+    )
+
+    window._repo_bar.show_folder_requested.emit("/repo/a")  # noqa: SLF001
+    window._repo_bar.copy_path_requested.emit("/repo/b")  # noqa: SLF001
+    assert show_calls == ["/repo/a"]
+    assert copy_calls == ["/repo/b"]
+
+    window.close()

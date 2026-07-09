@@ -135,6 +135,38 @@ Continue?
 
 Эти два правила **не должны конфликтовать**: fork connector — про горизонтальную связь «корень ↔ форк», bridge pipe — про вертикальную связь «строка выше ↔ строка ниже». Если оба правила применить к одному сегменту (например, дать горизонтали в корневой строке цвет предыдущей строки), форк-коннектор «отвяжется» от своего стэша и начнёт читаться как ветка, ответвившаяся от WIP. Это и был исходный баг — первая попытка исправить bridge pipe сломала fork connector, и наоборот. Регрессионные тесты `test_stash_fork_connector_uses_merging_branch_colour` (UI) и `test_fork_connector_*` (core) фиксируют оба инварианта.
 
+## Контекстное меню на вкладках репозиториев
+
+Правый клик по табу репозитория (`QTabBar.customContextMenuRequested`) открывает меню из пяти пунктов:
+
+```
+Show repo folder          → MainVM.show_repo_in_folder(path)
+Copy repo path            → MainVM.copy_repo_path(path)        ── separator ──
+Close repo tab            → RepoTabViewModel.remove_tab(index)
+Close other tabs          → RepoTabViewModel.close_others(index)
+Close tabs to the right   → RepoTabViewModel.close_to_right(index)
+```
+
+Меню строится через отдельный builder `_build_tab_context_menu_actions(index, path, tab_count)` — симметричный паттерн с `_build_branch_menu_actions` в `graph_panel.py` и `_context_menu_actions` в `LeftPanel`. Это позволяет тестам инспектировать список действий синхронно (без блокирующего `QMenu.exec`).
+
+**Disabled-state правила** (как в остальных меню приложения):
+
+- `Close other tabs` — серый, если `tab_count == 1`. Действие бессмысленно при единственном табе.
+- `Close tabs to the right` — серый, если кликнутый таб уже самый правый (`index == tab_count - 1`). Действие ничего не изменит.
+- `Close repo tab`, `Show repo folder`, `Copy repo path` — всегда enabled. Они работают на пути кликнутого таба, не на состоянии списка.
+
+**Защитные guards** (от багов, а не от пользователя):
+
+- Right click вне табов (`tabAt == -1`) → no-op. Иначе меню попыталось бы построить actions с мусорным `index`.
+- `tabData(index) == ""` → no-op. Race window между `_rebuild_tabs` и `setTabData` не должен приводить к эмиссии пустого пути (который бы silently сбросил clipboard или попытался открыть `explorer ""`).
+- Все три "path"-related защиты на пустые payload-ы в `MainWindow._on_show_repo_folder` / `_on_copy_repo_path` — повторяют тот же паттерн, что в `_on_copy_branch_name` / `_on_copy_commit_sha`.
+
+**Где живёт логика:**
+
+- `RepoTabViewModel.close_others(index)` / `close_to_right(index)` — новые verb-методы рядом с `remove_tab`. Оба no-op при out-of-range и при «no tabs to act on»; оба эмитят `tabs_changed` + `active_tab_changed`.
+- `MainViewModel.show_repo_in_folder(path)` — открывает Explorer на нормализованном пути. `os.path.normpath` для mixed separators, `os.path.isdir` для защиты от stale tab path, swallow `subprocess.Popen` failures (Windows Explorer crash не actionable). Это repository-уровневая (а не file-уровневая, как существующая `show_in_folder` для staged-файлов) версия.
+- `MainViewModel.copy_repo_path(path)` — делегирует в существующий `copy_to_clipboard`; защита от пустого пути остаётся на стороне VM (как у `copy_to_clipboard`).
+
 ## Core-ограничения
 
 - Модуль `core/graph_v2.py` не импортирует PySide6.

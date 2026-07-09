@@ -806,6 +806,47 @@ class MainViewModel(QObject):
         if clipboard is not None:
             clipboard.setText(path)
 
+    def show_repo_in_folder(self, path: str) -> None:
+        """Open the OS file explorer at the repository root *path*.
+
+        Used by the right-click context menu on a repository tab:
+        *Show repo folder* opens Explorer (or the platform equivalent)
+        in the directory the tab points at. The path is normalised
+        through :func:`os.path.normpath` before being handed to the
+        shell so trailing backslashes / mixed separators do not trip
+        up ``explorer.exe``.
+
+        Non-existent paths are silently ignored (a tab may briefly
+        reference a stale path during config restore). All other
+        failures are swallowed for the same reason — surfacing an
+        error dialog here would interrupt the user mid-action and the
+        OS error from ``explorer`` is rarely actionable anyway.
+        """
+        import os as _os
+        import subprocess as _sp
+
+        if not path:
+            return
+        normalised = _os.path.normpath(path)
+        if not _os.path.isdir(normalised):
+            return
+        try:
+            _sp.Popen(["explorer", normalised])
+        except Exception:
+            pass
+
+    def copy_repo_path(self, path: str) -> None:
+        """Copy *path* (a repository root) to the system clipboard.
+
+        Thin helper paired with :meth:`show_repo_in_folder` — both
+        are invoked by the tab-bar context menu. Guards on empty
+        input so a stale menu with no selected row cannot clear the
+        clipboard by accident.
+        """
+        if not path:
+            return
+        self.copy_to_clipboard(path)
+
     def copy_file_diff(self, path: str, *, staged: bool = False) -> None:
         """Copy the unified diff of a single file to the system clipboard.
 

@@ -242,6 +242,13 @@ class MainWindow(QMainWindow):
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
 
         self._repo_bar.add_requested.connect(self._on_add_repository)
+        # Context-menu signals from the tab bar: the widget stays
+        # passive and emits the clicked tab's repo path; the window
+        # forwards to :class:`MainViewModel` so the helpers can share
+        # the central clipboard / Explorer helpers with the rest of
+        # the app.
+        self._repo_bar.show_folder_requested.connect(self._on_show_repo_folder)
+        self._repo_bar.copy_path_requested.connect(self._on_copy_repo_path)
         self._repo_tabs_vm.active_tab_changed.connect(self._on_tab_changed)
 
     def _on_add_repository(self) -> None:
@@ -1447,6 +1454,34 @@ class MainWindow(QMainWindow):
         idx = self._repo_tabs_vm.active_index
         if idx >= 0:
             self._repo_tabs_vm.remove_tab(idx)
+
+    def _on_show_repo_folder(self, path: str) -> None:
+        """Open the OS file explorer at the given *path*.
+
+        Forwarded from the repository tab bar's right-click context
+        menu (*Show repo folder*). The status bar reflects the action
+        so the user sees confirmation that Explorer opened — the
+        underlying helper silently no-ops on missing paths so we
+        cannot raise a dialog here.
+        """
+        if not path:
+            return
+        self._main_vm.show_repo_in_folder(path)
+        self._status.showMessage(f"Opened {path} in Explorer", 3000)
+
+    def _on_copy_repo_path(self, path: str) -> None:
+        """Copy a repository path to the system clipboard.
+
+        Forwarded from the repository tab bar's right-click context
+        menu (*Copy repo path*). Empty payloads are ignored — a stale
+        menu with no selected row must not silently clear the
+        clipboard (mirrors the branch-name / commit-sha guards in
+        :meth:`_on_copy_branch_name`).
+        """
+        if not path:
+            return
+        self._main_vm.copy_repo_path(path)
+        self._status.showMessage(f"Copied repository path: {path}", 3000)
 
 
 def _same_path(a: str, b: str) -> bool:

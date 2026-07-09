@@ -4,14 +4,29 @@ Uses ``QTabBar.setTabButton`` with a lightweight ``QWidget`` that
 paints its own ``×`` glyph, completely bypassing ``QPushButton`` style
 padding.  The glyph is hidden by default and revealed when the
 mouse hovers over the parent tab.
+
+Right-click on a tab opens a context menu with five actions:
+
+* **Show repo folder** — open the repo root in the OS file explorer.
+* **Copy repo path** — copy the repo root to the clipboard.
+* **Close repo tab** — remove the clicked tab.
+* **Close other tabs** — keep only the clicked tab.
+* **Close tabs to the right** — remove everything to its right.
+
+The two "close" actions are greyed out when they would not change
+state (only one tab, or clicked tab is already rightmost). The two
+"open / copy" actions always emit :attr:`show_folder_requested` /
+:attr:`copy_path_requested` carrying the clicked tab's repository
+path — :class:`MainWindow` forwards them to the central
+:class:`MainViewModel`.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter
-from PySide6.QtWidgets import QHBoxLayout, QPushButton, QTabBar, QWidget
+from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QFont, QMouseEvent, QPainter
+from PySide6.QtWidgets import QHBoxLayout, QMenu, QPushButton, QTabBar, QWidget
 
 from src.viewmodels.repo_tabs_viewmodel import RepoTabViewModel
 
@@ -75,6 +90,8 @@ class RepoBarWidget(QWidget):
     """
 
     add_requested = Signal()
+    show_folder_requested = Signal(str)   # repo root path
+    copy_path_requested = Signal(str)     # repo root path
 
     def __init__(self, view_model: RepoTabViewModel, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -98,6 +115,8 @@ class RepoBarWidget(QWidget):
         self._tab_bar.setMouseTracking(True)
         self._tab_bar.installEventFilter(self)
         self._tab_bar.currentChanged.connect(self._on_tab_selected)
+        self._tab_bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tab_bar.customContextMenuRequested.connect(self._on_tab_context_menu)
         layout.addWidget(self._tab_bar, stretch=1)
 
         # Delay hiding so the mouse can move from tab to × without
@@ -200,6 +219,107 @@ class RepoBarWidget(QWidget):
 
     def _on_add_clicked(self) -> None:
         self.add_requested.emit()
+
+    # ----- right-click context menu -------------------------------------
+
+    def _on_tab_context_menu(self, pos: QPoint) -> None:
+        """Build and show the right-click menu for the tab at *pos*.
+
+        No-op when the right click missed every tab — e.g. landed on
+        the area between the rightmost tab and the ``+`` button. A
+        ``tab_at`` of ``-1`` would otherwise build a menu that
+        operates on an undefined index.
+        """
+        index = self._tab_bar.tabAt(pos)
+        if index < 0 or index >= self._tab_bar.count():
+            return
+        path = self._tab_bar.tabData(index)
+        if not isinstance(path, str) or not path:
+            return
+        actions = self._build_tab_context_menu_actions(
+            index, path, self._tab_bar.count(),
+        )
+        menu = QMenu(self)
+        for action in actions:
+            menu.addAction(action)
+        menu.exec(self._tab_bar.mapToGlobal(pos))
+
+    def _build_tab_context_menu_actions(
+        self,
+        index: int,
+        path: str,
+        tab_count: int,
+    ) -> list[QAction]:
+        """Return the :class:`QAction` list for a right click on *index*.
+
+        Exposed (single underscore) so tests can inspect the actions
+        synchronously the way :meth:`_build_branch_menu_actions` is
+        consumed in ``test_graph_widget.py``. Splitting the builder
+        from the ``QMenu.exec`` keeps tests free of the
+        event-loop-blocking modal.
+
+        Disabled-state rules:
+
+        * **Close other tabs** — only enabled when ``tab_count > 1``.
+        * **Close tabs to the right** — only enabled when ``index``
+          is not already the rightmost tab (``index < tab_count - 1``).
+        * The remaining three actions are always enabled; they
+          carry the *path* of the clicked tab, not the active one.
+
+        The lambdas capture ``index`` / ``path`` by default so
+        ``checked=True`` from ``QAction.triggered`` cannot leak into
+        them — same pattern used in
+        :class:`src.ui.widgets.left_panel.LeftPanel`.
+        """
+        actions: list[QAction] = []
+
+        show = QAction("Show repo folder", self)
+        show.triggered.connect(
+            lambda checked=False, p=path: self.show_folder_requested.emit(p),
+        )
+        actions.append(show)
+
+        copy = QAction("Copy repo path", self)
+        copy.triggered.connect(
+            lambda checked=False, p=path: self.copy_path_requested.emit(p),
+        )
+        actions.append(copy)
+
+        actions.append(self._make_separator())
+
+        close_self = QAction("Close repo tab", self)
+        close_self.triggered.connect(
+            lambda checked=False, i=index: self._vm.remove_tab(i),
+        )
+        actions.append(close_self)
+
+        close_others = QAction("Close other tabs", self)
+        close_others.setEnabled(tab_count > 1)
+        close_others.triggered.connect(
+            lambda checked=False, i=index: self._vm.close_others(i),
+        )
+        actions.append(close_others)
+
+        close_right = QAction("Close tabs to the right", self)
+        close_right.setEnabled(index < tab_count - 1)
+        close_right.triggered.connect(
+            lambda checked=False, i=index: self._vm.close_to_right(i),
+        )
+        actions.append(close_right)
+
+        return actions
+
+    @staticmethod
+    def _make_separator() -> QAction:
+        """Return a disabled separator :class:`QAction`.
+
+        ``QMenu.addSeparator()`` cannot be reused outside a real menu
+        instance; building separators ahead of time gives the test
+        builders a homogeneous list of actions.
+        """
+        sep = QAction("", None)
+        sep.setSeparator(True)
+        return sep
 
 
 def _tab_label(path: str) -> str:

@@ -82,6 +82,41 @@ class RepoTabViewModel(QObject):
         self._tabs_changed()
         self.active_tab_changed.emit(self._active_index)
 
+    def close_others(self, index: int) -> None:
+        """Remove every tab except the one at *index*.
+
+        No-op when *index* is out of range or when there is only one
+        tab left (the menu disables the action in that case anyway).
+        The active index is updated so :attr:`active_path` keeps
+        pointing at a real repository after the rebuild.
+        """
+        if index < 0 or index >= len(self._tabs):
+            return
+        if len(self._tabs) <= 1:
+            return
+        target = self._tabs[index]
+        self._tabs = [target]
+        self._active_index = 0
+        self._tabs_changed()
+        self.active_tab_changed.emit(self._active_index)
+
+    def close_to_right(self, index: int) -> None:
+        """Remove every tab to the right of *index*.
+
+        No-op when *index* is out of range or when *index* is already
+        the rightmost tab. The active index is trimmed to the last
+        surviving tab so :attr:`active_path` stays consistent.
+        """
+        if index < 0 or index >= len(self._tabs):
+            return
+        if index >= len(self._tabs) - 1:
+            return
+        self._tabs = self._tabs[: index + 1]
+        if self._active_index >= len(self._tabs):
+            self._active_index = len(self._tabs) - 1
+        self._tabs_changed()
+        self.active_tab_changed.emit(self._active_index)
+
     def set_active_tab(self, index: int) -> None:
         """Switch the active tab (does nothing if out of range)."""
         if index < 0 or index >= len(self._tabs):

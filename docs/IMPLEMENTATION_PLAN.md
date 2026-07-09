@@ -277,4 +277,27 @@ LeftPanel получил ту же drag-and-drop + context-menu функцион
 - `test_fork_connector_multiple_merges_keeps_tee_in_first_merge_colour` (core) — multi-merge: `TEE_RIGHT` остаётся в цвете первого merge, промежуточный `TEE_UP` — в цвете следующего merge, правый `MERGE_LEFT` — в цвете своего merge.
 - `test_fork_connector_main_lane_uses_main_colour_when_no_merges` (core) — без форков main-lane = простой PIPE в `main_color`.
 
+### Свежие правки (2026-07-09) — Контекстное меню на вкладках репозиториев
+
+Правый клик по табу репозитория теперь открывает меню из 5 пунктов (вместо default `QTabBar` меню «Close tab»). Файлы: `src/ui/widgets/repo_bar_widget.py`, `src/viewmodels/repo_tabs_viewmodel.py`, `src/viewmodels/main_viewmodel.py`, `src/ui/main_window.py`, плюс тесты в `tests/ui/test_repo_bar_widget.py`, `tests/viewmodels/test_repo_tabs_viewmodel.py`, `tests/viewmodels/test_main_viewmodel_repo_folder.py`, `tests/ui/test_main_window.py`.
+
+- **Структура меню.** Пункты по порядку: `Show repo folder` → `Copy repo path` → separator → `Close repo tab` → `Close other tabs` → `Close tabs to the right`. Первые два «путевые» (показывают/копируют путь кликнутого таба), последние три — операции над списком табов. Disabled-state: `Close other tabs` серый при единственном табе, `Close tabs to the right` серый на самом правом. Остальные всегда enabled.
+
+- **`RepoTabViewModel.close_others(index)` и `close_to_right(index)`.** Два новых метода-глагола, симметричных `remove_tab`. `close_others` коллапсирует список к одному табу с переданным индексом (no-op при 1 табе или index вне диапазона). `close_to_right` обрезает хвост после переданного индекса (no-op если index уже последний). В обоих случаях active-index пересчитывается, если он вышел за новые границы, и эмитятся `tabs_changed` + `active_tab_changed`.
+
+- **`MainViewModel.show_repo_in_folder(path)` и `copy_repo_path(path)`.** Новые хелперы рядом с существующими `show_in_folder`/`copy_file_path`. `show_repo_in_folder` нормализует путь (`os.path.normpath`), проверяет что директория существует, иначе — тихий no-op (таб может кратко ссылаться на stale path во время config restore). Все исключения из `subprocess.Popen` глотаются — failure не actionable. `copy_repo_path` делегирует в существующий `copy_to_clipboard`; пустая строка не трогает clipboard (защита от stale rebuild).
+
+- **`RepoBarWidget` — контекст-меню через `customContextMenuRequested`.** Установлен `Qt.CustomContextMenu` на `QTabBar`, сигнал приходит в `_on_tab_context_menu(pos)`. Меню строится через `_build_tab_context_menu_actions(index, path, tab_count)` (отдельный builder, как `_build_branch_menu_actions` в `graph_panel.py` — для синхронных тестов без `QMenu.exec`). Два новых сигнала: `show_folder_requested(str)` и `copy_path_requested(str)` несут путь кликнутого таба (не активного). Right click вне табов → no-op (защита от `tabAt == -1`). Empty `tabData` → no-op (защита от race между `_rebuild_tabs` и `setTabData`).
+
+- **`MainWindow` роутинг.** Подключает `_repo_bar.show_folder_requested → _on_show_repo_folder` и `_repo_bar.copy_path_requested → _on_copy_repo_path`. Хендлеры — тонкие обёртки над `MainViewModel.show_repo_in_folder`/`copy_repo_path` + status bar на 3 секунды («Opened … in Explorer» / «Copied repository path: …»). Пустые payload-ы игнорируются (защита от stale menu).
+
+- **Тесты.** +22 новых (12 viewmodel `RepoTabViewModel` мутации + 7 `MainViewModel.show_repo_in_folder`/`copy_repo_path` + 12 `RepoBarWidget` меню-строитель + 3 `MainWindow` роутинг = **22 новых уникальных** в сумме, итого **910/910 проходят**). 
+
+  - `tests/viewmodels/test_repo_tabs_viewmodel.py` — 12 тестов: `remove_tab` (3 — drop+adjust active, до-active-keep-index, out-of-range is noop), `close_others` (4 — keep-only-clicked, single-tab is noop, out-of-range is noop, эмиссия сигналов), `close_to_right` (5 — keep-up-to-incl-index с active-fallback, active-inside-keep-index, rightmost-is-noop, out-of-range is noop, эмиссия).
+  - `tests/viewmodels/test_main_viewmodel_repo_folder.py` — 7 тестов: open Explorer (нормализованный путь), missing path no-op, empty string no-op, Popen failure swallowing, copy_to_clipboard путь, empty-path-leaves-clipboard, делегация в `copy_to_clipboard`.
+  - `tests/ui/test_repo_bar_widget.py` — 12 тестов: список всех 5 действий в порядке, ровно 1 separator, disable-правила (`close other tabs` при 1 табе, `close to right` на rightmost и не-rightmost), action triggers (signal emission / VM method calls) для всех 5 пунктов, miss-clicks (tabAt==-1, empty tabData).
+  - `tests/ui/test_main_window.py` — 3 новых: `show_folder_requested` → MainVM.show_repo_in_folder (+ empty-payload), `copy_path_requested` → MainVM.copy_repo_path (+ empty-payload), widget-to-MainWindow signal wiring через прямую эмиссию.
+
+  **Итого 910 проходят, ruff чисто** для нового кода.
+
 Итого **9 регрессионных тестов** на инварианты раскладки и цвета; pre-existing 47 failures в `tests/ui/test_graph_widget.py` (branch popup, drag-drop edge-кейсы) к этой правке не относятся.
