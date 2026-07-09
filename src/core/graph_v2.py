@@ -965,21 +965,27 @@ def _build_row_cells(
 
         if parent_lane > commit_lane:
             # Connection to the right.
-            if parent_lane == commit_lane + 1:
-                # Adjacent parent — replace COMMIT with TEE_RIGHT so the
-                # horizontal exactly reaches the parent lane centre.
-                if commit_cell_idx < len(cells):
-                    cells[commit_cell_idx] = CellInfo(
-                        CellType.TEE_RIGHT,
-                        color_index=parent_color,
-                        pipe_color_index=commit_color,
-                    )
-            else:
+            # Replace the COMMIT cell with TEE_RIGHT so the horizontal
+            # line starts at the commit centre. Without this, the first
+            # HORIZONTAL cell sits at the mid of the commit lane and
+            # leaves a visible gap (≈ ``node_radius`` pixels) between
+            # the commit ellipse and the connector — a common symptom
+            # on PR-merge commits where the second parent lives
+            # multiple lanes away from the main line.
+            if commit_cell_idx < len(cells):
+                cells[commit_cell_idx] = CellInfo(
+                    CellType.TEE_RIGHT,
+                    color_index=parent_color,
+                    pipe_color_index=commit_color,
+                )
+            if parent_lane > commit_lane + 1:
                 for col in range(commit_lane * 2 + 1, parent_lane * 2 - 1):
                     if col < len(cells):
                         existing = cells[col]
                         if existing.cell_type == CellType.PIPE:
-                            cells[col] = CellInfo.horizontal_pipe(parent_color, existing.color_index)
+                            cells[col] = CellInfo.horizontal_pipe(
+                                parent_color, existing.color_index,
+                            )
                         elif existing.cell_type == CellType.EMPTY:
                             cells[col] = CellInfo.horizontal(parent_color)
 
@@ -993,20 +999,23 @@ def _build_row_cells(
                     cells[end_idx] = CellInfo.branch_left(parent_color)
         else:
             # Connection to the left.
-            if parent_lane == commit_lane - 1:
-                # Adjacent parent — replace COMMIT with TEE_LEFT.
-                if commit_cell_idx < len(cells):
-                    cells[commit_cell_idx] = CellInfo(
-                        CellType.TEE_LEFT,
-                        color_index=parent_color,
-                        pipe_color_index=commit_color,
-                    )
-            else:
+            # Replace the COMMIT cell with TEE_LEFT so the horizontal
+            # line reaches the commit centre. Symmetric to the
+            # rightward branch above.
+            if commit_cell_idx < len(cells):
+                cells[commit_cell_idx] = CellInfo(
+                    CellType.TEE_LEFT,
+                    color_index=parent_color,
+                    pipe_color_index=commit_color,
+                )
+            if parent_lane < commit_lane - 1:
                 for col in range(parent_lane * 2 + 1, commit_lane * 2 - 1):
                     if col < len(cells):
                         existing = cells[col]
                         if existing.cell_type == CellType.PIPE:
-                            cells[col] = CellInfo.horizontal_pipe(parent_color, existing.color_index)
+                            cells[col] = CellInfo.horizontal_pipe(
+                                parent_color, existing.color_index,
+                            )
                         elif existing.cell_type == CellType.EMPTY:
                             cells[col] = CellInfo.horizontal(parent_color)
 

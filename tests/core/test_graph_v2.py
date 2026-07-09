@@ -259,6 +259,200 @@ def test_merge_with_branch_names() -> None:
     assert layout.nodes[1].branch_names == ["feature"]
 
 
+def test_merge_non_adjacent_parent_uses_tee_right_at_commit() -> None:
+    """A merge commit whose second parent lives more than one lane
+    away must still use ``TEE_RIGHT`` at the commit lane.
+
+    Regression: the old code only replaced the commit cell with
+    ``TEE_RIGHT`` for *adjacent* parents. For a non-adjacent parent
+    the commit cell stayed as ``COMMIT`` (no horizontal) and the
+    first ``HORIZONTAL`` cell sat at the mid of the commit lane —
+    leaving a visible ``~node_radius``-pixel gap between the
+    commit ellipse and the start of the connector. The user-visible
+    symptom was a PR-merge connector that did not quite reach the
+    commit node (e.g. ``gpt-researcher`` commit ``5521508f``,
+    which has its second parent on lane 2 while the merge itself
+    sits on lane 0).
+
+    The test calls :func:`_build_row_cells` directly with a
+    controlled parent layout so the non-adjacent case is
+    guaranteed — the higher-level ``build_graph`` algorithm tries
+    to minimise lane usage and usually ends up placing the second
+    parent on ``commit_lane + 1``, which would mask the regression.
+    """
+    from src.core.graph_v2 import _build_row_cells
+
+    # Commit on lane 0 with TWO parents: the first parent on the
+    # commit's own lane (drawn as a vertical pipe) and the second
+    # parent two lanes over (on lane 2). The second parent is the
+    # PR-merge parent that is on the offset lane.
+    commit_lane = 0
+    commit_color = 1
+    first_parent_lane = 0
+    second_parent_lane = 2
+    first_parent_color = 1
+    second_parent_color = 3
+    max_lane = 2
+
+    parent_lanes = [
+        ("first_parent", first_parent_lane, False, first_parent_color, False),
+        ("second_parent", second_parent_lane, False, second_parent_color, False),
+    ]
+    active_lanes = [None, None, "second_parent"]  # only second parent is "in flight"
+    oid_color_index = {"second_parent": second_parent_color}
+    lane_color_index = {0: commit_color, 2: second_parent_color}
+
+    cells = _build_row_cells(
+        commit_lane=commit_lane,
+        commit_color=commit_color,
+        parent_lanes=parent_lanes,
+        active_lanes=active_lanes,
+        oid_color_index=oid_color_index,
+        lane_color_index=lane_color_index,
+        max_lane=max_lane,
+    )
+
+    # The cell at the commit lane must be TEE_RIGHT (not COMMIT).
+    # Without the fix this cell stayed as COMMIT and the first
+    # HORIZONTAL cell sat at the mid of the commit lane — leaving a
+    # ~radius-pixel gap between the commit ellipse and the start of
+    # the connector.
+    commit_cell = cells[commit_lane * 2]
+    assert commit_cell.cell_type == CellType.TEE_RIGHT, (
+        f"merge commit cell must be TEE_RIGHT for a non-adjacent "
+        f"rightward parent; got {commit_cell.cell_type} (this is the "
+        f"gap-between-commit-and-connector regression)"
+    )
+    # The vertical segment of TEE_RIGHT must keep the commit's own
+    # colour (pipe_color_index), so the downward pipe below the
+    # commit stays in the commit's branch.
+    assert commit_cell.pipe_color_index == commit_color
+    # The horizontal of TEE_RIGHT must use the second parent's
+    # colour, so the connector reads as the merged-in lane.
+    assert commit_cell.color_index == second_parent_color
+
+    # The lane-1 mid cell and the lane-1 lane cell should both
+    # carry the horizontal in the second parent's colour, so the
+    # line continues past the commit centre all the way to lane 2.
+    # (HORIZONTAL_PIPE only appears when the cell was previously a
+    # PIPE — i.e. an active commit lived on lane 1. In the synthetic
+    # test setup there is no such commit, so the cell is a plain
+    # HORIZONTAL.)
+    assert cells[1].cell_type == CellType.HORIZONTAL
+    assert cells[1].color_index == second_parent_color
+    assert cells[2].cell_type in (CellType.HORIZONTAL, CellType.HORIZONTAL_PIPE)
+    assert cells[2].color_index == second_parent_color
+
+    # The cell at the second parent's lane is a curve (BRANCH_LEFT
+    # in this case — the parent is not in the layout yet so the
+    # connection exits the connector as a downward fork).
+    assert cells[second_parent_lane * 2].cell_type == CellType.BRANCH_LEFT
+    assert cells[second_parent_lane * 2].color_index == second_parent_color
+
+
+def test_merge_non_adjacent_parent_leftward_uses_tee_left() -> None:
+    """Symmetric to :func:`test_merge_non_adjacent_parent_uses_tee_right_at_commit`
+    for a merge whose second parent sits to the LEFT of the commit
+    lane. The commit cell must become ``TEE_LEFT`` for the
+    horizontal to reach the commit centre from the left side.
+    """
+    from src.core.graph_v2 import _build_row_cells
+
+    # Commit on lane 2 with the second parent two lanes to the LEFT
+    # (on lane 0). This mirrors the rightward case in
+    # ``test_merge_non_adjacent_parent_uses_tee_right_at_commit``.
+    commit_lane = 2
+    commit_color = 1
+    first_parent_lane = 2
+    second_parent_lane = 0
+    first_parent_color = 1
+    second_parent_color = 3
+    max_lane = 2
+
+    parent_lanes = [
+        ("first_parent", first_parent_lane, False, first_parent_color, False),
+        ("second_parent", second_parent_lane, False, second_parent_color, False),
+    ]
+    active_lanes = ["second_parent", None, None]
+    oid_color_index = {"second_parent": second_parent_color}
+    lane_color_index = {0: second_parent_color, 2: commit_color}
+
+    cells = _build_row_cells(
+        commit_lane=commit_lane,
+        commit_color=commit_color,
+        parent_lanes=parent_lanes,
+        active_lanes=active_lanes,
+        oid_color_index=oid_color_index,
+        lane_color_index=lane_color_index,
+        max_lane=max_lane,
+    )
+
+    commit_cell = cells[commit_lane * 2]
+    assert commit_cell.cell_type == CellType.TEE_LEFT, (
+        f"merge commit cell must be TEE_LEFT for a non-adjacent "
+        f"leftward parent; got {commit_cell.cell_type}"
+    )
+    assert commit_cell.pipe_color_index == commit_color
+    assert commit_cell.color_index == second_parent_color
+
+    # The intermediate cells at lane 1 should carry the connector in
+    # the second parent's colour. (HORIZONTAL_PIPE only appears when
+    # the cell was previously a PIPE — i.e. an active commit lived
+    # on lane 1. In this synthetic setup there is no such commit, so
+    # the cell is a plain HORIZONTAL.)
+    assert cells[1].cell_type == CellType.HORIZONTAL
+    assert cells[1].color_index == second_parent_color
+    assert cells[2].cell_type in (CellType.HORIZONTAL, CellType.HORIZONTAL_PIPE)
+    assert cells[2].color_index == second_parent_color
+
+    # The cell at the second parent's lane is a curve (BRANCH_RIGHT
+    # for a leftward connection).
+    assert cells[second_parent_lane * 2].cell_type == CellType.BRANCH_RIGHT
+    assert cells[second_parent_lane * 2].color_index == second_parent_color
+
+
+def test_merge_adjacent_parent_still_uses_tee_right() -> None:
+    """Adjacent-parent merges must keep using TEE_RIGHT (regression
+    guard for the existing ``test_merge_commit`` contract).
+    """
+    from src.core.graph_v2 import _build_row_cells
+
+    commit_lane = 0
+    commit_color = 1
+    first_parent_lane = 0
+    second_parent_lane = 1  # adjacent — commit_lane + 1
+    max_lane = 1
+
+    parent_lanes = [
+        ("first_parent", first_parent_lane, False, commit_color, False),
+        ("second_parent", second_parent_lane, False, 3, False),
+    ]
+    active_lanes = [None, "second_parent"]
+    oid_color_index = {"second_parent": 3}
+    lane_color_index = {0: commit_color, 1: 3}
+
+    cells = _build_row_cells(
+        commit_lane=commit_lane,
+        commit_color=commit_color,
+        parent_lanes=parent_lanes,
+        active_lanes=active_lanes,
+        oid_color_index=oid_color_index,
+        lane_color_index=lane_color_index,
+        max_lane=max_lane,
+    )
+
+    commit_cell = cells[commit_lane * 2]
+    assert commit_cell.cell_type == CellType.TEE_RIGHT
+    assert commit_cell.color_index == 3
+    assert commit_cell.pipe_color_index == commit_color
+    # For an adjacent parent, the loop over
+    # ``range(commit_lane*2 + 1, parent_lane*2 - 1)`` is empty
+    # (range(1, 1)), so no intermediate HORIZONTAL cell is added
+    # between the commit and the parent lane. The cell at the
+    # parent lane is BRANCH_LEFT.
+    assert cells[second_parent_lane * 2].cell_type == CellType.BRANCH_LEFT
+
+
 # ---- fork point (2+ children) -------------------------------------------
 
 
