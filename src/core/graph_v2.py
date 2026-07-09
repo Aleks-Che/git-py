@@ -664,37 +664,33 @@ def build_graph(
             fork_lane_colors=fork_lane_colors,
         )
 
-        # Detect whether ``_build_row_cells`` placed a CROSS cell at a
-        # fork lane (fork-merge point — second parent shares a fork
-        # lane with one of the commit's children). When this happens,
-        # the fork-connector cells built by ``_build_fork_connector_cells``
-        # would conflict with the CROSS: the connector's TEE_RIGHT at
-        # the commit's lane uses the *child's* colour (the fork
-        # connector's "receiving lane" colour), but the merge
-        # connector that the CROSS serves must use the *second parent's*
-        # colour. Skipping the entire fork-connector merge in this case
-        # lets ``_build_row_cells``' TEE_RIGHT (coloured by the second
-        # parent) stand on its own.
-        has_cross_fork_lane = any(
-            c.cell_type == CellType.CROSS for c in cells
-        )
-
         # Merge fork connector cells into the commit's own cells so the
         # branching is rendered directly from the fork point commit node.
         # The fork connector already supplies the correct horizontal and
         # pipe colours, so the cells are used as-is.
         # EXCEPTION: a CROSS cell already placed by ``_build_row_cells``
         # at a fork-merge point (second parent sharing a fork lane)
-        # must NOT be overwritten by the fork connector's MERGE_LEFT
-        # curve — the cross carries the merge-from-below + branch-to-
-        # above semantic that the curve alone would lose. When ANY
-        # CROSS cell exists on the row, the entire fork-connector
-        # merge is skipped (see ``has_cross_fork_lane`` above).
-        if fork_merging_cells is not None and not has_cross_fork_lane:
+        # must NOT be overwritten by the fork connector's TEE_UP /
+        # MERGE_LEFT — the cross carries the merge-from-below +
+        # branch-to-above semantic that the curve alone would lose.
+        # The CROSS cell occupies the lane centre (col = lane * 2), so
+        # the fork connector's TEE_UP at that col is dropped, but the
+        # rest of the connector (horizontal at lane centres 1, 3, 5…,
+        # TEE_UP / MERGE_LEFT at other fork lanes, and PIPE at
+        # unrelated lanes) is merged in.
+        if fork_merging_cells is not None:
+            # Pre-compute the set of lane-centre columns that already
+            # have a CROSS cell — those columns must keep the CROSS.
+            cross_cols: set[int] = {
+                ci for ci, c in enumerate(cells)
+                if c.cell_type == CellType.CROSS
+            }
             while len(cells) < len(fork_merging_cells):
                 cells.append(CellInfo.empty())
             for fci, fc in enumerate(fork_merging_cells):
                 if fc.cell_type == CellType.EMPTY:
+                    continue
+                if fci in cross_cols:
                     continue
                 cells[fci] = fc
 

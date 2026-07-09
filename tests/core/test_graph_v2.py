@@ -641,6 +641,101 @@ def test_fork_point_with_three_children() -> None:
     assert has_tee
 
 
+def test_fork_keeps_horizontal_connector_when_cross_cell_present() -> None:
+    """A fork point (commit with 2+ children) that ALSO has a CROSS
+    cell (because one of its children shares a lane with the
+    second parent of a merge commit on the same line) must still
+    draw the fork connector's horizontal segment and TEE_UP /
+    MERGE_LEFT at every OTHER fork lane.
+
+    Regression: previously the entire ``_build_fork_connector_cells``
+    merge was skipped when a CROSS cell was placed on the row,
+    leaving only the merge connector (``TEE_RIGHT`` at the commit
+    lane) and the CROSS — the horizontal line connecting the
+    remaining fork lanes was missing entirely, so the parent
+    commit looked like a single-branch tip with no branching at
+    all. The ``gpt-researcher`` ``b364917f55ea57…`` (PR #1781)
+    example has 12 children at lanes 0–14 with the second parent
+    landing on lane 1; without the fix only the merge connector
+    at lane 0 and the CROSS at lane 1 were drawn, and the
+    horizontal bridge reaching lanes 2–13 (TEE_UP / MERGE_LEFT
+    curves) was gone.
+    """
+    # Topology, newest-first:
+    #
+    #   c_ch0 (lane 0) -- child of c_merge, lands on lane 0 (the
+    #                     commit's own lane)
+    #   c_ch2 (lane 2) -- child of c_merge, lands on lane 2
+    #   c_ch1 (lane 1) -- child of c_merge, lands on lane 1
+    #                     (this is the lane c_tip lives on — the
+    #                     second parent below — and is where the
+    #                     CROSS cell must appear at lane 1; the
+    #                     horizontal bridge must still continue
+    #                     past it to reach c_ch2 at lane 2)
+    #   c_merge (lane 0, parents=[c_main, c_tip]) -- fork point
+    #                     with 3 children, also a merge commit
+    #                     whose second parent c_tip lives on lane 1
+    #                     → CROSS cell at lane 1
+    #   c_tip   (lane 1)
+    #   c_main  (lane 0)
+    c_main = "1" * 40
+    c_tip = "2" * 40
+    c_merge = "3" * 40
+    c_ch0 = "4" * 40
+    c_ch1 = "5" * 40
+    c_ch2 = "6" * 40
+    commits = [
+        _c(c_ch0, [c_merge], ts=7),
+        _c(c_ch2, [c_merge], ts=6),
+        _c(c_ch1, [c_merge], ts=5),
+        _c(c_merge, [c_main, c_tip], ts=4),
+        _c(c_tip, [], ts=3),
+        _c(c_main, [], ts=2),
+    ]
+    layout = build_graph(commits, [])
+    nodes = layout.nodes
+    merge_node = next(n for n in nodes if n.commit and n.commit.sha == c_merge)
+
+    # CROSS must be present at lane 1 (shared by c_ch1 above and
+    # c_tip below) — that's the GitKraken-style fork-merge marker.
+    cross_present = any(
+        c.cell_type == CellType.CROSS for c in merge_node.cells
+    )
+    assert cross_present, (
+        "expected a CROSS cell on the merge commit's row to mark "
+        "the fork-merge point where c_ch1 (above) and c_tip "
+        "(below) share lane 1"
+    )
+
+    # The fork connector's horizontal bridge and the curve into
+    # the OTHER fork lane (c_ch2 at lane 2) must still be drawn.
+    # A working fork connector produces HORIZONTAL / HORIZONTAL_PIPE
+    # cells in the columns BETWEEN lane centres and a curve cell
+    # (TEE_UP / MERGE_LEFT) at lane 2. The CROSS at lane 1 only
+    # blocks the curve cell at that one lane; everything else is
+    # merged in.
+    has_horiz = any(
+        c.cell_type in (CellType.HORIZONTAL, CellType.HORIZONTAL_PIPE)
+        for c in merge_node.cells
+    )
+    assert has_horiz, (
+        "expected fork connector horizontal cells on the merge "
+        "commit's row even though a CROSS cell is present — the "
+        "horizontal bridge between fork lanes is what makes the "
+        "branching readable"
+    )
+    has_fork_curve = any(
+        c.cell_type in (CellType.TEE_UP, CellType.MERGE_LEFT,
+                        CellType.BRANCH_LEFT)
+        for c in merge_node.cells
+    )
+    assert has_fork_curve, (
+        "expected fork connector curve cells (TEE_UP / MERGE_LEFT "
+        "/ BRANCH_LEFT) at the OTHER fork lane (lane 2 for c_ch2) "
+        "even though a CROSS cell occupies lane 1"
+    )
+
+
 # ---- uncommitted changes -------------------------------------------------
 
 
