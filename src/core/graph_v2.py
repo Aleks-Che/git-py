@@ -115,6 +115,13 @@ class CellType(IntEnum):
     TEE_RIGHT = 9        # ├ T-junction right
     TEE_LEFT = 10        # ┤ T-junction left
     TEE_UP = 11          # ┴ T-junction up (fork middle lane)
+    CROSS = 12           # ┼ cross: horizontal + vertical up + vertical down
+                         # Used at a lane where a child sits above AND a
+                         # second parent sits below (a fork-merge point
+                         # whose child and second parent share the lane).
+                         # The horizontal pipe is the merge connector from
+                         # the merge commit; the vertical pipes pass
+                         # through the cell in both directions.
 
 
 @dataclass
@@ -140,6 +147,7 @@ class CellInfo:
             CellType.TEE_RIGHT,
             CellType.TEE_LEFT,
             CellType.TEE_UP,
+            CellType.CROSS,
         ):
             d["c"] = self.color_index
             if self.pipe_color_index:
@@ -195,6 +203,17 @@ class CellInfo:
     @staticmethod
     def tee_up(color: int) -> CellInfo:
         return CellInfo(CellType.TEE_UP, color_index=color)
+
+    @staticmethod
+    def cross(h_color: int, p_color: int) -> CellInfo:
+        """Cross-junction (┼): horizontal + vertical up + vertical down.
+
+        *h_color* is the horizontal/vertical-down colour (the merge
+        connector + the lane continuation down to the second parent).
+        *p_color* overrides the vertical-up colour (the pipe to the
+        child above).
+        """
+        return CellInfo(CellType.CROSS, color_index=h_color, pipe_color_index=p_color)
 
 
 @dataclass
@@ -430,6 +449,61 @@ def build_graph(
 
         # --- fork point handling: multiple lanes track the same commit ---
         fork_lanes: list[int] = [i for i, lo in enumerate(lanes) if lo == commit.sha]
+        # Snapshot the colour of every fork lane NOW, before the
+        # fork-connector handling releases those lanes. The CROSS
+        # cell placed at a fork-merge point needs the lane's
+        # original colour (the child's branch colour) for the
+        # vertical-up pipe; once ``lane_color_index.pop(ml)`` runs
+        # below the colour is gone and the CROSS cell would fall
+        # back to the second parent's colour, blending the two
+        # connections visually.
+        fork_lane_colors: dict[int, int] = {
+            ml: lane_color_index.get(ml, ml)
+            for ml in fork_lanes
+        }
+        # Track the fork lanes (children lanes) so that, when this
+        # commit is also a merge, a second parent landing on one of
+        # these lanes can be drawn with a CROSS cell at the
+        # intersection. The set is captured BEFORE the fork connector
+        # cells are merged into the commit's row and BEFORE the lanes
+        # are released, because we need to know which lanes are about
+        # to be freed (those lanes have a child of this commit).
+        fork_lane_set: set[int] = set(fork_lanes)
+
+        # ``child_lane_set`` collects the lanes of every child of
+        # *this* commit. ``fork_lane_set`` only knows about lanes that
+        # are tracking the commit SHA right now; for a fork-merge
+        # commit whose children landed on different lanes earlier
+        # (e.g. ``gpt-researcher`` ``409b8b60`` — children ``18d4051``
+        # on lane 0 and ``3080b0c4`` on lane 1, only the latter left
+        # ``lanes[0] == commit.sha`` at processing time), the second
+        # parent can collide with a child's lane that ``fork_lane_set``
+        # does NOT cover. Building the child-lane set from
+        # ``parent_children`` + the already-processed ``nodes`` list
+        # is the only way to detect every such case.
+        child_lane_set: set[int] = set()
+        for child_sha in parent_children.get(commit.sha, []):
+            for n in nodes:
+                if n.commit is not None and n.commit.sha == child_sha:
+                    child_lane_set.add(n.lane)
+                    break
+        fork_lane_set |= child_lane_set
+        # Also snapshot the colour of any child lane not already in
+        # ``fork_lane_colors``. ``oid_color_index`` carries the
+        # commit's assigned colour even after the lane was released.
+        for cl in child_lane_set:
+            if cl not in fork_lane_colors:
+                # Find the child SHA again to look up its colour.
+                for child_sha in parent_children.get(commit.sha, []):
+                    for n in nodes:
+                        if n.commit is not None and n.commit.sha == child_sha and n.lane == cl:
+                            fork_lane_colors[cl] = (
+                                lane_color_index.get(cl)
+                                or oid_color_index.get(child_sha, cl)
+                            )
+                            break
+                    if cl in fork_lane_colors:
+                        break
         fork_merging_cells: list[CellInfo] | None = None
         if len(fork_lanes) >= 2:
             main_lane = min(fork_lanes)
@@ -558,6 +632,17 @@ def build_graph(
             else commit_color_index
         )
 
+        # When a commit is BOTH a fork point (has children) AND
+        # has a second parent whose lane coincides with a child's
+        # lane, GitKraken-style rendering keeps the second
+        # parent on the SAME lane as the child and lets a
+        # dedicated ``CROSS`` cell at the intersection make
+        # both connections (merge from below + branch to above)
+        # visually unambiguous. The second parent therefore
+        # stays on its natural lane; nothing is reshuffled here.
+        # See ``_build_row_cells`` for the ``CROSS`` placement.
+        _ = fork_merging_cells  # intentional no-op; see comment above
+
         if lane > max_lane:
             max_lane = lane
         for _, pl, _, _, _ in parent_lanes:
@@ -575,13 +660,37 @@ def build_graph(
         cells = _build_row_cells(
             lane, final_color_index, parent_lanes, lanes,
             oid_color_index, lane_color_index, max_lane,
+            fork_lane_set=fork_lane_set,
+            fork_lane_colors=fork_lane_colors,
+        )
+
+        # Detect whether ``_build_row_cells`` placed a CROSS cell at a
+        # fork lane (fork-merge point — second parent shares a fork
+        # lane with one of the commit's children). When this happens,
+        # the fork-connector cells built by ``_build_fork_connector_cells``
+        # would conflict with the CROSS: the connector's TEE_RIGHT at
+        # the commit's lane uses the *child's* colour (the fork
+        # connector's "receiving lane" colour), but the merge
+        # connector that the CROSS serves must use the *second parent's*
+        # colour. Skipping the entire fork-connector merge in this case
+        # lets ``_build_row_cells``' TEE_RIGHT (coloured by the second
+        # parent) stand on its own.
+        has_cross_fork_lane = any(
+            c.cell_type == CellType.CROSS for c in cells
         )
 
         # Merge fork connector cells into the commit's own cells so the
         # branching is rendered directly from the fork point commit node.
         # The fork connector already supplies the correct horizontal and
         # pipe colours, so the cells are used as-is.
-        if fork_merging_cells is not None:
+        # EXCEPTION: a CROSS cell already placed by ``_build_row_cells``
+        # at a fork-merge point (second parent sharing a fork lane)
+        # must NOT be overwritten by the fork connector's MERGE_LEFT
+        # curve — the cross carries the merge-from-below + branch-to-
+        # above semantic that the curve alone would lose. When ANY
+        # CROSS cell exists on the row, the entire fork-connector
+        # merge is skipped (see ``has_cross_fork_lane`` above).
+        if fork_merging_cells is not None and not has_cross_fork_lane:
             while len(cells) < len(fork_merging_cells):
                 cells.append(CellInfo.empty())
             for fci, fc in enumerate(fork_merging_cells):
@@ -942,7 +1051,33 @@ def _build_row_cells(
     oid_color_index: dict[str, int],
     lane_color_index: dict[int, int],
     max_lane: int,
+    *,
+    fork_lane_set: set[int] | None = None,
+    fork_lane_colors: dict[int, int] | None = None,
 ) -> list[CellInfo]:
+    """Build the cell list for one row.
+
+    *fork_lane_set* — when provided, lanes in this set are treated as
+    "fork lanes": lanes that host a CHILD of the current commit. When the
+    second parent lands on one of those lanes (a fork-merge commit
+    whose child and second parent share a lane), the cell at that lane
+    is replaced with a :class:`CellType.CROSS` so the merge connector
+    (horizontal from the commit) and the vertical pipe passing through
+    (child above + second parent below) read as two distinct
+    connections instead of one continuous line. GitKraken does the
+    same — the second parent stays on the natural lane and a
+    cross-junction cell marks the fork-merge point.
+
+    *fork_lane_colors* — optional mapping of fork-lane → colour used
+    for the CROSS cell's vertical-up pipe. Captured BEFORE the fork
+    handling releases the lanes so the original child's branch
+    colour survives. Falls back to ``parent_color`` if missing.
+    """
+    if fork_lane_set is None:
+        fork_lane_set = set()
+    if fork_lane_colors is None:
+        fork_lane_colors = {}
+
     cells = [CellInfo.empty() for _ in range((max_lane + 1) * 2)]
 
     # Vertical lines for active lanes
@@ -959,14 +1094,86 @@ def _build_row_cells(
         cells[commit_cell_idx] = CellInfo.commit(commit_color)
 
     # Connections to parents
-    for _parent_sha, parent_lane, was_existing, parent_color, already_shown in parent_lanes:
+    for parent_idx, (_parent_sha, parent_lane, was_existing, parent_color, already_shown) in (
+        enumerate(parent_lanes)
+    ):
         if parent_lane == commit_lane:
+            continue
+
+        # Detect fork-merge point: this parent is the second parent
+        # (or any non-first parent) AND lands on a fork lane (a lane
+        # hosting one of the current commit's children). In that
+        # situation a CROSS cell replaces the curve so the merge
+        # connector reads as horizontal from the commit centre, and
+        # the vertical pipes (up to child + down to second parent)
+        # stay continuous through the cell.
+        on_fork_lane = (
+            parent_idx >= 1
+            and parent_lane in fork_lane_set
+        )
+
+        if on_fork_lane:
+            end_idx = parent_lane * 2
+            if end_idx < len(cells):
+                # The horizontal is the merge connector (the second
+                # parent's colour); the vertical-up is the child's
+                # colour (the fork lane above); the vertical-down is
+                # the second parent's colour (continuing down to the
+                # second parent itself). Use the fork-lane snapshot
+                # colour (captured before fork-lane release) for the
+                # child, so the two pipe sections stay colour-coded
+                # — gold for the branch-up, blue for the merge-down.
+                child_color = fork_lane_colors.get(
+                    parent_lane,
+                    lane_color_index.get(parent_lane, parent_color),
+                )
+                cells[end_idx] = CellInfo.cross(parent_color, child_color)
+            # The horizontal connector from the commit lane to this
+            # lane is handled by the ``TEE_RIGHT``/``TEE_LEFT`` block
+            # below. Continue so we still draw the connector.
+            # (We intentionally do NOT add a BRANCH_LEFT/MERGE_LEFT
+            # curve at this lane — CROSS replaces it.)
+            if parent_lane > commit_lane:
+                # Connection to the right.
+                if commit_cell_idx < len(cells):
+                    cells[commit_cell_idx] = CellInfo(
+                        CellType.TEE_RIGHT,
+                        color_index=parent_color,
+                        pipe_color_index=commit_color,
+                    )
+                if parent_lane > commit_lane + 1:
+                    for col in range(commit_lane * 2 + 1, parent_lane * 2 - 1):
+                        if col < len(cells):
+                            existing = cells[col]
+                            if existing.cell_type == CellType.PIPE:
+                                cells[col] = CellInfo.horizontal_pipe(
+                                    parent_color, existing.color_index,
+                                )
+                            elif existing.cell_type == CellType.EMPTY:
+                                cells[col] = CellInfo.horizontal(parent_color)
+            else:
+                # Connection to the left.
+                if commit_cell_idx < len(cells):
+                    cells[commit_cell_idx] = CellInfo(
+                        CellType.TEE_LEFT,
+                        color_index=parent_color,
+                        pipe_color_index=commit_color,
+                    )
+                if parent_lane < commit_lane - 1:
+                    for col in range(parent_lane * 2 + 1, commit_lane * 2 - 1):
+                        if col < len(cells):
+                            existing = cells[col]
+                            if existing.cell_type == CellType.PIPE:
+                                cells[col] = CellInfo.horizontal_pipe(
+                                    parent_color, existing.color_index,
+                                )
+                            elif existing.cell_type == CellType.EMPTY:
+                                cells[col] = CellInfo.horizontal(parent_color)
             continue
 
         if parent_lane > commit_lane:
             # Connection to the right.
             # Replace the COMMIT cell with TEE_RIGHT so the horizontal
-            # line starts at the commit centre. Without this, the first
             # HORIZONTAL cell sits at the mid of the commit lane and
             # leaves a visible gap (≈ ``node_radius`` pixels) between
             # the commit ellipse and the connector — a common symptom

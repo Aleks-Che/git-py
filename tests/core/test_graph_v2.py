@@ -453,6 +453,142 @@ def test_merge_adjacent_parent_still_uses_tee_right() -> None:
     assert cells[second_parent_lane * 2].cell_type == CellType.BRANCH_LEFT
 
 
+def test_merge_and_fork_on_same_lane_uses_cross_cell() -> None:
+    """A commit that is BOTH a merge (has 2 parents) AND a fork
+    point (has 2+ children) where the second parent and one of
+    the children land on the same lane must draw a CROSS cell
+    at that lane on the merge commit's row.
+
+    GitKraken does exactly this — the second parent stays on the
+    natural lane (the same lane as the child), and a dedicated
+    ┠ cross cell at the merge commit marks the
+    fork-merge point: the horizontal segment is the merge
+    connector coming in from the merge commit, while the
+    vertical pipes pass through the cell in both directions
+    (one to the child above, one to the second parent below).
+
+    Regression: without the fix the cell at the second parent's
+    lane was a plain ``MERGE_LEFT`` curve, leaving the user to
+    see a single curving line and read the merge connection as
+    ambiguous. Real-world example: ``gpt-researcher`` commit
+    ``409b8b60`` (PR #1817 merge) is followed by commit
+    ``3080b0c4`` on the same lane — a security branch created
+    from the merge. The user reported the merge connection as
+    visually unclear because the gold branch-creation line and
+    the blue merge line shared the same column at the merge
+    commit and rendered as one continuous curve.
+    """
+    # Topology, listed newest-first (which is the order
+    # ``build_graph`` processes them):
+    #
+    #   c_after   (lane 0, child of c_merge)        <-- processed first
+    #   c_branch  (lane 1, child of c_merge)        <-- processed second;
+    #                                                  pushes c_merge into
+    #                                                  active lanes at
+    #                                                  BOTH lane 0 and 1
+    #   c_merge   (lane 0, parents [c_main, c_tip]) <-- processed third;
+    #                                                  both children are
+    #                                                  in active lanes, so
+    #                                                  the fork connector
+    #                                                  fires here and a
+    #                                                  CROSS cell must be
+    #                                                  placed at lane 1
+    #                                                  (where c_branch is
+    #                                                  above AND c_tip is
+    #                                                  below)
+    #   c_tip     (lane 1, the PR being merged in)  <-- stays on lane 1
+    #                                                  (same as c_branch);
+    #                                                  a CROSS cell at
+    #                                                  lane 1 carries both
+    #                                                  connections
+    #   c_main    (lane 0, the main-line parent)    <-- older still
+    #   c_root    (lane 0, the root)
+    #
+    # We add a branches list so c_branch gets a non-main colour
+    # (otherwise the colour-assigner's hash-based fallback can
+    # collide with c_tip and we can't tell them apart in the
+    # assertion).
+    c_root = "0" * 40
+    c_main = "1" * 40
+    c_tip = "2" * 40
+    c_merge = "3" * 40
+    c_branch = "4" * 40
+    c_after = "5" * 40
+    commits = [
+        _c(c_after, [c_merge], ts=6),
+        _c(c_branch, [c_merge], ts=5),
+        _c(c_merge, [c_main, c_tip], ts=4),
+        _c(c_tip, [c_root], ts=3),
+        _c(c_main, [c_root], ts=2),
+        _c(c_root, ts=1),
+    ]
+    branches = [
+        _b("main", c_main, is_head=True),
+        _b("feature-x", c_branch),
+    ]
+    layout = build_graph(commits, branches)
+
+    merge_node = next(n for n in layout.nodes if n.commit and n.commit.sha == c_merge)
+    branch_node = next(n for n in layout.nodes if n.commit and n.commit.sha == c_branch)
+    tip_node = next(n for n in layout.nodes if n.commit and n.commit.sha == c_tip)
+
+    # The child (c_branch) and the second parent (c_tip) stay on
+    # the SAME lane — that is GitKraken's "тройник" rendering:
+    # one column for both connections, with the CROSS cell
+    # distinguishing them.
+    assert branch_node.lane == tip_node.lane, (
+        "expected child and second parent on the same lane "
+        f"(branch lane={branch_node.lane}, tip lane={tip_node.lane}); "
+        "the GitKraken-style rendering keeps them together and "
+        "uses a CROSS cell to mark the fork-merge point"
+    )
+
+    # The merge commit's row must contain a CROSS cell at the
+    # shared lane. The cross carries:
+    #   * horizontal/vertical-down in the second parent's colour
+    #   * vertical-up in the child's colour (the snapshot colour
+    #     of the fork lane)
+    branch_color = branch_node.color_index
+    tip_color = tip_node.color_index
+    shared_lane = branch_node.lane
+
+    cross_cells = [
+        c for ci, c in enumerate(merge_node.cells)
+        if ci // 2 == shared_lane and c.cell_type == CellType.CROSS
+    ]
+    non_empty = [
+        (ci, c.cell_type.name)
+        for ci, c in enumerate(merge_node.cells)
+        if c.cell_type != CellType.EMPTY
+    ]
+    assert cross_cells, (
+        f"expected a CROSS cell at lane {shared_lane} on the merge "
+        f"commit's row; got cells: {non_empty}"
+    )
+    cross = cross_cells[0]
+    assert cross.color_index == tip_color, (
+        f"CROSS horizontal/vertical-down colour must be the second "
+        f"parent's colour ({tip_color}); got {cross.color_index}"
+    )
+    assert cross.pipe_color_index == branch_color, (
+        f"CROSS vertical-up colour must be the child's branch colour "
+        f"({branch_color}); got {cross.pipe_color_index}"
+    )
+
+    # The merge commit at its own lane must have a TEE_RIGHT (or
+    # TEE_LEFT) that opens the horizontal connector toward the
+    # CROSS cell.
+    commit_lane = merge_node.lane
+    lane0_cells = [
+        c for ci, c in enumerate(merge_node.cells)
+        if ci // 2 == commit_lane and c.cell_type != CellType.EMPTY
+    ]
+    assert any(c.cell_type in (CellType.TEE_RIGHT, CellType.TEE_LEFT) for c in lane0_cells), (
+        f"expected a TEE_RIGHT or TEE_LEFT at the merge commit's "
+        f"lane ({commit_lane}); got {[c.cell_type.name for c in lane0_cells]}"
+    )
+
+
 # ---- fork point (2+ children) -------------------------------------------
 
 

@@ -162,7 +162,7 @@ _CELL_TYPE_NAMES: dict[int, int] = {
     0: "EMPTY", 1: "PIPE", 2: "COMMIT",
     3: "BRANCH_RIGHT", 4: "BRANCH_LEFT", 5: "MERGE_RIGHT",
     6: "MERGE_LEFT", 7: "HORIZONTAL", 8: "HORIZONTAL_PIPE",
-    9: "TEE_RIGHT", 10: "TEE_LEFT", 11: "TEE_UP",
+    9: "TEE_RIGHT", 10: "TEE_LEFT", 11: "TEE_UP", 12: "CROSS",
 }
 
 # Cell types as local constants for readability.
@@ -178,6 +178,7 @@ _T_HORIZONTAL_PIPE = 8
 _T_TEE_RIGHT = 9
 _T_TEE_LEFT = 10
 _T_TEE_UP = 11
+_T_CROSS = 12
 
 
 def _cell_color(index: int) -> QColor:
@@ -2512,6 +2513,26 @@ def _draw_cell_row(
             _draw_vert_line(
                 painter, x, y_center, half_h, edge_width, vert_color,
                 upward_only=True, top_half_h=node_radius,
+            )
+        elif t == _T_CROSS:
+            # Cross-junction: the merge commit at its own lane
+            # has already drawn a TEE_RIGHT / TEE_LEFT carrying the
+            # horizontal connector up to this cell. The CROSS itself
+            # therefore draws ONLY the vertical pipes - one UP to the
+            # child above (in the child's colour) and one DOWN to the
+            # second parent below (in the second parent's colour).
+            # Drawing an extra horizontal here would push the line
+            # off into empty space (the next lane has no commit at
+            # this row).
+            vert_down_color = color
+            vert_up_color = p_color if p else color
+            _draw_vert_line(
+                painter, x, y_center, half_h, edge_width, vert_up_color,
+                top_half_h=node_radius, bottom_half_h=0,
+            )
+            _draw_vert_line(
+                painter, x, y_center, half_h, edge_width, vert_down_color,
+                top_half_h=0, bottom_half_h=bot_half_h,
             )
 
 
