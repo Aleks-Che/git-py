@@ -702,17 +702,19 @@ def build_graph(
         # TEE_UP / MERGE_LEFT at other fork lanes, and PIPE at
         # unrelated lanes) is merged in.
         if fork_merging_cells is not None:
-            # Pre-compute the set of lane-centre columns that already
-            # have a CROSS cell — those columns must keep the CROSS.
-            cross_cols: set[int] = {
-                ci for ci, c in enumerate(cells) if c.cell_type == CellType.CROSS
-            }
             while len(cells) < len(fork_merging_cells):
                 cells.append(CellInfo.empty())
             for fci, fc in enumerate(fork_merging_cells):
                 if fc.cell_type == CellType.EMPTY:
                     continue
-                if fci in cross_cols:
+                existing = cells[fci]
+                if existing.cell_type in (
+                    CellType.BRANCH_RIGHT,
+                    CellType.BRANCH_LEFT,
+                    CellType.MERGE_LEFT,
+                    CellType.MERGE_RIGHT,
+                    CellType.CROSS,
+                ):
                     continue
                 cells[fci] = fc
 

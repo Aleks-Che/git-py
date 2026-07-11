@@ -82,6 +82,10 @@
 - `test_fork_connector_multiple_merges_keeps_tee_in_first_merge_colour` (core): `merging_lanes=[(2, 2), (4, 3)]` — `TEE_RIGHT` в первом merge-color, `TEE_UP` в следующем, правый `MERGE_LEFT` — в своём.
 - `test_fork_connector_main_lane_uses_main_colour_when_no_merges` (core): без форков main-lane = PIPE в `main_color`.
 
+**Fork-overlay priority.** При наложении `fork_merging_cells` на строку коммита уже существующие `BRANCH_*`, `MERGE_*` и `CROSS` не должны перезаписываться горизонталью fork-коннектора. Это сохраняет направление вертикали у merge/source-связи.
+- Визуальная регрессия: `python simulate_problem.py` на `gpt-researcher` merge `6c75117` должен показывать `BRANCH_LEFT c=11` на lane source-ветки и статус `downward branch is present`.
+- Core-инвариант для будущего теста: если `_build_row_cells` уже поставил `BRANCH_LEFT` / `BRANCH_RIGHT` / `MERGE_LEFT` / `MERGE_RIGHT` / `CROSS` в `cells[fci]`, overlay из `fork_merging_cells[fci]` обязан пропустить эту клетку.
+
 **Bridge pipe — цвет предыдущей строки.** Тесты пиныруют что вертикаль между строками наследует цвет ячейки предыдущей строки на том же lane, а не текущей.
 - `test_lane_above_root_stays_in_root_branch_colour` (UI, pixel-level): репо root + стэш + WIP. Pixel-проба между bottom-of-stash и top-of-root показывает WIP-grey `(80, 80, 80)`, не main-blue. Внутри stash row lane 0 PIPE — WIP-grey (не main-blue).
 - `test_topmost_commit_does_not_draw_line_stub_into_empty_space` (UI, pixel-level): выше topmost коммита нет пиксельных артефактов в его lane.

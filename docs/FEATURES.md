@@ -135,6 +135,16 @@ Continue?
 
 Эти два правила **не должны конфликтовать**: fork connector — про горизонтальную связь «корень ↔ форк», bridge pipe — про вертикальную связь «строка выше ↔ строка ниже». Если оба правила применить к одному сегменту (например, дать горизонтали в корневой строке цвет предыдущей строки), форк-коннектор «отвяжется» от своего стэша и начнёт читаться как ветка, ответвившаяся от WIP. Это и был исходный баг — первая попытка исправить bridge pipe сломала fork connector, и наоборот. Регрессионные тесты `test_stash_fork_connector_uses_merging_branch_colour` (UI) и `test_fork_connector_*` (core) фиксируют оба инварианта.
 
+## Защита merge/branch-клеток от fork-overlay
+
+Строка merge-коммита строится в два этапа: сначала `_build_row_cells` создаёт связи с родителями (`BRANCH_LEFT` / `BRANCH_RIGHT`, `MERGE_LEFT` / `MERGE_RIGHT`, `CROSS`), затем `build_graph` накладывает `fork_merging_cells`, чтобы показать создание дочерних веток от этого же коммита.
+
+Fork-overlay не должен перетирать уже выставленные смысловые клетки `BRANCH_*`, `MERGE_*` и `CROSS`. Эти клетки несут направление вертикали: `BRANCH_*` ведёт вниз к родителю, `MERGE_*` ведёт вверх к merge-точке, `CROSS` сохраняет обе связи. Если заменить такую клетку на `HORIZONTAL`, линия создания веток визуально стирает merge/source-соединение.
+
+Реальный кейс: `gpt-researcher` merge `6c75117` (`sudabg/fix/reference-error-1673` → `_render_target`). До overlay на lane source-ветки стоял корректный `BRANCH_LEFT c=11`; fork-коннектор от `_render_target` заменял его на `HORIZONTAL c=13`, и вертикаль вниз к source-коммиту пропадала. Теперь при наложении `fork_merging_cells` существующие `BRANCH_RIGHT`, `BRANCH_LEFT`, `MERGE_RIGHT`, `MERGE_LEFT` и `CROSS` имеют приоритет, а fork-коннектор заполняет только остальные клетки.
+
+Визуальная проверка: `python simulate_problem.py` должен показывать на проблемной точке `BRANCH_LEFT c=11` и статус `downward branch is present`.
+
 ## CROSS-`direction`: закрытие зазора у fork-merge точки
 
 `CROSS`-ячейка (cross-junction: горизонталь + вертикаль вверх + вертикаль вниз) рисуется в `_build_row_cells` в fork-merge кейсе — когда merge-коммит одновременно fork-точка (имеет 2+ детей), и один из его вторых родителей (`parent[1]`) лежит на lane, совпадающей с lane одного из детей. Это соответствует GitKraken-style рендерингу: один столбец несёт обе связи (merge снизу + child сверху), и `┼` делает их визуально различимыми.
