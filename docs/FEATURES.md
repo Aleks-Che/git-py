@@ -135,6 +135,25 @@ Continue?
 
 Эти два правила **не должны конфликтовать**: fork connector — про горизонтальную связь «корень ↔ форк», bridge pipe — про вертикальную связь «строка выше ↔ строка ниже». Если оба правила применить к одному сегменту (например, дать горизонтали в корневой строке цвет предыдущей строки), форк-коннектор «отвяжется» от своего стэша и начнёт читаться как ветка, ответвившаяся от WIP. Это и был исходный баг — первая попытка исправить bridge pipe сломала fork connector, и наоборот. Регрессионные тесты `test_stash_fork_connector_uses_merging_branch_colour` (UI) и `test_fork_connector_*` (core) фиксируют оба инварианта.
 
+## CROSS-`direction`: закрытие зазора у fork-merge точки
+
+`CROSS`-ячейка (cross-junction: горизонталь + вертикаль вверх + вертикаль вниз) рисуется в `_build_row_cells` в fork-merge кейсе — когда merge-коммит одновременно fork-точка (имеет 2+ детей), и один из его вторых родителей (`parent[1]`) лежит на lane, совпадающей с lane одного из детей. Это соответствует GitKraken-style рендерингу: один столбец несёт обе связи (merge снизу + child сверху), и `┼` делает их визуально различимыми.
+
+**Проблема.** Раньше `CROSS` рисовал только вертикали, а горизонталь шла из соседней between-lanes ячейки (`HORIZONTAL` / `HORIZONTAL_PIPE`) на col `parent_lane * 2 + 1`. Её `x` = `col_left + lane_w / 2` (центр lane), а не `x` = `col_left` (центр коммита). Между вертикальной трубой `CROSS` (центр коммита) и началом горизонтали (центр lane) оставалось `lane_w / 2 ≈ 11 px` пустоты. На merge-коммитах с дальним вторым родителем (например, `gpt-researcher` `693d3b72 ← b364917f`, lane 14 → lane 0) это выглядело как «обрыв» горизонтали в воздухе.
+
+**Решение.** `CellInfo` получил поле `direction: int = 0` (только для `CROSS`):
+- `+1` — провести горизонталь вправо от центра CROSS-ячейки на ширину `lane_w`;
+- `-1` — то же влево;
+- `0` — без дополнительной горизонтали (default, backwards-compatible).
+
+В `_build_row_cells` направление выбирается автоматически: `direction = -1 if parent_lane > commit_lane else 1` (горизонталь тянется в сторону merge-коммита, чтобы закрыть зазор между commit-вертикалью и between-lanes-горизонталью). В `_draw_cell_row` (`src/ui/widgets/graph_panel.py`) добавлен вызов `_draw_horiz_line(... lane_w * direction ...)` при `cell["d"] != 0`.
+
+Глобальный `_draw_horiz_line` остался без изменений — расширение применимо только к `CROSS`, что не задевает `HORIZONTAL` / `HORIZONTAL_PIPE` в других контекстах (соседние lanes, multi-merge fork connector).
+
+Полное описание: `docs/MERGE_LANE_FIX.md`. Регрессионные тесты: `test_cross_cell_carries_horizontal_direction`, `test_cross_cell_direction_default_is_zero`, `test_cross_cell_to_dict_omits_direction_when_zero` в `tests/core/test_graph_v2.py`.
+
+Визуальная проверка: `python simulate_problem.py` рендерит реальный `gpt-researcher` через те же `QPainter`-примитивы что и `graph_panel.py`. До фикса — красная рамка «empty gap (11 px)» на col 0 строки merge. После — зелёная галочка «bend bridged», горизонталь дотягивается до вертикали.
+
 ## Контекстное меню на вкладках репозиториев
 
 Правый клик по табу репозитория (`QTabBar.customContextMenuRequested`) открывает меню из пяти пунктов:

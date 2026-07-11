@@ -37,6 +37,7 @@ drag. ``chip_drag_mime`` is the custom MIME type the chip uses so
 the drop handler can distinguish branch drags from any other drop
 the widget might one day accept.
 """
+
 from __future__ import annotations
 
 import json
@@ -159,10 +160,19 @@ def _icon_pen(color: QColor, width: float) -> QPen:
 
 # Mapping from CellType integer to cell-type name (for debugging).
 _CELL_TYPE_NAMES: dict[int, int] = {
-    0: "EMPTY", 1: "PIPE", 2: "COMMIT",
-    3: "BRANCH_RIGHT", 4: "BRANCH_LEFT", 5: "MERGE_RIGHT",
-    6: "MERGE_LEFT", 7: "HORIZONTAL", 8: "HORIZONTAL_PIPE",
-    9: "TEE_RIGHT", 10: "TEE_LEFT", 11: "TEE_UP", 12: "CROSS",
+    0: "EMPTY",
+    1: "PIPE",
+    2: "COMMIT",
+    3: "BRANCH_RIGHT",
+    4: "BRANCH_LEFT",
+    5: "MERGE_RIGHT",
+    6: "MERGE_LEFT",
+    7: "HORIZONTAL",
+    8: "HORIZONTAL_PIPE",
+    9: "TEE_RIGHT",
+    10: "TEE_LEFT",
+    11: "TEE_UP",
+    12: "CROSS",
 }
 
 # Cell types as local constants for readability.
@@ -252,8 +262,14 @@ class GraphTableWidget(QWidget):
     branch_dropped_on_branch = Signal(str, str)  # source, target
 
     _AVATAR_COLORS: tuple[str, ...] = (
-        "#C44A2B", "#B85C8C", "#9A6E3A", "#5B7FA5",
-        "#8B5CF6", "#3B82A0", "#D97706", "#6D8EA0",
+        "#C44A2B",
+        "#B85C8C",
+        "#9A6E3A",
+        "#5B7FA5",
+        "#8B5CF6",
+        "#3B82A0",
+        "#D97706",
+        "#6D8EA0",
     )
 
     def __init__(
@@ -452,9 +468,7 @@ class GraphTableWidget(QWidget):
             row_sha = _row_sha(row)
             if row_sha == sha:
                 row_center_y = (
-                    self._cfg.header_height
-                    + idx * self._cfg.row_height
-                    + self._cfg.row_height // 2
+                    self._cfg.header_height + idx * self._cfg.row_height + self._cfg.row_height // 2
                 )
                 viewport_center = self.height() // 2
                 target = max(0, row_center_y - viewport_center)
@@ -587,7 +601,9 @@ class GraphTableWidget(QWidget):
             )
 
     def _compute_column_overflows(
-        self, ranges: list[tuple[int, int]], bar_h: int,
+        self,
+        ranges: list[tuple[int, int]],
+        bar_h: int,
     ) -> list[int]:
         del bar_h
         nr = self._cfg.node_radius
@@ -643,9 +659,11 @@ class GraphTableWidget(QWidget):
                 if len(parts) == 2:
                     display = parts[1]
             reserved = (
-                pad * 2 + (icon_size + gap if branch.get("is_head") else 0)
+                pad * 2
+                + (icon_size + gap if branch.get("is_head") else 0)
                 + (gap + icon_size if not branch.get("is_remote") else 0)
-                + gap + avatar_size
+                + gap
+                + avatar_size
             )
             cursor += fm.horizontalAdvance(display) + reserved
         return cursor
@@ -856,9 +874,7 @@ class GraphTableWidget(QWidget):
         actions.append(self._make_separator())
         copy_name = QAction("Copy branch name", self)
         copy_name.triggered.connect(
-            lambda checked=False, n=full_name: (
-                self.copy_branch_name_requested.emit(n)
-            ),
+            lambda checked=False, n=full_name: (self.copy_branch_name_requested.emit(n)),
         )
         actions.append(copy_name)
 
@@ -866,9 +882,7 @@ class GraphTableWidget(QWidget):
         if row_sha:
             copy_sha = QAction("Copy commit sha", self)
             copy_sha.triggered.connect(
-                lambda checked=False, s=row_sha: (
-                    self.copy_commit_sha_requested.emit(s)
-                ),
+                lambda checked=False, s=row_sha: (self.copy_commit_sha_requested.emit(s)),
             )
             actions.append(copy_sha)
 
@@ -1259,8 +1273,12 @@ class GraphTableWidget(QWidget):
             if avail < 20:
                 continue
             painter.drawText(
-                x_start + 6, 0, avail, hh,
-                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label,
+                x_start + 6,
+                0,
+                avail,
+                hh,
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                label,
             )
 
         # data area
@@ -1293,7 +1311,10 @@ class GraphTableWidget(QWidget):
         for dx in self._dividers:
             rect_w = self._cfg.divider_width
             painter.fillRect(
-                dx - rect_w // 2, 0, rect_w, self.height(),
+                dx - rect_w // 2,
+                0,
+                rect_w,
+                self.height(),
                 QColor(self._cfg.divider_color).darker(120),
             )
 
@@ -1401,8 +1422,10 @@ class GraphTableWidget(QWidget):
                     pen = QPen(clr, ew, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
                     painter.setPen(pen)
                     painter.drawLine(
-                        int(x), int(prev_y_center + nr),
-                        int(x), int(y_center - nr),
+                        int(x),
+                        int(prev_y_center + nr),
+                        int(x),
+                        int(y_center - nr),
                     )
 
             # ``prev_occupied`` feeds the NEXT iteration's pipe check.
@@ -1426,7 +1449,14 @@ class GraphTableWidget(QWidget):
             # dangling into the empty space below the root commit.
             bot_half_h = nr if row_idx == len(self._rows) - 1 else None
             _draw_cell_row(
-                painter, cells, col_left, lane_w, y_center, dh, ew, nr,
+                painter,
+                cells,
+                col_left,
+                lane_w,
+                y_center,
+                dh,
+                ew,
+                nr,
                 bottom_half_h=bot_half_h,
             )
 
@@ -1440,10 +1470,7 @@ class GraphTableWidget(QWidget):
             is_selected = sha == self._selected_sha
             is_hovered = sha == self._hovered_sha
             if is_selected or is_hovered:
-                bg_color = (
-                    self._cfg.selected_bg_color if is_selected
-                    else self._cfg.hover_bg_color
-                )
+                bg_color = self._cfg.selected_bg_color if is_selected else self._cfg.hover_bg_color
                 y_center = y + dh / 2
                 painter.fillRect(
                     self._dividers[0],
@@ -1454,7 +1481,11 @@ class GraphTableWidget(QWidget):
                 )
 
     def _draw_branch_column(
-        self, painter: QPainter, header_h: int, left: int, right: int,
+        self,
+        painter: QPainter,
+        header_h: int,
+        left: int,
+        right: int,
     ) -> None:
         dh = self._cfg.row_height
         fm = self.fontMetrics()
@@ -1466,7 +1497,11 @@ class GraphTableWidget(QWidget):
             self._draw_branch_chips(painter, row_data, (left, right), y_center, fm)
 
     def _draw_graph_column(
-        self, painter: QPainter, header_h: int, left: int, right: int,
+        self,
+        painter: QPainter,
+        header_h: int,
+        left: int,
+        right: int,
     ) -> None:
         self._draw_cells(painter, header_h)
         dh = self._cfg.row_height
@@ -1481,7 +1516,11 @@ class GraphTableWidget(QWidget):
             self._draw_graph_node(painter, row_data, col_cx, lane_w, y_center)
 
     def _draw_commit_column(
-        self, painter: QPainter, header_h: int, left: int, right: int,
+        self,
+        painter: QPainter,
+        header_h: int,
+        left: int,
+        right: int,
     ) -> None:
         dh = self._cfg.row_height
         fm = self.fontMetrics()
@@ -1497,8 +1536,12 @@ class GraphTableWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _draw_branch_chips(
-        self, painter: QPainter, row_data: dict,
-        col_range: tuple[int, int], y_center: float, fm,
+        self,
+        painter: QPainter,
+        row_data: dict,
+        col_range: tuple[int, int],
+        y_center: float,
+        fm,
     ) -> None:
         branch_refs = row_data.get("branch_refs", [])
         if not branch_refs:
@@ -1554,7 +1597,8 @@ class GraphTableWidget(QWidget):
         # 2+ branches → render 1 priority chip + ``▼``; the rest
         #   are revealed on hover via the branch-stack popup.
         sorted_branches = sorted(
-            visible_branches, key=self._branch_priority_key,
+            visible_branches,
+            key=self._branch_priority_key,
         )
         # Cache every chip rect (even for hidden siblings) so
         # hit-tests and external callers looking up the cache by
@@ -1589,7 +1633,7 @@ class GraphTableWidget(QWidget):
             # *primary* chip only — sibling chips never carry the
             # ``▼`` because the user accesses them via the hover
             # popup, not by clicking the row's collapsed indicator.
-            is_primary = (idx == 0)
+            is_primary = idx == 0
             indicator_extra = 0
             if is_primary and hidden_count > 0:
                 indicator_extra = 18 + (8 if hidden_count > 1 else 0)
@@ -1645,8 +1689,10 @@ class GraphTableWidget(QWidget):
             row_sha = _row_sha(row_data)
             self._branch_chip_rects[(row_sha, display)] = {
                 "rect": QRect(
-                    int(cursor_x), int(chip_top),
-                    int(content_w), int(chip_h),
+                    int(cursor_x),
+                    int(chip_top),
+                    int(content_w),
+                    int(chip_h),
                 ),
                 "is_remote": bool(is_remote),
                 "is_remote_only": is_remote_only,
@@ -1708,7 +1754,8 @@ class GraphTableWidget(QWidget):
                     inner_x += gap + icon_size
 
                 avatar = self._avatar_for(
-                    _row_author(row_data), avatar_size,
+                    _row_author(row_data),
+                    avatar_size,
                 )
                 painter.drawPixmap(int(inner_x + gap), int(inner_cy - avatar_size / 2), avatar)
                 inner_x += gap + avatar_size
@@ -1770,8 +1817,12 @@ class GraphTableWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _draw_graph_node(
-        self, painter: QPainter, row_data: dict,
-        col_cx: float, lane_w: float, y_center: float,
+        self,
+        painter: QPainter,
+        row_data: dict,
+        col_cx: float,
+        lane_w: float,
+        y_center: float,
     ) -> None:
         commit = row_data.get("commit")
         is_uncommitted = row_data.get("is_uncommitted", False)
@@ -1800,8 +1851,10 @@ class GraphTableWidget(QWidget):
             painter.setPen(QPen(wip_c, 1.5, Qt.PenStyle.DashLine))
             painter.setBrush(QColor(self._cfg.background_color))
             painter.drawEllipse(
-                int(cx - radius), int(y_center - radius),
-                int(radius * 2), int(radius * 2),
+                int(cx - radius),
+                int(y_center - radius),
+                int(radius * 2),
+                int(radius * 2),
             )
         elif is_stash:
             radius = self._cfg.wip_node_radius
@@ -1811,8 +1864,10 @@ class GraphTableWidget(QWidget):
             painter.setPen(QPen(stash_c, 1.5, Qt.PenStyle.DashLine))
             painter.setBrush(QColor(self._cfg.background_color))
             painter.drawEllipse(
-                int(cx - radius), int(y_center - radius),
-                int(radius * 2), int(radius * 2),
+                int(cx - radius),
+                int(y_center - radius),
+                int(radius * 2),
+                int(radius * 2),
             )
             bar_w = int(radius * 1.0)
             bar_h = max(2, int(radius * 0.22))
@@ -1831,16 +1886,20 @@ class GraphTableWidget(QWidget):
             painter.setBrush(_lighten_color(color, 0.4))
             painter.setPen(QPen(color, 0))
             painter.drawEllipse(
-                int(cx - radius), int(y_center - radius),
-                int(radius * 2), int(radius * 2),
+                int(cx - radius),
+                int(y_center - radius),
+                int(radius * 2),
+                int(radius * 2),
             )
         else:
             radius = self._cfg.node_radius
             painter.setBrush(color)
             painter.setPen(QPen(color, 0))
             painter.drawEllipse(
-                int(cx - radius), int(y_center - radius),
-                int(radius * 2), int(radius * 2),
+                int(cx - radius),
+                int(y_center - radius),
+                int(radius * 2),
+                int(radius * 2),
             )
 
         painter.restore()
@@ -1848,10 +1907,13 @@ class GraphTableWidget(QWidget):
         if not is_uncommitted and not is_stash:
             av_size = max(6, radius * 2 - 3)
             av_pix = self._avatar_for(
-                _row_author(row_data), av_size, shape="circle",
+                _row_author(row_data),
+                av_size,
+                shape="circle",
             )
             painter.drawPixmap(
-                QPointF(cx - av_size / 2.0, y_center - av_size / 2.0), av_pix,
+                QPointF(cx - av_size / 2.0, y_center - av_size / 2.0),
+                av_pix,
             )
 
         chip_y = y_center - self._cfg.ref_chip_height / 2 - 1
@@ -1864,7 +1926,12 @@ class GraphTableWidget(QWidget):
             label_x += chip[0] + self._cfg.ref_chip_gap
 
     def _draw_ref_chip(
-        self, painter: QPainter, label: str, x: float, y: float, color: QColor,
+        self,
+        painter: QPainter,
+        label: str,
+        x: float,
+        y: float,
+        color: QColor,
     ) -> tuple[float, float]:
         text_w = self.fontMetrics().horizontalAdvance(label)
         pad = self._cfg.ref_chip_padding
@@ -1879,8 +1946,12 @@ class GraphTableWidget(QWidget):
         return w, h
 
     def _draw_commit_text(
-        self, painter: QPainter, row_data: dict,
-        col_range: tuple[int, int], y_center: float, fm,
+        self,
+        painter: QPainter,
+        row_data: dict,
+        col_range: tuple[int, int],
+        y_center: float,
+        fm,
     ) -> None:
         col_left, col_right = col_range
         if col_right - col_left < 20:
@@ -1892,7 +1963,8 @@ class GraphTableWidget(QWidget):
 
         kind = _row_kind(row_data)
         text_color = (
-            QColor(self._cfg.dim_text_color) if kind in ("wip", "stash")
+            QColor(self._cfg.dim_text_color)
+            if kind in ("wip", "stash")
             else QColor(self._cfg.text_color)
         )
         subject_x = col_left + 8
@@ -1907,7 +1979,11 @@ class GraphTableWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _avatar_for(
-        self, seed: str, size: int = 14, *, shape: str = "square",
+        self,
+        seed: str,
+        size: int = 14,
+        *,
+        shape: str = "square",
     ) -> QPixmap:
         if not seed:
             seed = "?"
@@ -2062,9 +2138,8 @@ class GraphTableWidget(QWidget):
             and self._drag_active_chip is None
         ):
             moved = (
-                (event.pos() - self._drag_press_pos).manhattanLength()
-                >= _DRAG_START_THRESHOLD_PX
-            )
+                event.pos() - self._drag_press_pos
+            ).manhattanLength() >= _DRAG_START_THRESHOLD_PX
             if moved:
                 self._begin_chip_drag(self._drag_press_chip, self._drag_press_pos)
                 # ``QDrag.exec`` blocks until the drag finishes; once
@@ -2386,25 +2461,29 @@ class GraphTableWidget(QWidget):
             cells_out: list[dict] = []
             for ci, cell in enumerate(row_data.get("cells", [])):
                 t = cell.get("t", 0)
-                cells_out.append({
-                    "idx": ci,
-                    "lane": ci // 2,
-                    "type": t,
-                    "color": cell.get("c", 0),
-                    "pipe_color": cell.get("p", 0),
-                })
-            rows_data.append({
-                "row": idx,
-                "lane": row_data.get("lane", 0),
-                "color_index": row_data.get("color_index", 0),
-                "branch_names": row_data.get("branch_names", []),
-                "is_head": row_data.get("is_head", False),
-                "is_uncommitted": row_data.get("is_uncommitted", False),
-                "sha": commit["sha"] if commit else None,
-                "short_sha": commit["short_sha"] if commit else None,
-                "subject": row_data.get("commit", {}).get("subject", ""),
-                "cells": cells_out,
-            })
+                cells_out.append(
+                    {
+                        "idx": ci,
+                        "lane": ci // 2,
+                        "type": t,
+                        "color": cell.get("c", 0),
+                        "pipe_color": cell.get("p", 0),
+                    }
+                )
+            rows_data.append(
+                {
+                    "row": idx,
+                    "lane": row_data.get("lane", 0),
+                    "color_index": row_data.get("color_index", 0),
+                    "branch_names": row_data.get("branch_names", []),
+                    "is_head": row_data.get("is_head", False),
+                    "is_uncommitted": row_data.get("is_uncommitted", False),
+                    "sha": commit["sha"] if commit else None,
+                    "short_sha": commit["short_sha"] if commit else None,
+                    "subject": row_data.get("commit", {}).get("subject", ""),
+                    "cells": cells_out,
+                }
+            )
 
         palette_map = {i: c for i, c in enumerate(BRANCH_PALETTE)}
         palette_map[UNCOMMITTED_COLOR_INDEX] = self._cfg.wip_color
@@ -2413,7 +2492,8 @@ class GraphTableWidget(QWidget):
             "timestamp": datetime.now().isoformat(),
             "row_count": len(self._rows),
             "max_lane": max(
-                (row_data.get("lane", 0) for row_data in self._rows), default=0,
+                (row_data.get("lane", 0) for row_data in self._rows),
+                default=0,
             ),
             "palette": palette_map,
             "wip_color_index": UNCOMMITTED_COLOR_INDEX,
@@ -2423,7 +2503,10 @@ class GraphTableWidget(QWidget):
 
         default_name = f"graph_dump_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Graph Dump", default_name, "JSON (*.json)",
+            self,
+            "Save Graph Dump",
+            default_name,
+            "JSON (*.json)",
         )
         if not path:
             return
@@ -2434,6 +2517,7 @@ class GraphTableWidget(QWidget):
 # --------------------------------------------------------------------------
 # Standalone cell drawing (used by _draw_cells and reusable for tests)
 # --------------------------------------------------------------------------
+
 
 def _draw_cell_row(
     painter: QPainter,
@@ -2461,7 +2545,7 @@ def _draw_cell_row(
         p = cell.get("p", 0)
 
         lane = idx // 2
-        is_even = (idx % 2 == 0)
+        is_even = idx % 2 == 0
 
         if is_even:
             x = col_left + lane * lane_w
@@ -2489,56 +2573,110 @@ def _draw_cell_row(
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
         elif t == _T_HORIZONTAL_PIPE:
             _draw_vert_line(
-                painter, x, y_center, half_h, edge_width, p_color,
-                top_half_h=node_radius, bottom_half_h=bot_half_h,
+                painter,
+                x,
+                y_center,
+                half_h,
+                edge_width,
+                p_color,
+                top_half_h=node_radius,
+                bottom_half_h=bot_half_h,
             )
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
         elif t == _T_TEE_RIGHT:
             vert_color = p_color if p else color
             _draw_vert_line(
-                painter, x, y_center, half_h, edge_width, vert_color,
-                top_half_h=node_radius, bottom_half_h=bot_half_h,
+                painter,
+                x,
+                y_center,
+                half_h,
+                edge_width,
+                vert_color,
+                top_half_h=node_radius,
+                bottom_half_h=bot_half_h,
             )
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
         elif t == _T_TEE_LEFT:
             vert_color = p_color if p else color
             _draw_vert_line(
-                painter, x, y_center, half_h, edge_width, vert_color,
-                top_half_h=node_radius, bottom_half_h=bot_half_h,
+                painter,
+                x,
+                y_center,
+                half_h,
+                edge_width,
+                vert_color,
+                top_half_h=node_radius,
+                bottom_half_h=bot_half_h,
             )
             _draw_horiz_line(painter, x, y_center, -lane_w, edge_width, color)
         elif t == _T_TEE_UP:
             vert_color = p_color if p else color
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
             _draw_vert_line(
-                painter, x, y_center, half_h, edge_width, vert_color,
-                upward_only=True, top_half_h=node_radius,
+                painter,
+                x,
+                y_center,
+                half_h,
+                edge_width,
+                vert_color,
+                upward_only=True,
+                top_half_h=node_radius,
             )
         elif t == _T_CROSS:
             # Cross-junction: the merge commit at its own lane
             # has already drawn a TEE_RIGHT / TEE_LEFT carrying the
             # horizontal connector up to this cell. The CROSS itself
-            # therefore draws ONLY the vertical pipes - one UP to the
+            # therefore draws the vertical pipes - one UP to the
             # child above (in the child's colour) and one DOWN to the
-            # second parent below (in the second parent's colour).
-            # Drawing an extra horizontal here would push the line
-            # off into empty space (the next lane has no commit at
-            # this row).
+            # second parent below (in the second parent's colour) -
+            # and, when ``direction`` is set, an additional
+            # horizontal segment one lane wide so the connector
+            # reaches the commit-centred vertical pipe without the
+            # ``lane_w / 2`` empty gap that the between-lanes
+            # horizontal alone would leave.
             vert_down_color = color
             vert_up_color = p_color if p else color
             _draw_vert_line(
-                painter, x, y_center, half_h, edge_width, vert_up_color,
-                top_half_h=node_radius, bottom_half_h=0,
+                painter,
+                x,
+                y_center,
+                half_h,
+                edge_width,
+                vert_up_color,
+                top_half_h=node_radius,
+                bottom_half_h=0,
             )
             _draw_vert_line(
-                painter, x, y_center, half_h, edge_width, vert_down_color,
-                top_half_h=0, bottom_half_h=bot_half_h,
+                painter,
+                x,
+                y_center,
+                half_h,
+                edge_width,
+                vert_down_color,
+                top_half_h=0,
+                bottom_half_h=bot_half_h,
             )
+            direction = cell.get("d", 0)
+            if direction:
+                _draw_horiz_line(
+                    painter,
+                    x,
+                    y_center,
+                    lane_w * direction,
+                    edge_width,
+                    color,
+                )
 
 
 def _draw_vert_line(
-    painter: QPainter, x: float, y_center: float,
-    half_h: float, width: float, color: QColor, *, upward_only: bool = False,
+    painter: QPainter,
+    x: float,
+    y_center: float,
+    half_h: float,
+    width: float,
+    color: QColor,
+    *,
+    upward_only: bool = False,
     top_half_h: float | None = None,
     bottom_half_h: float | None = None,
 ) -> None:
@@ -2569,8 +2707,12 @@ def _draw_vert_line(
 
 
 def _draw_horiz_line(
-    painter: QPainter, x: float, y_center: float,
-    lane_w: float, width: float, color: QColor,
+    painter: QPainter,
+    x: float,
+    y_center: float,
+    lane_w: float,
+    width: float,
+    color: QColor,
 ) -> None:
     pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
     painter.setPen(pen)
@@ -2580,8 +2722,12 @@ def _draw_horiz_line(
 
 
 def _draw_branch_right(
-    painter: QPainter, x: float, y_center: float,
-    radius: float, width: float, color: QColor,
+    painter: QPainter,
+    x: float,
+    y_center: float,
+    radius: float,
+    width: float,
+    color: QColor,
 ) -> None:
     """Branch starting here, going down and right (╭)."""
     pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
@@ -2595,8 +2741,12 @@ def _draw_branch_right(
 
 
 def _draw_branch_left(
-    painter: QPainter, x: float, y_center: float,
-    radius: float, width: float, color: QColor,
+    painter: QPainter,
+    x: float,
+    y_center: float,
+    radius: float,
+    width: float,
+    color: QColor,
 ) -> None:
     """Branch starting here, going down and left (╮)."""
     pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
@@ -2610,8 +2760,12 @@ def _draw_branch_left(
 
 
 def _draw_merge_right(
-    painter: QPainter, x: float, y_center: float,
-    radius: float, width: float, color: QColor,
+    painter: QPainter,
+    x: float,
+    y_center: float,
+    radius: float,
+    width: float,
+    color: QColor,
 ) -> None:
     """Merge from below, going up and right (╰)."""
     pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
@@ -2625,8 +2779,12 @@ def _draw_merge_right(
 
 
 def _draw_merge_left(
-    painter: QPainter, x: float, y_center: float,
-    radius: float, width: float, color: QColor,
+    painter: QPainter,
+    x: float,
+    y_center: float,
+    radius: float,
+    width: float,
+    color: QColor,
 ) -> None:
     """Merge from below, going up and left (╯)."""
     pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
@@ -2642,6 +2800,7 @@ def _draw_merge_left(
 # --------------------------------------------------------------------------
 # Row data access helpers
 # --------------------------------------------------------------------------
+
 
 def _row_sha(row: dict) -> str:
     """Extract SHA from a row dict (works with both old and new formats)."""
@@ -2686,6 +2845,8 @@ def _row_color(row: dict) -> QColor:
         return QColor(DARK_THEME.graph_wip)
     ci = row.get("color_index", 0)
     return _cell_color(ci)
+
+
 def _branch_display_name(branch: dict) -> str:
     """Return the user-visible chip label for a branch ref dict.
 
@@ -2724,9 +2885,7 @@ def _suppress_dup_remotes(
     """
     if local_display_names is None:
         local_display_names = {
-            _branch_display_name(b)
-            for b in branch_refs
-            if not b.get("is_remote")
+            _branch_display_name(b) for b in branch_refs if not b.get("is_remote")
         }
     kept: list[dict] = []
     for branch in branch_refs:
@@ -2750,6 +2909,7 @@ def _suppress_dup_remotes(
 # --------------------------------------------------------------------------
 # BranchStackPopup: branch-list dropdown for the "two branches at one commit" UX
 # --------------------------------------------------------------------------
+
 
 class BranchStackPopup(QFrame):
     """Compact floating list of branches that share a commit.
@@ -2813,7 +2973,8 @@ class BranchStackPopup(QFrame):
             layout.addWidget(row)
 
         size_policy = QSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
         )
         self.setSizePolicy(size_policy)
         self.adjustSize()
@@ -3088,9 +3249,7 @@ class BranchStackPopup(QFrame):
                 bg = palette[color_idx]
             else:
                 bg = palette[0]
-            self.setStyleSheet(
-                f"background-color: {bg}; border-radius: 4px;"
-            )
+            self.setStyleSheet(f"background-color: {bg}; border-radius: 4px;")
 
         def mousePressEvent(self, event) -> None:  # noqa: N802
             if event.button() == Qt.MouseButton.LeftButton:
@@ -3108,5 +3267,3 @@ class BranchStackPopup(QFrame):
 
 
 __all__ = ["GraphTableWidget", "RenderConfig", "BranchStackPopup"]
-
-

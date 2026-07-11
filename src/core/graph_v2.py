@@ -24,6 +24,7 @@ Key differences from the old ``graph.py``:
 
 This module is pure Core — no PySide6 imports.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -104,24 +105,24 @@ class CellType(IntEnum):
     """
 
     EMPTY = 0
-    PIPE = 1             # │ vertical line (active lane)
-    COMMIT = 2           # ● commit node
-    BRANCH_RIGHT = 3     # ╭ branch starts, goes right + down
-    BRANCH_LEFT = 4      # ╮ branch starts, goes left + down
-    MERGE_RIGHT = 5      # ╰ merge from right, goes up
-    MERGE_LEFT = 6       # ╯ merge from left, goes up
-    HORIZONTAL = 7       # ─ horizontal line
+    PIPE = 1  # │ vertical line (active lane)
+    COMMIT = 2  # ● commit node
+    BRANCH_RIGHT = 3  # ╭ branch starts, goes right + down
+    BRANCH_LEFT = 4  # ╮ branch starts, goes left + down
+    MERGE_RIGHT = 5  # ╰ merge from right, goes up
+    MERGE_LEFT = 6  # ╯ merge from left, goes up
+    HORIZONTAL = 7  # ─ horizontal line
     HORIZONTAL_PIPE = 8  # ─┼─ horizontal crossing a vertical
-    TEE_RIGHT = 9        # ├ T-junction right
-    TEE_LEFT = 10        # ┤ T-junction left
-    TEE_UP = 11          # ┴ T-junction up (fork middle lane)
-    CROSS = 12           # ┼ cross: horizontal + vertical up + vertical down
-                         # Used at a lane where a child sits above AND a
-                         # second parent sits below (a fork-merge point
-                         # whose child and second parent share the lane).
-                         # The horizontal pipe is the merge connector from
-                         # the merge commit; the vertical pipes pass
-                         # through the cell in both directions.
+    TEE_RIGHT = 9  # ├ T-junction right
+    TEE_LEFT = 10  # ┤ T-junction left
+    TEE_UP = 11  # ┴ T-junction up (fork middle lane)
+    CROSS = 12  # ┼ cross: horizontal + vertical up + vertical down
+    # Used at a lane where a child sits above AND a
+    # second parent sits below (a fork-merge point
+    # whose child and second parent share the lane).
+    # The horizontal pipe is the merge connector from
+    # the merge commit; the vertical pipes pass
+    # through the cell in both directions.
 
 
 @dataclass
@@ -137,6 +138,12 @@ class CellInfo:
     cell_type: CellType
     color_index: int = 0
     pipe_color_index: int = 0
+    direction: int = 0
+    """For ``CROSS`` cells: ``1`` = horizontal extends to the RIGHT
+    (toward the next lane), ``-1`` = to the LEFT (toward the previous
+    lane), ``0`` = no horizontal segment.  Bridges the gap between the
+    commit-centred vertical pipe and the between-lanes horizontal
+    connector — see ``graph_panel._draw_cell_row`` for the renderer."""
 
     def to_dict(self) -> dict:
         d: dict = {"t": int(self.cell_type)}
@@ -154,6 +161,8 @@ class CellInfo:
                 d["p"] = self.pipe_color_index
         else:
             d["c"] = self.color_index
+        if self.cell_type == CellType.CROSS and self.direction:
+            d["d"] = self.direction
         return d
 
     @staticmethod
@@ -205,15 +214,26 @@ class CellInfo:
         return CellInfo(CellType.TEE_UP, color_index=color)
 
     @staticmethod
-    def cross(h_color: int, p_color: int) -> CellInfo:
+    def cross(h_color: int, p_color: int, direction: int = 0) -> CellInfo:
         """Cross-junction (┼): horizontal + vertical up + vertical down.
 
         *h_color* is the horizontal/vertical-down colour (the merge
         connector + the lane continuation down to the second parent).
         *p_color* overrides the vertical-up colour (the pipe to the
         child above).
+        *direction* — ``1`` to extend the horizontal RIGHTWARD by one
+        lane width, ``-1`` to extend LEFTWARD, ``0`` for no horizontal
+        stub.  The renderer in ``graph_panel._draw_cell_row`` uses
+        this to bridge the ``lane_w / 2`` gap between the commit-
+        centred vertical pipe and the between-lanes horizontal
+        connector at the merge commit's row.
         """
-        return CellInfo(CellType.CROSS, color_index=h_color, pipe_color_index=p_color)
+        return CellInfo(
+            CellType.CROSS,
+            color_index=h_color,
+            pipe_color_index=p_color,
+            direction=direction,
+        )
 
 
 @dataclass
@@ -258,6 +278,7 @@ class GraphNode:
 @dataclass
 class GraphLayout:
     """Complete graph layout."""
+
     nodes: list[GraphNode]
     max_lane: int
 
@@ -265,6 +286,7 @@ class GraphLayout:
 # ---------------------------------------------------------------------------
 # ColorAssigner
 # ---------------------------------------------------------------------------
+
 
 class ColorAssigner:
     """Manages allocation of colour indices for graph lanes.
@@ -351,6 +373,7 @@ class ColorAssigner:
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
 
 def build_graph(
     commits: list[CommitInfo],
@@ -457,10 +480,7 @@ def build_graph(
         # below the colour is gone and the CROSS cell would fall
         # back to the second parent's colour, blending the two
         # connections visually.
-        fork_lane_colors: dict[int, int] = {
-            ml: lane_color_index.get(ml, ml)
-            for ml in fork_lanes
-        }
+        fork_lane_colors: dict[int, int] = {ml: lane_color_index.get(ml, ml) for ml in fork_lanes}
         # Track the fork lanes (children lanes) so that, when this
         # commit is also a merge, a second parent landing on one of
         # these lanes can be drawn with a CROSS cell at the
@@ -497,9 +517,8 @@ def build_graph(
                 for child_sha in parent_children.get(commit.sha, []):
                     for n in nodes:
                         if n.commit is not None and n.commit.sha == child_sha and n.lane == cl:
-                            fork_lane_colors[cl] = (
-                                lane_color_index.get(cl)
-                                or oid_color_index.get(child_sha, cl)
+                            fork_lane_colors[cl] = lane_color_index.get(cl) or oid_color_index.get(
+                                child_sha, cl
                             )
                             break
                     if cl in fork_lane_colors:
@@ -520,13 +539,17 @@ def build_graph(
             if main_lane > max_lane:
                 max_lane = main_lane
 
-            main_color = (
-                lane_color_index.get(main_lane)
-                or oid_color_index.get(commit.sha, main_lane)
+            main_color = lane_color_index.get(main_lane) or oid_color_index.get(
+                commit.sha, main_lane
             )
             fork_merging_cells = _build_fork_connector_cells(
-                main_lane, main_color, merging_lanes, lanes,
-                oid_color_index, lane_color_index, max_lane,
+                main_lane,
+                main_color,
+                merging_lanes,
+                lanes,
+                oid_color_index,
+                lane_color_index,
+                max_lane,
             )
 
             for ml, _ in merging_lanes:
@@ -583,19 +606,15 @@ def build_graph(
                 if parent_idx == 0 and parent_sha in fork_points:
                     lanes[lane] = parent_sha
                     main_c = color_assigner.get_main_color()
-                    color = (
-                        main_c if color_assigner.is_main_lane(lane)
-                        else commit_color_index
-                    )
+                    color = main_c if color_assigner.is_main_lane(lane) else commit_color_index
                     fork_sibling_color = color
                     lane_color_index[lane] = color
                     parent_lane = lane
                     was_existing = False
                     parent_color = color
                 else:
-                    color = (
-                        lane_color_index.get(existing_parent_lane)
-                        or oid_color_index.get(parent_sha, existing_parent_lane)
+                    color = lane_color_index.get(existing_parent_lane) or oid_color_index.get(
+                        parent_sha, existing_parent_lane
                     )
                     parent_lane = existing_parent_lane
                     was_existing = True
@@ -628,8 +647,7 @@ def build_graph(
             )
 
         final_color_index = (
-            fork_sibling_color if fork_sibling_color is not None
-            else commit_color_index
+            fork_sibling_color if fork_sibling_color is not None else commit_color_index
         )
 
         # When a commit is BOTH a fork point (has children) AND
@@ -658,8 +676,13 @@ def build_graph(
 
         # Build cells
         cells = _build_row_cells(
-            lane, final_color_index, parent_lanes, lanes,
-            oid_color_index, lane_color_index, max_lane,
+            lane,
+            final_color_index,
+            parent_lanes,
+            lanes,
+            oid_color_index,
+            lane_color_index,
+            max_lane,
             fork_lane_set=fork_lane_set,
             fork_lane_colors=fork_lane_colors,
         )
@@ -682,8 +705,7 @@ def build_graph(
             # Pre-compute the set of lane-centre columns that already
             # have a CROSS cell — those columns must keep the CROSS.
             cross_cols: set[int] = {
-                ci for ci, c in enumerate(cells)
-                if c.cell_type == CellType.CROSS
+                ci for ci, c in enumerate(cells) if c.cell_type == CellType.CROSS
             }
             while len(cells) < len(fork_merging_cells):
                 cells.append(CellInfo.empty())
@@ -695,16 +717,18 @@ def build_graph(
                 cells[fci] = fc
 
         branch_names = oid_to_branches.get(commit.sha, [])
-        is_head = (head_oid is not None and head_oid == commit.sha)
+        is_head = head_oid is not None and head_oid == commit.sha
 
-        nodes.append(GraphNode(
-            commit=commit,
-            lane=lane,
-            color_index=final_color_index,
-            branch_names=branch_names,
-            is_head=is_head,
-            cells=cells,
-        ))
+        nodes.append(
+            GraphNode(
+                commit=commit,
+                lane=lane,
+                color_index=final_color_index,
+                branch_names=branch_names,
+                is_head=is_head,
+                cells=cells,
+            )
+        )
 
         # --- handle lane merging ---
         if lane_merge is not None:
@@ -728,7 +752,7 @@ def build_graph(
             if ending_l < len(lanes):
                 first_parent_on_ending = False
                 if parent_lanes:
-                    first_parent_on_ending = (parent_lanes[0][1] == ending_l)
+                    first_parent_on_ending = parent_lanes[0][1] == ending_l
 
                 if not first_parent_on_ending and not continues_down:
                     if ending_l < len(lanes) and lanes[ending_l] is not None:
@@ -832,14 +856,17 @@ def build_graph(
             uncommitted_cells: list[CellInfo] = [CellInfo.empty() for _ in range(required_cells)]
             uncommitted_cells[uncommitted_lane * 2] = CellInfo.commit(UNCOMMITTED_COLOR_INDEX)
 
-            nodes.insert(0, GraphNode(
-                commit=None,
-                lane=uncommitted_lane,
-                color_index=UNCOMMITTED_COLOR_INDEX,
-                is_uncommitted=True,
-                uncommitted_count=uncommitted_count,
-                cells=uncommitted_cells,
-            ))
+            nodes.insert(
+                0,
+                GraphNode(
+                    commit=None,
+                    lane=uncommitted_lane,
+                    color_index=UNCOMMITTED_COLOR_INDEX,
+                    is_uncommitted=True,
+                    uncommitted_count=uncommitted_count,
+                    cells=uncommitted_cells,
+                ),
+            )
 
     return GraphLayout(nodes=nodes, max_lane=max_lane)
 
@@ -847,6 +874,7 @@ def build_graph(
 # ---------------------------------------------------------------------------
 # Cell building helpers
 # ---------------------------------------------------------------------------
+
 
 def _is_wip_compatible(
     nodes: list[GraphNode],
@@ -915,7 +943,8 @@ def _rebalance_stashes_for_wip(
     # Find stash rows above HEAD whose first parent is HEAD — these are
     # the only stashes the rebalance needs to move.
     stash_indices: list[int] = [
-        i for i in range(head_node_idx)
+        i
+        for i in range(head_node_idx)
         if nodes[i].commit is not None
         and nodes[i].commit.kind == "stash"
         and nodes[i].commit.parents
@@ -936,7 +965,8 @@ def _rebalance_stashes_for_wip(
     # collide with one of these.  Stash lanes are excluded because
     # the rebalance is about to free them.
     used_lanes: set[int] = {
-        nodes[i].lane for i in range(head_node_idx)
+        nodes[i].lane
+        for i in range(head_node_idx)
         if nodes[i].commit is None or nodes[i].commit.kind != "stash"
     }
 
@@ -1017,16 +1047,19 @@ def _rebalance_stashes_for_wip(
     merging_lanes: list[tuple[int, int]] = []
     for i in range(head_node_idx):
         n = nodes[i]
-        if (n.commit is not None
-                and n.commit.parents
-                and n.commit.parents[0] == head_oid):
+        if n.commit is not None and n.commit.parents and n.commit.parents[0] == head_oid:
             merging_lanes.append((n.lane, n.color_index))
     merging_lanes.sort()
 
     active_lanes: list[str | None] = [None] * (new_max_lane + 1)
     fork_cells = _build_fork_connector_cells(
-        head_lane, head_color, merging_lanes, active_lanes,
-        {}, {}, new_max_lane,
+        head_lane,
+        head_color,
+        merging_lanes,
+        active_lanes,
+        {},
+        {},
+        new_max_lane,
     )
 
     # Overlay the fork connector on HEAD's row.  HEAD's PIPE at the
@@ -1090,9 +1123,13 @@ def _build_row_cells(
         cells[commit_cell_idx] = CellInfo.commit(commit_color)
 
     # Connections to parents
-    for parent_idx, (_parent_sha, parent_lane, was_existing, parent_color, already_shown) in (
-        enumerate(parent_lanes)
-    ):
+    for parent_idx, (
+        _parent_sha,
+        parent_lane,
+        was_existing,
+        parent_color,
+        already_shown,
+    ) in enumerate(parent_lanes):
         if parent_lane == commit_lane:
             continue
 
@@ -1103,10 +1140,7 @@ def _build_row_cells(
         # connector reads as horizontal from the commit centre, and
         # the vertical pipes (up to child + down to second parent)
         # stay continuous through the cell.
-        on_fork_lane = (
-            parent_idx >= 1
-            and parent_lane in fork_lane_set
-        )
+        on_fork_lane = parent_idx >= 1 and parent_lane in fork_lane_set
 
         if on_fork_lane:
             end_idx = parent_lane * 2
@@ -1123,7 +1157,17 @@ def _build_row_cells(
                     parent_lane,
                     lane_color_index.get(parent_lane, parent_color),
                 )
-                cells[end_idx] = CellInfo.cross(parent_color, child_color)
+                # Direction of the merge connector at the fork-merge
+                # CROSS cell: extend the horizontal toward the merge
+                # commit so it bridges the ``lane_w / 2`` gap between
+                # the commit-centred vertical pipe and the between-
+                # lanes horizontal at col 1 / col 2*parent_lane-1.
+                cross_dir = -1 if parent_lane > commit_lane else 1
+                cells[end_idx] = CellInfo.cross(
+                    parent_color,
+                    child_color,
+                    direction=cross_dir,
+                )
             # The horizontal connector from the commit lane to this
             # lane is handled by the ``TEE_RIGHT``/``TEE_LEFT`` block
             # below. Continue so we still draw the connector.
@@ -1143,7 +1187,8 @@ def _build_row_cells(
                             existing = cells[col]
                             if existing.cell_type == CellType.PIPE:
                                 cells[col] = CellInfo.horizontal_pipe(
-                                    parent_color, existing.color_index,
+                                    parent_color,
+                                    existing.color_index,
                                 )
                             elif existing.cell_type == CellType.EMPTY:
                                 cells[col] = CellInfo.horizontal(parent_color)
@@ -1161,7 +1206,8 @@ def _build_row_cells(
                             existing = cells[col]
                             if existing.cell_type == CellType.PIPE:
                                 cells[col] = CellInfo.horizontal_pipe(
-                                    parent_color, existing.color_index,
+                                    parent_color,
+                                    existing.color_index,
                                 )
                             elif existing.cell_type == CellType.EMPTY:
                                 cells[col] = CellInfo.horizontal(parent_color)
@@ -1187,7 +1233,8 @@ def _build_row_cells(
                         existing = cells[col]
                         if existing.cell_type == CellType.PIPE:
                             cells[col] = CellInfo.horizontal_pipe(
-                                parent_color, existing.color_index,
+                                parent_color,
+                                existing.color_index,
                             )
                         elif existing.cell_type == CellType.EMPTY:
                             cells[col] = CellInfo.horizontal(parent_color)
@@ -1217,7 +1264,8 @@ def _build_row_cells(
                         existing = cells[col]
                         if existing.cell_type == CellType.PIPE:
                             cells[col] = CellInfo.horizontal_pipe(
-                                parent_color, existing.color_index,
+                                parent_color,
+                                existing.color_index,
                             )
                         elif existing.cell_type == CellType.EMPTY:
                             cells[col] = CellInfo.horizontal(parent_color)
@@ -1253,13 +1301,13 @@ def _build_fork_connector_cells(
     first_merge_color = merging_lanes[0][1] if merging_lanes else main_color
     if main_cell_idx < len(cells):
         if len(merging_lanes) == 1:
-            cells[main_cell_idx] = CellInfo(CellType.TEE_RIGHT,
-                                            color_index=first_merge_color,
-                                            pipe_color_index=main_color)
+            cells[main_cell_idx] = CellInfo(
+                CellType.TEE_RIGHT, color_index=first_merge_color, pipe_color_index=main_color
+            )
         elif len(merging_lanes) >= 2:
-            cells[main_cell_idx] = CellInfo(CellType.TEE_RIGHT,
-                                            color_index=first_merge_color,
-                                            pipe_color_index=main_color)
+            cells[main_cell_idx] = CellInfo(
+                CellType.TEE_RIGHT, color_index=first_merge_color, pipe_color_index=main_color
+            )
         else:
             cells[main_cell_idx] = CellInfo.pipe(main_color)
 
@@ -1273,8 +1321,8 @@ def _build_fork_connector_cells(
 
     prev_lane = main_lane
     for idx, (merge_lane, merge_color) in enumerate(merging_lanes):
-        is_rightmost = (idx == len(merging_lanes) - 1)
-        is_adjacent = (merge_lane == prev_lane + 1)
+        is_rightmost = idx == len(merging_lanes) - 1
+        is_adjacent = merge_lane == prev_lane + 1
 
         # Skip intermediate horizontals for the rightmost merge only
         # when it is adjacent (the previous cell's horizontal already
@@ -1297,9 +1345,9 @@ def _build_fork_connector_cells(
         if end_idx < len(cells):
             if not is_rightmost:
                 next_merge_color = merging_lanes[idx + 1][1]
-                cells[end_idx] = CellInfo(CellType.TEE_UP,
-                                          color_index=next_merge_color,
-                                          pipe_color_index=merge_color)
+                cells[end_idx] = CellInfo(
+                    CellType.TEE_UP, color_index=next_merge_color, pipe_color_index=merge_color
+                )
             else:
                 cells[end_idx] = CellInfo.merge_left(merge_color)
 
@@ -1320,6 +1368,7 @@ def _find_empty_lane(lanes: list[str | None]) -> int | None:
 # Serialisation helpers
 # ---------------------------------------------------------------------------
 
+
 def graph_to_dicts(layout: GraphLayout) -> list[dict]:
     """Serialise a :class:`GraphLayout` to plain dicts for Qt signals."""
     return [n.to_dict() for n in layout.nodes]
@@ -1328,6 +1377,7 @@ def graph_to_dicts(layout: GraphLayout) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Old-graph compatibility: BranchRef + refs/branch_refs helpers
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class BranchRef:
@@ -1374,6 +1424,7 @@ def _build_branch_refs_map(branches: list[BranchInfo]) -> dict[str, list[BranchR
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _subject(message: str) -> str:
     """Return the first non-empty line of *message*, stripped."""

@@ -239,6 +239,31 @@ LeftPanel получил ту же drag-and-drop + context-menu функцион
 
 - **Тесты.** +21 новый тест: `test_three_branches_collapse_to_primary_chip`, `test_three_branches_popup_lists_all_three`, `test_three_branches_render_only_one_visible_chip` (pixel-level), `test_remote_branch_suppressed_when_local_duplicate_exists`, `test_origin_head_remote_is_dropped_from_chip_cache`, `test_drop_on_suppressed_chip_emits_signal`, `test_remote_duplicate_of_local_marks_is_remote_only_false`, `test_branch_popup_lists_all_branches`, `test_branch_popup_row_click_emits_checkout`, `test_branch_popup_closes_on_mouse_leave`, `test_branch_popup_tracks_parent_window_move`, `test_branch_popup_filters_origin_main_and_origin_head`, `test_branch_popup_closes_on_global_mouse_move_outside`, `test_remote_branch_dropped_when_same_name_local_exists` (viewmodel), `test_double_click_on_remote_branch_with_local_confirms_reset` (repurposed в проверку suppression), `test_create_branch_here_emits_signal`, `test_create_branch_from_chip_routes_to_vm`, `test_create_branch_here_inline_editor_opens_and_accepts`, `test_chip_drag_emits_drop_on_chip_menu`, `test_drop_emits_merge_or_rebase_branch_requested`, плюс обновлены 6 существующих тестов для использования remote-only имени `from-upstream` вместо коллизии `origin/main`. Итого **827/827 проходят**, `ruff check` чисто (3 pre-existing ошибки не из этого набора).
 
+### Свежие правки (2026-07-11) — CROSS-`direction`: закрытие зазора у merge-коннектора
+
+Исправлен визуальный дефект на merge-коммитах с дальним вторым родителем: между вертикальной трубой родителя и горизонтальным коннектором оставалось `lane_w / 2 ≈ 11 px` пустоты. Конкретный кейс — `gpt-researcher` `693d3b72 ← b364917f` (merge на lane 14, второй родитель на lane 0): розовая горизонталь «обрывалась» в воздухе, не доходя до вертикали. Полное описание в `docs/MERGE_LANE_FIX.md`.
+
+**Причина.** `CROSS`-ячейка (cross-junction, рисуется в fork-merge кейсе на lane родителя) рисовала только вертикали (`_T_CROSS` блок в `_draw_cell_row`). Горизонталь шла из соседней between-lanes ячейки `HORIZONTAL` / `HORIZONTAL_PIPE` на col `parent_lane * 2 + 1` — её `x = col_left + lane_w / 2` (центр lane), а не `x = col_left` (центр коммита). Между вертикальной трубой CROSS и началом горизонтали — `lane_w / 2` пустоты.
+
+**Решение.** Расширили `CellInfo` полем `direction: int = 0` (только для `CROSS`):
+- `+1` / `-1` — провести горизонталь от центра CROSS-ячейки вправо / влево на ширину `lane_w`;
+- `0` — без дополнительной горизонтали (default, backwards-compatible).
+
+В `_build_row_cells` направление выбирается автоматически: `direction = -1 if parent_lane > commit_lane else 1` (горизонталь тянется в сторону merge-коммита, закрывая зазор между commit-вертикалью и between-lanes-горизонталью). В `_draw_cell_row` (`src/ui/widgets/graph_panel.py`) добавлен вызов `_draw_horiz_line(... lane_w * direction ...)` при `cell["d"] != 0`. Глобальный `_draw_horiz_line` не трогали — расширение локализовано в `CROSS` и не задевает `HORIZONTAL` / `HORIZONTAL_PIPE` в других контекстах (соседние lanes, multi-merge fork connector).
+
+**Что НЕ менялось.** Fork-connector (`_build_fork_connector_cells`), цвета bridge pipe / fork connector (см. «Цвета bridge pipe и fork connector» ниже), существующие cell types (`BRANCH_LEFT` / `BRANCH_RIGHT` / `MERGE_LEFT` / `MERGE_RIGHT` / `TEE_RIGHT` / `TEE_LEFT`) — все они уже рисуют горизонталь, когда это нужно. Меняется только поведение `CROSS`, и только в новых fork-merge кейсах. Backwards-compatible: существующие caller-ы `CellInfo.cross()` без `direction=` аргумента получают `direction=0`, и renderer не рисует дополнительной горизонтали — поведение до фикса сохраняется.
+
+**Файлы.** `src/core/graph_v2.py` (поле `CellInfo.direction`, kw-arg у `CellInfo.cross()`, `to_dict()` сериализует ключ `d`, выбор направления в `_build_row_cells`), `src/ui/widgets/graph_panel.py` (рендер CROSS), `tests/core/test_graph_v2.py` (+3 регрессионных), `simulate_problem.py` (тот же фикс в локальной копии рендерера, чтобы симуляция отражала исправленную картинку). Документация: `docs/MERGE_LANE_FIX.md` (полное описание проблемы, причин и решения), `docs/FEATURES.md` (раздел «CROSS-`direction`: закрытие зазора у fork-merge точки»).
+
+**Тесты.** +3 новых в `tests/core/test_graph_v2.py`:
+- `test_cross_cell_carries_horizontal_direction` — `CROSS` на lane, отличном от merge-lane, несёт правильное направление (`+1` если `parent_lane < commit_lane`, `-1` если `>`); сериализованный `to_dict()` содержит ключ `d`.
+- `test_cross_cell_direction_default_is_zero` — `CellInfo.cross()` без `direction=` аргумента остаётся backwards-compatible (`direction=0`, ключ `d` отсутствует в `to_dict()`).
+- `test_cross_cell_to_dict_omits_direction_when_zero` — `to_dict()` не пишет лишний ключ при явном `direction=0` (минимальный wire-формат).
+
+Итого **70/70** тестов на `tests/core/test_graph_v2.py` + `tests/viewmodels/test_graph_viewmodel.py` проходят, `ruff check` чисто. Pre-existing access-violation падения в `tests/viewmodels/test_main_viewmodel_clipboard.py` и `tests/ui/test_graph_widget.py` к этой правке не относятся (Qt/clipboard mocking на Windows).
+
+**Визуальная проверка.** `python simulate_problem.py` рендерит реальный `gpt-researcher` через `QPainter` (те же примитивы что и `graph_panel.py`) и сохраняет PNG в `%TEMP%\opencode\merge_bend_problem.png` (и `_zoom.png` 4×). До фикса — красная рамка «empty gap (11 px)» на col 0 строки merge. После — зелёная галочка «bend bridged», горизонталь дотягивается до вертикали без зазора.
+
 ### Свежие правки (2026-07-07) — Copy branch name на графе
 
 В графе теперь можно скопировать имя ветки и SHA коммита прямо из контекстного меню branch-chip — симметрично с `LeftPanel`, где эти пункты уже были. Файлы: `src/ui/widgets/graph_panel.py`, `src/ui/main_window.py`, плюс тесты в `tests/ui/test_graph_widget.py`, `tests/ui/test_main_window.py`.

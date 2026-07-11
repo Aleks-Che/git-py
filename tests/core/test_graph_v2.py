@@ -3,6 +3,7 @@
 Exercises :func:`build_graph` with synthetic histories and verifies
 cell contents, lane assignment, colour indices, and fork-point handling.
 """
+
 from __future__ import annotations
 
 import time
@@ -553,7 +554,8 @@ def test_merge_and_fork_on_same_lane_uses_cross_cell() -> None:
     shared_lane = branch_node.lane
 
     cross_cells = [
-        c for ci, c in enumerate(merge_node.cells)
+        c
+        for ci, c in enumerate(merge_node.cells)
         if ci // 2 == shared_lane and c.cell_type == CellType.CROSS
     ]
     non_empty = [
@@ -580,13 +582,115 @@ def test_merge_and_fork_on_same_lane_uses_cross_cell() -> None:
     # CROSS cell.
     commit_lane = merge_node.lane
     lane0_cells = [
-        c for ci, c in enumerate(merge_node.cells)
+        c
+        for ci, c in enumerate(merge_node.cells)
         if ci // 2 == commit_lane and c.cell_type != CellType.EMPTY
     ]
     assert any(c.cell_type in (CellType.TEE_RIGHT, CellType.TEE_LEFT) for c in lane0_cells), (
         f"expected a TEE_RIGHT or TEE_LEFT at the merge commit's "
         f"lane ({commit_lane}); got {[c.cell_type.name for c in lane0_cells]}"
     )
+
+
+def test_cross_cell_carries_horizontal_direction() -> None:
+    """CROSS at the fork-merge point must carry a ``direction`` so the
+    renderer bridges the ``lane_w / 2`` gap between the commit-centred
+    vertical pipe and the between-lanes horizontal connector.
+
+    Regression: ``gpt-researcher`` merge commit ``693d3b72`` has
+    parent[1] ``b364917f`` on lane 0, far to the LEFT of the merge
+    commit's lane (lane 14). The CROSS at lane 0 used to draw only
+    vertical pipes; the horizontal connector started at col 1,
+    ``lane_w / 2`` pixels to the right of the commit vertical, leaving
+    a visible empty gap.  With ``direction = +1`` the renderer now
+    extends the horizontal LEFT-to-RIGHT from the commit vertical to
+    meet the between-lanes horizontal — closing the gap.
+    """
+    # Topology (mirrors gpt-researcher ``b364917f -> 693d3b72``):
+    #
+    #   c_ch0   (lane 0, child of c_merge)        -- keeps lane 0 alive
+    #                                                after the merge so
+    #                                                lane 0 is a fork
+    #                                                lane on c_merge
+    #   c_merge (lane 0, parents=[c_main, c_tip]) -- fork-merge: its
+    #                                                child c_ch0 lives
+    #                                                on lane 0, and
+    #                                                c_tip (parent[1])
+    #                                                also lives on
+    #                                                lane 0 → CROSS at
+    #                                                lane 0 (well to
+    #                                                the LEFT of the
+    #                                                merge commit's
+    #                                                lane if we widen
+    #                                                the graph first)
+    #   c_tip   (lane 0)
+    #   c_main  (lane 0)
+    #
+    # We wedge two extra children on different lanes between c_merge
+    # and c_ch0 so the merge commit ends up on lane 2 (analog of
+    # gpt-researcher's lane 14 — anything > 0 demonstrates the
+    # direction pick).
+    c_main = "1" * 40
+    c_tip = "2" * 40
+    c_merge = "3" * 40
+    c_ch0 = "4" * 40  # child of c_merge on lane 0
+    c_ch1 = "5" * 40  # child of c_merge on lane 1
+    c_ch2 = "6" * 40  # child of c_merge on lane 2
+    commits = [
+        _c(c_ch0, [c_merge], ts=7),
+        _c(c_ch1, [c_merge], ts=6),
+        _c(c_ch2, [c_merge], ts=5),
+        _c(c_merge, [c_main, c_tip], ts=4),
+        _c(c_tip, [], ts=3),
+        _c(c_main, [], ts=2),
+    ]
+    layout = build_graph(commits, [])
+    merge_node = next(n for n in layout.nodes if n.commit.sha == c_merge)
+
+    # Find every CROSS on the merge row.
+    cross_cells = [
+        (ci, c) for ci, c in enumerate(merge_node.cells) if c.cell_type == CellType.CROSS
+    ]
+    assert cross_cells, "expected at least one CROSS cell on the merge row"
+
+    for ci, c in cross_cells:
+        lane = ci // 2
+        if lane < merge_node.lane:
+            assert c.direction == 1, (
+                f"CROSS at lane {lane} (left of merge lane "
+                f"{merge_node.lane}) must carry direction=+1 to bridge "
+                f"the gap between the commit vertical and the "
+                f"between-lanes horizontal; got direction={c.direction}"
+            )
+        elif lane > merge_node.lane:
+            assert c.direction == -1, (
+                f"CROSS at lane {lane} (right of merge lane "
+                f"{merge_node.lane}) must carry direction=-1; got "
+                f"direction={c.direction}"
+            )
+
+    # Serialised form must include the direction key.
+    for _, c in cross_cells:
+        d = c.to_dict()
+        assert "d" in d, f"to_dict() missing 'd' for CROSS with direction={c.direction}"
+        assert d["d"] == c.direction
+
+
+def test_cross_cell_direction_default_is_zero() -> None:
+    """``CellInfo.cross()`` defaults to ``direction=0`` (no horizontal
+    stub) so existing callers that omit the argument stay compatible."""
+    cell = CellInfo.cross(h_color=2, p_color=3)
+    assert cell.cell_type == CellType.CROSS
+    assert cell.direction == 0
+    assert "d" not in cell.to_dict()
+
+
+def test_cross_cell_to_dict_omits_direction_when_zero() -> None:
+    """Even when ``direction`` is explicitly 0, ``to_dict()`` must not
+    emit a redundant ``"d"`` key — keeps the wire format minimal."""
+    cell = CellInfo.cross(h_color=2, p_color=3, direction=0)
+    d = cell.to_dict()
+    assert "d" not in d
 
 
 # ---- fork point (2+ children) -------------------------------------------
@@ -612,8 +716,7 @@ def test_fork_point_connector_row() -> None:
     root_node = nodes[2]
     assert root_node.commit.sha == c1
     has_merge = any(
-        c.cell_type in (CellType.MERGE_LEFT, CellType.MERGE_RIGHT)
-        for c in root_node.cells
+        c.cell_type in (CellType.MERGE_LEFT, CellType.MERGE_RIGHT) for c in root_node.cells
     )
     assert has_merge
 
@@ -698,9 +801,7 @@ def test_fork_keeps_horizontal_connector_when_cross_cell_present() -> None:
 
     # CROSS must be present at lane 1 (shared by c_ch1 above and
     # c_tip below) — that's the GitKraken-style fork-merge marker.
-    cross_present = any(
-        c.cell_type == CellType.CROSS for c in merge_node.cells
-    )
+    cross_present = any(c.cell_type == CellType.CROSS for c in merge_node.cells)
     assert cross_present, (
         "expected a CROSS cell on the merge commit's row to mark "
         "the fork-merge point where c_ch1 (above) and c_tip "
@@ -715,8 +816,7 @@ def test_fork_keeps_horizontal_connector_when_cross_cell_present() -> None:
     # blocks the curve cell at that one lane; everything else is
     # merged in.
     has_horiz = any(
-        c.cell_type in (CellType.HORIZONTAL, CellType.HORIZONTAL_PIPE)
-        for c in merge_node.cells
+        c.cell_type in (CellType.HORIZONTAL, CellType.HORIZONTAL_PIPE) for c in merge_node.cells
     )
     assert has_horiz, (
         "expected fork connector horizontal cells on the merge "
@@ -725,8 +825,7 @@ def test_fork_keeps_horizontal_connector_when_cross_cell_present() -> None:
         "branching readable"
     )
     has_fork_curve = any(
-        c.cell_type in (CellType.TEE_UP, CellType.MERGE_LEFT,
-                        CellType.BRANCH_LEFT)
+        c.cell_type in (CellType.TEE_UP, CellType.MERGE_LEFT, CellType.BRANCH_LEFT)
         for c in merge_node.cells
     )
     assert has_fork_curve, (
@@ -840,8 +939,9 @@ def test_color_assigner_branches_get_different_colors() -> None:
     ]
     layout = build_graph(commits, [])
     colors = {n.commit.sha: n.color_index for n in layout.nodes if n.commit}
-    assert colors[c1] != colors[c2] or colors[c1] != colors[c3], \
-        f"Expected different colors, got {colors}"
+    assert (
+        colors[c1] != colors[c2] or colors[c1] != colors[c3]
+    ), f"Expected different colors, got {colors}"
 
 
 def test_color_palette_accessible() -> None:
@@ -868,11 +968,15 @@ def test_pick_branch_color_is_deterministic_across_runs() -> None:
         assert [_pick_branch_color(n) for n in names] == expected
     import subprocess
     import sys
+
     out = subprocess.check_output(
-        [sys.executable, "-c",
-         "from src.core.graph_v2 import _pick_branch_color as f;"
-         "print(','.join(str(f(n)) for n in "
-         "['main-content','feature/login','release/1.2','Bugfix/Auth','main']))"],
+        [
+            sys.executable,
+            "-c",
+            "from src.core.graph_v2 import _pick_branch_color as f;"
+            "print(','.join(str(f(n)) for n in "
+            "['main-content','feature/login','release/1.2','Bugfix/Auth','main']))",
+        ],
         cwd=".",
         text=True,
     ).strip()
@@ -1004,7 +1108,10 @@ def test_wip_sits_on_main_lane_above_stash() -> None:
     ]
     branches = [_b("main", c1, is_head=True)]
     layout = build_graph(
-        commits, branches, uncommitted_count=2, head_commit_sha=c1,
+        commits,
+        branches,
+        uncommitted_count=2,
+        head_commit_sha=c1,
     )
 
     assert len(layout.nodes) == 4
@@ -1050,7 +1157,10 @@ def test_consecutive_stashes_form_ladder_via_wip_rebalancing() -> None:
     ]
     branches = [_b("main", c1, is_head=True)]
     layout = build_graph(
-        commits, branches, uncommitted_count=1, head_commit_sha=c1,
+        commits,
+        branches,
+        uncommitted_count=1,
+        head_commit_sha=c1,
     )
 
     # [WIP, stash1, stash2, HEAD, parent]
@@ -1100,7 +1210,10 @@ def test_stash_alongside_commit_inherits_main_loop_ladder() -> None:
         _b("feature", feat),
     ]
     layout = build_graph(
-        commits, branches, uncommitted_count=1, head_commit_sha=c1,
+        commits,
+        branches,
+        uncommitted_count=1,
+        head_commit_sha=c1,
     )
 
     # [WIP, stash, feature, HEAD, parent]
@@ -1130,7 +1243,10 @@ def test_stash_below_head_is_not_moved() -> None:
     ]
     branches = [_b("main", c2, is_head=True)]
     layout = build_graph(
-        commits, branches, uncommitted_count=1, head_commit_sha=c2,
+        commits,
+        branches,
+        uncommitted_count=1,
+        head_commit_sha=c2,
     )
 
     # Stash sits on whatever lane the main loop gave it (not above
@@ -1139,10 +1255,7 @@ def test_stash_below_head_is_not_moved() -> None:
     # in any row above HEAD.
     assert layout.nodes[0].is_uncommitted
     assert layout.nodes[0].lane == 0
-    stash = next(
-        n for n in layout.nodes
-        if n.commit is not None and n.commit.kind == "stash"
-    )
+    stash = next(n for n in layout.nodes if n.commit is not None and n.commit.kind == "stash")
     # The stash's parent is c1 (HEAD's parent), so the rebalance
     # never touches it — its lane is whatever the main loop assigned.
     assert stash.commit.parents[0] == c1
@@ -1166,7 +1279,10 @@ def test_wip_compatibility_allows_pipe_at_head_lane() -> None:
     ]
     branches = [_b("main", c1, is_head=True)]
     layout = build_graph(
-        commits, branches, uncommitted_count=1, head_commit_sha=c1,
+        commits,
+        branches,
+        uncommitted_count=1,
+        head_commit_sha=c1,
     )
     # The stash sits on lane 1, so the cell at lane 0 in the stash's
     # row is the PIPE that the WIP insertion adds — and the WIP still
@@ -1196,7 +1312,10 @@ def test_horizontal_across_head_lane_blocks_wip() -> None:
     ]
     branches = [_b("main", c2, is_head=True)]
     layout = build_graph(
-        commits, branches, uncommitted_count=1, head_commit_sha=c2,
+        commits,
+        branches,
+        uncommitted_count=1,
+        head_commit_sha=c2,
     )
     wip = layout.nodes[0]
     # WIP must be inserted somewhere — we only assert the layout is
@@ -1264,8 +1383,9 @@ def test_build_branch_refs_map_filters_invalid_sha_keys() -> None:
     branches_list = [
         BranchInfo(name="main", is_head=True, is_remote=False, target_sha="a" * 40),
         BranchInfo(name="origin/main", is_head=False, is_remote=True, target_sha="a" * 40),
-        BranchInfo(name="origin/HEAD", is_head=False, is_remote=True,
-                   target_sha="refs/remotes/origin/main"),
+        BranchInfo(
+            name="origin/HEAD", is_head=False, is_remote=True, target_sha="refs/remotes/origin/main"
+        ),
         BranchInfo(name="broken", is_head=False, is_remote=False, target_sha=None),
     ]
 
@@ -1350,8 +1470,7 @@ def test_fork_connector_uses_merging_branch_colour() -> None:
         if cell.cell_type == CellType.EMPTY:
             continue
         assert cell.cell_type in (CellType.HORIZONTAL, CellType.HORIZONTAL_PIPE), (
-            f"unexpected cell at col {col} (lane {lane_idx}): "
-            f"{cell.cell_type.name}"
+            f"unexpected cell at col {col} (lane {lane_idx}): " f"{cell.cell_type.name}"
         )
         assert cell.color_index == merge_color, (
             f"{cell.cell_type.name} at col {col} (lane {lane_idx}) "
@@ -1383,11 +1502,16 @@ def test_fork_connector_multiple_merges_keeps_tee_in_first_merge_colour() -> Non
         merging_lanes=[(2, first_merge_color), (4, second_merge_color)],
         active_lanes=["root", None, "m1", None, "m2"],
         oid_color_index={
-            "root": main_color, "m1": first_merge_color, "m2": second_merge_color,
+            "root": main_color,
+            "m1": first_merge_color,
+            "m2": second_merge_color,
         },
         lane_color_index={
-            0: main_color, 1: main_color, 2: first_merge_color,
-            3: main_color, 4: second_merge_color,
+            0: main_color,
+            1: main_color,
+            2: first_merge_color,
+            3: main_color,
+            4: second_merge_color,
         },
         max_lane=4,
     )
