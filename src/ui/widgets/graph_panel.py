@@ -2562,13 +2562,13 @@ def _draw_cell_row(
         elif t == _T_COMMIT:
             _draw_vert_line(painter, x, y_center, node_radius, edge_width, color)
         elif t == _T_BRANCH_RIGHT:
-            _draw_branch_right(painter, x, y_center, bot_half_h, edge_width, color)
+            _draw_branch_right(painter, x, y_center, bot_half_h, edge_width, color, lane_w)
         elif t == _T_BRANCH_LEFT:
-            _draw_branch_left(painter, x, y_center, bot_half_h, edge_width, color)
+            _draw_branch_left(painter, x, y_center, bot_half_h, edge_width, color, lane_w)
         elif t == _T_MERGE_RIGHT:
-            _draw_merge_right(painter, x, y_center, half_h, edge_width, color)
+            _draw_merge_right(painter, x, y_center, half_h, edge_width, color, lane_w)
         elif t == _T_MERGE_LEFT:
-            _draw_merge_left(painter, x, y_center, half_h, edge_width, color)
+            _draw_merge_left(painter, x, y_center, half_h, edge_width, color, lane_w)
         elif t == _T_HORIZONTAL:
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
         elif t == _T_HORIZONTAL_PIPE:
@@ -2728,6 +2728,7 @@ def _draw_branch_right(
     radius: float,
     width: float,
     color: QColor,
+    lane_w: float = 30.0,
 ) -> None:
     """Branch starting here, going down and right (╭)."""
     pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
@@ -2736,7 +2737,12 @@ def _draw_branch_right(
     path = QPainterPath()
     path.moveTo(x, y_center + radius)
     path.lineTo(x, y_center + cr)
-    path.cubicTo(x, y_center, x, y_center, x + cr, y_center)
+    # Extend the curve endpoint to ``x + lane_w / 2`` so the curve
+    # meets the next ``HORIZONTAL`` cell (which starts at ``x +
+    # lane_w / 2`` from the cell centre). Without this, ``cr = 8``
+    # leaves a 7-pixel visible break between the curve endpoint and
+    # the horizontal start.
+    path.cubicTo(x, y_center, x, y_center, x + lane_w / 2, y_center)
     painter.drawPath(path)
 
 
@@ -2747,6 +2753,7 @@ def _draw_branch_left(
     radius: float,
     width: float,
     color: QColor,
+    lane_w: float = 30.0,
 ) -> None:
     """Branch starting here, going down and left (╮)."""
     pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
@@ -2755,7 +2762,10 @@ def _draw_branch_left(
     path = QPainterPath()
     path.moveTo(x, y_center + radius)
     path.lineTo(x, y_center + cr)
-    path.cubicTo(x, y_center, x, y_center, x - cr, y_center)
+    # Mirror of ``_draw_branch_right`` — extend the curve endpoint
+    # to ``x - lane_w / 2`` so it meets the previous ``HORIZONTAL_PIPE``
+    # cell (which extends to ``x`` from its centre).
+    path.cubicTo(x, y_center, x, y_center, x - lane_w / 2, y_center)
     painter.drawPath(path)
 
 
@@ -2766,6 +2776,7 @@ def _draw_merge_right(
     radius: float,
     width: float,
     color: QColor,
+    lane_w: float = 30.0,
 ) -> None:
     """Merge from below, going up and right (╰)."""
     pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
@@ -2774,7 +2785,9 @@ def _draw_merge_right(
     path = QPainterPath()
     path.moveTo(x, y_center - radius)
     path.lineTo(x, y_center - cr)
-    path.cubicTo(x, y_center, x, y_center, x + cr, y_center)
+    # Same curve-extension fix as ``_draw_branch_right`` — extend
+    # the curve endpoint to ``x + lane_w / 2``.
+    path.cubicTo(x, y_center, x, y_center, x + lane_w / 2, y_center)
     painter.drawPath(path)
 
 
@@ -2785,6 +2798,7 @@ def _draw_merge_left(
     radius: float,
     width: float,
     color: QColor,
+    lane_w: float = 30.0,
 ) -> None:
     """Merge from below, going up and left (╯)."""
     pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
@@ -2793,7 +2807,9 @@ def _draw_merge_left(
     path = QPainterPath()
     path.moveTo(x, y_center - radius)
     path.lineTo(x, y_center - cr)
-    path.cubicTo(x, y_center, x, y_center, x - cr, y_center)
+    # Same curve-extension fix as ``_draw_branch_left`` — extend
+    # the curve endpoint to ``x - lane_w / 2``.
+    path.cubicTo(x, y_center, x, y_center, x - lane_w / 2, y_center)
     painter.drawPath(path)
 
 
