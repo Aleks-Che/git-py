@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pygit2
 import pytest
+from PySide6.QtCore import QRect
+from PySide6.QtWidgets import QApplication
 from src.core.repository import RepositoryManager
 from src.ui.main_window import MainWindow
 from src.utils.config import (
@@ -165,24 +167,32 @@ def test_main_window_with_none_config_path_does_not_write_to_disk(
     assert not config_path.exists()
 
 
-def test_main_window_persists_size_on_close(qtbot, tmp_path: Path) -> None:
+def test_main_window_persists_size_on_close(
+    qtbot, tmp_path: Path, large_screen,
+) -> None:
     """After close, the config file holds the window size we set."""
     config_path = tmp_path / "config.json"
     window = _make_window(qtbot, config_path=config_path)
-    # Resize to a recognisable non-default size.
-    window.resize(1500, 900)
+    # Resize to a recognisable non-default size that comfortably
+    # exceeds ``MainWindow``'s 835x334 ``minimumSizeHint`` so Qt
+    # does not snap the window back up to the hint.
+    target_w, target_h = 1000, 700
+    window.resize(target_w, target_h)
     # Qt does not always honour ``resize`` synchronously, so pump
     # events until the size sticks (or the test times out via
     # ``qtbot.waitUntil``).
     qtbot.waitUntil(
-        lambda: window.size().width() == 1500 and window.size().height() == 900,
+        lambda: (
+            window.size().width() == target_w
+            and window.size().height() == target_h
+        ),
         timeout=2000,
     )
     window.close()
     assert config_path.is_file()
     saved = load_window_size(load_config(config_path))
     # The exact width / height we asked for.
-    assert saved == (1500, 900)
+    assert saved == (target_w, target_h)
 
 
 def test_main_window_persists_splitter_sizes_on_close(qtbot, tmp_path: Path) -> None:
@@ -230,14 +240,20 @@ def test_main_window_persists_splitter_sizes_on_close(qtbot, tmp_path: Path) -> 
     assert saved[SPLITTER_KEY_HORIZONTAL] == expected
 
 
-def test_main_window_restores_size_on_next_launch(qtbot, tmp_path: Path) -> None:
+def test_main_window_restores_size_on_next_launch(
+    qtbot, tmp_path: Path, large_screen,
+) -> None:
     """A second ``MainWindow`` from the same config file picks up the saved size."""
     config_path = tmp_path / "config.json"
 
+    target_w, target_h = 1000, 700
     first = _make_window(qtbot, config_path=config_path)
-    first.resize(1500, 900)
+    first.resize(target_w, target_h)
     qtbot.waitUntil(
-        lambda: first.size().width() == 1500 and first.size().height() == 900,
+        lambda: (
+            first.size().width() == target_w
+            and first.size().height() == target_h
+        ),
         timeout=2000,
     )
     first.close()
@@ -246,11 +262,14 @@ def test_main_window_restores_size_on_next_launch(qtbot, tmp_path: Path) -> None
     second = _make_window(qtbot, config_path=config_path)
     try:
         qtbot.waitUntil(
-            lambda: second.size().width() == 1500 and second.size().height() == 900,
+            lambda: (
+                second.size().width() == target_w
+                and second.size().height() == target_h
+            ),
             timeout=2000,
         )
-        assert second.size().width() == 1500
-        assert second.size().height() == 900
+        assert second.size().width() == target_w
+        assert second.size().height() == target_h
     finally:
         second.close()
 
@@ -305,9 +324,16 @@ def test_main_window_restores_splitter_sizes_on_next_launch(
 
 
 def test_main_window_falls_back_to_defaults_when_config_has_bad_values(
-    qtbot, tmp_path: Path,
+    qtbot, tmp_path: Path, large_screen,
 ) -> None:
-    """A corrupted config must not crash the app — defaults are used."""
+    """A corrupted config must not crash the app — defaults are used.
+
+    With screen-aware geometry the default size (1280x800) is
+    clamped to fit the screen, so we assert the window stays inside
+    the available geometry rather than checking for an exact pixel
+    size. The point of the test is that the bad config does not
+    crash the app and the user gets *some* sensible layout.
+    """
     config_path = tmp_path / "config.json"
     # Manually write a corrupt config: bad window_size, partial
     # splitter_sizes. The loaders must ignore the bad bits and
@@ -320,10 +346,16 @@ def test_main_window_falls_back_to_defaults_when_config_has_bad_values(
 
     window = _make_window(qtbot, config_path=config_path)
     try:
-        # Bad window_size → default size from the constructor (the
-        # same value ``__init__`` would use without persistence).
-        assert window.size().width() == 1280
-        assert window.size().height() == 800
+        # Bad window_size → default 1280x800 from the constructor,
+        # clamped to fit the (fake) 1920x1080 screen — i.e. close to
+        # 1280x800 but no smaller than ``_MIN_WIDTH`` / ``_MIN_HEIGHT``.
+        assert window.size().width() >= window._MIN_WIDTH  # noqa: SLF001
+        assert window.size().height() >= window._MIN_HEIGHT  # noqa: SLF001
+        # The window must stay inside the available geometry (the
+        # fake 1920x1080 rect).
+        sw, sh = large_screen.width(), large_screen.height()
+        assert window.size().width() <= sw
+        assert window.size().height() <= sh
         # Bad splitter_sizes → no setSizes() call, default layout.
         assert window._top_splitter is not None  # noqa: SLF001
         assert window._top_splitter.sizes() != [0, 0, 0]
@@ -360,7 +392,7 @@ def test_main_window_close_does_not_lose_other_config_keys(
 
 
 def test_main_window_splitter_drag_persists_after_close(
-    qtbot, tmp_path: Path,
+    qtbot, tmp_path: Path, large_screen,
 ) -> None:
     """End-to-end: resize the window, drag the horizontal splitter, close, reopen.
 
@@ -373,10 +405,14 @@ def test_main_window_splitter_drag_persists_after_close(
     """
     config_path = tmp_path / "config.json"
 
+    target_w, target_h = 1000, 700
     first = _make_window(qtbot, config_path=config_path)
-    first.resize(1500, 900)
+    first.resize(target_w, target_h)
     qtbot.waitUntil(
-        lambda: first.size().width() == 1500 and first.size().height() == 900,
+        lambda: (
+            first.size().width() == target_w
+            and first.size().height() == target_h
+        ),
         timeout=2000,
     )
     qtbot.waitUntil(
@@ -400,7 +436,10 @@ def test_main_window_splitter_drag_persists_after_close(
     second = _make_window(qtbot, config_path=config_path)
     try:
         qtbot.waitUntil(
-            lambda: second.size().width() == 1500 and second.size().height() == 900,
+            lambda: (
+                second.size().width() == target_w
+                and second.size().height() == target_h
+            ),
             timeout=2000,
         )
         qtbot.waitUntil(
@@ -476,3 +515,209 @@ def test_main_window_closing_with_diff_open_preserves_layout(
         assert second._top_splitter.sizes()[0] > 0  # noqa: SLF001
     finally:
         second.close()
+
+
+# ----- screen-aware geometry ---------------------------------------
+
+
+def _screen_geometry() -> tuple[int, int, int, int]:
+    """Return ``(x, y, w, h)`` of the primary screen's available geometry.
+
+    Used by the screen-aware geometry tests to assert the window
+    fits inside the screen and is centered on it. The offscreen Qt
+    platform used in CI still reports a real ``QScreen`` with a
+    default size — we read its actual geometry rather than hard-code
+    a value so the tests work on whatever resolution the runner has.
+    """
+    screen = QApplication.primaryScreen()
+    assert screen is not None, "QApplication has no primary screen"
+    avail = screen.availableGeometry()
+    return avail.x(), avail.y(), avail.width(), avail.height()
+
+
+@pytest.fixture
+def large_screen(monkeypatch):
+    """Make ``primaryScreen().availableGeometry()`` report a 1920x1080 rect.
+
+    The offscreen Qt platform used in CI reports an 800x800 default
+    screen, but :class:`MainWindow`'s ``minimumSizeHint`` is 835x334
+    (driven by menu bar + toolbars + panels). Without a fake screen
+    big enough to fit the minimum size, Qt widens the window past
+    the screen and the screen-aware assertions fail. This fixture
+    installs a 1920x1080 virtual screen for the duration of one test.
+    """
+    fake = QRect(0, 0, 1920, 1080)
+
+    def fake_available(self):  # noqa: ARG001 - bound method
+        return QRect(fake)
+
+    monkeypatch.setattr(
+        type(QApplication.primaryScreen()),
+        "availableGeometry",
+        fake_available,
+    )
+    yield fake
+    # monkeypatch restores the original automatically.
+
+
+def test_apply_screen_aware_geometry_clamps_oversized_window(
+    qtbot, tmp_path: Path,
+) -> None:
+    """A size larger than the screen must be clamped so the window fits.
+
+    Without the clamp, a persisted 4000x2500 size (saved on a 4K
+    monitor) spills off a smaller laptop display and the user cannot
+    reach the title bar. The helper must shrink the window to fit
+    inside ``availableGeometry`` minus a small margin.
+    """
+    window = MainWindow(config_path=tmp_path / "config.json")
+    qtbot.addWidget(window)
+    sx, sy, sw, sh = _screen_geometry()
+    # Use a deliberately oversized request — guaranteed bigger than
+    # any test runner's screen.
+    window._apply_screen_aware_geometry(9999, 9999)  # noqa: SLF001
+    geo = window.geometry()
+    assert geo.width() <= sw
+    assert geo.height() <= sh
+    # The window must stay inside the screen bounds (with the small
+    # margin the helper reserves).
+    assert geo.left() >= sx
+    assert geo.top() >= sy
+    assert geo.right() <= sx + sw
+    assert geo.bottom() <= sy + sh
+    window.close()
+
+
+def test_apply_screen_aware_geometry_centers_window_on_screen(
+    qtbot, tmp_path: Path,
+) -> None:
+    """A normal-sized window must end up centered on the available geometry.
+
+    The helper computes ``x = avail.x() + (avail.width() - w) // 2``
+    (and similarly for ``y``). Within rounding the window's centre
+    must coincide with the screen's centre.
+    """
+    window = MainWindow(config_path=tmp_path / "config.json")
+    qtbot.addWidget(window)
+    sx, sy, sw, sh = _screen_geometry()
+    requested_w = min(800, max(window._MIN_WIDTH, sw - 100))  # noqa: SLF001
+    requested_h = min(600, max(window._MIN_HEIGHT, sh - 100))  # noqa: SLF001
+    window._apply_screen_aware_geometry(requested_w, requested_h)  # noqa: SLF001
+    geo = window.geometry()
+    screen_center_x = sx + sw // 2
+    screen_center_y = sy + sh // 2
+    window_center_x = geo.left() + geo.width() // 2
+    window_center_y = geo.top() + geo.height() // 2
+    assert abs(window_center_x - screen_center_x) <= 1
+    assert abs(window_center_y - screen_center_y) <= 1
+    window.close()
+
+
+def test_apply_screen_aware_geometry_respects_minimum_size(
+    qtbot, tmp_path: Path,
+) -> None:
+    """A request smaller than ``_MIN_WIDTH`` / ``_MIN_HEIGHT`` is raised.
+
+    Defensive floor: a config or test that asks for e.g. 10x10
+    would produce an unusable window. The helper clamps up to the
+    minimum, never down.
+    """
+    window = MainWindow(config_path=tmp_path / "config.json")
+    qtbot.addWidget(window)
+    window._apply_screen_aware_geometry(10, 10)  # noqa: SLF001
+    assert window.width() >= window._MIN_WIDTH  # noqa: SLF001
+    assert window.height() >= window._MIN_HEIGHT  # noqa: SLF001
+    window.close()
+
+
+def test_main_window_clamps_oversized_persisted_size(
+    qtbot, tmp_path: Path, large_screen,
+) -> None:
+    """A huge persisted size must be clamped on the next launch.
+
+    End-to-end regression for the bug: a config written on a 4K
+    monitor (``window_size = [4000, 2500]``) reopens on the
+    current screen without spilling off the edge.
+    """
+    config_path = tmp_path / "config.json"
+    save_config(config_path, {"window_size": [4000, 2500]})
+
+    window = MainWindow(config_path=config_path)
+    qtbot.addWidget(window)
+    window.show()
+    # ``_restore_state`` runs via ``QTimer.singleShot(0)``; wait
+    # until the deferred restore applies the (clamped) geometry.
+    sw, sh = large_screen.width(), large_screen.height()
+    qtbot.waitUntil(
+        lambda: (
+            window.size().width() <= sw
+            and window.size().height() <= sh
+            and window.size().width() >= window._MIN_WIDTH  # noqa: SLF001
+            and window.size().height() >= window._MIN_HEIGHT  # noqa: SLF001
+        ),
+        timeout=2000,
+    )
+    geo = window.geometry()
+    assert geo.width() <= sw
+    assert geo.height() <= sh
+    assert geo.left() >= 0
+    assert geo.top() >= 0
+    window.close()
+
+
+def test_main_window_centers_default_size_on_screen(
+    qtbot, tmp_path: Path, large_screen,
+) -> None:
+    """A fresh ``MainWindow`` (no config) must be centered on screen.
+
+    The constructor calls ``_apply_screen_aware_geometry`` with the
+    default 1280x800, so the window appears centered even before
+    ``_restore_state`` fires.
+    """
+    window = MainWindow(config_path=tmp_path / "config.json")
+    qtbot.addWidget(window)
+    window.show()
+    sw, sh = large_screen.width(), large_screen.height()
+    screen_center_x = sw // 2
+    screen_center_y = sh // 2
+    # Window may not be fully laid out yet; assert within a couple
+    # of pixels (Qt rounds the centred position).
+    qtbot.waitUntil(
+        lambda: abs(
+            (window.geometry().left() + window.geometry().width() // 2)
+            - screen_center_x,
+        ) <= 2 and abs(
+            (window.geometry().top() + window.geometry().height() // 2)
+            - screen_center_y,
+        ) <= 2,
+        timeout=2000,
+    )
+    window.close()
+
+
+def test_screen_changed_re_clamps_window(qtbot, tmp_path: Path) -> None:
+    """A screen topology change must re-clamp + re-center the window.
+
+    ``MainWindow`` connects to ``QApplication.screenAdded`` /
+    ``screenRemoved`` in its constructor. We exercise the slot
+    directly because emitting a fake ``screenRemoved`` in a unit
+    test would mutate the global ``QApplication`` state and affect
+    other tests in the same process.
+    """
+    window = MainWindow(config_path=tmp_path / "config.json")
+    qtbot.addWidget(window)
+    window.resize(window._MIN_WIDTH + 10, window._MIN_HEIGHT + 10)  # noqa: SLF001
+    # Stretch the window past the screen so the callback has work
+    # to do.
+    window._apply_screen_aware_geometry(9999, 9999)  # noqa: SLF001
+    sx, sy, sw, sh = _screen_geometry()
+    # The slot is what ``QApplication.screenAdded`` /
+    # ``screenRemoved`` invoke; calling it directly has the same
+    # effect as a runtime screen topology change.
+    window._on_screen_changed(None)  # noqa: SLF001
+    geo = window.geometry()
+    assert geo.width() <= sw
+    assert geo.height() <= sh
+    assert geo.left() >= sx
+    assert geo.top() >= sy
+    window.close()

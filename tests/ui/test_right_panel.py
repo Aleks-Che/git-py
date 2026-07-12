@@ -313,6 +313,97 @@ def test_commit_detail_panel_showing_new_commit_clears_selection(
     assert detail.selected_file() is None
 
 
+# ----- commit-detail author avatar ---------------------------------------
+
+
+def test_commit_detail_panel_shows_square_avatar_for_author(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The detail panel renders a square author avatar to the left of
+    the info block, sized to match two lines of the info font."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = RightPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    vm.select_commit(head_sha)
+    detail = panel._commit_detail
+
+    avatar_label = detail._avatar_label  # noqa: SLF001
+    assert avatar_label.isVisible()
+    pix = avatar_label.pixmap()
+    assert pix is not None
+    # Square: width == height, and equals the badge widget's size.
+    expected = detail._avatar_size  # noqa: SLF001
+    assert pix.width() == expected
+    assert pix.height() == expected
+    assert avatar_label.width() == expected
+    assert avatar_label.height() == expected
+    # Height must equal roughly two text lines of the info font.
+    from PySide6.QtGui import QFontMetrics
+    two_lines = QFontMetrics(detail._info.font()).height() * 2  # noqa: SLF001
+    assert expected == two_lines
+
+
+def test_commit_detail_avatar_uses_author_email_as_seed(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The pixmap is keyed by the author email — same email produces
+    a pixmap identical to a freshly-built one. This guards against
+    regressions where the panel renders the avatar from a different
+    seed than the rest of the UI."""
+    from src.utils.avatar import make_avatar_pixmap
+
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = RightPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    # Without a selected commit the badge is hidden — verify that.
+    detail = panel._commit_detail
+    assert not detail._avatar_label.isVisible()  # noqa: SLF001
+
+    # Select a real commit; the badge should now show the author's
+    # identicon rendered from the same algorithm.
+    head_sha = mgr.head_commit.sha
+    vm.select_commit(head_sha)
+
+    info = mgr.get_commit(head_sha)
+    seed = info.author_email or info.author_name
+    assert seed, "fixture should produce an author email or name"
+
+    rendered_img = detail._avatar_label.pixmap().toImage()  # noqa: SLF001
+    expected_img = make_avatar_pixmap(
+        seed, detail._avatar_size,  # noqa: SLF001
+    ).toImage()
+    # Comparing raw image data avoids any dependence on QPixmap cache identity.
+    assert bytes(rendered_img.bits()) == bytes(expected_img.bits())
+
+
+def test_commit_detail_avatar_hides_in_empty_state(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Without a selected commit the avatar badge is hidden so the
+    "Select a commit" placeholder does not show a dangling image."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = RightPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+
+    detail = panel._commit_detail
+    # The empty state is the starting state.
+    detail.clear()
+    assert not detail._avatar_label.isVisible()  # noqa: SLF001
+    assert detail._avatar_label.pixmap().isNull()  # noqa: SLF001
+
+
 # ----- commit-detail file context menu (right-click) -------------------
 
 
@@ -652,6 +743,59 @@ def test_commit_detail_panel_clears_selection_on_hide(
 
     window._main_vm.select_commit(WIP_SHA)
     assert window._graph_stack.currentIndex() == 0
+
+
+def test_stash_push_closes_open_diff(qtbot, tmp_git_repo: Path) -> None:
+    """User-reported regression: clicking *Stash Changes* while a
+    file's diff is open in the centre column must close the diff.
+
+    Before the fix the diff view stayed open even though the file
+    list in the right panel was emptied by the stash, leaving the
+    user no way to dismiss the diff.
+    """
+    mgr = _make_dirty_repo(tmp_git_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(WIP_SHA)
+
+    cp_vm = window._main_vm.commit_panel_view_model()
+    cp_vm.select_file("f.txt")
+    assert window._diff_view.isVisible()
+    assert window._graph_stack.currentIndex() == 1
+
+    # Run the stash verb the same way the toolbar / menu does.
+    window._main_vm.stash_push("WIP")
+
+    # After the stash the working tree is clean, the file list in
+    # the right panel is empty, and the diff must therefore close.
+    assert cp_vm.file_changes() == []
+    assert not window._diff_view.isVisible()
+    assert window._graph_stack.currentIndex() == 0
+    assert cp_vm.selected_file() is None
+
+
+def test_discard_all_closes_open_diff(qtbot, tmp_git_repo: Path) -> None:
+    """Same defensive guarantee for *Discard All Changes*: any
+    operation that empties the file list while a diff is open must
+    close the diff too."""
+    mgr = _make_dirty_repo(tmp_git_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(WIP_SHA)
+
+    cp_vm = window._main_vm.commit_panel_view_model()
+    cp_vm.select_file("f.txt")
+    assert window._diff_view.isVisible()
+
+    window._main_vm.discard_changes()
+
+    assert cp_vm.file_changes() == []
+    assert not window._diff_view.isVisible()
+    assert cp_vm.selected_file() is None
 
 
 # ----- left panel hide / show on diff ---------------------------------

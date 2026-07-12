@@ -123,6 +123,87 @@ def test_refresh_status_distinguishes_staged_vs_unstaged_modified(
     assert "hello.txt" not in vm.staged_files()
 
 
+def test_refresh_status_clears_selection_when_file_disappears(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """If the user had a file selected for diff preview and the next
+    ``refresh_status`` finds it gone (e.g. after Stash Changes empties
+    the working tree), the selection must be cleared so the diff view
+    in the centre column also closes.
+
+    Without this the user is stuck looking at a diff whose source
+    file is no longer in the right-panel list and so has no
+    UI affordance to dismiss.
+    """
+    _ensure_app()
+    from pathlib import Path
+
+    worktree = Path(committed_repo.path)
+    # Make the file dirty so the user has something to click.
+    (worktree / "hello.txt").write_text("hello, world!\n")
+    vm = CommitPanelViewModel()
+    vm.set_repository(committed_repo)
+    vm.select_file("hello.txt")
+    assert vm.selected_file() == "hello.txt"
+
+    # Simulate the post-stash state: revert the working tree to HEAD
+    # (the fixture's ``committed_repo`` second commit has
+    # ``"hello, world\n"`` as its tree content).
+    (worktree / "hello.txt").write_text("hello, world\n")
+    vm.refresh_status()
+
+    assert vm.file_changes() == []
+    assert vm.selected_file() is None
+    assert vm.current_diff() == ""
+
+
+def test_refresh_status_keeps_selection_when_file_still_present(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """A refresh that still finds the selected file in the new
+    status must NOT clear the selection — the diff is still
+    relevant (e.g. user edited the file again, status is just
+    being re-read)."""
+    _ensure_app()
+    from pathlib import Path
+
+    worktree = Path(committed_repo.path)
+    (worktree / "hello.txt").write_text("hello, world!\n")
+    vm = CommitPanelViewModel()
+    vm.set_repository(committed_repo)
+    vm.select_file("hello.txt")
+    assert vm.selected_file() == "hello.txt"
+
+    # File is still modified, just with different content.
+    (worktree / "hello.txt").write_text("hello, world!!\n")
+    vm.refresh_status()
+
+    assert vm.selected_file() == "hello.txt"
+
+
+def test_refresh_status_clears_selection_after_partial_discard(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """Discarding only one tracked file must also clear its diff
+    selection when the refresh finds the file gone (the user
+    discarded the file from the worktree, so it is no longer
+    in the status list)."""
+    _ensure_app()
+    from pathlib import Path
+
+    worktree = Path(committed_repo.path)
+    (worktree / "hello.txt").write_text("hello, changed\n")
+    vm = CommitPanelViewModel()
+    vm.set_repository(committed_repo)
+    vm.select_file("hello.txt")
+
+    # Simulate the post-discard state on disk: file matches HEAD.
+    (worktree / "hello.txt").write_text("hello, world\n")
+    vm.refresh_status()
+
+    assert vm.selected_file() is None
+
+
 # ----- stage_file / unstage_file -----------------------------------------
 
 

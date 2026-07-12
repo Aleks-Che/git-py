@@ -26,6 +26,7 @@ from PySide6.QtCore import QRect, QSize, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter
 from PySide6.QtWidgets import (
     QFrame,
+    QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -48,6 +49,7 @@ from src.ui.widgets.file_list_model import (
     STATUS_BADGE,
     STATUS_TOOLTIP,
 )
+from src.utils.avatar import make_avatar_pixmap
 from src.viewmodels.main_viewmodel import MainViewModel
 
 # Status badge + path colours are imported from :mod:`file_list_model`
@@ -221,8 +223,38 @@ class CommitDetailPanel(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse
             | Qt.TextInteractionFlag.TextSelectableByKeyboard,
         )
-        self._info.setStyleSheet("color: #8B8B8B; font-size: 11px; padding: 2px 0;")
+        self._info.setStyleSheet("color: #8B8B8B; font-size: 11px; padding: 0;")
         self._info.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+
+        # --- author avatar badge (square, height = 2 info-text lines) ---
+        # Sits to the left of the info block. The avatar is rendered by
+        # the same identicon helper that powers the graph-node chips so
+        # the same author is rendered identically everywhere — only
+        # the shape/clip differs (square here, circular inside the
+        # graph node circle). The actual badge size is computed lazily
+        # in :meth:`_set_avatar_for` because the info stylesheet
+        # (font-size: 11px) only resolves after the panel is shown —
+        # measuring in ``_build_ui`` would lock the size to the
+        # pre-show default font.
+        self._avatar_size = 0
+        self._avatar_label = QLabel(self)
+        self._avatar_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._avatar_label.setVisible(False)
+        # Cached per-call so repeated renders of the same commit do
+        # not regenerate the pixmap. Keyed by (seed, size, shape).
+        self._avatar_cache: dict[tuple[str, int, str], object] = {}
+
+        info_row = QWidget()
+        info_row_layout = QHBoxLayout(info_row)
+        info_row_layout.setContentsMargins(0, 0, 0, 0)
+        # Tight spacing (5 px) keeps the avatar and the first text line
+        # visually connected; the previous 8 px was wide enough to read
+        # as a divider rather than a margin between badge and label.
+        info_row_layout.setSpacing(5)
+        info_row_layout.addWidget(
+            self._avatar_label, 0, Qt.AlignmentFlag.AlignTop,
+        )
+        info_row_layout.addWidget(self._info, 1)
 
         # --- changed files ---
         self._files_header = QLabel("Changed Files (0)", self)
@@ -251,7 +283,7 @@ class CommitDetailPanel(QWidget):
         top_layout.addWidget(self._message)
         top_layout.addWidget(self._body_scroll, stretch=1)
         top_layout.addSpacing(6)
-        top_layout.addWidget(self._info)
+        top_layout.addWidget(info_row)
         top_layout.addStretch()
 
         files_container = QWidget()
@@ -356,6 +388,8 @@ class CommitDetailPanel(QWidget):
         self._body_scroll.verticalScrollBar().setValue(0)
         self._body_scroll.setVisible(False)
         self._info.clear()
+        self._avatar_label.clear()
+        self._avatar_label.setVisible(False)
         self._files_header.setText("Changed Files (0)")
         self._files.clear()
 
@@ -388,6 +422,7 @@ class CommitDetailPanel(QWidget):
             self._body_scroll.setVisible(False)
 
         self._info.setText(_format_info(info))
+        self._set_avatar_for(info)
 
         # File list.
         self._files.clear()
@@ -398,6 +433,35 @@ class CommitDetailPanel(QWidget):
             if len(changes) != 1
             else "Changed Files (1)",
         )
+
+    def _set_avatar_for(self, info: CommitInfo) -> None:
+        """Render and display the author avatar next to the info block.
+
+        The avatar uses the same identicon algorithm as the graph-node
+        chips so the same author is recognisable across the UI. The
+        ``square`` shape (rounded-corner square) is used here; the
+        graph-node interior uses ``circle``. The pixmap is cached on
+        ``self._avatar_cache`` so re-renders of the same commit skip
+        the painter work.
+        """
+        seed = info.author_email or info.author_name or "?"
+        # Re-measure the info font here — the stylesheet only resolves
+        # after the panel is shown, and we want the badge height to
+        # match the actual rendered line height (not the pre-show
+        # default font).
+        line_height = QFontMetrics(self._info.font()).height()
+        size = line_height * 2
+        if size != self._avatar_size:
+            self._avatar_size = size
+            self._avatar_label.setFixedSize(size, size)
+        shape = "square"
+        cache_key = (seed, size, shape)
+        pix = self._avatar_cache.get(cache_key)
+        if pix is None:
+            pix = make_avatar_pixmap(seed, size, shape=shape)
+            self._avatar_cache[cache_key] = pix
+        self._avatar_label.setPixmap(pix)
+        self._avatar_label.setVisible(True)
 
     def _append_change_item(self, change: FileChange) -> None:
         item = QListWidgetItem(self._files)
