@@ -952,6 +952,18 @@ def test_color_palette_accessible() -> None:
         assert len(c) == 7
 
 
+def test_uncommitted_color_index_is_outside_palette() -> None:
+    """``UNCOMMITTED_COLOR_INDEX`` must not collide with a regular
+    palette index.  The WIP marker needs a reserved index that
+    ``crc32(name) % len(BRANCH_PALETTE)`` can never produce.
+    """
+    assert UNCOMMITTED_COLOR_INDEX >= len(BRANCH_PALETTE), (
+        f"UNCOMMITTED_COLOR_INDEX={UNCOMMITTED_COLOR_INDEX} sits inside "
+        f"BRANCH_PALETTE (size {len(BRANCH_PALETTE)}) — a regular branch "
+        f"hash could land on it and be misrendered as the WIP marker"
+    )
+
+
 def test_pick_branch_color_is_deterministic_across_runs() -> None:
     """Branch colours must be stable across process restarts.
 

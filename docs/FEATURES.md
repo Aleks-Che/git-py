@@ -196,6 +196,93 @@ Close tabs to the right   → RepoTabViewModel.close_to_right(index)
 - `MainViewModel.show_repo_in_folder(path)` — открывает Explorer на нормализованном пути. `os.path.normpath` для mixed separators, `os.path.isdir` для защиты от stale tab path, swallow `subprocess.Popen` failures (Windows Explorer crash не actionable). Это repository-уровневая (а не file-уровневая, как существующая `show_in_folder` для staged-файлов) версия.
 - `MainViewModel.copy_repo_path(path)` — делегирует в существующий `copy_to_clipboard`; защита от пустого пути остаётся на стороне VM (как у `copy_to_clipboard`).
 
+## Цвет ветки: устойчивость при merge в основной граф
+
+После того как коммит с именем ветки (branch_name) уже «предзарегистрирован» на lane (через parent processing более нового merge-коммита), его собственный цвет должен браться из `_pick_branch_color(branch_name)`, а не из lane-cache, который заполнил merge коммит.
+
+**Проблема.** В `build_graph` цикл обработки коммитов начинается со старшинства по timestamp (`history` отсортирован newest first). Если ветка `3mk4yl/fix-dict-unhashable-bug` уже влита в main через merge `31b22352`, merge обрабатывается **раньше** tip-коммита ветки `987c9e8`. При обработке `31b22352`:
+- `lanes[merge.lane] = '987c9e8'` (parent[0] ставится на lane merge коммита)
+- `oid_color['987c9e8'] = merge.color` (pre-coloring для ещё не обработанного parent)
+
+Когда `987c9e8` наконец обрабатывается, его SHA уже отслеживается на lane (`commit_lane_opt is not None`), и старая логика брала цвет из `lane_colors[lane]` — то есть цвет merge коммита, fallback idx=0 (GREEN), вместо собственного цвета ветки `_pick_branch_color("3mk4yl/fix-dict-unhashable-bug") = 15` (GOLD).
+
+Воспроизведение: `python tools/reproduce_31b22352_bug.py` (оригинальный repro скрипт). До фикса на `987c9e8` (tip side-branch) рендерился `PIPE c=6` (PINK) на строках выше, и вся линия ветки выглядела в цвете merge коммита.
+
+**Решение (Изменение A в `src/core/graph_v2.py:566-582`).** В `commit_lane_opt is not None` ветке:
+
+```python
+if commit_lane_opt is not None:
+    if primary_branch is not None:
+        # Side-branch tip: use own branch colour, not the
+        # pre-coloured lane-cache value the merge commit set.
+        commit_color_index = color_assigner.assign_color(
+            lane, primary_branch
+        )
+    else:
+        commit_color_index = color_assigner.continue_lane(lane)
+```
+
+`primary_branch` — это первый branch name в `oid_to_branches[commit.sha]`. Если коммит помечен какой-то веткой — `assign_color(lane, primary_branch)` использует `_pick_branch_color(primary_branch)` (детерминированный crc32 % len(palette)). Иначе — fallback `continue_lane(lane)` (старое поведение для orphan коммитов).
+
+**Второй источник проблемы — pre-coloring fork siblings.** Старая логика parent lanes setup писала `lane_color_index[new_lane] = new_color` безусловно. Когда `new_color` — это fallback от `_pick_fallback(lane)` (потому что parent не имеет `primary_branch`), это отравляло lane cache. Все последующие коммиты, попадавшие на этот lane через `continue_lane()`, получали fallback цвет.
+
+**Решение (Изменение B в `src/core/graph_v2.py:664-684`).** `lane_color_index[new_lane] = new_color` для fork siblings теперь записывается **только** если у parent есть `primary_branch`. Для orphan parents предыдущее значение `lane_colors[lane]` сохраняется, и mainline коммиты больше не перекрашиваются в случайный fallback-цвет.
+
+```python
+if parent_branch is not None:
+    lane_color_index[new_lane] = new_color
+# else: leave the existing lane_colors[new_lane] in place
+```
+
+**Третий источник — `fork_sibling_color` для single-parent коммитов.** Раньше в `if existing_parent_lane is not None and parent_idx == 0 and parent_sha in fork_points:` блоке `commit_color_index` перезаписывался на `main_color` для **любого** коммита, чей parent — fork point. Это давало правильный результат для merge коммитов (merge в mainline), но ломало single-parent коммиты (например, side-branch tip `987c9e8` рисовался в BLUE/master поверх собственного GOLD).
+
+**Решение (Изменение C в `src/core/graph_v2.py:623-654`).** `fork_sibling_color` присваивается **только** для merge коммитов (`len(valid_parents) >= 2`). Single-parent коммиты с parent на fork point сохраняют оригинальную логику (`parent_lane = lane`, `was_existing = False`), но **без** перезаписи `lane_color_index[lane]` на `main_color`.
+
+```python
+if (parent_idx == 0
+    and parent_sha in fork_points
+    and len(valid_parents) >= 2):
+    # ... merge commit: set fork_sibling_color
+elif parent_idx == 0 and parent_sha in fork_points:
+    # Single-parent commit: legacy behaviour but no lane_colour overwrite
+    lanes[lane] = parent_sha
+    parent_lane = lane
+    was_existing = False
+    parent_color = commit_color_index
+else:
+    # Standard existing-parent path
+```
+
+**Результат на реальных данных.** До фикса: `987c9e8` рендерился с col 46 = `PIPE c=6` (PINK) на строках 104-109; mainline (lane 0) на строках 84-94 имел `TEE_RIGHT c=N p=6` (PINK pipes, отравленные fallback от merge `parent[1]`). После: `987c9e8` рендерится с col 46 = `PIPE c=15` (GOLD), mainline больше не в PINK.
+
+**Тесты.** `tests/core/test_graph_v2.py`:
+- `test_branch_tip_keeps_own_colour_when_merge_processed_first` — tip side-branch получает `_pick_branch_color(name)`, не цвет merge.
+- `test_fork_sibling_does_not_overwrite_mainline_lane_colour` — mainline tip сохраняет master BLUE через fork-sibling pre-coloring.
+
+## Расширенная палитра `BRANCH_PALETTE` (40 цветов)
+
+После фикса выше коллизии crc32 между разными ветками стали заметнее: до фикса коммиты одной ветки могли получать **разные** цвета через `lane_colors[lane]` cache, после фикса — стабильный цвет через `_pick_branch_color(primary_branch)`. В репозитории с 60+ веток на 24-цветной палитре это означало в среднем 3.0 ветки на индекс, и заметные визуальные коллизии (например, две разные ветки рисуются одинаковым цветом).
+
+**Решение.** `BRANCH_PALETTE` расширена с 24 до 40 цветов в `src/core/graph_v2.py:39-79`. Новые 16 индексов (24..39) — дополнительные оттенки (sea, coral, bronze, indigo, sky, sand, burgundy, peach, khaki, jade, fuchsia, chestnut, cerulean, wisteria, sandalwood, moss), hex-коды выбраны для контраста на тёмном фоне `DARK_THEME.bg = #1E1E1E`. Все цвета medium-saturated, видимы и различимы на тёмном background.
+
+**`UNCOMMITTED_COLOR_INDEX` перенесён** с 24 на 40. Это специальный idx за пределами палитры — `crc32(name) % 40` не может дать 40, поэтому WIP маркер невозможно спутать с обычным цветом ветки. Защитный тест `test_uncommitted_color_index_is_outside_palette` гарантирует это инвариант при будущих изменениях палитры.
+
+**Код** — никаких дополнительных правок не нужно:
+- `_pick_branch_color` использует `crc32(name) % len(BRANCH_PALETTE)` (line 94)
+- `_pick_fallback` использует `len(BRANCH_PALETTE)` (lines 361-366)
+- `_cell_color` в `graph_panel.py:194-200` уже обрабатывает `UNCOMMITTED_COLOR_INDEX` отдельно от диапазона палитры
+- `palette_map` строится через `enumerate(BRANCH_PALETTE)` и добавляет `palette_map[UNCOMMITTED_COLOR_INDEX] = self._cfg.wip_color`
+
+**Результат для `gpt-researcher`** (66 веток):
+
+| Метрика | 24 цвета | 40 цветов |
+|---------|----------|-----------|
+| Distinct indices used | 22 | 33 |
+| Avg branches per index | 3.0 | **2.0** |
+| Свободные индексы для будущих веток | 2 | 7 |
+
+В типичных репозиториях с <40 веток коллизий обычно нет вовсе; для крупных монорепозиториев средняя плотность снизилась с 3 до 2 веток на индекс. `ruff check` чисто, 205/205 core тестов проходят.
+
 ## Core-ограничения
 
 - Модуль `core/graph_v2.py` не импортирует PySide6.

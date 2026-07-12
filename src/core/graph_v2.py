@@ -33,8 +33,12 @@ from zlib import crc32
 
 from src.core.models import BranchInfo, CommitInfo
 
-UNCOMMITTED_COLOR_INDEX: int = 24
-"""Special colour index reserved for the uncommitted-changes node."""
+UNCOMMITTED_COLOR_INDEX: int = 40
+"""Special colour index reserved for the uncommitted-changes node.
+
+One past the end of :data:`BRANCH_PALETTE` so that a regular branch
+hash can never collide with the WIP marker.
+"""
 
 BRANCH_PALETTE: tuple[str, ...] = (
     "#1A5924",  # 0   green
@@ -61,8 +65,26 @@ BRANCH_PALETTE: tuple[str, ...] = (
     "#595F6B",  # 21  slate
     "#7C5E9E",  # 22  lilac
     "#41804A",  # 23  pine
+    # --- extended palette (24..39): added in 2026-07 to reduce
+    # crc32 % 24 collisions in repositories with 60+ branches.
+    "#0F4D5C",  # 24  sea
+    "#D05B3F",  # 25  coral
+    "#9A7B3A",  # 26  bronze
+    "#3A4F8C",  # 27  indigo
+    "#5BA8C9",  # 28  sky
+    "#B8945C",  # 29  sand
+    "#7A2E3F",  # 30  burgundy
+    "#E8956C",  # 31  peach
+    "#A89968",  # 32  khaki
+    "#3F8C73",  # 33  jade
+    "#A8478B",  # 34  fuchsia
+    "#8B5A3C",  # 35  chestnut
+    "#2680B0",  # 36  cerulean
+    "#9A7CB0",  # 37  wisteria
+    "#C4845A",  # 38  sandalwood
+    "#5C8C42",  # 39  moss
 )
-"""24-colour palette used by :class:`ColorAssigner` and the widget layer."""
+"""40-colour palette used by :class:`ColorAssigner` and the widget layer."""
 
 # Hardcoded overrides ensure that important branches always get the same
 # well-known colours, regardless of which repository is open.

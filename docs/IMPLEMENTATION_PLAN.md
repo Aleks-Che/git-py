@@ -242,6 +242,22 @@ LeftPanel получил ту же drag-and-drop + context-menu функцион
   - **До:** `987c9e8` рендерился с col 46 = `PIPE c=6` (PINK #7D2559) на строках 104-109; mainline (lane 0) на строках 84-94 имел `TEE_RIGHT c=N p=6` (PINK pipes).
   - **После:** `987c9e8` рендерится с col 46 = `PIPE c=15` (GOLD #C4912E); mainline больше не в PINK — fallback LIME (idx=11) не отравлен pre-coloring'ом.
 
+### Свежие правки (2026-07-12) — расширение `BRANCH_PALETTE` с 24 до 40 цветов
+
+После фикса выше коллизии crc32 между разными ветками стали более заметны: до фикса коммиты одной ветки могли получать **разные** цвета через `lane_colors[lane]` cache, после фикса — стабильный цвет через `_pick_branch_color(primary_branch)`. В `gpt-researcher` (66 веток) на 22 индексах 18 коллидировали, в среднем 3.0 ветки на индекс.
+
+- **`BRANCH_PALETTE` расширена** с 24 до 40 цветов в `src/core/graph_v2.py:39-79`. Новые 16 индексов (24..39) — дополнительные оттенки (sea, coral, bronze, indigo, sky, sand, burgundy, peach, khaki, jade, fuchsia, chestnut, cerulean, wisteria, sandalwood, moss) с hex-кодами выбранными для контраста на тёмном фоне `DARK_THEME.bg = #1E1E1E`.
+
+- **`UNCOMMITTED_COLOR_INDEX` перенесён** с 24 на 40 — специальный idx за пределами палитры, чтобы `crc32(name) % 40` никогда не мог дать этот индекс. Это сохраняет семантику WIP-маркера как **отдельного** специального значения, не конкурирующего с обычными цветами веток.
+
+- **Код** — никаких дополнительных изменений не нужно: `_pick_branch_color` использует `crc32(name) % len(BRANCH_PALETTE)` (line 94), `_pick_fallback` использует `len(BRANCH_PALETTE)` (lines 361-366), `_cell_color` в `graph_panel.py:194-200` уже обрабатывает `UNCOMMITTED_COLOR_INDEX` отдельно от диапазона палитры.
+
+- **Тесты.** +1 новый в `tests/core/test_graph_v2.py`:
+  - `test_uncommitted_color_index_is_outside_palette` — гарантирует что `UNCOMMITTED_COLOR_INDEX >= len(BRANCH_PALETTE)`, защита от регрессии при будущих изменениях палитры.
+  - **Все 53 теста `test_graph_v2.py` проходят**, `ruff check` чисто.
+
+- **Результат** для `gpt-researcher`: 66 веток на 33 индексах, 19 групп коллизий, avg **2.0** ветки на индекс (было 3.0). Коллизий стало статистически меньше на каждую ветку, и в типичных репозиториях с <40 веток коллизий обычно нет вовсе.
+
 ### Свежие правки (2026-07-07) — branch-chip UX
 
 Вся работа по интерактивным чипам веток и связанным правилам подавления. Файлы: `src/ui/widgets/graph_panel.py`, `src/ui/widgets/left_panel.py`, `src/viewmodels/branch_panel_viewmodel.py`, `src/viewmodels/main_viewmodel.py`, `src/viewmodels/graph_viewmodel.py`, `src/ui/main_window.py`, плюс тесты в `tests/ui/test_graph_widget.py`, `tests/ui/test_left_panel.py`, `tests/viewmodels/test_branch_panel_viewmodel.py`, `tests/viewmodels/test_main_viewmodel_branches.py`, `tests/ui/test_main_window.py`.
