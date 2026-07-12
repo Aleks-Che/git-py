@@ -105,10 +105,12 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("git-py")
         # Default size is overridden by :meth:`_restore_state` when
-        # ``config_path`` is provided. We still call ``resize`` here
-        # so callers that disable persistence (passing ``None``) see
-        # the same initial size as before Stage 9.
-        self.resize(1280, 800)
+        # ``config_path`` is provided. We still apply screen-aware
+        # geometry here so callers that disable persistence (passing
+        # ``None``) see the same initial size as before Stage 9 — but
+        # clamped to the current screen so a 1280x800 window does not
+        # spill off a 1024x768 laptop display, for example.
+        self._apply_screen_aware_geometry(1280, 800)
 
         # ``async_enabled=True`` enables the long-running path for
         # rebase and large merges (see ``MainViewModel.busy_changed``).
@@ -180,6 +182,14 @@ class MainWindow(QMainWindow):
         # on startup.
         from PySide6.QtCore import QTimer
         QTimer.singleShot(0, self._restore_state)
+        # Re-clamp + re-center the window when the screen topology
+        # changes at runtime — laptop docked / undocked, external
+        # monitor disconnected, resolution switch. We hook at the
+        # ``QApplication`` level (not per-window) because a future
+        # secondary window would otherwise need its own hook.
+        if app is not None:
+            app.screenAdded.connect(self._on_screen_changed)
+            app.screenRemoved.connect(self._on_screen_changed)
 
     # ----- public API (also used by tests) -----------------------------
 
@@ -992,6 +1002,59 @@ class MainWindow(QMainWindow):
 
     # ----- state persistence (Stage 9) ---------------------------------
 
+    # Minimum on-screen footprint: keep the window usable even on tiny
+    # displays / very large persisted sizes. 400x300 is wide enough to
+    # show the toolbar + a sliver of every column in the main view.
+    _MIN_WIDTH = 400
+    _MIN_HEIGHT = 300
+
+    def _apply_screen_aware_geometry(self, width: int, height: int) -> None:
+        """Resize to ``(width, height)`` clamped to the current screen and centered.
+
+        Used both for the default size from :meth:`__init__` and the
+        persisted size restored by :meth:`_restore_state`. Without this
+        clamp a window restored from a previous monitor at e.g.
+        2400x1500 spills off a 1366x768 laptop display and the user
+        cannot reach the title bar to drag it back.
+
+        ``availableGeometry()`` (not ``screenGeometry()``) is used so
+        the window does not overlap the OS taskbar / dock / menu bar.
+        ``QApplication.screenAt`` picks the monitor the window is
+        currently on (top-left corner); ``primaryScreen`` is the
+        fallback before the window has been positioned.
+        """
+        screen = QApplication.screenAt(self.pos()) or QApplication.primaryScreen()
+        if screen is None:
+            # Headless / no display at all — apply the requested size
+            # verbatim. Centering is meaningless without a screen.
+            self.resize(width, height)
+            return
+        avail = screen.availableGeometry()
+        # Reserve a small margin so the title bar and resize grips
+        # stay inside the screen bounds.
+        margin = 32
+        max_w = max(self._MIN_WIDTH, avail.width() - margin * 2)
+        max_h = max(self._MIN_HEIGHT, avail.height() - margin * 2)
+        clamped_w = max(self._MIN_WIDTH, min(width, max_w))
+        clamped_h = max(self._MIN_HEIGHT, min(height, max_h))
+        x = avail.x() + (avail.width() - clamped_w) // 2
+        y = avail.y() + (avail.height() - clamped_h) // 2
+        self.setGeometry(int(x), int(y), int(clamped_w), int(clamped_h))
+
+    def _on_screen_changed(self, _screen: object) -> None:
+        """Re-clamp and re-center when the available screens change.
+
+        Connected to :attr:`QApplication.screenAdded` and
+        :attr:`QApplication.screenRemoved` in :meth:`__init__`. Fires
+        when the OS reports a screen topology change — laptop docked /
+        undocked, external display connected or disconnected,
+        resolution switched. The slot is called with the new / removed
+        ``QScreen`` but ignores the argument; only the geometry
+        matters. Skips the call when the window has not been
+        positioned yet (``windowHandle() is None`` before ``show``).
+        """
+        self._apply_screen_aware_geometry(self.width(), self.height())
+
     def _restore_state(self) -> None:
         """Apply saved window size, splitter sizes, and repo tabs from config.
 
@@ -1012,7 +1075,14 @@ class MainWindow(QMainWindow):
             return
         config = self._config
         width, height = load_window_size(config)
-        self.resize(width, height)
+        # Apply screen-aware geometry here rather than a bare
+        # ``resize`` so a size saved on a 4K monitor (e.g. 2400x1500)
+        # is clamped to the current screen when the user opens the
+        # app on a smaller laptop display. ``_restore_state`` runs
+        # via ``QTimer.singleShot(0)`` so the window has been moved
+        # to the OS-default position by then; ``screenAt`` resolves
+        # the right monitor.
+        self._apply_screen_aware_geometry(width, height)
         splitter_sizes = load_splitter_sizes(config)
         horizontal = splitter_sizes.get(SPLITTER_KEY_HORIZONTAL)
         if horizontal is not None and self._top_splitter is not None and len(horizontal) == 3:
