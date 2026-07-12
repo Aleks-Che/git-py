@@ -198,6 +198,15 @@ class CommitPanelViewModel(QObject):
         both the :class:`FileChange` list and the staged-files set,
         avoiding a second ``repo.status()`` call that walks the
         working tree a second time.
+
+        If the currently-selected file is no longer present in the
+        refreshed status (for example after ``Stash Changes`` or
+        ``Discard All Changes`` empties the working tree, or after
+        ``Discard File`` removes a single tracked file), the file
+        selection is cleared so the diff view also closes. Without
+        this, the diff would stay open in the centre column while
+        the file list that drives it became empty — leaving the user
+        with no UI affordance to dismiss it.
         """
         if self._repo is None or not self._repo.is_open:
             self._file_changes = []
@@ -211,6 +220,15 @@ class CommitPanelViewModel(QObject):
                 self.error_occurred.emit(str(exc))
                 self._file_changes = []
                 self._staged_files = set()
+        # Force-close the diff when the selected file disappeared from
+        # the working-tree / index status. ``select_file(None)`` is
+        # idempotent (no-op when nothing is selected) and emits the
+        # ``selected_file_changed`` / ``diff_ready`` signals that the
+        # main window uses to swap the graph back in.
+        if self._selected_file is not None:
+            paths = {c.path for c in self._file_changes}
+            if self._selected_file not in paths:
+                self.select_file(None)
         self.file_changes_changed.emit()
         self.staged_files_changed.emit(sorted(self._staged_files))
 

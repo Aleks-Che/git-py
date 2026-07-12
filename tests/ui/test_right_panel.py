@@ -654,6 +654,59 @@ def test_commit_detail_panel_clears_selection_on_hide(
     assert window._graph_stack.currentIndex() == 0
 
 
+def test_stash_push_closes_open_diff(qtbot, tmp_git_repo: Path) -> None:
+    """User-reported regression: clicking *Stash Changes* while a
+    file's diff is open in the centre column must close the diff.
+
+    Before the fix the diff view stayed open even though the file
+    list in the right panel was emptied by the stash, leaving the
+    user no way to dismiss the diff.
+    """
+    mgr = _make_dirty_repo(tmp_git_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(WIP_SHA)
+
+    cp_vm = window._main_vm.commit_panel_view_model()
+    cp_vm.select_file("f.txt")
+    assert window._diff_view.isVisible()
+    assert window._graph_stack.currentIndex() == 1
+
+    # Run the stash verb the same way the toolbar / menu does.
+    window._main_vm.stash_push("WIP")
+
+    # After the stash the working tree is clean, the file list in
+    # the right panel is empty, and the diff must therefore close.
+    assert cp_vm.file_changes() == []
+    assert not window._diff_view.isVisible()
+    assert window._graph_stack.currentIndex() == 0
+    assert cp_vm.selected_file() is None
+
+
+def test_discard_all_closes_open_diff(qtbot, tmp_git_repo: Path) -> None:
+    """Same defensive guarantee for *Discard All Changes*: any
+    operation that empties the file list while a diff is open must
+    close the diff too."""
+    mgr = _make_dirty_repo(tmp_git_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(WIP_SHA)
+
+    cp_vm = window._main_vm.commit_panel_view_model()
+    cp_vm.select_file("f.txt")
+    assert window._diff_view.isVisible()
+
+    window._main_vm.discard_changes()
+
+    assert cp_vm.file_changes() == []
+    assert not window._diff_view.isVisible()
+    assert cp_vm.selected_file() is None
+
+
 # ----- left panel hide / show on diff ---------------------------------
 
 
