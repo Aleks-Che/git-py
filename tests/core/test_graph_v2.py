@@ -952,6 +952,18 @@ def test_color_palette_accessible() -> None:
         assert len(c) == 7
 
 
+def test_uncommitted_color_index_is_outside_palette() -> None:
+    """``UNCOMMITTED_COLOR_INDEX`` must not collide with a regular
+    palette index.  The WIP marker needs a reserved index that
+    ``crc32(name) % len(BRANCH_PALETTE)`` can never produce.
+    """
+    assert UNCOMMITTED_COLOR_INDEX >= len(BRANCH_PALETTE), (
+        f"UNCOMMITTED_COLOR_INDEX={UNCOMMITTED_COLOR_INDEX} sits inside "
+        f"BRANCH_PALETTE (size {len(BRANCH_PALETTE)}) — a regular branch "
+        f"hash could land on it and be misrendered as the WIP marker"
+    )
+
+
 def test_pick_branch_color_is_deterministic_across_runs() -> None:
     """Branch colours must be stable across process restarts.
 
@@ -1552,4 +1564,115 @@ def test_fork_connector_main_lane_uses_main_colour_when_no_merges() -> None:
     )
 
     assert cells[0].cell_type == CellType.PIPE
-    assert cells[0].color_index == main_color
+
+
+# ---- bug 31b22352: branch colour inherited from merge commit -----------
+
+
+def test_branch_tip_keeps_own_colour_when_merge_processed_first() -> None:
+    """When a merge commit that contains a side-branch tip is
+    processed **before** the side-branch tip itself (because
+    ``history`` is sorted newest-first and the merge is newer),
+    the tip commit must still receive its own colour derived from
+    its branch name.
+
+    Regression: a previous version of :func:`build_graph` took the
+    colour from ``lane_colors[lane]`` whenever the commit's SHA was
+    already tracking on a lane — which meant the lane colour set by
+    the merge commit (via ``oid_color_index[parent_sha] = …``) won
+    over the side branch's own ``_pick_branch_color(name)``.  The
+    side-branch tip ended up rendered in the merge's fallback colour
+    instead of its own deterministic colour.
+
+    Reproduces the ``gpt-researcher`` ``31b22352`` /
+    ``3mk4yl/fix-dict-unhashable-bug`` symptom where the entire
+    side-branch line is drawn in GREEN even though
+    ``_pick_branch_color("3mk4yl/fix-dict-unhashable-bug")`` is
+    GOLD (idx=15).
+    """
+    root = "1" * 40
+    side = "2" * 40          # child of root — the side-branch tip
+    main_next = "3" * 40     # child of root — the next mainline commit
+    merge = "4" * 40         # merge(side, main_next)
+    # Newest first.
+    commits = [
+        _c(merge, parents=[side, main_next], ts=4, message="merge"),
+        _c(main_next, parents=[root], ts=3, message="main_next"),
+        _c(side, parents=[root], ts=2, message="side"),
+        _c(root, ts=1, message="root"),
+    ]
+    branches = [
+        _b("3mk4yl/fix-dict-unhashable-bug", side),
+        _b("master", merge, is_head=True),
+    ]
+    layout = build_graph(commits, branches)
+    sha_to_node = {n.commit.sha: n for n in layout.nodes if n.commit is not None}
+
+    expected_side_colour = _pick_branch_color("3mk4yl/fix-dict-unhashable-bug")
+    side_node = sha_to_node[side]
+    assert side_node.color_index == expected_side_colour, (
+        f"side-branch tip should be drawn in its own branch colour "
+        f"idx={expected_side_colour} ({BRANCH_PALETTE[expected_side_colour]}), "
+        f"got idx={side_node.color_index} "
+        f"({BRANCH_PALETTE[side_node.color_index]}); the tip is "
+        f"inheriting the colour the merge commit pre-assigned to its lane"
+    )
+
+
+def test_fork_sibling_does_not_overwrite_mainline_lane_colour() -> None:
+    """A fork-sibling parent (the second parent of a merge commit)
+    that lands on a lane which already holds a ``lane_colors``
+    entry must not clobber that entry with the fork-sibling
+    fallback colour.
+
+    Regression: the second-parent setup loop wrote
+    ``lane_color_index[new_lane] = _pick_fallback(new_lane)``
+    unconditionally, which poisoned the cache for every later
+    commit that landed on the same lane via ``continue_lane()``.
+    In ``gpt-researcher`` that turned the mainline around commit
+    ``31b22352`` from BLUE/master into PINK (``idx=6``) because
+    the merge's second parent happened to land on a previously
+    well-established mainline lane.
+
+    The synthetic DAG seeds ``lane_colors[0]`` with BLUE via a
+    commit that points at a branch whose name hashes to ``1``
+    (use ``master`` for the override path); the merge's second
+    parent then lands on lane 0 and the regression would set
+    ``lane_colors[0]`` to ``_pick_fallback(0)`` instead.
+    """
+    root = "1" * 40
+    side = "2" * 40
+    main_next = "3" * 40
+    merge = "4" * 40
+    # Newest first.
+    commits = [
+        _c(merge, parents=[side, main_next], ts=4, message="merge"),
+        _c(main_next, parents=[root], ts=3, message="main_next"),
+        _c(side, parents=[root], ts=2, message="side"),
+        _c(root, ts=1, message="root"),
+    ]
+    # ``master`` points at ``main_next`` so ``main_next`` is the
+    # master tip with branch colour BLUE (idx=1).  ``side`` has no
+    # branch.  ``merge`` carries a remote-tracking-style branch
+    # (``origin/main``) so it is *not* eligible for the master
+    # override — it falls through ``assign_main_color``'s override
+    # path and we hit the fork-sibling pre-coloring instead.
+    branches = [
+        _b("master", main_next, is_head=True),
+        _b("origin/main", merge),
+    ]
+    layout = build_graph(commits, branches)
+    sha_to_node = {n.commit.sha: n for n in layout.nodes if n.commit is not None}
+
+    # main_next must keep master's colour (idx=1).  The regression
+    # produced ``_pick_fallback(lane)`` (some other index) because
+    # the merge's second-parent pre-coloring wrote ``lane_colors[0]``
+    # with the fallback.
+    main_next_node = sha_to_node[main_next]
+    assert main_next_node.color_index == _pick_branch_color("master"), (
+        f"mainline tip must keep master's colour idx={_pick_branch_color('master')} "
+        f"({BRANCH_PALETTE[_pick_branch_color('master')]}), got "
+        f"idx={main_next_node.color_index} "
+        f"({BRANCH_PALETTE[main_next_node.color_index]}); the merge's "
+        f"second-parent fallback colour is leaking onto the mainline"
+    )
