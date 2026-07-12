@@ -219,6 +219,29 @@ LeftPanel получил ту же drag-and-drop + context-menu функцион
 ### Свежие правки (2026-07-02)
 - **Stash Changes в контекстном меню WIP-ноды.** Правый клик по синтетической ноде незакоммиченных изменений теперь предлагает `Stash Changes` первым пунктом меню (над разделителем, до `Discard changes` / `Copy diff`). Действие маршрутизируется через новый сигнал `GraphTableWidget.stash_push_requested` → `MainWindow._on_stash_push_graph` → `MainViewModel.stash_push("WIP")` (та же команда `StashPushCommand` что и тулбар `Ctrl+Shift+S`, попадает в undo-стек). Контекстное меню ноды (commit/stash/WIP) вынесено в `_build_node_menu(sha, kind)` (паттерн как у `_build_branch_menu_actions`) — 4 новых теста в `test_graph_widget.py` (структура WIP-меню, эмиссия сигнала, сохранение `discard_changes_requested`, отсутствие `Stash Changes` на обычном коммите) + 1 тест в `test_main_window.py` (роутинг сигнала в VM). **+5 тестов, 796/796 проходят, `ruff check` чисто для нового кода**.
 
+### Свежие правки (2026-07-12) — фикс цвета ветки `3mk4yl/fix-dict-unhashable-bug`
+
+Исправлен баг `gpt-researcher` commit `31b22352`: tip side-branch коммита рисовался в цвете merge коммита (а не в собственном цвете ветки), а mainline вокруг merge окрашивался в fallback-цвет от `parent[1]` pre-coloring. Подробное расследование — в `docs/BUG_31b22352_branch_colors.md`.
+
+- **Корень проблемы** — две точки в `src/core/graph_v2.py:build_graph`:
+  1. `commit_lane_opt is not None` ветка (строка 566) использовала `color_assigner.continue_lane(lane)` даже когда у коммита был свой `primary_branch`. Цвет из `lane_colors[lane]` (заполненный ранее merge коммитом) перебивал `_pick_branch_color(name)`. Side-branch tip получал цвет merge коммита.
+  2. Parent lanes setup (строка 655) писал `lane_color_index[new_lane] = new_color` безусловно. Когда `new_color` — это fallback от `_pick_fallback(lane)` (потому что parent — orphan без `primary_branch`), это отравляло lane cache для всех последующих коммитов на этой lane.
+
+- **Изменение A (строки 566-582)** — `commit_lane_opt is not None` ветка теперь проверяет `primary_branch`. Если коммит имеет имя ветки, вызывается `assign_color(lane, primary_branch)` вместо `continue_lane(lane)`, чтобы tip side-branch получил свой собственный цвет из `_pick_branch_color(name)`.
+
+- **Изменение B (строки 664-684)** — `lane_color_index[new_lane] = new_color` для fork siblings теперь записывается **только** когда у parent есть `primary_branch`. Для orphan parents (например, merge коммита, чьи предки — mainline без ветки) предыдущее значение `lane_colors[lane]` сохраняется, и mainline коммиты больше не перекрашиваются в случайный fallback-цвет.
+
+- **Изменение C (строки 623-654)** — `fork_sibling_color` логика (которая перекрашивала коммит в `main_color` если его parent — fork point и `commit_lane is main_lane`) теперь применяется **только к merge коммитам** (`len(valid_parents) >= 2`). Для single-parent коммитов с parent на fork point сохранена оригинальная логика (`parent_lane = lane`, `was_existing = False`), но **без** перезаписи `lane_color_index[lane]` на `main_color`. Это устранило случай, когда side-branch tip перекрашивался в master BLUE поверх собственного GOLD.
+
+- **Тесты.** +2 новых в `tests/core/test_graph_v2.py`:
+  - `test_branch_tip_keeps_own_colour_when_merge_processed_first` — tip side-branch (`987c9e8`) получает `_pick_branch_color("3mk4yl/fix-dict-unhashable-bug")` = idx=15 (GOLD), а не цвет merge коммита.
+  - `test_fork_sibling_does_not_overwrite_mainline_lane_colour` — `master` tip (main_next) сохраняет master BLUE через fork-sibling pre-coloring, не перезаписывается на fallback.
+  И **все 52 теста `test_graph_v2.py`** проходят (204/204 core тестов), `ruff check` чисто.
+
+- **Результат на реальных данных** (`tools/reproduce_31b22352_bug.py`):
+  - **До:** `987c9e8` рендерился с col 46 = `PIPE c=6` (PINK #7D2559) на строках 104-109; mainline (lane 0) на строках 84-94 имел `TEE_RIGHT c=N p=6` (PINK pipes).
+  - **После:** `987c9e8` рендерится с col 46 = `PIPE c=15` (GOLD #C4912E); mainline больше не в PINK — fallback LIME (idx=11) не отравлен pre-coloring'ом.
+
 ### Свежие правки (2026-07-07) — branch-chip UX
 
 Вся работа по интерактивным чипам веток и связанным правилам подавления. Файлы: `src/ui/widgets/graph_panel.py`, `src/ui/widgets/left_panel.py`, `src/viewmodels/branch_panel_viewmodel.py`, `src/viewmodels/main_viewmodel.py`, `src/viewmodels/graph_viewmodel.py`, `src/ui/main_window.py`, плюс тесты в `tests/ui/test_graph_widget.py`, `tests/ui/test_left_panel.py`, `tests/viewmodels/test_branch_panel_viewmodel.py`, `tests/viewmodels/test_main_viewmodel_branches.py`, `tests/ui/test_main_window.py`.

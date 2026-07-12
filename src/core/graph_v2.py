@@ -564,7 +564,22 @@ def build_graph(
 
         commit_color_index: int
         if commit_lane_opt is not None:
-            commit_color_index = color_assigner.continue_lane(lane)
+            # When the commit's SHA is already tracking on a lane (set
+            # earlier by a merge commit's parent processing), prefer
+            # the colour derived from the commit's own branch name
+            # over the lane-cache colour the merge pre-assigned.
+            # Without this, a side-branch tip that lives below a
+            # merge commit gets drawn in the merge's fallback
+            # colour instead of its own ``_pick_branch_color``
+            # colour (e.g. the ``gpt-researcher``
+            # ``3mk4yl/fix-dict-unhashable-bug`` tip rendered in
+            # GREEN instead of GOLD).
+            if primary_branch is not None:
+                commit_color_index = color_assigner.assign_color(
+                    lane, primary_branch
+                )
+            else:
+                commit_color_index = color_assigner.continue_lane(lane)
         elif not nodes or all(n.commit is None for n in nodes):
             commit_color_index = color_assigner.assign_main_color(lane, primary_branch)
         else:
@@ -603,7 +618,15 @@ def build_graph(
             parent_color: int
 
             if existing_parent_lane is not None:
-                if parent_idx == 0 and parent_sha in fork_points:
+                if (
+                    parent_idx == 0
+                    and parent_sha in fork_points
+                    and len(valid_parents) >= 2
+                ):
+                    # Merge commit whose first parent is a fork point:
+                    # keep parent on the same lane as commit and
+                    # force ``final_color_index`` to ``main_color`` so
+                    # the merge reads as the main line's colour.
                     lanes[lane] = parent_sha
                     main_c = color_assigner.get_main_color()
                     color = main_c if color_assigner.is_main_lane(lane) else commit_color_index
@@ -612,6 +635,19 @@ def build_graph(
                     parent_lane = lane
                     was_existing = False
                     parent_color = color
+                elif parent_idx == 0 and parent_sha in fork_points:
+                    # Single-parent commit whose parent sits on a
+                    # fork-point lane (the legacy path).  Keep
+                    # parent on the same lane as commit, but DO NOT
+                    # overwrite the lane colour with the main line's
+                    # colour — that clobbers a side-branch tip's own
+                    # ``commit_color_index`` (e.g. the
+                    # ``3mk4yl/fix-dict-unhashable-bug`` GOLD tip
+                    # would otherwise be repainted as BLUE/master).
+                    lanes[lane] = parent_sha
+                    parent_lane = lane
+                    was_existing = False
+                    parent_color = commit_color_index
                 else:
                     color = lane_color_index.get(existing_parent_lane) or oid_color_index.get(
                         parent_sha, existing_parent_lane
@@ -637,7 +673,20 @@ def build_graph(
                 parent_branch = parent_branch_names[0] if parent_branch_names else None
                 new_color = color_assigner.assign_fork_sibling_color(new_lane, parent_branch)
                 oid_color_index[parent_sha] = new_color
-                lane_color_index[new_lane] = new_color
+                # Deliberately do NOT overwrite ``lane_color_index[new_lane]``
+                # with ``new_color`` when ``new_color`` is a fallback
+                # (``primary_branch is None``).  Doing so poisons the
+                # lane cache for every later commit that lands on this
+                # lane via ``continue_lane()`` and renders the mainline
+                # around a merge commit in the fork-sibling fallback
+                # colour (e.g. ``gpt-researcher`` mainline around
+                # ``31b22352`` drawn in PINK instead of BLUE/master).
+                # The branch-name case is harmless: when the parent
+                # itself is processed its ``commit_lane_opt`` branch
+                # calls ``assign_color(lane, primary_branch)`` and
+                # writes the correct lane colour anyway.
+                if parent_branch is not None:
+                    lane_color_index[new_lane] = new_color
                 parent_lane = new_lane
                 was_existing = False
                 parent_color = new_color
