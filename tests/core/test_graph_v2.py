@@ -1336,6 +1336,94 @@ def test_horizontal_across_head_lane_blocks_wip() -> None:
     assert wip.cells[wip.lane * 2].cell_type == CellType.COMMIT
 
 
+def test_lane0_pipe_continues_through_offset_stash_when_no_wip() -> None:
+    """Lane 0 line above HEAD stays continuous through an offset-lane stash.
+
+    HEAD is a fork point: it has a regular child branch (``feature``) and
+    a stash as siblings. The main loop places ``feature`` on lane 1 (fork
+    detection) and the stash on lane 2 (next free) — neither is on lane 0.
+    The lane 0 line above HEAD must therefore be a continuous PIPE
+    through both rows.
+
+    The rebalance originally cleared the PIPE at lane 0 in the stash row
+    (the logic is only justified when a WIP node will refill the cell);
+    for a clean workdir (no WIP) the cleared cell stayed EMPTY and broke
+    the visual line at the main lane.
+    """
+    c1 = "a" * 40  # HEAD
+    c0 = "b" * 40  # parent
+    feat = "c" * 40  # feature branch tip, parent=c1
+    s1 = "s" * 40  # stash, parent=c1
+    commits = [
+        _c(s1, parents=[c1], ts=4, kind="stash", message="Stash @0: wip"),
+        _c(feat, parents=[c1], ts=3, message="feature commit"),
+        _c(c1, parents=[c0], ts=2, message="HEAD commit"),
+        _c(c0, ts=1, message="parent"),
+    ]
+    branches = [
+        _b("main", c1, is_head=True),
+        _b("feature", feat),
+    ]
+    layout = build_graph(
+        commits,
+        branches,
+        # CRUCIALLY: no WIP — the cells must remain continuous on their own.
+        uncommitted_count=None,
+        head_commit_sha=c1,
+    )
+
+    # Layout: [stash, feature, HEAD, parent]
+    stash, feature, head, _parent = layout.nodes
+
+    # The stash was placed on an offset lane (next free after feature).
+    assert stash.lane >= 2
+    # The PIPE at lane 0 in the stash's row must survive — it is the
+    # lane 0 line passing through the stash's row, drawn by the main loop
+    # because lane 0 was still tracking HEAD's parent above HEAD.
+    assert stash.cells[0].cell_type == CellType.PIPE, (
+        "Lane 0 PIPE through the stash row was cleared by the stash "
+        "rebalance even though no WIP node was inserted; this severs "
+        "the lane 0 line above HEAD for clean-workdir views."
+    )
+    # Same for the feature branch's row.
+    assert feature.cells[0].cell_type == CellType.PIPE
+
+
+def test_lane0_pipe_restored_after_stash_moved_off_head_lane_when_no_wip() -> None:
+    """Stash originally on lane 0 leaves a PIPE there after rebalance if no WIP.
+
+    The stash's parent is HEAD and the main loop placed it on lane 0
+    (no other lanes to compete). The rebalance moves it to lane 1 so
+    the WIP can sit on lane 0 — but with no WIP present the cell at
+    lane 0 in the stash's row would have been left EMPTY, severing
+    the lane 0 line above HEAD. The rebalance now restores a PIPE in
+    that cell so the line stays continuous.
+    """
+    c1 = "a" * 40  # HEAD
+    c0 = "b" * 40  # parent
+    s1 = "s" * 40  # stash, parent=c1
+    commits = [
+        _c(s1, parents=[c1], ts=3, kind="stash", message="Stash @0: wip"),
+        _c(c1, parents=[c0], ts=2, message="HEAD commit"),
+        _c(c0, ts=1, message="parent"),
+    ]
+    branches = [_b("main", c1, is_head=True)]
+    layout = build_graph(
+        commits,
+        branches,
+        uncommitted_count=None,  # no WIP
+        head_commit_sha=c1,
+    )
+
+    # Layout: [stash, HEAD, parent]
+    stash, head, _parent = layout.nodes
+    # Stash moved to lane 1 so HEAD can keep lane 0 for itself.
+    assert stash.lane == 1
+    # The cleared cell at lane 0 is now a PIPE, not EMPTY — the lane 0
+    # line passes through the stash row to reach HEAD.
+    assert stash.cells[0].cell_type == CellType.PIPE
+
+
 # ---- performance ---------------------------------------------------------
 
 

@@ -848,7 +848,7 @@ def build_graph(
     # and re-renders HEAD's fork connector so it joins every lane that
     # has a branch into HEAD — including the freshly-shifted stashes
     # and any pre-existing branches the main loop already placed.
-    max_lane = _rebalance_stashes_for_wip(nodes, head_oid, max_lane)
+    max_lane = _rebalance_stashes_for_wip(nodes, head_oid, max_lane, uncommitted_count)
 
     # --- Insert uncommitted changes node ---
     if uncommitted_count is not None and uncommitted_count >= 0:
@@ -983,6 +983,7 @@ def _rebalance_stashes_for_wip(
     nodes: list[GraphNode],
     head_oid: str | None,
     max_lane: int,
+    uncommitted_count: int | None = None,
 ) -> int:
     """Move stash nodes above HEAD to offset lanes, freeing lane 0 for WIP.
 
@@ -998,6 +999,13 @@ def _rebalance_stashes_for_wip(
     any pre-existing branches the main loop already placed).
 
     The function is a no-op when there are no stashes above HEAD.
+
+    ``uncommitted_count`` — pass the value the caller is about to use
+    for WIP insertion so the rebalance knows whether the head-lane
+    cell it clears will be refilled by a WIP pipe. Clearing the cell
+    when no WIP is coming leaves the lane 0 line with an EMPTY cell
+    that breaks its visual continuity above HEAD (see fix note in
+    the per-stash loop below).
 
     Returns the updated ``max_lane``.
     """
@@ -1077,17 +1085,43 @@ def _rebalance_stashes_for_wip(
         stash = nodes[stash_idx]
         old_lane = stash.lane
 
-        # Clear the stash's old COMMIT cell so lane 0 is free for WIP.
+        # Clear the stash's old COMMIT cell so the new position can take over.
         old_cell_idx = old_lane * 2
         if old_cell_idx < len(stash.cells):
             stash.cells[old_cell_idx] = CellInfo.empty()
-        # Also clear the head-lane cell — a stash that was NOT on
-        # head_lane may have a PIPE there from the main loop's active-lane
-        # tracking.  WIP insertion below will fill it with the correct
-        # PIPE(UNCOMMITTED_COLOR_INDEX).
+        # Also handle the head-lane cell — three cases:
+        #
+        # 1. The stash was already on ``head_lane``: ``old_cell_idx`` IS
+        #    ``head_cell_idx`` so the clear above already emptied it.
+        # 2. The stash was on an offset lane: the cell at ``head_lane``
+        #    is a PIPE drawn by the main loop's active-lane tracking
+        #    and belongs to the lane 0 line above HEAD.
+        # 3. WIP will be inserted: the WIP refill step only writes a new
+        #    PIPE into EMPTY cells, so anything left in the way blocks it.
+        #
+        # Case (2) + no WIP is the visual bug we are fixing: clearing the
+        # PIPE when nothing will refill it leaves an EMPTY cell that
+        # severs the lane 0 line above HEAD.  With WIP (case 3) the clear
+        # is required to make way for the uniform UNCOMMITTED pipe.
+        has_wip = uncommitted_count is not None and uncommitted_count >= 0
         head_cell_idx = head_lane * 2
         if head_cell_idx < len(stash.cells) and head_cell_idx != old_cell_idx:
-            stash.cells[head_cell_idx] = CellInfo.empty()
+            if has_wip:
+                stash.cells[head_cell_idx] = CellInfo.empty()
+            # else: preserve the main-loop PIPE — it is the lane 0 line
+            # passing through the stash's row.
+
+        # When the stash moved *away* from ``head_lane``, the cell at
+        # ``head_lane`` was just emptied (it was the stash's old COMMIT).
+        # With WIP, the WIP insertion would have refilled it; without
+        # WIP we restore a PIPE here so the lane 0 line above HEAD stays
+        # continuous through every row.
+        if (
+            not has_wip
+            and head_cell_idx < len(stash.cells)
+            and stash.cells[head_cell_idx].cell_type == CellType.EMPTY
+        ):
+            stash.cells[head_cell_idx] = CellInfo.pipe(head_color)
 
         # Update the stash's lane and draw the commit at its new lane.
         # No vertical PIPE is added above the stash — the commit's own
