@@ -18,6 +18,7 @@ from src.core.graph_v2 import (
     graph_to_dicts,
 )
 from src.core.models import BranchInfo, CommitInfo
+from src.core.repository import RepositoryManager
 
 
 def _c(
@@ -1763,4 +1764,185 @@ def test_fork_sibling_does_not_overwrite_mainline_lane_colour() -> None:
         f"idx={main_next_node.color_index} "
         f"({BRANCH_PALETTE[main_next_node.color_index]}); the merge's "
         f"second-parent fallback colour is leaking onto the mainline"
+    )
+
+
+
+def test_cellinfo_to_dict_preserves_pipe_color_zero() -> None:
+    """`pipe_color_index=0` (GREEN) survives the round-trip into the wire dict.
+
+    Regression test for ``BUG_VISUAL_FEAT_PIPE_COLOR``: the previous
+    serialiser used ``if self.pipe_color_index:`` which silently dropped
+    ``"p"`` whenever the value was falsy, including the legitimate
+    palette index 0 (GREEN ``#1A5924``).  The renderer then fell back to
+    ``color_index`` and painted the vertical pipe in the crossing
+    branch's colour at every fork-merge intersection.
+    """
+    cell = CellInfo(
+        CellType.HORIZONTAL_PIPE,
+        color_index=15,
+        pipe_color_index=0,
+    )
+    d = cell.to_dict()
+    assert d["t"] == int(CellType.HORIZONTAL_PIPE)
+    assert d["c"] == 15
+    assert "p" in d, (
+        "wire format must carry `p` so the renderer can distinguish "
+        "`pipe_color_index=0` (GREEN) from `pipe_color_index=None` (fallback)"
+    )
+    assert d["p"] == 0, (
+        f"pipe colour 0 (GREEN) must round-trip unchanged, got {d.get('p')!r}"
+    )
+
+
+def test_cellinfo_to_dict_writes_pipe_for_all_pipe_aware_types() -> None:
+    """Every cell type that carries a pipe colour writes `p` unconditionally."""
+    for ctype in (
+        CellType.HORIZONTAL_PIPE,
+        CellType.TEE_RIGHT,
+        CellType.TEE_LEFT,
+        CellType.TEE_UP,
+        CellType.CROSS,
+    ):
+        cell = CellInfo(ctype, color_index=15, pipe_color_index=0)
+        d = cell.to_dict()
+        assert "p" in d, f"{ctype.name} should always carry `p` in wire format"
+        assert d["p"] == 0
+
+        cell_nonzero = CellInfo(ctype, color_index=15, pipe_color_index=37)
+        d_nonzero = cell_nonzero.to_dict()
+        assert d_nonzero["p"] == 37
+
+
+def test_build_graph_pipe_color_zero_does_not_fall_back_to_oid_color() -> None:
+    """``lane_color_index[lane] = 0`` (GREEN) must not fall back to the oid colour.
+
+    Regression test for ``BUG_VISUAL_FEAT_PIPE_COLOR``.  The pipe-colour
+    lookup used to be ``dict.get(...) or dict.get(...)``, which treated
+    ``0`` as "missing" and silently fell back to the oid colour.  In
+    the local ``git-py`` repository this turned the lane-1 pipe below
+    the visual-feat chain into the wisteria mainline colour instead of
+    the visual-feat GREEN.
+
+    The test inspects the **first** pipe cell on lane 1 *after* the
+    visual-feat chain ends — the cell that the bug used to colour
+    wisteria.  With the fix in place it stays GREEN.
+    """
+    rm = RepositoryManager()
+    rm.open(".")
+    layout = build_graph(rm.get_all_history(max_count=10_000), rm.branches)
+
+    visual_tip_sha = None
+    for b in rm.branches:
+        if b.name == "visual-feat" and b.target_sha:
+            visual_tip_sha = b.target_sha
+            break
+    assert visual_tip_sha is not None, "test needs a branch named 'visual-feat'"
+
+    # Find the row index of the tip and walk one row past the bottom
+    # of the visual-feat chain.
+    tip_idx: int | None = None
+    for i, n in enumerate(layout.nodes):
+        if n.commit is not None and n.commit.sha == visual_tip_sha:
+            tip_idx = i
+            break
+    assert tip_idx is not None
+
+    # Walk down the chain from the tip until the lane changes.
+    bottom_idx = tip_idx
+    for j in range(tip_idx, len(layout.nodes) - 1):
+        n = layout.nodes[j]
+        if n.commit is None:
+            break
+        next_node = layout.nodes[j + 1]
+        if next_node.commit is None or next_node.lane != n.lane:
+            break
+        bottom_idx = j + 1
+
+    # The first row *after* the visual-feat chain sits on a different
+    # lane, but the cell at col = (visual-feat lane) * 2 still carries a
+    # PIPE because the lane was re-used by the mainline / a sibling
+    # side branch.  That pipe used to inherit the wisteria mainline
+    # colour via the ``or`` fallback.  With the fix it stays GREEN.
+    first_after = layout.nodes[bottom_idx + 1]
+    col = layout.nodes[tip_idx].lane * 2
+    assert col < len(first_after.cells), (
+        "test setup changed: cell column out of range"
+    )
+    cell = first_after.cells[col]
+    assert cell.cell_type in (CellType.PIPE, CellType.HORIZONTAL_PIPE), (
+        f"expected a pipe at row {bottom_idx + 1} col={col}, got {cell.cell_type.name}"
+    )
+    assert cell.color_index == 0, (
+        f"Pipe below visual-feat was over-painted: row {bottom_idx + 1} "
+        f"col={col} {cell.cell_type.name} colour idx={cell.color_index} "
+        f"({BRANCH_PALETTE[cell.color_index]}).  The "
+        f"``lane_color_index.get(...) or ...`` fallback in ``build_graph`` "
+        "swapped a 0-valued GREEN for whatever ``oid_color_index`` held.  "
+        "See BUG_VISUAL_FEAT_PIPE_COLOR."
+    )
+
+
+def test_build_graph_horizontal_pipe_carries_pipe_color_in_wire_dict() -> None:
+    """Every HORIZONTAL_PIPE cell in ``build_graph`` output serialises ``p``.
+
+    Regression test for ``BUG_VISUAL_FEAT_PIPE_COLOR``: the wire format
+    must round-trip ``pipe_color_index`` exactly — including the
+    legitimate GREEN value 0 — so the renderer can paint the vertical
+    pipe in the lane's own colour at every fork-merge intersection
+    instead of falling back to the crossing branch's ``color_index``.
+
+    Topology: an already-merged side branch (``alpha``) leaves its
+    vertical pipe on lane 1.  A later merge (``merge_b``) brings a new
+    side branch (``beta``) into main on lane 4, and the merge
+    connector's horizontal connector must cross the alpha pipe on
+    lane 1 — producing a ``HORIZONTAL_PIPE`` whose ``color_index`` is
+    beta's colour and ``pipe_color_index`` is alpha's colour.
+    """
+    root = "r" * 40
+    m1 = "m" * 40 + "1" * 36
+    m2 = "m" * 40 + "2" * 36
+    a1 = "a" * 40 + "1" * 36
+    a2 = "a" * 40 + "2" * 36
+    merge_a = "a" * 40
+    b1 = "b" * 40 + "1" * 36
+    b2 = "b" * 40 + "2" * 36
+    merge_b = "c" * 40
+
+    commits = [
+        _c(m2, parents=[m1], ts=8, message="m2"),
+        _c(m1, parents=[merge_b], ts=7, message="m1"),
+        _c(a2, parents=[a1], ts=6, message="a2"),
+        _c(a1, parents=[root], ts=5, message="a1"),
+        _c(merge_a, parents=[m1, a2], ts=4, message="merge alpha"),
+        _c(b2, parents=[b1], ts=3, message="b2"),
+        _c(b1, parents=[root], ts=2, message="b1"),
+        _c(merge_b, parents=[root, b2], ts=1, message="merge beta"),
+        _c(root, ts=0, message="root"),
+    ]
+    branches = [
+        _b("alpha", a2),
+        _b("beta", b2),
+    ]
+    layout = build_graph(commits, branches)
+
+    found_horizontal_pipe = False
+    for node in layout.nodes:
+        if node.commit is None:
+            continue
+        for col, cell in enumerate(node.cells):
+            if cell.cell_type != CellType.HORIZONTAL_PIPE:
+                continue
+            found_horizontal_pipe = True
+            d = cell.to_dict()
+            assert "p" in d, (
+                f"HORIZONTAL_PIPE at sha={node.commit.short_sha} col={col} "
+                "lost its pipe colour during serialisation; the renderer "
+                "will fall back to colour index and paint the vertical "
+                "pipe in the crossing branch's colour"
+            )
+            assert d["p"] == cell.pipe_color_index
+    assert found_horizontal_pipe, (
+        "synthetic history produced no HORIZONTAL_PIPE cell — adjust the "
+        "test fixtures so at least one crossing exists"
     )

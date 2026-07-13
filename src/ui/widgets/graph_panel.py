@@ -1403,7 +1403,12 @@ class GraphTableWidget(QWidget):
                         if ci // 2 == li and pc.get("t", _T_EMPTY) != _T_EMPTY:
                             pt = pc.get("t", _T_EMPTY)
                             if pt in (_T_HORIZONTAL_PIPE, _T_TEE_RIGHT, _T_TEE_LEFT, _T_TEE_UP):
-                                clr_idx = pc.get("p", pc.get("c", 0))
+                                # ``"p"`` is now always written by ``CellInfo.to_dict``;
+                                # if it's missing the cell is malformed and we fall back
+                                # to the horizontal colour (``c``) for robustness.
+                                clr_idx = pc.get("p")
+                                if clr_idx is None:
+                                    clr_idx = pc.get("c", 0)
                             else:
                                 clr_idx = pc.get("c", 0)
                             break
@@ -1412,7 +1417,9 @@ class GraphTableWidget(QWidget):
                             if ci // 2 == li and cell.get("t", _T_EMPTY) != _T_EMPTY:
                                 t = cell.get("t", _T_EMPTY)
                                 if t in (_T_HORIZONTAL_PIPE, _T_TEE_RIGHT, _T_TEE_LEFT, _T_TEE_UP):
-                                    clr_idx = cell.get("p", cell.get("c", 0))
+                                    clr_idx = cell.get("p")
+                                    if clr_idx is None:
+                                        clr_idx = cell.get("c", 0)
                                 else:
                                     clr_idx = cell.get("c", 0)
                                 break
@@ -2467,7 +2474,7 @@ class GraphTableWidget(QWidget):
                         "lane": ci // 2,
                         "type": t,
                         "color": cell.get("c", 0),
-                        "pipe_color": cell.get("p", 0),
+                        "pipe_color": cell.get("p"),
                     }
                 )
             rows_data.append(
@@ -2542,7 +2549,13 @@ def _draw_cell_row(
     for idx, cell in enumerate(cells):
         t = cell.get("t", 0)
         c = cell.get("c", 0)
-        p = cell.get("p", 0)
+        # ``p`` may be missing entirely (fall back to ``color_index``)
+        # OR be a legitimate palette index — including 0 (GREEN), which
+        # used to be conflated with "missing" because the wire format
+        # dropped ``"p"`` whenever the value was falsy.  See
+        # ``CellInfo.to_dict`` in ``src/core/graph_v2.py``.
+        p = cell.get("p")
+        has_pipe_color = p is not None
 
         lane = idx // 2
         is_even = idx % 2 == 0
@@ -2553,7 +2566,7 @@ def _draw_cell_row(
             x = col_left + lane * lane_w + lane_w / 2
 
         color = _cell_color(c)
-        p_color = _cell_color(p) if p else color
+        p_color = _cell_color(p) if has_pipe_color else color
 
         if t == _T_EMPTY:
             continue
@@ -2584,7 +2597,7 @@ def _draw_cell_row(
             )
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
         elif t == _T_TEE_RIGHT:
-            vert_color = p_color if p else color
+            vert_color = p_color if has_pipe_color else color
             _draw_vert_line(
                 painter,
                 x,
@@ -2597,7 +2610,7 @@ def _draw_cell_row(
             )
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
         elif t == _T_TEE_LEFT:
-            vert_color = p_color if p else color
+            vert_color = p_color if has_pipe_color else color
             _draw_vert_line(
                 painter,
                 x,
@@ -2610,7 +2623,7 @@ def _draw_cell_row(
             )
             _draw_horiz_line(painter, x, y_center, -lane_w, edge_width, color)
         elif t == _T_TEE_UP:
-            vert_color = p_color if p else color
+            vert_color = p_color if has_pipe_color else color
             _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
             _draw_vert_line(
                 painter,
@@ -2635,7 +2648,7 @@ def _draw_cell_row(
             # ``lane_w / 2`` empty gap that the between-lanes
             # horizontal alone would leave.
             vert_down_color = color
-            vert_up_color = p_color if p else color
+            vert_up_color = p_color if has_pipe_color else color
             _draw_vert_line(
                 painter,
                 x,

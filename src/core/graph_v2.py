@@ -179,8 +179,12 @@ class CellInfo:
             CellType.CROSS,
         ):
             d["c"] = self.color_index
-            if self.pipe_color_index:
-                d["p"] = self.pipe_color_index
+            # ``pipe_color_index == 0`` is a legitimate palette index
+            # (GREEN ``#1A5924``) and must survive the round-trip.  The
+            # renderer distinguishes "use the pipe colour" from "fall
+            # back to ``color_index``" by checking whether the ``p`` key
+            # is present at all.
+            d["p"] = self.pipe_color_index
         else:
             d["c"] = self.color_index
         if self.cell_type == CellType.CROSS and self.direction:
@@ -539,9 +543,9 @@ def build_graph(
                 for child_sha in parent_children.get(commit.sha, []):
                     for n in nodes:
                         if n.commit is not None and n.commit.sha == child_sha and n.lane == cl:
-                            fork_lane_colors[cl] = lane_color_index.get(cl) or oid_color_index.get(
-                                child_sha, cl
-                            )
+                            fork_lane_colors[cl] = lane_color_index.get(cl)
+                            if fork_lane_colors[cl] is None:
+                                fork_lane_colors[cl] = oid_color_index.get(child_sha, cl)
                             break
                     if cl in fork_lane_colors:
                         break
@@ -552,7 +556,9 @@ def build_graph(
             for fl in fork_lanes:
                 if fl == main_lane:
                     continue
-                color = lane_color_index.get(fl) or oid_color_index.get(commit.sha, fl)
+                color = lane_color_index.get(fl)
+                if color is None:
+                    color = oid_color_index.get(commit.sha, fl)
                 merging_lanes.append((fl, color))
 
             for ml, _ in merging_lanes:
@@ -561,9 +567,9 @@ def build_graph(
             if main_lane > max_lane:
                 max_lane = main_lane
 
-            main_color = lane_color_index.get(main_lane) or oid_color_index.get(
-                commit.sha, main_lane
-            )
+            main_color = lane_color_index.get(main_lane)
+            if main_color is None:
+                main_color = oid_color_index.get(commit.sha, main_lane)
             fork_merging_cells = _build_fork_connector_cells(
                 main_lane,
                 main_color,
@@ -671,9 +677,9 @@ def build_graph(
                     was_existing = False
                     parent_color = commit_color_index
                 else:
-                    color = lane_color_index.get(existing_parent_lane) or oid_color_index.get(
-                        parent_sha, existing_parent_lane
-                    )
+                    color = lane_color_index.get(existing_parent_lane)
+                    if color is None:
+                        color = oid_color_index.get(parent_sha, existing_parent_lane)
                     parent_lane = existing_parent_lane
                     was_existing = True
                     parent_color = color
@@ -1221,7 +1227,15 @@ def _build_row_cells(
         if lane_oid is not None and lane_idx != commit_lane:
             cell_idx = lane_idx * 2
             if cell_idx < len(cells):
-                color = lane_color_index.get(lane_idx) or oid_color_index.get(lane_oid, lane_idx)
+                # ``0`` (GREEN) is a valid palette index, so the lookup
+                # must use ``is None`` for the fallback — ``or`` would
+                # treat 0 as "missing" and silently fall back to the
+                # oid-derived colour (which is the *other* branch's
+                # colour for a re-used lane).  See the
+                # ``BUG_VISUAL_FEAT_PIPE_COLOR`` regression.
+                color = lane_color_index.get(lane_idx)
+                if color is None:
+                    color = oid_color_index.get(lane_oid, lane_idx)
                 cells[cell_idx] = CellInfo.pipe(color)
 
     # Commit node
@@ -1351,7 +1365,11 @@ def _build_row_cells(
                 if was_existing and already_shown:
                     cells[end_idx] = CellInfo.merge_left(parent_color)
                 elif was_existing:
-                    cells[end_idx] = CellInfo.tee_left(parent_color)
+                    cells[end_idx] = CellInfo(
+                        CellType.TEE_LEFT,
+                        color_index=parent_color,
+                        pipe_color_index=parent_color,
+                    )
                 else:
                     cells[end_idx] = CellInfo.branch_left(parent_color)
         else:
@@ -1382,7 +1400,11 @@ def _build_row_cells(
                 if was_existing and already_shown:
                     cells[start_idx] = CellInfo.merge_right(parent_color)
                 elif was_existing:
-                    cells[start_idx] = CellInfo.tee_right(parent_color)
+                    cells[start_idx] = CellInfo(
+                        CellType.TEE_RIGHT,
+                        color_index=parent_color,
+                        pipe_color_index=parent_color,
+                    )
                 else:
                     cells[start_idx] = CellInfo.branch_right(parent_color)
 
@@ -1423,7 +1445,11 @@ def _build_fork_connector_cells(
         if lane_oid is not None and lane_idx != main_lane and lane_idx not in merging_lane_nums:
             cell_idx = lane_idx * 2
             if cell_idx < len(cells):
-                color = lane_color_index.get(lane_idx) or oid_color_index.get(lane_oid, lane_idx)
+                # ``0`` (GREEN) is a valid palette index; use ``is None``
+                # for the fallback.  See ``BUG_VISUAL_FEAT_PIPE_COLOR``.
+                color = lane_color_index.get(lane_idx)
+                if color is None:
+                    color = oid_color_index.get(lane_oid, lane_idx)
                 cells[cell_idx] = CellInfo.pipe(color)
 
     prev_lane = main_lane
