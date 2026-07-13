@@ -1122,8 +1122,16 @@ def _rebalance_stashes_for_wip(
         # With WIP, the WIP insertion would have refilled it; without
         # WIP we restore a PIPE here so the lane 0 line above HEAD stays
         # continuous through every row.
+        #
+        # Skip the restore at the very top of the graph (``stash_idx ==
+        # 0``): there is no row above to bridge to, so the PIPE would
+        # be an orphan stub that extends ``node_radius`` pixels up into
+        # the empty space above the topmost commit.  An EMPTY cell lets
+        # the bridge from the row below terminate at the topmost row's
+        # commit edge with no dangling stub.
         if (
             not has_wip
+            and stash_idx > 0
             and head_cell_idx < len(stash.cells)
             and stash.cells[head_cell_idx].cell_type == CellType.EMPTY
         ):
