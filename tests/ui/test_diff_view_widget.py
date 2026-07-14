@@ -16,12 +16,14 @@ deletions, context, and the hunk separator.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtCore import QCoreApplication, Qt
+from PySide6.QtWidgets import QApplication
 from src.core.diff_parser import DiffLineType
 from src.ui.widgets.diff_view_widget import (
     ADDITION_BG,
     DELETION_BG,
     HUNK_BG,
+    DiffViewMode,
     DiffViewWidget,
 )
 
@@ -238,3 +240,264 @@ def test_set_diff_against_pygit2_patch_works(qtbot, tmp_git_repo) -> None:
     ]
     assert additions, "expected at least one addition in the diff"
     assert view._editor._line_info[additions[0]].line_number == 2
+
+
+# ----- view-mode toolbar (Changes only / Full document) ---------------
+
+
+# A two-hunk diff that covers different parts of the same file:
+#
+# * Hunk 1  (`@@ -1,3 +1,3 @@`)  changes only file lines 1-3.
+# * Hunk 2  (`@@ -100,3 +100,3 @@`) changes only file lines 100-102.
+#
+# The two pre-baked texts simulate what ``repo.diff()`` produces when
+# called with ``context_lines=3`` (two separate hunks) versus with
+# ``context_lines=large`` (one merged hunk spanning the whole file).
+# The widget is content-agnostic — it just renders whichever text the
+# caller hands in for the active mode.
+_CHANGES_ONLY_HUGE_DIFF = (
+    "diff --git a/big.txt b/big.txt\n"
+    "index 1234567..89abcde 100644\n"
+    "--- a/big.txt\n"
+    "+++ b/big.txt\n"
+    "@@ -1,3 +1,3 @@\n"
+    " first-original\n"
+    "-second-original\n"
+    "+second-replaced\n"
+    " third-original\n"
+    "@@ -100,3 +100,3 @@\n"
+    " hundred-original\n"
+    "-hundred-1-original\n"
+    "+hundred-1-replaced\n"
+    " hundred-2-original\n"
+)
+_FULL_DOCUMENT_HUGE_DIFF = (
+    "diff --git a/big.txt b/big.txt\n"
+    "index 1234567..89abcde 100644\n"
+    "--- a/big.txt\n"
+    "+++ b/big.txt\n"
+    "@@ -1,102 +1,102 @@\n"
+    " first-original\n"
+    "-second-original\n"
+    "+second-replaced\n"
+    " third-original\n"
+    " ...middle elided for the test...\n"
+    " hundred-original\n"
+    "-hundred-1-original\n"
+    "+hundred-1-replaced\n"
+    " hundred-2-original\n"
+)
+
+
+def test_default_view_mode_is_changes_only(qtbot) -> None:
+    """A freshly built widget starts in Changes-only mode."""
+    _ensure_app()
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+    assert view.view_mode() == DiffViewMode.CHANGES_ONLY
+    assert view._changes_button.isChecked()
+    assert not view._document_button.isChecked()
+
+
+def test_toolbar_has_two_centre_aligned_buttons(qtbot) -> None:
+    """The toolbar exposes exactly two checkable buttons, mutually exclusive."""
+    _ensure_app()
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+
+    assert view._changes_button.isCheckable()
+    assert view._document_button.isCheckable()
+    assert not (view._changes_button.isChecked() and view._document_button.isChecked())
+
+    # Triggering the second button must uncheck the first (exclusive group).
+    view._document_button.setChecked(True)
+    assert not view._changes_button.isChecked()
+    view._changes_button.setChecked(True)
+    assert not view._document_button.isChecked()
+
+
+def test_set_diff_pair_stores_both_variants(qtbot) -> None:
+    """``set_diff_pair`` accepts two distinct texts and remembers them."""
+    _ensure_app()
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+
+    changes_only = "@@ -1,1 +1,1 @@\n-old\n+new\n"
+    full_doc = (
+        "@@ -1,5 +1,5 @@\n"
+        " keep-a\n"
+        " keep-b\n"
+        "-old\n"
+        "+new\n"
+        " keep-c\n"
+    )
+    view.set_diff_pair(changes_only, full_doc)
+
+    # In Changes-only mode the editor shows the small diff.
+    view.set_view_mode(DiffViewMode.CHANGES_ONLY)
+    assert view.toPlainText().count("\n") < full_doc.count("\n")
+    assert "-old" in view.toPlainText()
+    assert "keep-c" not in view.toPlainText()
+
+    # Switching modes swaps the rendered text — no further input needed.
+    view.set_view_mode(DiffViewMode.FULL_DOCUMENT)
+    assert "keep-a" in view.toPlainText()
+    assert "keep-b" in view.toPlainText()
+    assert "keep-c" in view.toPlainText()
+    assert "+new" in view.toPlainText()
+
+
+def test_toggle_full_document_shows_all_context_lines(qtbot) -> None:
+    """In Full document mode the editor paints every context line, not
+    just the three lines around each change.
+
+    The widget is content-agnostic: it renders whichever text the
+    caller hands it for the active mode. The test supplies two
+    pre-baked variants — one with two separate hunks
+    (``context_lines=3``), one with a single spanning hunk that
+    covers the whole file (``context_lines=large``) — and asserts
+    the editor reflects both.
+    """
+    _ensure_app()
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+    view.set_diff_pair(_CHANGES_ONLY_HUGE_DIFF, _FULL_DOCUMENT_HUGE_DIFF)
+
+    view.set_view_mode(DiffViewMode.CHANGES_ONLY)
+    changes_only_text = view.toPlainText()
+
+    view.set_view_mode(DiffViewMode.FULL_DOCUMENT)
+    full_document_text = view.toPlainText()
+
+    # Both variants render differently — the only thing toggled is
+    # which cached text the editor paints.
+    assert changes_only_text != full_document_text
+    # The full-document variant covers the entire 102-line file.
+    assert "...middle elided for the test..." in full_document_text
+    # Changes-only did not.
+    assert "...middle elided for the test..." not in changes_only_text
+
+    from src.core.diff_parser import parse_diff_lines as _parse
+    changes_only_hunks = sum(
+        1
+        for p in _parse(changes_only_text)
+        if p.line_type == DiffLineType.HUNK
+    )
+    full_document_hunks = sum(
+        1
+        for p in _parse(full_document_text)
+        if p.line_type == DiffLineType.HUNK
+    )
+    assert changes_only_hunks == 2
+    assert full_document_hunks == 1
+
+
+def test_set_diff_mirrors_text_into_full_document_when_empty(qtbot) -> None:
+    """The legacy ``set_diff`` entry point keeps the toolbar usable
+    by storing the same text for both variants when only one was
+    supplied."""
+    _ensure_app()
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+    view.set_diff(_SAMPLE_DIFF)
+    assert view._changes_only_text == _SAMPLE_DIFF
+    assert view._full_document_text == _SAMPLE_DIFF
+
+
+def test_set_full_document_diff_only_replaces_one_variant(qtbot) -> None:
+    """``set_full_document_diff`` updates the full variant without
+    touching the changes-only text."""
+    _ensure_app()
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+    view.set_diff(_SAMPLE_DIFF)
+    bigger = _SAMPLE_DIFF + "\n@ extra\n"
+    view.set_full_document_diff(bigger)
+    assert view._changes_only_text == _SAMPLE_DIFF
+    assert view._full_document_text == bigger
+
+    view.set_view_mode(DiffViewMode.FULL_DOCUMENT)
+    assert "@ extra" in view.toPlainText()
+
+
+def test_view_mode_changed_signal_fires_on_toggle(qtbot) -> None:
+    """Toggling from one mode to another emits ``view_mode_changed``
+    with the new mode value."""
+    _ensure_app()
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+
+    captured: list = []
+    view.view_mode_changed.connect(captured.append)
+
+    with qtbot.waitSignal(view.view_mode_changed, timeout=500) as blocker:
+        view._document_button.click()
+    assert blocker.args[0] == DiffViewMode.FULL_DOCUMENT
+    assert captured == [DiffViewMode.FULL_DOCUMENT]
+
+    with qtbot.waitSignal(view.view_mode_changed, timeout=500) as blocker:
+        view._changes_button.click()
+    assert blocker.args[0] == DiffViewMode.CHANGES_ONLY
+    assert captured == [DiffViewMode.FULL_DOCUMENT, DiffViewMode.CHANGES_ONLY]
+
+
+def test_set_view_mode_does_not_emit_when_unchanged(qtbot) -> None:
+    """Programmatic switches to the *current* mode are no-ops (no
+    unnecessary re-render, no spurious signal)."""
+    _ensure_app()
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+
+    captured: list = []
+    view.view_mode_changed.connect(captured.append)
+
+    view.set_view_mode(DiffViewMode.CHANGES_ONLY)
+    view.set_view_mode(DiffViewMode.CHANGES_ONLY)
+    assert captured == []
+
+
+def test_full_document_keeps_addition_and_deletion_colouring(qtbot) -> None:
+    """The colour-coding contract from earlier stages is preserved in
+    full-document mode: additions and deletions still get their
+    backgrounds, hunks still get the cyan background."""
+    _ensure_app()
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+    view.set_diff_pair(_SAMPLE_DIFF, _SAMPLE_DIFF)
+    view.set_view_mode(DiffViewMode.FULL_DOCUMENT)
+
+    selections = view._editor.extraSelections()
+    backgrounds = {
+        sel.cursor.blockNumber(): sel.format.background().color()
+        for sel in selections
+    }
+    line_info = view._editor._line_info
+    for idx, info in enumerate(line_info):
+        if info.line_type == DiffLineType.ADDITION:
+            assert backgrounds.get(idx) == ADDITION_BG
+        elif info.line_type == DiffLineType.DELETION:
+            assert backgrounds.get(idx) == DELETION_BG
+        elif info.line_type == DiffLineType.HUNK:
+            assert backgrounds.get(idx) == HUNK_BG
+
+
+def test_toolbar_button_has_focus_policy(qtbot) -> None:
+    """The toolbar buttons are interactive — clicking them toggles the
+    view mode without needing to involve the editor.
+
+    (Avoids an accidental focus-stealing behaviour where a stray
+    keyboard shortcut on the toolbar button would shift focus away
+    from the diff text.)"""
+    _ensure_app()
+    QApplication.instance() or QApplication([])
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+    view.show()
+
+    assert view._changes_button.focusPolicy() != Qt.FocusPolicy.NoFocus
+    assert view._document_button.focusPolicy() != Qt.FocusPolicy.NoFocus
+
+    view._document_button.click()
+    assert view._document_button.isChecked()
+    assert not view._changes_button.isChecked()
+    assert view.view_mode() == DiffViewMode.FULL_DOCUMENT

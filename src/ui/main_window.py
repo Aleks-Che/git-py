@@ -595,6 +595,10 @@ class MainWindow(QMainWindow):
         cp_vm = self._main_vm.commit_panel_view_model()
         cp_vm.selected_file_changed.connect(self._on_selected_file_changed)
         cp_vm.diff_ready.connect(self._on_diff_ready)
+        # The full-document variant is pre-computed in the same VM
+        # call as the changes-only diff so the diff view can toggle
+        # between its two display modes without a round-trip to Git.
+        cp_vm.diff_pair_ready.connect(self._on_diff_pair_ready)
 
         # The commit-detail panel emits the same signal pair so a
         # file click in either right-panel view swaps the graph for
@@ -603,6 +607,9 @@ class MainWindow(QMainWindow):
             self._on_selected_file_changed,
         )
         self._right_panel._commit_detail.diff_ready.connect(self._on_diff_ready)
+        self._right_panel._commit_detail.diff_pair_ready.connect(
+            self._on_diff_pair_ready,
+        )
 
         top = QSplitter(self)
         top.addWidget(self._left_panel)
@@ -732,8 +739,26 @@ class MainWindow(QMainWindow):
                 self._top_splitter.setSizes(self._last_normal_splitter_sizes)
 
     def _on_diff_ready(self, text: str) -> None:
-        """Display the computed diff text in the diff view."""
+        """Display the computed diff text in the diff view.
+
+        ``diff_ready`` is the legacy single-text signal carried over
+        from the changes-only era; in practice both diff sources
+        (WIP VM + commit-detail panel) emit
+        :meth:`DiffViewWidget.set_diff_pair` through the richer
+        ``diff_pair_ready`` signal so toggling the toolbar is free.
+        We still keep this slot wired so any future caller that only
+        has a single text falls back to a sane view (the same text
+        is shown in both modes — the toolbar just lets the user
+        confirm that).
+        """
         self._diff_view.set_diff(text)
+
+    def _on_diff_pair_ready(
+        self, changes_only: str, full_document: str,
+    ) -> None:
+        """Hand the pre-computed (changes-only, full-document) pair to
+        the diff widget so toggling its toolbar is instantaneous."""
+        self._diff_view.set_diff_pair(changes_only, full_document)
 
     def _on_copy_diff(self, sha: str) -> None:
         """Copy the full unified diff to the system clipboard."""

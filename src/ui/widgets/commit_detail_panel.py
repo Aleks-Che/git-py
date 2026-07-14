@@ -52,6 +52,12 @@ from src.ui.widgets.file_list_model import (
 from src.utils.avatar import make_avatar_pixmap
 from src.viewmodels.main_viewmodel import MainViewModel
 
+# When generating the "full document" variant of a diff we want
+# enough context on either side of every change to span the entire
+# file. ``2**31 - 1`` is the maximum value libgit2 will accept for
+# ``context_lines`` and is large enough for any realistic file size.
+_FULL_DOCUMENT_CONTEXT_LINES = 2**31 - 1
+
 # Status badge + path colours are imported from :mod:`file_list_model`
 # so the commit-detail view and the WIP panel stay visually identical.
 
@@ -154,6 +160,14 @@ class CommitDetailPanel(QWidget):
 
     diff_ready = Signal(str)
     """Emitted with the unified-diff text for the selected file."""
+
+    diff_pair_ready = Signal(str, str)
+    """Emitted with the (changes-only, full-document) diff pair.
+
+    Mirrors the WIP-side signal so the :class:`MainWindow` can hand
+    both variants to :class:`DiffViewWidget` at once. See
+    :attr:`CommitPanelViewModel.diff_pair_ready` for the full
+    contract."""
 
     error_occurred = Signal(str)
 
@@ -333,6 +347,7 @@ class CommitDetailPanel(QWidget):
         self.selected_file_changed.emit(path)
         if path is None or self._current_sha is None:
             self.diff_ready.emit("")
+            self.diff_pair_ready.emit("", "")
             return
         self._compute_and_emit_diff(self._current_sha, path)
 
@@ -348,6 +363,7 @@ class CommitDetailPanel(QWidget):
         self._highlight_selected_file()
         self.selected_file_changed.emit(None)
         self.diff_ready.emit("")
+        self.diff_pair_ready.emit("", "")
 
         repo = self._main_vm.repository_manager()
         if repo is None or not repo.is_open:
@@ -374,6 +390,7 @@ class CommitDetailPanel(QWidget):
         self._highlight_selected_file()
         self.selected_file_changed.emit(None)
         self.diff_ready.emit("")
+        self.diff_pair_ready.emit("", "")
         self._render_empty()
 
     # ----- rendering ---------------------------------------------------
@@ -569,22 +586,40 @@ class CommitDetailPanel(QWidget):
     # ----- diff computation -------------------------------------------
 
     def _compute_and_emit_diff(self, sha: str, path: str) -> None:
-        """Compute the commit-vs-parent diff for ``path`` and emit
-        :attr:`diff_ready`."""
+        """Compute the commit-vs-parent diff for ``path`` and emit the
+        diff signals.
+
+        Emits :attr:`diff_ready` with the changes-only text and
+        :attr:`diff_pair_ready` with the changes-only + full-document
+        pair, so the centre-column :class:`DiffViewWidget` has both
+        variants cached when the user toggles its toolbar.
+        """
         repo = self._main_vm.repository_manager()
         if repo is None or not repo.is_open:
             self.diff_ready.emit("")
+            self.diff_pair_ready.emit("", "")
             return
         try:
-            text = self._build_commit_diff_text(repo, sha, path)
+            changes_only = self._build_commit_diff_text(
+                repo, sha, path, context_lines=3,
+            )
+            full_document = self._build_commit_diff_text(
+                repo, sha, path, context_lines=_FULL_DOCUMENT_CONTEXT_LINES,
+            )
         except GitError as exc:
             self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
             self.diff_ready.emit("")
+            self.diff_pair_ready.emit("", "")
             return
-        self.diff_ready.emit(text)
+        self.diff_ready.emit(changes_only)
+        self.diff_pair_ready.emit(changes_only, full_document)
 
     def _build_commit_diff_text(
-        self, repo, sha: str, path: str,  # noqa: ANN001 - RepositoryManager
+        self,
+        repo,  # noqa: ANN001 - RepositoryManager
+        sha: str,
+        path: str,
+        context_lines: int = 3,
     ) -> str:
         """Return the unified diff for ``path`` (commit tree vs its
         first parent's tree).
@@ -593,6 +628,11 @@ class CommitDetailPanel(QWidget):
         tree, so every file it introduces is reported as
         ``new file``. We pick the patch for ``path`` out of a
         multi-file diff via :meth:`_extract_patch_for`.
+
+        ``context_lines`` controls how many unchanged lines surround
+        each change: ``3`` (the default) produces a compact diff for
+        review; the *Full document* viewer mode passes a value large
+        enough to cover the whole file.
         """
         try:
             obj = repo.repo.revparse_single(sha).peel(pygit2.Commit)
@@ -606,7 +646,7 @@ class CommitDetailPanel(QWidget):
         else:
             parent_tree = repo.repo.TreeBuilder().write()
         try:
-            diff = repo.repo.diff(parent_tree, obj.tree, context_lines=3)
+            diff = repo.repo.diff(parent_tree, obj.tree, context_lines=context_lines)
         except (pygit2.GitError, KeyError, ValueError) as exc:
             raise GitError(f"Failed to diff {sha!r}: {exc}") from exc
         return self._extract_patch_for(diff, path)

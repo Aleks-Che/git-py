@@ -485,3 +485,82 @@ def test_build_diff_text_untracked(
     assert "+alpha" in text
     assert "+beta" in text
 
+
+def test_build_diff_text_accepts_context_lines(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """``build_diff_text`` exposes ``context_lines`` so callers can
+    request the full-document variant (``context_lines=large``)
+    independently of the changes-only default of 3.
+
+    The fixture commits a 50-line file first, then mutates one line
+    in the worktree. The diff therefore carries *real* context lines
+    on either side of the change, and the wider ``context_lines``
+    value is expected to produce more of them in the patch text.
+    """
+    import time
+
+    import pygit2
+    from src.core.repository import RepositoryManager
+    _ensure_app()
+
+    initial = (
+        "first\n"
+        + "\n".join(f"line-{i}" for i in range(1, 49))
+        + "\nlast\n"
+    )
+    (tmp_git_repo / "hello.txt").write_text(initial)
+    manager = RepositoryManager(str(tmp_git_repo))
+    sig = pygit2.Signature("tester", "tester@example.com", int(time.time()), 0)
+    manager.repo.index.add("hello.txt")
+    manager.repo.index.write()
+    tree = manager.repo.index.write_tree()
+    manager.repo.create_commit(
+        "refs/heads/main", sig, sig, "init", tree, [],
+    )
+
+    # Replace the middle line to leave real context on both sides.
+    mutated = initial.replace("line-25\n", "line-25-modified\n")
+    (tmp_git_repo / "hello.txt").write_text(mutated)
+
+    vm = CommitPanelViewModel()
+    vm.set_repository(manager)
+
+    short = vm.build_diff_text("hello.txt", staged=False, context_lines=3)
+    long = vm.build_diff_text("hello.txt", staged=False, context_lines=200)
+    assert short != long
+    from src.core.diff_parser import parse_diff_lines
+
+    short_ctx = sum(
+        1 for p in parse_diff_lines(short) if p.line_type.name == "CONTEXT"
+    )
+    long_ctx = sum(
+        1 for p in parse_diff_lines(long) if p.line_type.name == "CONTEXT"
+    )
+    assert long_ctx > short_ctx
+
+
+def test_select_file_emits_diff_pair_ready(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """Selecting a file emits the ``diff_pair_ready`` signal with both
+    the changes-only and full-document variants so the diff view can
+    toggle modes without re-running Git."""
+    from pathlib import Path
+    _ensure_app()
+    (Path(committed_repo.path) / "hello.txt").write_text("changed\n")
+    vm = CommitPanelViewModel()
+    vm.set_repository(committed_repo)
+
+    with qtbot.waitSignal(vm.diff_pair_ready, timeout=500) as blocker:
+        vm.select_file("hello.txt")
+    changes_only, full_document = blocker.args
+    # Both variants are non-empty and contain the change.
+    assert changes_only
+    assert full_document
+    assert "+changed" in changes_only
+    assert "+changed" in full_document
+    # The full-document variant is at least as long as the
+    # changes-only one (more context = more lines).
+    assert len(full_document) >= len(changes_only)
+

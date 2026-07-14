@@ -44,6 +44,12 @@ _STAGED_FLAGS = (
     | pygit2.GIT_STATUS_INDEX_TYPECHANGE
 )
 
+# When generating the "full document" variant of a diff we want
+# enough context on either side of every change to span the entire
+# file. ``2**31 - 1`` is the maximum value libgit2 will accept for
+# ``context_lines`` and is large enough for any realistic file size.
+_FULL_DOCUMENT_CONTEXT_LINES = 2**31 - 1
+
 
 class CommitPanelViewModel(QObject):
     """State + verb methods for the WIP / commit-message panel."""
@@ -59,6 +65,16 @@ class CommitPanelViewModel(QObject):
 
     diff_ready = Signal(str)
     """Emitted with the unified-diff text for the selected file."""
+
+    diff_pair_ready = Signal(str, str)
+    """Emitted with the (changes-only, full-document) diff pair.
+
+    The first string is the changes-only diff (the same one
+    :attr:`diff_ready` emits); the second is the same file's
+    full-document variant with effectively unlimited context so the
+    entire file is rendered in the viewer. The :class:`DiffViewWidget`
+    uses both to switch between its two view modes without re-running
+    Git on toggle."""
 
     commit_summary_changed = Signal(str)
     """Emitted when ``commit_summary`` changes."""
@@ -179,6 +195,7 @@ class CommitPanelViewModel(QObject):
         self._commit_description = ""
         self.selected_file_changed.emit(None)
         self.diff_ready.emit("")
+        self.diff_pair_ready.emit("", "")
         self.commit_summary_changed.emit("")
         self.commit_description_changed.emit("")
         self.commit_message_changed.emit("")
@@ -390,28 +407,62 @@ class CommitPanelViewModel(QObject):
         return self._compute_staged_files_from_raw(self._repo.repo.status())
 
     def _compute_and_emit_diff(self, path: str | None) -> None:
-        """Compute the diff for ``path`` and emit :attr:`diff_ready`."""
+        """Compute the diff for ``path`` and emit the diff signals.
+
+        Emits both :attr:`diff_ready` (with the changes-only text) and
+        :attr:`diff_pair_ready` (with the changes-only + full-document
+        pair) so older listeners and the new :class:`DiffViewWidget`
+        toolbar stay in sync.
+
+        For untracked files the "full document" view is just the file
+        itself, so both variants are identical to avoid showing an
+        empty editor when the user toggles modes on such a file.
+        """
         if self._repo is None or not self._repo.is_open or path is None:
             self._current_diff = ""
             self.diff_ready.emit("")
+            self.diff_pair_ready.emit("", "")
             return
         try:
-            text = self.build_diff_text(path, staged=self._selected_file_staged)
+            changes_only = self.build_diff_text(
+                path,
+                staged=self._selected_file_staged,
+                context_lines=3,
+            )
+            full_document = self.build_diff_text(
+                path,
+                staged=self._selected_file_staged,
+                context_lines=_FULL_DOCUMENT_CONTEXT_LINES,
+            )
         except GitError as exc:
             self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
             self._current_diff = ""
             self.diff_ready.emit("")
+            self.diff_pair_ready.emit("", "")
             return
-        self._current_diff = text
-        self.diff_ready.emit(text)
+        self._current_diff = changes_only
+        self.diff_ready.emit(changes_only)
+        self.diff_pair_ready.emit(changes_only, full_document)
 
-    def build_diff_text(self, path: str, staged: bool = False) -> str:
+    def build_diff_text(
+        self,
+        path: str,
+        staged: bool = False,
+        context_lines: int = 3,
+    ) -> str:
         """Return the unified diff for ``path``.
 
         When ``staged=False`` (default) shows the working-tree diff
         (worktree vs HEAD).  When ``staged=True`` shows the index diff
         (index vs HEAD) — what would be committed if you ran ``git
         commit`` right now.
+
+        ``context_lines`` controls how many unchanged lines surround
+        each change: ``3`` (the default) produces a compact, change-
+        focused diff suitable for review; a very large value
+        (e.g. ``2**31 - 1``, used by the *Full document* viewer mode)
+        makes the surrounding hunks grow until they span the whole
+        file, so the entire document is rendered with diff colouring.
 
         Public — the *Copy Diff* context-menu action in the right
         panel's commit-input view calls this to grab the text that
@@ -427,7 +478,7 @@ class CommitPanelViewModel(QObject):
             diff = repo.diff(
                 "HEAD",
                 cached=staged,
-                context_lines=3,
+                context_lines=context_lines,
                 flags=pygit2.enums.DiffOption.INCLUDE_UNTRACKED
                 | pygit2.enums.DiffOption.RECURSE_UNTRACKED_DIRS,
             )
