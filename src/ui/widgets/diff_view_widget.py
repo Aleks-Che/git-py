@@ -34,19 +34,35 @@ buttons that toggle between **Changes only** and **Full document**:
   context so every line of both versions is present. The additions,
   deletions and hunks appear in the same colour-coded form as in the
   changes-only view; only the unchanged context expands to cover the
-  whole file.
+  whole file. Switching to this mode (or loading a new diff in this
+  mode) auto-scrolls to the first change so the user lands on it
+  without hunting through the file head.
 
 The widget stores both variants of the diff text and renders whichever
 matches the active mode, so toggling is instant (no re-diff needed).
 Upstream code is expected to call :meth:`set_diff_pair` (or the legacy
 :meth:`set_diff` + :meth:`set_full_document_diff`) when a new file is
 selected; the toolbar then decides which variant to show.
+
+Custom scrollbar
+----------------
+The vertical scrollbar is a :class:`_DiffScrollBar` that paints as a
+minimap of the diff:
+
+* Wider than the platform default so a thin vertical line in the
+  middle can split it into two halves.
+* **Left half** — red tick mark for every deletion, positioned by
+  its file line number.
+* **Right half** — green tick mark for every addition, positioned
+  the same way.
+* Background and thumb use alpha-blended colours so the bar reads
+  as semi-transparent without breaking hit-testing.
 """
 from __future__ import annotations
 
 from enum import IntEnum
 
-from PySide6.QtCore import QRect, QSize, Qt, Signal
+from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -60,6 +76,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QPlainTextEdit,
     QPushButton,
+    QScrollBar,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -85,10 +102,43 @@ ExtraSelection = QTextEdit.ExtraSelection
 # implementation used (digits + 3).
 _GUTTER_RIGHT_PADDING_CHARS = 3
 
-# Border between the toolbar and the editor. Mirrors a QFrame default
-# so the toolbar reads as "attached" to the editor without borrowing
-# focus colours from the rest of the app.
-_TOOLBAR_BOTTOM_MARGIN = 4
+# Symmetric vertical padding around the toolbar's button row.
+# Equal top and bottom so the buttons read as visually centred
+# against both the widget edge above and the editor body below.
+_TOOLBAR_VERTICAL_MARGIN = 4
+
+# Default scrollbar width on Windows is ~16px. The custom scrollbar
+# needs to fit two halves + a divider. We use an *odd* width so the
+# centre column sits at an integer pixel — this gives us exact 10+1+10
+# splits at any DPI scale, with no half-pixel offset to confuse the eye.
+_SCROLLBAR_WIDTH = 21
+
+# ── minimap-style scrollbar colours ───────────────────────────────────
+# Background paints alpha-blended so the bar looks semi-transparent
+# against the editor (the widget itself stays opaque — setting
+# ``WA_TranslucentBackground`` interferes with hit-testing).
+# Darker than the editor body so the marker colours pop and the
+# bar reads as a distinct rail rather than as a continuation of
+# the gutter background.
+_SCROLLBAR_BG = QColor(18, 18, 18, 200)
+# Divider is intentionally *dim* so it reads as a quiet boundary
+# rather than as content — a bright divider pulled either side
+# toward it visually, so we make it only slightly brighter than the
+# background and let the colour contrast of the two halves do the
+# real visual work.
+_SCROLLBAR_DIVIDER = QColor(90, 90, 90, 200)
+_SCROLLBAR_THUMB = QColor(220, 220, 220, 150)
+_SCROLLBAR_THUMB_BORDER = QColor(80, 80, 80, 200)
+_SCROLLBAR_DELETION = QColor(220, 70, 70, 230)
+_SCROLLBAR_ADDITION = QColor(70, 200, 110, 230)
+
+# Marker rectangles are drawn solid-filled rather than as thin
+# lines so adjacent markers in line-number order overlap into a
+# single visible block. 8 px is wide enough to span the typical
+# line-to-line gap on a long document yet stays well within a
+# hunk so it doesn't visually merge two unrelated hunks.
+_SCROLLBAR_MARKER_HALF_HEIGHT = 4
+# ──────────────────────────────────────────────────────────────────────
 
 
 class DiffViewMode(IntEnum):
@@ -96,6 +146,213 @@ class DiffViewMode(IntEnum):
 
     CHANGES_ONLY = 0
     FULL_DOCUMENT = 1
+
+
+class _DiffScrollBar(QScrollBar):
+    """Vertical scrollbar visualised as a minimap of the diff.
+
+    The widget is wider than the platform default
+    (:data:`_SCROLLBAR_WIDTH`); a thin vertical line in the middle
+    splits it into two halves.
+
+    * The **left half** paints horizontal red tick lines at the
+      relative position of every deletion.
+    * The **right half** does the same in green for additions.
+
+    Both halves share a single semi-transparent thumb (sized from
+    ``pageStep()`` / ``maximum()`` and positioned from ``value()``),
+    so scrolling the document moves the same indicator over both
+    halves at once. The whole bar background is drawn with a low alpha
+    so it reads as semi-transparent against the editor body — the
+    widget itself stays opaque so input still works.
+
+    Public API
+    ----------
+    set_diff_markers
+        Hand in normalised positions for deletions / additions.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(Qt.Orientation.Vertical, parent)
+        self._deletion_positions: list[float] = []
+        self._addition_positions: list[float] = []
+        # Force the width through several size hints so the host
+        # widget's layout manager (which manages the scrollbar when
+        # it is installed via ``setVerticalScrollBar``) cannot shrink
+        # or stretch it on us. Without this, native styles on some
+        # platforms report a smaller default extent and the bar ends
+        # up with a paint area that is *one pixel less* than the
+        # requested width — which is exactly enough to make the
+        # 50/50 split look skewed (9+2+8 instead of 9+2+9).
+        self.setFixedWidth(_SCROLLBAR_WIDTH)
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt naming
+        """Always report our preferred width regardless of style hints."""
+        return QSize(_SCROLLBAR_WIDTH, super().sizeHint().height())
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 - Qt naming
+        """Don't let the host shrink us below the preferred width."""
+        return QSize(_SCROLLBAR_WIDTH, super().minimumSizeHint().height())
+
+    def set_diff_markers(
+        self,
+        deletions: list[float],
+        additions: list[float],
+    ) -> None:
+        """Replace the marker lists. Each list holds values in ``[0, 1]``.
+
+        Values are clamped to ``[0, 1]`` so callers don't have to be
+        careful about the exact ratio. The widget repaints
+        immediately.
+        """
+        self._deletion_positions = [
+            max(0.0, min(1.0, float(v))) for v in deletions
+        ]
+        self._addition_positions = [
+            max(0.0, min(1.0, float(v))) for v in additions
+        ]
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        """Replace the platform scrollbar painting with the minimap look.
+
+        PySide6 doesn't expose ``SE_ScrollBarSlider`` via
+        :class:`QStyle.SubElement`, so we compute the thumb rect
+        ourselves from ``value()`` / ``maximum()`` / ``pageStep()``.
+        The math mirrors what Qt's default style does internally.
+
+        Why ``contentsRect`` instead of ``rect``
+        ----------------------------------------
+        ``self.rect()`` reports the widget's *outer* geometry, but
+        some native styles (Windows in particular) reserve a 1-pixel
+        border on one or both sides of a ``QScrollBar``. Painting into
+        ``self.rect()`` puts our marker bars behind that border, which
+        shifts everything one column and breaks the 50/50 split
+        the user sees in real life (even when an offscreen test
+        environment, which uses a styleless paint, looks balanced).
+        ``self.contentsRect()`` is the inner area the host platform
+        actually expects us to draw into, so we use that.
+
+        Layout
+        ------
+        The ``contentsRect`` is split exactly in half; the centre
+        column (integer for the odd :data:`_SCROLLBAR_WIDTH`) becomes
+        the divider. With width 21 that's ``10 + 1 + 10`` — both
+        halves the same pixel count, divider exactly centred, and
+        no fractional offsets to worry about at any DPI.
+        """
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Use the contents rect, not the widget rect — see the
+        # docstring for why.
+        rect = self.contentsRect()
+
+        # 1) Semi-transparent background. The widget itself is opaque
+        # so mouse events still work — the visual cue is achieved by
+        # using alpha-blended fills instead.
+        painter.fillRect(rect, _SCROLLBAR_BG)
+
+        # 2) Two equal halves + a 1-px centre divider.
+        half_w = rect.width() // 2
+        left_rect = QRect(
+            rect.left(), rect.top(), half_w, rect.height(),
+        )
+        right_rect = QRect(
+            rect.left() + half_w + 1, rect.top(), rect.width() - half_w - 1,
+            rect.height(),
+        )
+        divider_x = rect.left() + half_w
+
+        # Marker region (leaving room for the thumb ends).
+        pad = 3
+        usable_top = rect.top() + pad
+        usable_height = rect.height() - 2 * pad
+        if usable_height <= 0:
+            painter.end()
+            return
+
+        # 3) Markers — drawn as solid filled rectangles spanning the
+        # full half width. The rectangles are tall enough that
+        # adjacent markers (line-spacing apart on the bar) overlap
+        # into one continuous coloured block, so a hunk reads as a
+        # single bar rather than as a stack of thin lines.
+        marker_h = _SCROLLBAR_MARKER_HALF_HEIGHT * 2
+        for pos in self._deletion_positions:
+            y = int(usable_top + pos * usable_height)
+            painter.fillRect(
+                left_rect.left(),
+                y - _SCROLLBAR_MARKER_HALF_HEIGHT,
+                left_rect.width(),
+                marker_h,
+                _SCROLLBAR_DELETION,
+            )
+        for pos in self._addition_positions:
+            y = int(usable_top + pos * usable_height)
+            painter.fillRect(
+                right_rect.left(),
+                y - _SCROLLBAR_MARKER_HALF_HEIGHT,
+                right_rect.width(),
+                marker_h,
+                _SCROLLBAR_ADDITION,
+            )
+
+        # 4) Divider — exactly one column, dead-centre.
+        painter.fillRect(
+            divider_x, rect.top(), 1, rect.height(), _SCROLLBAR_DIVIDER,
+        )
+
+        # 5) Thumb. Size is proportional to the visible fraction of
+        # the document so the user gets the same "this much of the
+        # file is in view" cue they'd get from a regular scrollbar;
+        # position uses the live ``value()``.
+        #
+        # We only ``fillRect`` the thumb and *do not* draw a border:
+        # ``drawRect`` paints the outline at the rect's outer edge,
+        # which — once antialiasing is factored in — bleeds one
+        # pixel past the fill area and partially obscures the
+        # topmost marker (the one that sits right below the thumb).
+        # The fill alone reads clearly against the rest of the
+        # bar; the border is decorative and not worth the artefact.
+        thumb_rect = self._compute_thumb_rect(rect, pad)
+        if not thumb_rect.isNull() and thumb_rect.isValid():
+            painter.fillRect(thumb_rect, _SCROLLBAR_THUMB)
+
+        painter.end()
+
+    def _compute_thumb_rect(self, rect: QRect, pad: int) -> QRect:
+        """Return the thumb rectangle for the current scrollbar state.
+
+        PySide6 doesn't expose ``SE_ScrollBarSlider`` via
+        :class:`QStyle.SubElement`, so we compute the geometry from
+        ``value()`` / ``maximum()`` / ``minimum()`` directly. The
+        math mirrors Qt's standard slider proportion: thumb height is
+        ``pageStep / (pageStep + range)`` of the usable area, the
+        position is interpolated from ``value()``.
+        """
+        slider_min = self.minimum()
+        slider_max = self.maximum()
+        slider_range = slider_max - slider_min
+        usable_height = rect.height() - 2 * pad
+        if usable_height <= 0 or slider_range <= 0:
+            return QRect()
+        page_step = max(1, self.pageStep())
+        # Visible fraction of the document — same formula Qt uses
+        # internally for scrollbar thumbs.
+        thumb_height = max(
+            24,
+            min(
+                int(page_step / (page_step + slider_range) * usable_height),
+                usable_height,
+            ),
+        )
+        if thumb_height >= usable_height:
+            return QRect(rect.left(), rect.top() + pad, rect.width(), thumb_height)
+        travel = usable_height - thumb_height
+        value = max(slider_min, min(slider_max, self.value()))
+        offset = int((value - slider_min) / slider_range * travel)
+        return QRect(
+            rect.left(), rect.top() + pad + offset, rect.width(), thumb_height,
+        )
 
 
 class _LineNumberArea(QWidget):
@@ -160,6 +417,12 @@ class _DiffEditor(QPlainTextEdit):
         # instead of a sequential index.
         self._line_info: list[ParsedDiffLine] = []
         self._line_number_area = _LineNumberArea(self)
+        # Custom scrollbar — see :class:`_DiffScrollBar` for the
+        # two-half minimap visualisation (red deletions on the
+        # left, green additions on the right, semi-transparent
+        # through alpha-blended paints).
+        self._diff_scrollbar = _DiffScrollBar(self)
+        self.setVerticalScrollBar(self._diff_scrollbar)
         self.blockCountChanged.connect(self._update_gutter_width)
         self.updateRequest.connect(self._update_line_number_area)
 
@@ -195,6 +458,40 @@ class _DiffEditor(QPlainTextEdit):
         # have changed; ``blockCountChanged`` only fires when the
         # number of blocks changes, not when their metadata does.
         self._update_gutter_width()
+
+    def update_diff_markers(self, line_info: list[ParsedDiffLine]) -> None:
+        """Push the diff's deletion/addition positions to the scrollbar.
+
+        Positions follow **file line numbers**, normalised by the
+        largest line number that appears in the diff. A change at
+        file line 100 of a 1000-line document therefore lands at
+        exactly 10 % of the bar height — proportional to where it
+        lives in the file, the way a real minimap should work.
+
+        Adjacent markers in line-number order are drawn as
+        overlapping solid filled rectangles, so a hunk that touches
+        lines 61–78 reads as one continuous green bar rather than
+        as 18 separate thin lines. See :data:`_SCROLLBAR_MARKER_HALF_HEIGHT`
+        for the block thickness.
+        """
+        max_line = max(
+            (info.line_number for info in line_info if info.line_number),
+            default=0,
+        )
+        if max_line <= 0:
+            self._diff_scrollbar.set_diff_markers([], [])
+            return
+        deletions = sorted(
+            info.line_number / max_line
+            for info in line_info
+            if info.line_type == DiffLineType.DELETION and info.line_number
+        )
+        additions = sorted(
+            info.line_number / max_line
+            for info in line_info
+            if info.line_type == DiffLineType.ADDITION and info.line_number
+        )
+        self._diff_scrollbar.set_diff_markers(deletions, additions)
 
     # ── internal slots connected to signals ───────────────────────
 
@@ -260,18 +557,56 @@ class DiffViewWidget(QWidget):
 
     # ── layout ────────────────────────────────────────────────────
 
+    # ── stylesheet (active button is visually distinct) ──────────
+    #
+    # The default ``QPushButton`` checked-state rendering is so subtle
+    # on Windows that the user can't tell which mode is active. The
+    # stylesheet paints the *checked* button with the theme accent so
+    # the active mode is unmissable. Colours match :data:`DARK_THEME`
+    # (``bg_panel``, ``accent``/``accent_hover``/``accent_pressed``,
+    # ``text_on_accent``); the widget is theme-agnostic today so the
+    # literals are duplicated rather than threaded through the theme
+    # system.
+    _BUTTON_STYLESHEET = (
+        "QPushButton {"
+        " background-color: transparent;"
+        " color: #D4D4D4;"
+        " border: 1px solid #3F3F46;"
+        " border-radius: 3px;"
+        " padding: 4px 12px;"
+        " font-weight: 500;"
+        "}"
+        "QPushButton:hover { background-color: #2A2D2E; }"
+        "QPushButton:checked {"
+        " background-color: #007ACC;"
+        " color: #FFFFFF;"
+        " border-color: #007ACC;"
+        "}"
+        "QPushButton:checked:hover { background-color: #1F8AD2; }"
+        "QPushButton:pressed { background-color: #005A9E; }"
+        "QPushButton:focus { outline: none; }"
+    )
+
     def _build_toolbar(self) -> None:
         """Create the two-mode toggle buttons that sit above the editor.
 
         The buttons are wrapped in a :class:`QButtonGroup` so only one
         can be checked at a time, and an inner :class:`QHBoxLayout`
         keeps the group horizontally centred inside the toolbar row.
+        A shared stylesheet makes the *checked* button visibly
+        highlighted (theme accent fill, white text) so the user can
+        see at a glance which mode is active.
         """
         self._changes_button = QPushButton("Changes only", self)
         self._changes_button.setCheckable(True)
         self._changes_button.setChecked(True)
+        self._changes_button.setStyleSheet(self._BUTTON_STYLESHEET)
+        self._changes_button.setCursor(Qt.CursorShape.PointingHandCursor)
+
         self._document_button = QPushButton("Full document", self)
         self._document_button.setCheckable(True)
+        self._document_button.setStyleSheet(self._BUTTON_STYLESHEET)
+        self._document_button.setCursor(Qt.CursorShape.PointingHandCursor)
 
         group_row = QHBoxLayout()
         group_row.setContentsMargins(0, 0, 0, 0)
@@ -289,7 +624,12 @@ class DiffViewWidget(QWidget):
 
         self._toolbar = QWidget(self)
         toolbar_layout = QHBoxLayout(self._toolbar)
-        toolbar_layout.setContentsMargins(0, 0, 0, _TOOLBAR_BOTTOM_MARGIN)
+        # Equal top and bottom margin so the buttons sit visually
+        # centred between the widget's top edge and the editor body
+        # below — without the top margin the buttons hug the upper
+        # edge while a chunk of empty space separates them from the
+        # editor.
+        toolbar_layout.setContentsMargins(0, _TOOLBAR_VERTICAL_MARGIN, 0, _TOOLBAR_VERTICAL_MARGIN)
         toolbar_layout.addLayout(group_row)
 
     def _layout_body(self) -> None:
@@ -365,17 +705,20 @@ class DiffViewWidget(QWidget):
         The toolbar's checked button is kept in sync so the UI stays
         consistent with programmatic switches (e.g. when the user
         closes and re-opens the same file).
+
+        Both buttons' checked state is rewritten explicitly rather than
+        relying on the ``QButtonGroup`` exclusivity dance — toggling
+        ``setExclusive(False)`` mid-update leaves both buttons in the
+        checked state when it is re-enabled, so the group would no
+        longer reflect which mode is active.
         """
         if mode == self._view_mode:
             return
         self._view_mode = mode
-        # Update the button group without re-triggering the click
-        # handler that drives :meth:`_on_mode_button_clicked`.
-        sender = self._mode_group.button(int(mode))
-        if sender is not None:
-            self._mode_group.setExclusive(False)
-            sender.setChecked(True)
-            self._mode_group.setExclusive(True)
+        for candidate in DiffViewMode:
+            btn = self._mode_group.button(int(candidate))
+            if btn is not None:
+                btn.setChecked(candidate == mode)
         self._render()
         self.view_mode_changed.emit(mode)
 
@@ -384,6 +727,7 @@ class DiffViewWidget(QWidget):
         self._editor.clear()
         self._editor.set_line_info([])
         self._editor.setExtraSelections([])
+        self._editor._diff_scrollbar.set_diff_markers([], [])
         self._changes_only_text = ""
         self._full_document_text = ""
 
@@ -422,6 +766,12 @@ class DiffViewWidget(QWidget):
         on toggle) and the file-level headers are dropped before the
         document is rebuilt. Highlighting is applied last so the
         gutter widths line up with the line-info array.
+
+        After painting the editor pushes the deletion/addition
+        positions to the custom scrollbar's minimap. In *Full
+        document* mode the view also scrolls to the first diff line
+        so the user immediately sees the change when they switch
+        modes on a long file.
         """
         if self._view_mode == DiffViewMode.CHANGES_ONLY:
             text = self._changes_only_text
@@ -435,6 +785,43 @@ class DiffViewWidget(QWidget):
         self._editor.set_line_info(kept)
         self._editor.setPlainText("\n".join(p.text for p in kept))
         self._apply_highlighting(kept)
+        self._editor.update_diff_markers(kept)
+        if self._view_mode == DiffViewMode.FULL_DOCUMENT:
+            self._scroll_to_first_diff()
+
+    def _scroll_to_first_diff(self) -> None:
+        """Place the first deletion or addition at the top of the view.
+
+        Only invoked in :attr:`DiffViewMode.FULL_DOCUMENT` mode where
+        the whole file is rendered and the first change may be far
+        down the document; without this the user sees the file head
+        and has to scroll past hundreds of unchanged lines to find
+        the diff.
+
+        The cursor is reset (not extended) so any previous selection
+        is collapsed cleanly. We schedule the actual ``scrollContentsBy``
+        via a zero-delay :class:`QTimer` so the layout engine has a
+        chance to compute the new ``maximum()`` and block heights
+        before we ask the editor to scroll.
+        """
+        line_info = self._editor._line_info
+        target_idx: int | None = None
+        for idx, info in enumerate(line_info):
+            if info.line_type in (DiffLineType.ADDITION, DiffLineType.DELETION):
+                target_idx = idx
+                break
+        if target_idx is None:
+            return
+        block = self._editor.document().findBlockByLineNumber(target_idx)
+        if not block.isValid():
+            return
+        cursor = QTextCursor(block)
+
+        def _do_scroll() -> None:
+            self._editor.setTextCursor(cursor)
+            self._editor.ensureCursorVisible()
+
+        QTimer.singleShot(0, _do_scroll)
 
     # ── highlighting ──────────────────────────────────────────────
 

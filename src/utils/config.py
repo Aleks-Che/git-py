@@ -87,7 +87,15 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "recent_repos": [],
     # The active repository path (str or null).
     "active_repo": None,
+    # Diff-view mode in the centre pane (``"changes_only"`` or
+    # ``"full_document"``). Restored on launch, persisted on close.
+    # See :class:`src.ui.widgets.diff_view_widget.DiffViewWidget`.
+    "diff_view_mode": "changes_only",
 }
+
+# Valid values of the ``"diff_view_mode"`` config key. Anything else
+# (including a missing key) falls back to ``"changes_only"``.
+_VALID_DIFF_VIEW_MODES = frozenset({"changes_only", "full_document"})
 
 # Keys that must be ints (validation on load; bad values fall back).
 _INT_KEYS = frozenset({"merge_async_threshold", "auto_fetch_interval_ms"})
@@ -223,6 +231,14 @@ def load_hotkey(
     return value.strip()
 
 
+def load_diff_view_mode(config: dict[str, Any]) -> str:
+    """Return the persisted diff-view mode; ``"changes_only"`` on bad / missing."""
+    value = config.get("diff_view_mode")
+    if value in _VALID_DIFF_VIEW_MODES:
+        return value
+    return "changes_only"
+
+
 def load_graph_column_widths(
     config: dict[str, Any], repo_path: str | None,
 ) -> list[int] | None:
@@ -321,6 +337,7 @@ __all__ = [
     "get_int",
     "load_author_signature",
     "load_config",
+    "load_diff_view_mode",
     "load_graph_column_widths",
     "load_hotkey",
     "load_splitter_sizes",

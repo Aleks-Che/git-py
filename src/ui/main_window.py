@@ -69,7 +69,7 @@ from src.ui.dialogs.open_or_clone_dialog import OpenOrCloneDialog
 from src.ui.dialogs.remote_manage_dialog import RemoteManageDialog
 from src.ui.dialogs.settings_dialog import SettingsDialog
 from src.ui.widgets.action_history_widget import ActionHistoryWidget
-from src.ui.widgets.diff_view_widget import DiffViewWidget
+from src.ui.widgets.diff_view_widget import DiffViewMode, DiffViewWidget
 from src.ui.widgets.graph_panel import GraphTableWidget
 from src.ui.widgets.left_panel import LeftPanel
 from src.ui.widgets.log_widget import LogWidget
@@ -80,6 +80,7 @@ from src.ui.widgets.terminal_widget import TerminalWidget
 from src.utils.config import (
     SPLITTER_KEY_HORIZONTAL,
     load_config,
+    load_diff_view_mode,
     load_graph_column_widths,
     load_hotkey,
     load_splitter_sizes,
@@ -1150,6 +1151,13 @@ class MainWindow(QMainWindow):
             self._graph_table.set_divider_positions(
                 [graph_widths[0], graph_widths[0] + graph_widths[1]],
             )
+        # Restore the diff-view mode (Changes only / Full document).
+        # The widget's default is CHANGES_ONLY; setting a new mode
+        # re-renders, which is safe even when no file is selected
+        # (the cached diff text is empty in that case).
+        saved_mode = load_diff_view_mode(config)
+        if saved_mode == "full_document":
+            self._diff_view.set_view_mode(DiffViewMode.FULL_DOCUMENT)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt naming
         """Persist geometry, splitter sizes, and repo tabs before close.
@@ -1188,6 +1196,17 @@ class MainWindow(QMainWindow):
                             live[2] += donation
                     splitter_sizes[SPLITTER_KEY_HORIZONTAL] = live
             config["splitter_sizes"] = splitter_sizes
+            # Persist the active diff-view mode so the next launch
+            # restores whichever view (Changes only / Full document)
+            # the user was last using. See
+            # :func:`load_diff_view_mode` for the whitelisting rules.
+            if self._diff_view is not None:
+                mode = self._diff_view.view_mode()
+                config["diff_view_mode"] = (
+                    "full_document"
+                    if mode == DiffViewMode.FULL_DOCUMENT
+                    else "changes_only"
+                )
             # Persist repo tabs.
             tab_state = self._repo_tabs_vm.save_to_state()
             config["recent_repos"] = tab_state["paths"]

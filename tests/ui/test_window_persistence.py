@@ -721,3 +721,92 @@ def test_screen_changed_re_clamps_window(qtbot, tmp_path: Path) -> None:
     assert geo.left() >= sx
     assert geo.top() >= sy
     window.close()
+
+
+# ----- diff-view mode persistence -------------------------------------
+
+
+def test_diff_view_mode_persists_across_restart(
+    qtbot, tmp_path: Path, tmp_git_repo,
+) -> None:
+    """Switching to *Full document* and closing the window must write
+    that choice to the config; relaunching with the same config path
+    must restore it. Switching back to *Changes only* must overwrite
+    the saved value, and the missing key must default back to
+    *Changes only* (the legacy behaviour)."""
+    from src.ui.widgets.diff_view_widget import DiffViewMode
+
+    cfg_path = tmp_path / "config.json"
+    if cfg_path.exists():
+        cfg_path.unlink()
+
+    # --- Session 1: open with no prior config → defaults to CHANGES_ONLY ---
+    window1 = MainWindow(config_path=cfg_path)
+    qtbot.addWidget(window1)
+    window1._diff_view.set_view_mode(DiffViewMode.CHANGES_ONLY)
+    window1.close()
+    # Config written on close; reading it back must show the default.
+    cfg = load_config(cfg_path)
+    assert cfg["diff_view_mode"] == "changes_only"
+
+    # --- Session 2: open again, switch to FULL_DOCUMENT, close ---
+    window2 = MainWindow(config_path=cfg_path)
+    qtbot.addWidget(window2)
+    window2._diff_view.set_view_mode(DiffViewMode.FULL_DOCUMENT)
+    window2.close()
+    cfg = load_config(cfg_path)
+    assert cfg["diff_view_mode"] == "full_document"
+
+    # --- Session 3: open again, must restore FULL_DOCUMENT ---
+    window3 = MainWindow(config_path=cfg_path)
+    qtbot.addWidget(window3)
+    # ``_restore_state`` is wired via ``QTimer.singleShot(0)`` so we
+    # have to let the event loop tick before checking the widget.
+    qtbot.waitUntil(
+        lambda: window3._diff_view.view_mode() == DiffViewMode.FULL_DOCUMENT,
+        timeout=1000,
+    )
+    assert window3._diff_view.view_mode() == DiffViewMode.FULL_DOCUMENT
+    window3.close()
+
+    # --- Session 4: switch back, close, reopen — must read
+    #              CHANGES_ONLY ---
+    window4 = MainWindow(config_path=cfg_path)
+    qtbot.addWidget(window4)
+    window4._diff_view.set_view_mode(DiffViewMode.CHANGES_ONLY)
+    window4.close()
+    cfg = load_config(cfg_path)
+    assert cfg["diff_view_mode"] == "changes_only"
+
+    window5 = MainWindow(config_path=cfg_path)
+    qtbot.addWidget(window5)
+    qtbot.waitUntil(
+        lambda: window5._diff_view.view_mode() == DiffViewMode.CHANGES_ONLY,
+        timeout=1000,
+    )
+    assert window5._diff_view.view_mode() == DiffViewMode.CHANGES_ONLY
+    window5.close()
+
+
+def test_diff_view_mode_handles_corrupt_value(
+    qtbot, tmp_path: Path,
+) -> None:
+    """A config that pins ``diff_view_mode`` to a junk value must
+    fall back to ``"changes_only"`` rather than crash the app."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        '{"diff_view_mode": "wibble", "recent_repos": [], "active_repo": null}',
+        encoding="utf-8",
+    )
+
+    from src.ui.widgets.diff_view_widget import DiffViewMode
+    window = MainWindow(config_path=cfg_path)
+    qtbot.addWidget(window)
+    qtbot.waitUntil(
+        lambda: window._diff_view is not None, timeout=500,
+    )
+    # The startup defaults to CHANGES_ONLY — the bogus config value
+    # must not flip the widget into an unknown state.
+    assert window._diff_view.view_mode() == DiffViewMode.CHANGES_ONLY
+    window.close()
