@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, QThreadPool, QTimer, Signal
 
+from src.core.diff_parser import ParsedDiffLine
 from src.core.exceptions import (
     GitError,
     MergeConflictError,
@@ -307,7 +308,7 @@ class MainViewModel(QObject):
                     return {"error": err}
                 print("[worker::bg] _compute_status_data...")
                 _t2 = _wt.monotonic()
-                file_changes, staged = (
+                file_changes, staged, raw_status = (
                     CommitPanelViewModel._compute_status_data(worker_repo)
                 )
                 _elapsed2 = _wt.monotonic() - _t2
@@ -335,6 +336,7 @@ class MainViewModel(QObject):
                 "rows": rows,
                 "file_changes": file_changes,
                 "staged": staged,
+                "raw_status": raw_status,
                 "branch_data": branch_data,
             }
 
@@ -351,11 +353,13 @@ class MainViewModel(QObject):
             rows: list = data["rows"]
             file_changes: list = data["file_changes"]
             staged: set = data["staged"]
+            raw_status: dict = data["raw_status"]
             branch_data: dict = data["branch_data"]
 
             self._graph_view_model.graph_updated.emit(rows)
             self._commit_panel_view_model._file_changes = file_changes
             self._commit_panel_view_model._staged_files = staged
+            self._commit_panel_view_model._raw_status = raw_status
             self._commit_panel_view_model.file_changes_changed.emit()
             self._commit_panel_view_model.staged_files_changed.emit(
                 sorted(staged),
@@ -427,6 +431,44 @@ class MainViewModel(QObject):
     def unstage_file(self, path: str) -> None:
         """Delegate to :meth:`CommitPanelViewModel.unstage_file`."""
         self._commit_panel_view_model.unstage_file(path)
+
+    def stage_diff_line(self, path: str, line: ParsedDiffLine) -> None:
+        """Stage one added or deleted row from the index-to-worktree diff."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        from src.viewmodels.commands import StageDiffLineCommand
+
+        try:
+            self._command_processor.execute(
+                StageDiffLineCommand(self._repo_manager, path, line),
+            )
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("staging", f"Stage line failed: {exc}", level="error")
+            return
+        self._commit_panel_view_model.refresh_status()
+        self._commit_panel_view_model.refresh_selected_diff()
+        self._log("staging", f"Staged one line in {path}")
+
+    def unstage_diff_line(self, path: str, line: ParsedDiffLine) -> None:
+        """Unstage one added or deleted row from the HEAD-to-index diff."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        from src.viewmodels.commands import UnstageDiffLineCommand
+
+        try:
+            self._command_processor.execute(
+                UnstageDiffLineCommand(self._repo_manager, path, line),
+            )
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("staging", f"Unstage line failed: {exc}", level="error")
+            return
+        self._commit_panel_view_model.refresh_status()
+        self._commit_panel_view_model.refresh_selected_diff()
+        self._log("staging", f"Unstaged one line in {path}")
 
     def stage_all_unstaged(self) -> None:
         """Stage every currently-unstaged file in one call.
@@ -530,6 +572,7 @@ class MainViewModel(QObject):
             self._log("undo", f"Undo failed: {exc}", level="error")
             return
         self._refresh_all_views()
+        self._commit_panel_view_model.refresh_selected_diff()
         self._log("undo", "Undo succeeded")
 
     def redo(self) -> None:
@@ -543,6 +586,7 @@ class MainViewModel(QObject):
             self._log("redo", f"Redo failed: {exc}", level="error")
             return
         self._refresh_all_views()
+        self._commit_panel_view_model.refresh_selected_diff()
         self._log("redo", "Redo succeeded")
 
     # ----- commit checkout (detached HEAD) ----------------------------

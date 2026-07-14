@@ -11,9 +11,11 @@ from pathlib import Path
 import pygit2
 import pytest
 from PySide6.QtCore import QCoreApplication
+from src.core.diff_parser import DiffLineType, parse_diff_lines
 from src.core.models import FileStatus
 from src.core.repository import RepositoryManager
 from src.viewmodels.commit_panel_viewmodel import CommitPanelViewModel
+from src.viewmodels.main_viewmodel import MainViewModel
 
 
 def _ensure_app() -> None:
@@ -563,4 +565,112 @@ def test_select_file_emits_diff_pair_ready(
     # The full-document variant is at least as long as the
     # changes-only one (more context = more lines).
     assert len(full_document) >= len(changes_only)
+
+
+def test_partial_stage_keeps_file_in_both_lists_and_hides_clicked_line(
+    qtbot,
+    committed_repo: RepositoryManager,
+) -> None:
+    worktree = Path(committed_repo.path)
+    worktree.joinpath("hello.txt").write_text("hello, world\n1\n2\n3\n")
+    main_vm = MainViewModel()
+    main_vm.set_repository(committed_repo)
+    panel_vm = main_vm.commit_panel_view_model()
+    panel_vm.select_file("hello.txt")
+    line = next(
+        item
+        for item in parse_diff_lines(panel_vm.current_diff() or "")
+        if item.line_type == DiffLineType.ADDITION and item.text == "+3"
+    )
+
+    main_vm.stage_diff_line("hello.txt", line)
+
+    assert "hello.txt" in {item.path for item in panel_vm.unstaged_files()}
+    assert "hello.txt" in {item.path for item in panel_vm.staged_files_detailed()}
+    assert "+3" not in panel_vm.build_diff_text("hello.txt", staged=False)
+    assert "+1" in panel_vm.build_diff_text("hello.txt", staged=False)
+    assert "+3" in panel_vm.build_diff_text("hello.txt", staged=True)
+
+
+def test_partial_stage_command_is_undoable(
+    qtbot,
+    committed_repo: RepositoryManager,
+) -> None:
+    worktree = Path(committed_repo.path)
+    worktree.joinpath("hello.txt").write_text("hello, world\nextra\n")
+    main_vm = MainViewModel()
+    main_vm.set_repository(committed_repo)
+    panel_vm = main_vm.commit_panel_view_model()
+    line = next(
+        item
+        for item in parse_diff_lines(panel_vm.build_diff_text("hello.txt"))
+        if item.line_type == DiffLineType.ADDITION
+    )
+    before = committed_repo.repo.index["hello.txt"].id
+
+    main_vm.stage_diff_line("hello.txt", line)
+    assert committed_repo.repo.index["hello.txt"].id != before
+    assert main_vm.command_processor().can_undo
+
+    main_vm.undo()
+    assert committed_repo.repo.index["hello.txt"].id == before
+
+
+def test_stage_multiple_lines_from_refreshed_filtered_diff(
+    qtbot,
+    committed_repo: RepositoryManager,
+) -> None:
+    worktree = Path(committed_repo.path)
+    worktree.joinpath("hello.txt").write_text("hello, world\none\ntwo\nthree\n")
+    main_vm = MainViewModel()
+    main_vm.set_repository(committed_repo)
+    panel_vm = main_vm.commit_panel_view_model()
+    panel_vm.select_file("hello.txt")
+    errors: list[str] = []
+    main_vm.error_occurred.connect(errors.append)
+
+    for text in ("+one", "+two", "+three"):
+        line = next(
+            item
+            for item in parse_diff_lines(panel_vm.current_diff() or "")
+            if item.line_type == DiffLineType.ADDITION and item.text == text
+        )
+        main_vm.stage_diff_line("hello.txt", line)
+
+    assert errors == []
+    staged_text = panel_vm.build_diff_text("hello.txt", staged=True)
+    assert all(text in staged_text for text in ("+one", "+two", "+three"))
+
+
+def test_unstage_all_refreshes_open_partial_diff_to_unstaged_side(
+    qtbot,
+    committed_repo: RepositoryManager,
+) -> None:
+    worktree = Path(committed_repo.path)
+    worktree.joinpath("hello.txt").write_text(
+        "hello, world\none\ntwo\nthree\nfour\n",
+    )
+    main_vm = MainViewModel()
+    main_vm.set_repository(committed_repo)
+    panel_vm = main_vm.commit_panel_view_model()
+    panel_vm.select_file("hello.txt")
+    for text in ("+one", "+two", "+three"):
+        line = next(
+            item
+            for item in parse_diff_lines(panel_vm.current_diff() or "")
+            if item.line_type == DiffLineType.ADDITION and item.text == text
+        )
+        main_vm.stage_diff_line("hello.txt", line)
+    panel_vm.select_file("hello.txt", staged=True)
+    assert "+four" not in (panel_vm.current_diff() or "")
+
+    main_vm.unstage_all_staged()
+
+    assert panel_vm.staged_files() == []
+    assert panel_vm.selected_file() == "hello.txt"
+    assert not panel_vm.selected_file_is_staged()
+    assert all(
+        text in (panel_vm.current_diff() or "")
+        for text in ("+one", "+two", "+three", "+four")
+    )
 

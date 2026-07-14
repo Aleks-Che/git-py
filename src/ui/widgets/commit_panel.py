@@ -440,7 +440,7 @@ class CommitPanel(QWidget):
         if modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
             return
         current = self._vm.selected_file()
-        if current == path:
+        if current == path and not self._vm.selected_file_is_staged():
             self._vm.select_file(None)
             self._unstaged_list.clearSelection()
             self._staged_list.clearSelection()
@@ -456,7 +456,7 @@ class CommitPanel(QWidget):
         if modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
             return
         current = self._vm.selected_file()
-        if current == path:
+        if current == path and self._vm.selected_file_is_staged():
             self._vm.select_file(None)
             self._unstaged_list.clearSelection()
             self._staged_list.clearSelection()
@@ -576,12 +576,17 @@ class CommitPanel(QWidget):
 
     def _highlight_selected_file(self) -> None:
         selected = self._vm.selected_file()
+        selected_view = (
+            self._staged_list
+            if self._vm.selected_file_is_staged()
+            else self._unstaged_list
+        )
         for list_view in (self._unstaged_list, self._staged_list):
             sel_model = list_view.selectionModel()
             if sel_model is None:
                 continue
             sel_model.clearSelection()
-            if selected is not None:
+            if selected is not None and list_view is selected_view:
                 model = list_view.model()
                 for row in range(model.rowCount()):
                     change = model.change_at(row)

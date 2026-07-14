@@ -16,6 +16,7 @@ numbers).
 from __future__ import annotations
 
 import re
+from collections import Counter
 from enum import Enum, auto
 from typing import NamedTuple
 
@@ -59,11 +60,19 @@ class ParsedDiffLine(NamedTuple):
         * For ``HUNK`` lines this is the new-file line number of the
           first line in the hunk — useful as a separator marker, but
           the viewer usually leaves the gutter blank for it.
+    old_line_number:
+        The current old-side line for this diff row. For additions this
+        is the insertion cursor between old-side lines.
+    new_line_number:
+        The current new-side line for this diff row. For deletions this
+        is the insertion cursor between new-side lines.
     """
 
     line_type: DiffLineType
     text: str
     line_number: int | None
+    old_line_number: int | None = None
+    new_line_number: int | None = None
 
 # Map ``pygit2`` delta status to our :class:`FileStatus` enum.
 _DELTA_TO_STATUS: dict[int, FileStatus] = {
@@ -196,7 +205,11 @@ def parse_diff_lines(text: str) -> list[ParsedDiffLine]:
             # to start.
             result.append(
                 ParsedDiffLine(
-                    DiffLineType.HUNK, stripped, new_start or old_start,
+                    DiffLineType.HUNK,
+                    stripped,
+                    new_start or old_start,
+                    old_start,
+                    new_start,
                 ),
             )
         elif stripped.startswith("+") and not stripped.startswith("+++"):
@@ -204,6 +217,8 @@ def parse_diff_lines(text: str) -> list[ParsedDiffLine]:
                 ParsedDiffLine(
                     DiffLineType.ADDITION,
                     stripped,
+                    new_line if in_hunk else None,
+                    old_line if in_hunk else None,
                     new_line if in_hunk else None,
                 ),
             )
@@ -215,6 +230,8 @@ def parse_diff_lines(text: str) -> list[ParsedDiffLine]:
                     DiffLineType.DELETION,
                     stripped,
                     old_line if in_hunk else None,
+                    old_line if in_hunk else None,
+                    new_line if in_hunk else None,
                 ),
             )
             if in_hunk:
@@ -225,6 +242,8 @@ def parse_diff_lines(text: str) -> list[ParsedDiffLine]:
                 ParsedDiffLine(
                     DiffLineType.CONTEXT,
                     stripped,
+                    new_line if in_hunk else None,
+                    old_line if in_hunk else None,
                     new_line if in_hunk else None,
                 ),
             )
@@ -285,10 +304,43 @@ def _is_header_line(line: str) -> bool:
     )
 
 
+def diff_line_action_key(
+    line: ParsedDiffLine,
+) -> tuple[DiffLineType, int | None, str]:
+    """Return a stable HEAD-relative key for an actionable diff row."""
+    return line.line_type, line.old_line_number, line.text
+
+
+def filter_staged_diff_lines(
+    text: str,
+    staged_text: str,
+) -> tuple[str, list[ParsedDiffLine]]:
+    """Hide staged actions while preserving their original line metadata."""
+    staged_counts = Counter(
+        diff_line_action_key(line)
+        for line in parse_diff_lines(staged_text)
+        if line.line_type in (DiffLineType.ADDITION, DiffLineType.DELETION)
+    )
+    if not staged_counts:
+        return text, parse_diff_lines(text)
+    kept: list[ParsedDiffLine] = []
+    for line in parse_diff_lines(text):
+        if line.line_type in (DiffLineType.ADDITION, DiffLineType.DELETION):
+            key = diff_line_action_key(line)
+            if staged_counts[key] > 0:
+                staged_counts[key] -= 1
+                continue
+        kept.append(line)
+    suffix = "\n" if text.endswith("\n") and kept else ""
+    return "\n".join(line.text for line in kept) + suffix, kept
+
+
 __all__ = [
     "DiffLineType",
     "ParsedDiffLine",
+    "diff_line_action_key",
     "diff_to_text",
+    "filter_staged_diff_lines",
     "parse_diff",
     "parse_diff_lines",
 ]

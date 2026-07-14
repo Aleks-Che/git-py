@@ -235,8 +235,8 @@ def test_main_window_persists_splitter_sizes_on_close(qtbot, tmp_path: Path) -> 
     # closeEvent corrects a zero-width right panel (hidden) to at
     # least MIN_RIGHT_WIDTH, borrowing from the graph column.
     from src.ui.main_window import MainWindow
-    MIN_RIGHT = MainWindow.MIN_RIGHT_WIDTH
-    expected = [top_actual[0], max(0, top_actual[1] - MIN_RIGHT), MIN_RIGHT]
+    min_right = MainWindow.MIN_RIGHT_WIDTH
+    expected = [top_actual[0], max(0, top_actual[1] - min_right), min_right]
     assert saved[SPLITTER_KEY_HORIZONTAL] == expected
 
 
@@ -311,8 +311,6 @@ def test_main_window_restores_splitter_sizes_on_next_launch(
         # windows.  The left-panel and graph widths match the
         # corrected values that closeEvent saved, not the
         # pre-correction values from setSizes.
-        from src.ui.main_window import MainWindow
-        MIN_RIGHT = MainWindow.MIN_RIGHT_WIDTH
         sizes = list(second._top_splitter.sizes())  # noqa: SLF001
         assert sizes[0] > 0
         assert sizes[2] == 0  # right panel still hidden
@@ -424,12 +422,12 @@ def test_main_window_splitter_drag_persists_after_close(
     first.close()
 
     from src.ui.main_window import MainWindow
-    MIN_RIGHT = MainWindow.MIN_RIGHT_WIDTH
+    min_right = MainWindow.MIN_RIGHT_WIDTH
     # The saved config has the right panel width raised from 0 to
     # MIN_RIGHT, borrowing from the centre column.
     saved = load_splitter_sizes(load_config(config_path))
     saved_h = saved[SPLITTER_KEY_HORIZONTAL]
-    assert saved_h[2] == MIN_RIGHT
+    assert saved_h[2] == min_right
     # The left panel keeps its saved width.
     assert saved_h[0] > 0
 

@@ -22,9 +22,11 @@ from pathlib import Path
 
 import pygit2
 from PySide6.QtGui import QColor
+from src.core.diff_parser import DiffLineType
 from src.core.models import FileStatus
 from src.core.repository import RepositoryManager
 from src.ui.main_window import MainWindow
+from src.ui.widgets.diff_view_widget import DiffLineActionMode
 from src.ui.widgets.file_list_model import (
     PATH_TEXT_COLOR,
     STATUS_BADGE,
@@ -637,6 +639,114 @@ def test_selecting_staged_file_shows_diff(qtbot, tmp_git_repo: Path) -> None:
     assert len(window._diff_view.toPlainText()) > 0
 
 
+def test_unstaged_modified_file_enables_green_line_actions(
+    qtbot,
+    tmp_git_repo: Path,
+) -> None:
+    mgr = _make_dirty_repo(tmp_git_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(WIP_SHA)
+
+    window._main_vm.commit_panel_view_model().select_file("f.txt")
+
+    assert window._diff_view.line_action_mode() == DiffLineActionMode.STAGE
+
+
+def test_staged_modified_file_enables_red_line_actions(
+    qtbot,
+    tmp_git_repo: Path,
+) -> None:
+    mgr = _make_dirty_repo(tmp_git_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(WIP_SHA)
+    window._main_vm.stage_file("f.txt")
+
+    window._main_vm.commit_panel_view_model().select_file("f.txt", staged=True)
+
+    assert window._diff_view.line_action_mode() == DiffLineActionMode.UNSTAGE
+
+
+def test_untracked_file_has_no_line_actions(qtbot, tmp_git_repo: Path) -> None:
+    mgr = _make_dirty_repo(tmp_git_repo)
+    (tmp_git_repo / "new.txt").write_text("new\n")
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(WIP_SHA)
+    cp_vm = window._main_vm.commit_panel_view_model()
+    cp_vm.refresh_status()
+
+    cp_vm.select_file("new.txt")
+
+    assert window._diff_view.line_action_mode() is None
+
+
+def test_diff_line_signal_stages_and_hides_that_line(
+    qtbot,
+    tmp_git_repo: Path,
+) -> None:
+    mgr = _make_dirty_repo(tmp_git_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(WIP_SHA)
+    cp_vm = window._main_vm.commit_panel_view_model()
+    cp_vm.select_file("f.txt")
+    line = next(
+        item
+        for item in window._diff_view._editor._line_info
+        if item.line_type == DiffLineType.ADDITION
+    )
+
+    window._diff_view.line_action_requested.emit(line)
+
+    assert "f.txt" in cp_vm.staged_files()
+    assert line.text not in cp_vm.build_diff_text("f.txt", staged=False)
+
+
+def test_unstage_all_button_refreshes_open_partial_diff(
+    qtbot,
+    tmp_git_repo: Path,
+) -> None:
+    mgr = _make_dirty_repo(tmp_git_repo)
+    (tmp_git_repo / "f.txt").write_text("v2\none\ntwo\nthree\nfour\n")
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(WIP_SHA)
+    cp_vm = window._main_vm.commit_panel_view_model()
+    cp_vm.select_file("f.txt")
+    for text in ("+one", "+two", "+three"):
+        line = next(
+            item
+            for item in window._diff_view._editor._line_info
+            if item.line_type == DiffLineType.ADDITION and item.text == text
+        )
+        window._diff_view.line_action_requested.emit(line)
+    cp_vm.select_file("f.txt", staged=True)
+    assert "+four" not in window._diff_view.toPlainText()
+
+    window._right_panel._commit_input._unstage_all_button.click()
+
+    assert cp_vm.staged_files() == []
+    assert cp_vm.selected_file() == "f.txt"
+    assert not cp_vm.selected_file_is_staged()
+    assert window._diff_view.line_action_mode() == DiffLineActionMode.STAGE
+    assert all(
+        text in window._diff_view.toPlainText()
+        for text in ("+one", "+two", "+three", "+four")
+    )
+
+
 def test_deselecting_staged_file_returns_graph(qtbot, tmp_git_repo: Path) -> None:
     """Deselecting a staged file returns the graph view."""
     mgr = _make_dirty_repo(tmp_git_repo)
@@ -675,6 +785,7 @@ def test_clicking_file_in_commit_detail_shows_diff(
     assert window._graph_stack.currentIndex() == 1
     assert window._diff_view.isVisible()
     assert len(window._diff_view.toPlainText()) > 0
+    assert window._diff_view.line_action_mode() is None
 
 
 def test_clicking_same_file_in_commit_detail_toggles_off(

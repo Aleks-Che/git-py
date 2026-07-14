@@ -13,6 +13,11 @@ from pathlib import Path
 
 import pygit2
 import pytest
+from src.core.diff_parser import (
+    DiffLineType,
+    filter_staged_diff_lines,
+    parse_diff_lines,
+)
 from src.core.exceptions import (
     GitError,
     GitNotInstalledError,
@@ -48,12 +53,14 @@ from src.core.operations import (
     reset,
     restore_stash,
     revert,
+    stage_diff_line,
     stash_apply,
     stash_drop,
     stash_oid_at,
     stash_pop,
     stash_push,
     stash_push_staged,
+    unstage_diff_line,
 )
 from src.core.repository import RepositoryManager
 
@@ -928,3 +935,215 @@ def test_fetch_from_local_origin_still_works(
     # **not** needing the CLI fallback, so pygit2 handles it.
     fetch(second_mgr, "origin")
     second_mgr.repo.lookup_reference(f"refs/remotes/origin/{branch}").resolve()
+
+
+def _make_partial_line_repo(path: Path) -> RepositoryManager:
+    manager = RepositoryManager(str(path))
+    signature = pygit2.Signature("tester", "tester@example.com", int(time.time()), 0)
+    (path / "lines.txt").write_text("start\nend\n")
+    manager.repo.index.add("lines.txt")
+    manager.repo.index.write()
+    tree = manager.repo.index.write_tree()
+    manager.repo.create_commit("refs/heads/main", signature, signature, "base", tree, [])
+    return manager
+
+
+def _diff_line(
+    manager: RepositoryManager,
+    text: str,
+    *,
+    staged: bool = False,
+    line_type: DiffLineType = DiffLineType.ADDITION,
+):
+    diff = manager.repo.diff("HEAD", cached=staged, context_lines=3)
+    patch = next(
+        patch.text
+        for patch in diff
+        if patch.delta.new_file.path == "lines.txt"
+        or patch.delta.old_file.path == "lines.txt"
+    )
+    return next(
+        line
+        for line in parse_diff_lines(patch)
+        if line.line_type == line_type and line.text == text
+    )
+
+
+def _filtered_diff_line(
+    manager: RepositoryManager,
+    text: str,
+    *,
+    context_lines: int = 3,
+    line_type: DiffLineType = DiffLineType.ADDITION,
+):
+    source = manager.repo.diff("HEAD", context_lines=context_lines)
+    staged = manager.repo.diff("HEAD", cached=True, context_lines=3)
+    source_text = "".join(
+        patch.text
+        for patch in source
+        if patch.delta.new_file.path == "lines.txt"
+        or patch.delta.old_file.path == "lines.txt"
+    )
+    staged_text = "".join(
+        patch.text
+        for patch in staged
+        if patch.delta.new_file.path == "lines.txt"
+        or patch.delta.old_file.path == "lines.txt"
+    )
+    filtered_text = filter_staged_diff_lines(source_text, staged_text)[0]
+    return next(
+        line
+        for line in parse_diff_lines(filtered_text)
+        if line.line_type == line_type and line.text == text
+    )
+
+
+def _index_text(manager: RepositoryManager) -> str:
+    entry = manager.repo.index["lines.txt"]
+    return manager.repo[entry.id].data.decode()
+
+
+def test_stage_diff_lines_preserves_click_order(tmp_git_repo: Path) -> None:
+    manager = _make_partial_line_repo(tmp_git_repo)
+    (tmp_git_repo / "lines.txt").write_text("start\n1\n2\n3\n4\n5\nend\n")
+
+    clicked = ["5", "1", "2", "4", "3"]
+    staged: list[str] = []
+    for value in clicked:
+        stage_diff_line(manager, "lines.txt", _diff_line(manager, f"+{value}"))
+        staged.append(value)
+        expected = "start\n" + "".join(f"{item}\n" for item in staged)
+        assert _index_text(manager) == expected + "end\n"
+
+
+def test_unstage_diff_line_returns_only_clicked_line(tmp_git_repo: Path) -> None:
+    manager = _make_partial_line_repo(tmp_git_repo)
+    (tmp_git_repo / "lines.txt").write_text("start\n1\n2\n3\nend\n")
+    for value in ("3", "1", "2"):
+        stage_diff_line(manager, "lines.txt", _diff_line(manager, f"+{value}"))
+
+    unstage_diff_line(
+        manager,
+        "lines.txt",
+        _diff_line(manager, "+1", staged=True),
+    )
+
+    assert _index_text(manager) == "start\n3\n2\nend\n"
+    assert (tmp_git_repo / "lines.txt").read_text() == "start\n1\n2\n3\nend\n"
+
+
+def test_stage_diff_line_can_remove_one_original_line(tmp_git_repo: Path) -> None:
+    manager = _make_partial_line_repo(tmp_git_repo)
+    (tmp_git_repo / "lines.txt").write_text("start\n")
+
+    stage_diff_line(
+        manager,
+        "lines.txt",
+        _diff_line(
+            manager,
+            "-end",
+            line_type=DiffLineType.DELETION,
+        ),
+    )
+
+    assert _index_text(manager) == "start\n"
+
+
+def test_stage_diff_line_resolves_next_filtered_addition(tmp_git_repo: Path) -> None:
+    manager = _make_partial_line_repo(tmp_git_repo)
+    (tmp_git_repo / "lines.txt").write_text("start\n1\n2\n3\nend\n")
+
+    stage_diff_line(manager, "lines.txt", _filtered_diff_line(manager, "+1"))
+    second = _filtered_diff_line(manager, "+2")
+    stage_diff_line(manager, "lines.txt", second)
+    third = _filtered_diff_line(manager, "+3")
+    stage_diff_line(manager, "lines.txt", third)
+
+    assert _index_text(manager) == "start\n1\n2\n3\nend\n"
+
+
+def test_stage_diff_line_resolves_next_filtered_deletion(tmp_git_repo: Path) -> None:
+    manager = _make_partial_line_repo(tmp_git_repo)
+    (tmp_git_repo / "lines.txt").write_text("start\n1\n2\n3\nend\n")
+    manager.repo.index.add("lines.txt")
+    manager.repo.index.write()
+    tree = manager.repo.index.write_tree()
+    signature = pygit2.Signature("tester", "tester@example.com", int(time.time()), 0)
+    manager.repo.create_commit(
+        "HEAD",
+        signature,
+        signature,
+        "more lines",
+        tree,
+        [manager.repo.head.target],
+    )
+    (tmp_git_repo / "lines.txt").write_text("start\nend\n")
+
+    stage_diff_line(
+        manager,
+        "lines.txt",
+        _filtered_diff_line(
+            manager,
+            "-1",
+            line_type=DiffLineType.DELETION,
+        ),
+    )
+    stage_diff_line(
+        manager,
+        "lines.txt",
+        _filtered_diff_line(
+            manager,
+            "-2",
+            line_type=DiffLineType.DELETION,
+        ),
+    )
+
+    assert _index_text(manager) == "start\n3\nend\n"
+
+
+def test_stage_diff_line_resolves_filtered_full_document_row(tmp_git_repo: Path) -> None:
+    manager = _make_partial_line_repo(tmp_git_repo)
+    base_lines = [f"line-{index}" for index in range(20)]
+    (tmp_git_repo / "lines.txt").write_text("\n".join(base_lines) + "\n")
+    manager.repo.index.add("lines.txt")
+    manager.repo.index.write()
+    tree = manager.repo.index.write_tree()
+    signature = pygit2.Signature("tester", "tester@example.com", int(time.time()), 0)
+    manager.repo.create_commit(
+        "HEAD",
+        signature,
+        signature,
+        "long file",
+        tree,
+        [manager.repo.head.target],
+    )
+    worktree_lines = base_lines[:2] + ["first-added"] + base_lines[2:16]
+    worktree_lines += ["second-added"] + base_lines[16:]
+    (tmp_git_repo / "lines.txt").write_text("\n".join(worktree_lines) + "\n")
+
+    stage_diff_line(
+        manager,
+        "lines.txt",
+        _filtered_diff_line(manager, "+first-added"),
+    )
+    stage_diff_line(
+        manager,
+        "lines.txt",
+        _filtered_diff_line(
+            manager,
+            "+second-added",
+            context_lines=2**31 - 1,
+        ),
+    )
+
+    assert "first-added\n" in _index_text(manager)
+    assert "second-added\n" in _index_text(manager)
+
+
+def test_stage_diff_line_rejects_new_file(tmp_git_repo: Path) -> None:
+    manager = _make_partial_line_repo(tmp_git_repo)
+    (tmp_git_repo / "new.txt").write_text("new\n")
+    line = parse_diff_lines("@@ -0,0 +1,1 @@\n+new\n")[1]
+
+    with pytest.raises(GitError, match="no unstaged text modification"):
+        stage_diff_line(manager, "new.txt", line)

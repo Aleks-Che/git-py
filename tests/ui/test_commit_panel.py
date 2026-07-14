@@ -15,6 +15,7 @@ from PySide6.QtCore import QEvent, QItemSelectionModel, QPoint, Qt
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QStyleOptionViewItem
+from src.core.diff_parser import DiffLineType, parse_diff_lines
 from src.core.models import FileChange, FileStatus
 from src.core.repository import RepositoryManager
 from src.ui.widgets.commit_panel import CommitPanel, FileListView
@@ -179,7 +180,56 @@ def test_clicking_stage_file_button_stages_one_file(
     assert "f.txt" in _panel_paths(panel._staged_list)
 
 
-# ----- Click on row = select for diff ----------------------------------
+def test_partial_stage_shows_modified_file_in_both_lists(
+    qtbot,
+    tmp_git_repo: Path,
+) -> None:
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    panel_vm = vm.commit_panel_view_model()
+    line = next(
+        item
+        for item in parse_diff_lines(panel_vm.build_diff_text("f.txt"))
+        if item.line_type == DiffLineType.ADDITION
+    )
+
+    vm.stage_diff_line("f.txt", line)
+
+    assert "f.txt" in _panel_paths(panel._unstaged_list)
+    assert "f.txt" in _panel_paths(panel._staged_list)
+
+
+def test_partial_file_can_switch_between_unstaged_and_staged_diff(
+    qtbot,
+    tmp_git_repo: Path,
+) -> None:
+    mgr = _make_repo_with_change(tmp_git_repo)
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    panel.show()
+    panel_vm = vm.commit_panel_view_model()
+    line = next(
+        item
+        for item in parse_diff_lines(panel_vm.build_diff_text("f.txt"))
+        if item.line_type == DiffLineType.ADDITION
+    )
+    vm.stage_diff_line("f.txt", line)
+    unstaged_index = panel._unstaged_list.model().index(0, 0)
+    staged_index = panel._staged_list.model().index(0, 0)
+
+    panel._on_unstaged_index_clicked(unstaged_index)
+    assert not panel_vm.selected_file_is_staged()
+    panel._on_staged_index_clicked(staged_index)
+
+    assert panel_vm.selected_file() == "f.txt"
+    assert panel_vm.selected_file_is_staged()
+
 
 
 def test_clicking_unstaged_row_selects_file(qtbot, tmp_git_repo: Path) -> None:

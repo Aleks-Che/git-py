@@ -30,8 +30,9 @@ from __future__ import annotations
 import pygit2
 from PySide6.QtCore import QObject, Signal
 
+from src.core.diff_parser import filter_staged_diff_lines
 from src.core.exceptions import GitError
-from src.core.models import FileChange
+from src.core.models import FileChange, FileStatus
 from src.core.repository import RepositoryManager
 
 # Bitmask of pygit2 status flags that mean "the change is already
@@ -42,6 +43,14 @@ _STAGED_FLAGS = (
     | pygit2.GIT_STATUS_INDEX_DELETED
     | pygit2.GIT_STATUS_INDEX_RENAMED
     | pygit2.GIT_STATUS_INDEX_TYPECHANGE
+)
+
+_UNSTAGED_FLAGS = (
+    pygit2.GIT_STATUS_WT_NEW
+    | pygit2.GIT_STATUS_WT_MODIFIED
+    | pygit2.GIT_STATUS_WT_DELETED
+    | pygit2.GIT_STATUS_WT_RENAMED
+    | pygit2.GIT_STATUS_WT_TYPECHANGE
 )
 
 # When generating the "full document" variant of a diff we want
@@ -93,6 +102,7 @@ class CommitPanelViewModel(QObject):
         super().__init__(parent)
         self._repo: RepositoryManager | None = None
         self._file_changes: list[FileChange] = []
+        self._raw_status: dict[str, int] = {}
         self._staged_files: set[str] = set()
         self._selected_file: str | None = None
         self._selected_file_staged: bool = False
@@ -115,29 +125,53 @@ class CommitPanelViewModel(QObject):
         return set(self._staged_files)
 
     def unstaged_paths(self) -> list[str]:
-        """Return the sorted list of paths that are in the working tree
-        but **not** currently recorded in the index.
-
-        Used by the right panel's *Stage All Changes* button. Files
-        that are already staged are filtered out.
-        """
-        staged = self._staged_files
-        return sorted(c.path for c in self._file_changes if c.path not in staged)
+        """Return paths with working-tree changes not recorded in the index."""
+        return sorted(
+            path
+            for path, flag in self._raw_status.items()
+            if flag & _UNSTAGED_FLAGS
+        )
 
     def unstaged_files(self) -> list[FileChange]:
-        """Return the :class:`FileChange` records that are not yet staged."""
-        staged = self._staged_files
-        return [c for c in self._file_changes if c.path not in staged]
+        """Return one side-specific record for every working-tree change."""
+        result: list[FileChange] = []
+        for path, flag in self._raw_status.items():
+            status = self._worktree_status(flag)
+            if status is not None:
+                result.append(FileChange(path=path, status=status))
+        return result
 
     def staged_files_detailed(self) -> list[FileChange]:
-        """Return the :class:`FileChange` records for staged paths.
+        """Return one side-specific record for every index change."""
+        result: list[FileChange] = []
+        for path, flag in self._raw_status.items():
+            status = self._index_status(flag)
+            if status is not None:
+                result.append(FileChange(path=path, status=status))
+        return result
 
-        The result keeps the original :class:`FileStatus` from
-        ``file_changes``; callers that need a per-file ``M`` / ``A``
-        / ``D`` badge read this directly.
-        """
-        staged = self._staged_files
-        return [c for c in self._file_changes if c.path in staged]
+    def selected_file_is_staged(self) -> bool:
+        """Return whether the selected diff is the staged side of the file."""
+        return self._selected_file_staged
+
+    def selected_file_supports_line_actions(self) -> bool:
+        """Return whether the selected side is a tracked text modification."""
+        path = self._selected_file
+        if path is None or self._repo is None or not self._repo.is_open:
+            return False
+        flag = self._raw_status.get(path, pygit2.GIT_STATUS_CURRENT)
+        required = (
+            pygit2.GIT_STATUS_INDEX_MODIFIED
+            if self._selected_file_staged
+            else pygit2.GIT_STATUS_WT_MODIFIED
+        )
+        if not flag & required:
+            return False
+        try:
+            self._repo.repo.revparse_single(f"HEAD:{path}")
+        except (KeyError, pygit2.GitError, ValueError):
+            return False
+        return not self._is_binary(path)
 
     def selected_file(self) -> str | None:
         return self._selected_file
@@ -188,6 +222,7 @@ class CommitPanelViewModel(QObject):
         caller can batch it inside a background worker.
         """
         self._repo = manager
+        self._raw_status = {}
         self._selected_file = None
         self._selected_file_staged = False
         self._current_diff = None
@@ -227,15 +262,18 @@ class CommitPanelViewModel(QObject):
         """
         if self._repo is None or not self._repo.is_open:
             self._file_changes = []
+            self._raw_status = {}
             self._staged_files = set()
         else:
             try:
                 raw_status = self._repo.repo.status()
+                self._raw_status = dict(raw_status)
                 self._file_changes = self._repo.get_status_from_raw(raw_status)
                 self._staged_files = self._compute_staged_files_from_raw(raw_status)
             except GitError as exc:
                 self.error_occurred.emit(str(exc))
                 self._file_changes = []
+                self._raw_status = {}
                 self._staged_files = set()
         # Force-close the diff when the selected file disappeared from
         # the working-tree / index status. ``select_file(None)`` is
@@ -272,6 +310,7 @@ class CommitPanelViewModel(QObject):
             self.error_occurred.emit(f"Failed to stage {path!r}: {exc}")
             return
         self.refresh_status()
+        self._refresh_selected_file_side(path, prefer_staged=True)
 
     @staticmethod
     def _is_deleted_from_disk(repo: RepositoryManager, path: str) -> bool:
@@ -309,6 +348,7 @@ class CommitPanelViewModel(QObject):
             self.error_occurred.emit(f"Failed to unstage {path!r}: {exc}")
             return
         self.refresh_status()
+        self._refresh_selected_file_side(path, prefer_staged=False)
 
     def select_file(self, path: str | None, staged: bool = False) -> None:
         """Set the file whose diff is shown in the preview pane.
@@ -320,6 +360,10 @@ class CommitPanelViewModel(QObject):
         self._selected_file_staged = staged if path is not None else False
         self.selected_file_changed.emit(path)
         self._compute_and_emit_diff(path)
+
+    def refresh_selected_diff(self) -> None:
+        """Recompute the currently selected file diff without changing selection."""
+        self._compute_and_emit_diff(self._selected_file)
 
     def set_commit_summary(self, text: str) -> None:
         """Update the commit summary; emits :attr:`commit_summary_changed`
@@ -370,27 +414,69 @@ class CommitPanelViewModel(QObject):
 
     # ----- internals ---------------------------------------------------
 
+    def _refresh_selected_file_side(self, path: str, *, prefer_staged: bool) -> None:
+        if self._selected_file != path:
+            return
+        flag = self._raw_status.get(path, pygit2.GIT_STATUS_CURRENT)
+        has_staged = bool(flag & _STAGED_FLAGS)
+        has_unstaged = bool(flag & _UNSTAGED_FLAGS)
+        if prefer_staged and has_staged:
+            self.select_file(path, staged=True)
+        elif not prefer_staged and has_unstaged:
+            self.select_file(path, staged=False)
+        elif has_staged:
+            self.select_file(path, staged=True)
+        elif has_unstaged:
+            self.select_file(path, staged=False)
+        else:
+            self.select_file(None)
+
     @staticmethod
     def _compute_staged_files_from_raw(raw_status: dict[str, int]) -> set[str]:
         """Rebuild the staged set from a pre-fetched ``pygit2`` status dict."""
         return {path for path, flag in raw_status.items() if flag & _STAGED_FLAGS}
 
     @staticmethod
+    def _worktree_status(flag: int) -> FileStatus | None:
+        if flag & pygit2.GIT_STATUS_CONFLICTED:
+            return FileStatus.CONFLICTED
+        if flag & pygit2.GIT_STATUS_WT_NEW:
+            return FileStatus.UNTRACKED
+        if flag & pygit2.GIT_STATUS_WT_RENAMED:
+            return FileStatus.RENAMED
+        if flag & pygit2.GIT_STATUS_WT_DELETED:
+            return FileStatus.DELETED
+        if flag & pygit2.GIT_STATUS_WT_TYPECHANGE:
+            return FileStatus.TYPE_CHANGED
+        if flag & pygit2.GIT_STATUS_WT_MODIFIED:
+            return FileStatus.MODIFIED
+        return None
+
+    @staticmethod
+    def _index_status(flag: int) -> FileStatus | None:
+        if flag & pygit2.GIT_STATUS_CONFLICTED:
+            return FileStatus.CONFLICTED
+        if flag & pygit2.GIT_STATUS_INDEX_NEW:
+            return FileStatus.NEW
+        if flag & pygit2.GIT_STATUS_INDEX_RENAMED:
+            return FileStatus.RENAMED
+        if flag & pygit2.GIT_STATUS_INDEX_DELETED:
+            return FileStatus.DELETED
+        if flag & pygit2.GIT_STATUS_INDEX_TYPECHANGE:
+            return FileStatus.TYPE_CHANGED
+        if flag & pygit2.GIT_STATUS_INDEX_MODIFIED:
+            return FileStatus.MODIFIED
+        return None
+
+    @staticmethod
     def _compute_status_data(
         repo: RepositoryManager,
-    ) -> tuple[list[FileChange], set[str]]:
-        """Read working-tree status from *repo* and return
-        ``(file_changes, staged_files)``.
-
-        Pure data-in/data-out — no signal emissions, safe to call
-        from a background thread.
-        """
+    ) -> tuple[list[FileChange], set[str], dict[str, int]]:
+        """Read and return file changes, staged paths, and raw status flags."""
         raw_status = repo.repo.status()
-        file_changes: list[FileChange] = []
-        for path, flag in raw_status.items():
-            file_changes.append(FileChange(path=path, status=repo._map_status(flag)))
+        file_changes = repo.get_status_from_raw(raw_status)
         staged = CommitPanelViewModel._compute_staged_files_from_raw(raw_status)
-        return file_changes, staged
+        return file_changes, staged, dict(raw_status)
 
     def _compute_staged_files(self) -> set[str]:
         """Rebuild the staged set from the raw ``pygit2`` status flags.
@@ -452,10 +538,10 @@ class CommitPanelViewModel(QObject):
     ) -> str:
         """Return the unified diff for ``path``.
 
-        When ``staged=False`` (default) shows the working-tree diff
-        (worktree vs HEAD).  When ``staged=True`` shows the index diff
-        (index vs HEAD) — what would be committed if you ran ``git
-        commit`` right now.
+        When ``staged=False`` (default), shows the tracked worktree
+        changes that are not represented in the index. When
+        ``staged=True``, shows the index diff against ``HEAD`` — what
+        would be committed if you ran ``git commit`` right now.
 
         ``context_lines`` controls how many unchanged lines surround
         each change: ``3`` (the default) produces a compact, change-
@@ -475,16 +561,22 @@ class CommitPanelViewModel(QObject):
             label = "staged" if staged else "HEAD"
             return f"Binary file {path} differs from {label}.\n"
         try:
+            flags = (
+                pygit2.enums.DiffOption.INCLUDE_UNTRACKED
+                | pygit2.enums.DiffOption.RECURSE_UNTRACKED_DIRS
+            )
             diff = repo.diff(
                 "HEAD",
                 cached=staged,
                 context_lines=context_lines,
-                flags=pygit2.enums.DiffOption.INCLUDE_UNTRACKED
-                | pygit2.enums.DiffOption.RECURSE_UNTRACKED_DIRS,
+                flags=flags,
             )
         except (pygit2.GitError, KeyError) as exc:
             raise GitError(str(exc)) from exc
-        return self._extract_patch_for(diff, path)
+        text = self._extract_patch_for(diff, path)
+        if staged or not text:
+            return text
+        return self._without_staged_diff_lines(path, text)
 
     def _is_untracked(self, path: str) -> bool:
         """Return ``True`` if ``path`` is not present in the index/HEAD tree."""
@@ -509,6 +601,15 @@ class CommitPanelViewModel(QObject):
             if (delta.new_file.path == path) or (delta.old_file.path == path):
                 pieces.append(patch.text or "")
         return "".join(pieces)
+
+    def _without_staged_diff_lines(self, path: str, text: str) -> str:
+        repo = self._repo.repo
+        try:
+            staged_diff = repo.diff("HEAD", cached=True, context_lines=3)
+        except (pygit2.GitError, KeyError) as exc:
+            raise GitError(str(exc)) from exc
+        staged_text = self._extract_patch_for(staged_diff, path)
+        return filter_staged_diff_lines(text, staged_text)[0]
 
     def _is_binary(self, path: str) -> bool:
         """Best-effort binary detection: read up to 8 KiB and look for NUL bytes."""

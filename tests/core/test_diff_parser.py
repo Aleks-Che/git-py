@@ -13,6 +13,7 @@ import pytest
 from src.core.diff_parser import (
     DiffLineType,
     diff_to_text,
+    filter_staged_diff_lines,
     parse_diff,
     parse_diff_lines,
 )
@@ -296,4 +297,18 @@ def test_parse_diff_lines_preserves_leading_space_on_context() -> None:
     parsed = parse_diff_lines("@@ -1,1 +1,1 @@\n hello\n")
     assert parsed[1].text == " hello"
     assert parsed[1].line_type == DiffLineType.CONTEXT
+
+
+def test_filter_staged_diff_lines_preserves_original_action_coordinates() -> None:
+    source = "@@ -1,1 +1,4 @@\n start\n+one\n+two\n+three\n"
+    staged = "@@ -1,1 +1,2 @@\n start\n+one\n"
+
+    filtered, original_line_info = filter_staged_diff_lines(source, staged)
+    visible_line_info = parse_diff_lines(filtered)
+    visible_two = next(line for line in visible_line_info if line.text == "+two")
+    original_two = next(line for line in original_line_info if line.text == "+two")
+
+    assert "+one" not in filtered
+    assert visible_two.new_line_number == 2
+    assert original_two.new_line_number == 3
 

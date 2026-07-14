@@ -16,8 +16,9 @@ deletions, context, and the hunk separator.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QCoreApplication, Qt
-from PySide6.QtGui import QImage
+from PySide6.QtCore import QCoreApplication, QEvent, QPointF, Qt
+from PySide6.QtGui import QImage, QMouseEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from src.core.diff_parser import DiffLineType
 from src.ui.widgets.diff_view_widget import (
@@ -25,6 +26,7 @@ from src.ui.widgets.diff_view_widget import (
     ADDITION_BG,
     DELETION_BG,
     HUNK_BG,
+    DiffLineActionMode,
     DiffViewMode,
     DiffViewWidget,
     _DiffScrollBar,
@@ -1114,3 +1116,114 @@ def test_scrollbar_can_be_painted_on_empty_view(qtbot) -> None:
     bar.resize(20, 200)
     bar.show()
     bar.repaint()  # must not raise
+
+
+def test_stage_mode_adds_hover_button_left_of_line_number(qtbot) -> None:
+    _ensure_app()
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+    view.resize(700, 300)
+    view.set_line_action_mode(DiffLineActionMode.STAGE)
+    view.set_diff(_SAMPLE_DIFF)
+    view.show()
+    QApplication.processEvents()
+    addition_block = next(
+        index
+        for index, line in enumerate(view._editor._line_info)
+        if line.line_type == DiffLineType.ADDITION
+    )
+    area = view._editor._line_number_area
+    rect = area.action_rect_for_block(addition_block)
+
+    event = QMouseEvent(
+        QEvent.Type.MouseMove,
+        QPointF(rect.center()),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    area.mouseMoveEvent(event)
+
+    assert area._hovered_block == addition_block
+    assert rect.right() < view._editor.gutter_width()
+
+
+def test_stage_hover_button_emits_clicked_diff_line(qtbot) -> None:
+    _ensure_app()
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+    view.resize(700, 300)
+    view.set_line_action_mode(DiffLineActionMode.STAGE)
+    view.set_diff(_SAMPLE_DIFF)
+    view.show()
+    QApplication.processEvents()
+    addition_block = next(
+        index
+        for index, line in enumerate(view._editor._line_info)
+        if line.line_type == DiffLineType.ADDITION
+    )
+    area = view._editor._line_number_area
+    rect = area.action_rect_for_block(addition_block)
+
+    with qtbot.waitSignal(view.line_action_requested, timeout=500) as blocker:
+        QTest.mouseClick(area, Qt.MouseButton.LeftButton, pos=rect.center())
+
+    line = blocker.args[0]
+    assert line == view._editor._line_info[addition_block]
+    assert view.line_action_mode() == DiffLineActionMode.STAGE
+
+
+def test_unstage_mode_emits_deletion_or_addition_with_minus_action(qtbot) -> None:
+    _ensure_app()
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+    view.resize(700, 300)
+    view.set_line_action_mode(DiffLineActionMode.UNSTAGE)
+    view.set_diff(_SAMPLE_DIFF)
+    view.show()
+    QApplication.processEvents()
+    deletion_block = next(
+        index
+        for index, line in enumerate(view._editor._line_info)
+        if line.line_type == DiffLineType.DELETION
+    )
+    area = view._editor._line_number_area
+    rect = area.action_rect_for_block(deletion_block)
+
+    with qtbot.waitSignal(view.line_action_requested, timeout=500) as blocker:
+        QTest.mouseClick(area, Qt.MouseButton.LeftButton, pos=rect.center())
+
+    assert blocker.args[0].line_type == DiffLineType.DELETION
+    assert view.line_action_mode() == DiffLineActionMode.UNSTAGE
+
+
+def test_line_action_is_hidden_for_context_rows(qtbot) -> None:
+    _ensure_app()
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+    view.set_line_action_mode(DiffLineActionMode.STAGE)
+    view.set_diff(_SAMPLE_DIFF)
+    context_block = next(
+        index
+        for index, line in enumerate(view._editor._line_info)
+        if line.line_type == DiffLineType.CONTEXT
+    )
+
+    assert not view._editor.is_actionable_block(context_block)
+    with qtbot.assertNotEmitted(view.line_action_requested, wait=50):
+        view._editor.request_line_action(context_block)
+
+
+def test_disabling_line_actions_shrinks_gutter(qtbot) -> None:
+    _ensure_app()
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+    view.set_diff(_SAMPLE_DIFF)
+    plain_width = view._editor.gutter_width()
+
+    view.set_line_action_mode(DiffLineActionMode.STAGE)
+    action_width = view._editor.gutter_width()
+    view.set_line_action_mode(None)
+
+    assert action_width > plain_width
+    assert view._editor.gutter_width() == plain_width

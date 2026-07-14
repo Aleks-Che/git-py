@@ -313,7 +313,7 @@ class LeftPanel(QTreeWidget):
     # ----- user actions ------------------------------------------------
 
     def _on_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
-        """Double-click: local branch → checkout; remote → reset-or-create + checkout; tag → create branch.
+        """Double-click a local branch, remote branch, or tag.
 
         Double-clicking a remote-tracking branch is the conventional
         "switch to the remote" gesture. When a local tracking

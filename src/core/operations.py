@@ -25,11 +25,19 @@ import re
 import shutil
 import subprocess
 import time
+from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pygit2
 
+from src.core.diff_parser import (
+    DiffLineType,
+    ParsedDiffLine,
+    diff_line_action_key,
+    filter_staged_diff_lines,
+    parse_diff_lines,
+)
 from src.core.exceptions import (
     AuthError,
     DirtyWorkTreeError,
@@ -45,6 +53,9 @@ from src.core.repository import RepositoryManager, unwrap
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+
+_FULL_DIFF_CONTEXT_LINES = 2**31 - 1
 
 
 # ----- helpers --------------------------------------------------------------
@@ -790,6 +801,293 @@ def revert(
             )
         head = r[r.head.target]
     return _to_commit_info(head)
+
+
+def snapshot_index_entry(
+    repo: RepositoryManager | pygit2.Repository,
+    path: str,
+) -> tuple[str, int] | None:
+    """Return the index OID and mode for ``path``, or ``None`` when absent."""
+    with unwrap(repo) as r:
+        try:
+            entry = r.index[path]
+        except KeyError:
+            return None
+        return str(entry.id), int(entry.mode)
+
+
+def restore_index_entry(
+    repo: RepositoryManager | pygit2.Repository,
+    path: str,
+    snapshot: tuple[str, int] | None,
+) -> None:
+    """Restore one index entry from :func:`snapshot_index_entry`."""
+    with unwrap(repo) as r:
+        try:
+            if snapshot is None:
+                if path in r.index:
+                    r.index.remove(path)
+            else:
+                oid, mode = snapshot
+                entry = pygit2.IndexEntry(
+                    path,
+                    pygit2.Oid(hex=oid),
+                    pygit2.enums.FileMode(mode),
+                )
+                r.index.add(entry)
+            r.index.write()
+        except (pygit2.GitError, KeyError, ValueError, OSError) as exc:
+            raise GitError(f"Failed to restore index entry for {path!r}: {exc}") from exc
+
+
+def stage_diff_line(
+    repo: RepositoryManager | pygit2.Repository,
+    path: str,
+    line: ParsedDiffLine,
+) -> None:
+    """Apply one HEAD-to-worktree diff row to the index."""
+    _apply_diff_line(repo, path, line, unstage=False)
+
+
+def unstage_diff_line(
+    repo: RepositoryManager | pygit2.Repository,
+    path: str,
+    line: ParsedDiffLine,
+) -> None:
+    """Reverse one HEAD-to-index diff row in the index."""
+    _apply_diff_line(repo, path, line, unstage=True)
+
+
+def _apply_diff_line(
+    repo: RepositoryManager | pygit2.Repository,
+    path: str,
+    line: ParsedDiffLine,
+    *,
+    unstage: bool,
+) -> None:
+    if line.line_type not in (DiffLineType.ADDITION, DiffLineType.DELETION):
+        raise GitError("Only added or deleted diff lines can be staged individually.")
+    with unwrap(repo) as r:
+        if r.is_bare:
+            raise GitError("Cannot stage individual lines in a bare repository.")
+        if r.head_is_unborn:
+            raise GitError("Cannot stage individual lines before the first commit.")
+        status = r.status().get(path, pygit2.GIT_STATUS_CURRENT)
+        required = (
+            pygit2.GIT_STATUS_INDEX_MODIFIED
+            if unstage
+            else pygit2.GIT_STATUS_WT_MODIFIED
+        )
+        if not status & required:
+            side = "staged" if unstage else "unstaged"
+            raise GitError(f"{path!r} has no {side} text modification for this line.")
+        try:
+            index_entry = r.index[path]
+            staged_patch = _patch_text_for_path(
+                r.diff("HEAD", cached=True, context_lines=3),
+                path,
+            )
+            staged_lines = parse_diff_lines(staged_patch)
+            source_patch = (
+                staged_patch
+                if unstage
+                else _patch_text_for_path(r.diff("HEAD", context_lines=3), path)
+            )
+            source_lines = parse_diff_lines(source_patch)
+            if unstage:
+                if line not in source_lines:
+                    raise GitError(f"The diff for {path!r} changed; select the line again.")
+            else:
+                resolved_line = (
+                    line
+                    if line in source_lines
+                    else _resolve_stage_source_line(
+                        r,
+                        path,
+                        line,
+                        staged_patch,
+                        source_patch,
+                    )
+                )
+                if resolved_line is None:
+                    raise GitError(f"The diff for {path!r} changed; select the line again.")
+                line = resolved_line
+            if not unstage:
+                staged_counts = Counter(
+                    diff_line_action_key(item)
+                    for item in staged_lines
+                    if item.line_type in (DiffLineType.ADDITION, DiffLineType.DELETION)
+                )
+                source_counts = Counter(
+                    diff_line_action_key(item)
+                    for item in source_lines
+                    if item.line_type in (DiffLineType.ADDITION, DiffLineType.DELETION)
+                )
+                key = diff_line_action_key(line)
+                if staged_counts[key] >= source_counts[key]:
+                    raise GitError("The selected diff line is already staged.")
+            index_data = r[index_entry.id].data
+            head_data = r.revparse_single(f"HEAD:{path}").data
+            worktree_oid = r.create_blob_fromworkdir(path)
+            worktree_data = r[worktree_oid].data
+            index_lines = index_data.splitlines(keepends=True)
+            head_lines = head_data.splitlines(keepends=True)
+            worktree_lines = worktree_data.splitlines(keepends=True)
+            if unstage:
+                _unstage_line_content(index_lines, head_lines, line)
+            else:
+                _stage_line_content(
+                    index_lines,
+                    head_lines,
+                    worktree_lines,
+                    staged_lines,
+                    line,
+                )
+            blob_oid = r.create_blob(b"".join(index_lines))
+            r.index.add(pygit2.IndexEntry(path, blob_oid, index_entry.mode))
+            r.index.write()
+        except GitError:
+            raise
+        except (pygit2.GitError, KeyError, ValueError, IndexError, OSError) as exc:
+            verb = "unstage" if unstage else "stage"
+            raise GitError(f"Failed to {verb} line in {path!r}: {exc}") from exc
+
+
+def _resolve_stage_source_line(
+    repo: pygit2.Repository,
+    path: str,
+    line: ParsedDiffLine,
+    staged_patch: str,
+    source_patch: str,
+) -> ParsedDiffLine | None:
+    resolved = _resolve_filtered_diff_line(line, source_patch, staged_patch)
+    if resolved is not None:
+        return resolved
+    full_source_patch = _patch_text_for_path(
+        repo.diff("HEAD", context_lines=_FULL_DIFF_CONTEXT_LINES),
+        path,
+    )
+    return _resolve_filtered_diff_line(line, full_source_patch, staged_patch)
+
+
+def _resolve_filtered_diff_line(
+    line: ParsedDiffLine,
+    source_patch: str,
+    staged_patch: str,
+) -> ParsedDiffLine | None:
+    filtered_text, source_line_info = filter_staged_diff_lines(
+        source_patch,
+        staged_patch,
+    )
+    visible_line_info = parse_diff_lines(filtered_text)
+    for visible, source in zip(visible_line_info, source_line_info, strict=True):
+        if visible == line:
+            return source
+    return None
+
+
+def _stage_line_content(
+    index_lines: list[bytes],
+    head_lines: list[bytes],
+    worktree_lines: list[bytes],
+    staged_lines: list[ParsedDiffLine],
+    line: ParsedDiffLine,
+) -> None:
+    additions = [
+        item
+        for item in staged_lines
+        if item.line_type == DiffLineType.ADDITION
+        and item.old_line_number is not None
+    ]
+    deletions = [
+        item
+        for item in staged_lines
+        if item.line_type == DiffLineType.DELETION
+        and item.old_line_number is not None
+    ]
+    if line.line_type == DiffLineType.ADDITION:
+        if line.old_line_number is None:
+            raise GitError("The selected diff line has no insertion position.")
+        source = _existing_line(worktree_lines, line.new_line_number)
+        offset = line.old_line_number - 1
+        offset += sum(
+            1 for item in additions
+            if item.old_line_number <= line.old_line_number
+        )
+        offset -= sum(
+            1 for item in deletions
+            if item.old_line_number < line.old_line_number
+        )
+        index_lines.insert(_validated_insertion_offset(index_lines, offset), source)
+        return
+    if line.old_line_number is None:
+        raise GitError("The selected diff line has no source position.")
+    source = _existing_line(head_lines, line.old_line_number)
+    offset = line.old_line_number - 1
+    offset += sum(
+        1 for item in additions
+        if item.old_line_number <= line.old_line_number
+    )
+    offset -= sum(
+        1 for item in deletions
+        if item.old_line_number < line.old_line_number
+    )
+    offset = _validated_existing_offset(index_lines, offset)
+    if index_lines[offset] != source:
+        raise GitError("The selected diff line no longer maps to the index content.")
+    index_lines.pop(offset)
+
+
+def _unstage_line_content(
+    index_lines: list[bytes],
+    head_lines: list[bytes],
+    line: ParsedDiffLine,
+) -> None:
+    if line.line_type == DiffLineType.ADDITION:
+        index_lines.pop(_existing_offset(index_lines, line.new_line_number))
+        return
+    source = _existing_line(head_lines, line.old_line_number)
+    index_lines.insert(_insertion_offset(index_lines, line.new_line_number), source)
+
+
+def _validated_existing_offset(lines: list[bytes], offset: int) -> int:
+    if offset < 0 or offset >= len(lines):
+        raise GitError("The selected diff line no longer maps to the file content.")
+    return offset
+
+
+def _validated_insertion_offset(lines: list[bytes], offset: int) -> int:
+    if offset < 0 or offset > len(lines):
+        raise GitError("The selected diff line no longer maps to the file content.")
+    return offset
+
+
+def _existing_line(lines: list[bytes], line_number: int | None) -> bytes:
+    return lines[_existing_offset(lines, line_number)]
+
+
+def _existing_offset(lines: list[bytes], line_number: int | None) -> int:
+    if line_number is None or line_number < 1 or line_number > len(lines):
+        raise GitError("The selected diff line no longer maps to the file content.")
+    return line_number - 1
+
+
+def _insertion_offset(lines: list[bytes], line_number: int | None) -> int:
+    if line_number is None:
+        raise GitError("The selected diff line has no insertion position.")
+    offset = max(0, line_number - 1)
+    if offset > len(lines):
+        raise GitError("The selected diff line no longer maps to the file content.")
+    return offset
+
+
+def _patch_text_for_path(diff: pygit2.Diff, path: str) -> str:
+    pieces: list[str] = []
+    for patch in diff:
+        delta = patch.delta
+        if delta.new_file.path == path or delta.old_file.path == path:
+            pieces.append(patch.text or "")
+    return "".join(pieces)
 
 
 def unstage_changes(

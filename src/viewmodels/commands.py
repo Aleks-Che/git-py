@@ -21,6 +21,7 @@ from pathlib import Path
 import pygit2
 from PySide6.QtCore import QObject, Signal
 
+from src.core.diff_parser import ParsedDiffLine
 from src.core.operations import (
     abort_rebase,
     add_remote,
@@ -45,14 +46,18 @@ from src.core.operations import (
     remove_remote,
     rename_branch,
     reset,
+    restore_index_entry,
     restore_stash,
     revert,
+    snapshot_index_entry,
+    stage_diff_line,
     stash_apply,
     stash_drop,
     stash_oid_at,
     stash_pop,
     stash_push,
     stash_push_staged,
+    unstage_diff_line,
 )
 from src.core.repository import RepositoryManager
 
@@ -224,6 +229,64 @@ class CommitCommand(GitCommand):
             first_line = first_line[:49] + "…"
         suffix = f": {first_line}" if first_line else ""
         return f"commit{suffix}"
+
+
+class StageDiffLineCommand(GitCommand):
+    """Stage one diff row and restore the previous index blob on undo."""
+
+    def __init__(
+        self,
+        repo: RepositoryManager,
+        path: str,
+        line: ParsedDiffLine,
+    ) -> None:
+        self._repo = repo
+        self._path = path
+        self._line = line
+        self._previous_entry: tuple[str, int] | None = None
+        self._captured = False
+
+    def execute(self) -> None:
+        if not self._captured:
+            self._previous_entry = snapshot_index_entry(self._repo, self._path)
+            self._captured = True
+        stage_diff_line(self._repo, self._path, self._line)
+
+    def undo(self) -> None:
+        restore_index_entry(self._repo, self._path, self._previous_entry)
+
+    @property
+    def name(self) -> str:
+        return f"stage line in {self._path}"
+
+
+class UnstageDiffLineCommand(GitCommand):
+    """Unstage one diff row and restore the previous index blob on undo."""
+
+    def __init__(
+        self,
+        repo: RepositoryManager,
+        path: str,
+        line: ParsedDiffLine,
+    ) -> None:
+        self._repo = repo
+        self._path = path
+        self._line = line
+        self._previous_entry: tuple[str, int] | None = None
+        self._captured = False
+
+    def execute(self) -> None:
+        if not self._captured:
+            self._previous_entry = snapshot_index_entry(self._repo, self._path)
+            self._captured = True
+        unstage_diff_line(self._repo, self._path, self._line)
+
+    def undo(self) -> None:
+        restore_index_entry(self._repo, self._path, self._previous_entry)
+
+    @property
+    def name(self) -> str:
+        return f"unstage line in {self._path}"
 
 
 # ----- branches ---------------------------------------------------------
@@ -1284,4 +1347,6 @@ __all__ = [
     "StashPushCommand",
     "StashPushStagedCommand",
     "StashSingleFileCommand",
+    "StageDiffLineCommand",
+    "UnstageDiffLineCommand",
 ]

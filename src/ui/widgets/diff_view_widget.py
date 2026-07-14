@@ -65,6 +65,7 @@ from enum import IntEnum
 from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
+    QCursor,
     QFont,
     QPainter,
     QTextCharFormat,
@@ -93,6 +94,10 @@ GUTTER_FG = QColor(90, 90, 90)
 ADDITION_FG = QColor(172, 229, 172)
 DELETION_FG = QColor(229, 172, 172)
 HUNK_FG = QColor(140, 190, 210)
+LINE_STAGE_BG = QColor(63, 185, 80)
+LINE_UNSTAGE_BG = QColor(232, 104, 90)
+_LINE_ACTION_BUTTON_SIZE = 16
+_LINE_ACTION_MARGIN = 4
 # ──────────────────────────────────────────────────────────────────────
 
 ExtraSelection = QTextEdit.ExtraSelection
@@ -189,6 +194,13 @@ def _cluster_indices_to_blocks(
     ))
     return blocks
 # ──────────────────────────────────────────────────────────────────────
+
+
+class DiffLineActionMode(IntEnum):
+    """Action exposed in the diff gutter for changed rows."""
+
+    STAGE = 1
+    UNSTAGE = 2
 
 
 class DiffViewMode(IntEnum):
@@ -425,14 +437,31 @@ class _DiffScrollBar(QScrollBar):
 
 
 class _LineNumberArea(QWidget):
-    """Left gutter that paints the file line number for each block."""
+    """Left gutter that paints file numbers and optional line actions."""
 
     def __init__(self, editor: _DiffEditor) -> None:
         super().__init__(editor)
         self._editor = editor
+        self._hovered_block: int | None = None
+        self.setMouseTracking(True)
 
     def sizeHint(self) -> QSize:  # noqa: N802
         return QSize(self._editor.gutter_width(), 0)
+
+    def set_hovered_block(self, block_number: int | None) -> None:
+        actionable = self._editor.is_actionable_block(block_number)
+        value = block_number if actionable else None
+        if value == self._hovered_block:
+            return
+        self._hovered_block = value
+        self.update()
+
+    def action_rect_for_block(self, block_number: int) -> QRect:
+        block_data = self._block_at_number(block_number)
+        if block_data is None:
+            return QRect()
+        _, top, height = block_data
+        return self._action_rect(top, height)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
@@ -445,7 +474,8 @@ class _LineNumberArea(QWidget):
         )
         bottom = top + round(self._editor.blockBoundingRect(block).height())
         fm = self._editor.fontMetrics()
-        w = self.width() - fm.horizontalAdvance("9")
+        action_width = self._editor.action_gutter_width()
+        number_width = self.width() - action_width - fm.horizontalAdvance("9")
         line_info = self._editor._line_info
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
@@ -458,21 +488,110 @@ class _LineNumberArea(QWidget):
                 if line_number is not None:
                     painter.setPen(GUTTER_FG)
                     painter.drawText(
-                        0,
+                        action_width,
                         top,
-                        w,
+                        number_width,
                         fm.height(),
                         Qt.AlignmentFlag.AlignRight,
                         str(line_number),
                     )
+                if block_num == self._hovered_block:
+                    action_rect = self._action_rect(top, fm.height())
+                    mode = self._editor.line_action_mode()
+                    colour = (
+                        LINE_STAGE_BG
+                        if mode == DiffLineActionMode.STAGE
+                        else LINE_UNSTAGE_BG
+                    )
+                    symbol = "+" if mode == DiffLineActionMode.STAGE else "−"
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(colour)
+                    painter.drawRoundedRect(action_rect, 3, 3)
+                    painter.setPen(Qt.GlobalColor.white)
+                    painter.drawText(action_rect, Qt.AlignmentFlag.AlignCenter, symbol)
             block = block.next()
             top = bottom
             bottom = top + round(self._editor.blockBoundingRect(block).height())
         painter.end()
 
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        block_data = self._block_at_y(event.position().toPoint().y())
+        block_number = block_data[0] if block_data is not None else None
+        self.set_hovered_block(block_number)
+        if block_data is not None:
+            rect = self._action_rect(block_data[1], block_data[2])
+            if rect.contains(event.position().toPoint()):
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+                return
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        block_data = self._block_at_y(event.position().toPoint().y())
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and block_data is not None
+            and self._editor.is_actionable_block(block_data[0])
+            and self._action_rect(block_data[1], block_data[2]).contains(
+                event.position().toPoint(),
+            )
+        ):
+            self._editor.request_line_action(block_data[0])
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self.set_hovered_block(None)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().leaveEvent(event)
+
+    def _block_at_y(self, y: int) -> tuple[int, int, int] | None:
+        block = self._editor.firstVisibleBlock()
+        top = round(
+            self._editor.blockBoundingGeometry(block)
+            .translated(self._editor.contentOffset())
+            .top()
+        )
+        while block.isValid():
+            height = round(self._editor.blockBoundingRect(block).height())
+            if block.isVisible() and top <= y < top + height:
+                return block.blockNumber(), top, height
+            if top > y:
+                return None
+            top += height
+            block = block.next()
+        return None
+
+    def _block_at_number(self, block_number: int) -> tuple[int, int, int] | None:
+        block = self._editor.firstVisibleBlock()
+        top = round(
+            self._editor.blockBoundingGeometry(block)
+            .translated(self._editor.contentOffset())
+            .top()
+        )
+        while block.isValid():
+            height = round(self._editor.blockBoundingRect(block).height())
+            if block.blockNumber() == block_number:
+                return block_number, top, height
+            top += height
+            block = block.next()
+        return None
+
+    @staticmethod
+    def _action_rect(top: int, height: int) -> QRect:
+        y = top + max(0, (height - _LINE_ACTION_BUTTON_SIZE) // 2)
+        return QRect(
+            _LINE_ACTION_MARGIN,
+            y,
+            _LINE_ACTION_BUTTON_SIZE,
+            _LINE_ACTION_BUTTON_SIZE,
+        )
+
 
 class _DiffEditor(QPlainTextEdit):
     """Internal plain-text editor that collaborates with the gutter."""
+
+    line_action_requested = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -485,7 +604,10 @@ class _DiffEditor(QPlainTextEdit):
         # file line number, so the gutter can paint the file row
         # instead of a sequential index.
         self._line_info: list[ParsedDiffLine] = []
+        self._line_action_mode: DiffLineActionMode | None = None
         self._line_number_area = _LineNumberArea(self)
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
         # Custom scrollbar — see :class:`_DiffScrollBar` for the
         # two-half minimap visualisation (red deletions on the
         # left, green additions on the right, semi-transparent
@@ -510,7 +632,41 @@ class _DiffEditor(QPlainTextEdit):
         digits = len(str(max(max_block, max_line)))
         digits = max(1, digits)
         fm = self.fontMetrics()
-        return fm.horizontalAdvance("9") * (digits + _GUTTER_RIGHT_PADDING_CHARS)
+        return (
+            fm.horizontalAdvance("9") * (digits + _GUTTER_RIGHT_PADDING_CHARS)
+            + self.action_gutter_width()
+        )
+
+    def action_gutter_width(self) -> int:
+        if self._line_action_mode is None:
+            return 0
+        return _LINE_ACTION_BUTTON_SIZE + _LINE_ACTION_MARGIN * 2
+
+    def line_action_mode(self) -> DiffLineActionMode | None:
+        return self._line_action_mode
+
+    def set_line_action_mode(self, mode: DiffLineActionMode | None) -> None:
+        if mode == self._line_action_mode:
+            return
+        self._line_action_mode = mode
+        self._line_number_area.set_hovered_block(None)
+        self._update_gutter_width()
+        self._line_number_area.update()
+
+    def is_actionable_block(self, block_number: int | None) -> bool:
+        if self._line_action_mode is None or block_number is None:
+            return False
+        if block_number < 0 or block_number >= len(self._line_info):
+            return False
+        return self._line_info[block_number].line_type in (
+            DiffLineType.ADDITION,
+            DiffLineType.DELETION,
+        )
+
+    def request_line_action(self, block_number: int) -> None:
+        if not self.is_actionable_block(block_number):
+            return
+        self.line_action_requested.emit(self._line_info[block_number])
 
     def line_number_area_width(self) -> int:
         return self.gutter_width()
@@ -523,6 +679,7 @@ class _DiffEditor(QPlainTextEdit):
         :class:`ParsedDiffLine`.
         """
         self._line_info = list(line_info)
+        self._line_number_area.set_hovered_block(None)
         # Recompute gutter width now that the max line number may
         # have changed; ``blockCountChanged`` only fires when the
         # number of blocks changes, not when their metadata does.
@@ -598,6 +755,17 @@ class _DiffEditor(QPlainTextEdit):
         if rect.contains(self.viewport().rect()):
             self._update_gutter_width()
 
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        cursor = self.cursorForPosition(event.position().toPoint())
+        self._line_number_area.set_hovered_block(cursor.blockNumber())
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        gutter_pos = self._line_number_area.mapFromGlobal(QCursor.pos())
+        if not self._line_number_area.rect().contains(gutter_pos):
+            self._line_number_area.set_hovered_block(None)
+        super().leaveEvent(event)
+
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         cr = self.contentsRect()
@@ -632,6 +800,7 @@ class DiffViewWidget(QWidget):
     """
 
     view_mode_changed = Signal(object)
+    line_action_requested = Signal(object)
     """Emitted with the new :class:`DiffViewMode` when the user toggles
     the toolbar buttons (also fires when the mode is set programmatically
     via :meth:`set_view_mode`, but only when the value actually changes)."""
@@ -642,6 +811,7 @@ class DiffViewWidget(QWidget):
         self._changes_only_text: str = ""
         self._full_document_text: str = ""
         self._view_mode: DiffViewMode = DiffViewMode.CHANGES_ONLY
+        self._editor.line_action_requested.connect(self.line_action_requested)
         self._build_toolbar()
         self._layout_body()
 
@@ -783,6 +953,14 @@ class DiffViewWidget(QWidget):
         self._changes_only_text = changes_only_text
         self._full_document_text = full_document_text
         self._render()
+
+    def line_action_mode(self) -> DiffLineActionMode | None:
+        """Return the current per-line staging action, if enabled."""
+        return self._editor.line_action_mode()
+
+    def set_line_action_mode(self, mode: DiffLineActionMode | None) -> None:
+        """Show a stage or unstage control beside changed rows."""
+        self._editor.set_line_action_mode(mode)
 
     def view_mode(self) -> DiffViewMode:
         """Return the currently active :class:`DiffViewMode`."""
@@ -961,4 +1139,4 @@ _TYPE_COLOURS: dict[DiffLineType, tuple[QColor | None, QColor | None]] = {
 }
 
 
-__all__ = ["DiffViewMode", "DiffViewWidget"]
+__all__ = ["DiffLineActionMode", "DiffViewMode", "DiffViewWidget"]

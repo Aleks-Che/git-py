@@ -69,7 +69,11 @@ from src.ui.dialogs.open_or_clone_dialog import OpenOrCloneDialog
 from src.ui.dialogs.remote_manage_dialog import RemoteManageDialog
 from src.ui.dialogs.settings_dialog import SettingsDialog
 from src.ui.widgets.action_history_widget import ActionHistoryWidget
-from src.ui.widgets.diff_view_widget import DiffViewMode, DiffViewWidget
+from src.ui.widgets.diff_view_widget import (
+    DiffLineActionMode,
+    DiffViewMode,
+    DiffViewWidget,
+)
 from src.ui.widgets.graph_panel import GraphTableWidget
 from src.ui.widgets.left_panel import LeftPanel
 from src.ui.widgets.log_widget import LogWidget
@@ -594,18 +598,21 @@ class MainWindow(QMainWindow):
         # Wire the commit panel VM's file selection signals to
         # switch between graph and diff view.
         cp_vm = self._main_vm.commit_panel_view_model()
-        cp_vm.selected_file_changed.connect(self._on_selected_file_changed)
+        cp_vm.selected_file_changed.connect(self._on_commit_file_selected)
         cp_vm.diff_ready.connect(self._on_diff_ready)
         # The full-document variant is pre-computed in the same VM
         # call as the changes-only diff so the diff view can toggle
         # between its two display modes without a round-trip to Git.
         cp_vm.diff_pair_ready.connect(self._on_diff_pair_ready)
+        self._diff_view.line_action_requested.connect(
+            self._on_diff_line_action_requested,
+        )
 
         # The commit-detail panel emits the same signal pair so a
         # file click in either right-panel view swaps the graph for
         # a diff in this same stack.
         self._right_panel._commit_detail.selected_file_changed.connect(
-            self._on_selected_file_changed,
+            self._on_commit_detail_file_selected,
         )
         self._right_panel._commit_detail.diff_ready.connect(self._on_diff_ready)
         self._right_panel._commit_detail.diff_pair_ready.connect(
@@ -690,6 +697,32 @@ class MainWindow(QMainWindow):
         self._main_vm.error_occurred.connect(self._log_widget.append_log)
 
     # ----- diff view (replaces graph on file selection) ---------------
+
+    def _on_commit_file_selected(self, path: str | None) -> None:
+        cp_vm = self._main_vm.commit_panel_view_model()
+        mode: DiffLineActionMode | None = None
+        if path is not None and cp_vm.selected_file_supports_line_actions():
+            mode = (
+                DiffLineActionMode.UNSTAGE
+                if cp_vm.selected_file_is_staged()
+                else DiffLineActionMode.STAGE
+            )
+        self._diff_view.set_line_action_mode(mode)
+        self._on_selected_file_changed(path)
+
+    def _on_commit_detail_file_selected(self, path: str | None) -> None:
+        self._diff_view.set_line_action_mode(None)
+        self._on_selected_file_changed(path)
+
+    def _on_diff_line_action_requested(self, line) -> None:
+        cp_vm = self._main_vm.commit_panel_view_model()
+        path = cp_vm.selected_file()
+        if path is None or not cp_vm.selected_file_supports_line_actions():
+            return
+        if cp_vm.selected_file_is_staged():
+            self._main_vm.unstage_diff_line(path, line)
+        else:
+            self._main_vm.stage_diff_line(path, line)
 
     def _on_selected_file_changed(self, path: str | None) -> None:
         """Switch between graph and diff view when a file is selected.
