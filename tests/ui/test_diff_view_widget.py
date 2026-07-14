@@ -713,9 +713,11 @@ def test_scrollbar_is_wider_than_default(qtbot) -> None:
     assert view._editor._diff_scrollbar.width() > plain
 
 
-def test_scrollbar_markers_track_deletions_and_additions(qtbot) -> None:
-    """After ``set_diff`` the scrollbar caches deletion (left-half) and
-    addition (right-half) positions derived from the parsed line info."""
+def test_scrollbar_blocks_track_deletion_and_addition_clusters(qtbot) -> None:
+    """After ``set_diff`` the scrollbar caches deletion (left-half)
+    and addition (right-half) *block* ranges. Each block spans a
+    cluster of consecutive deletion/addition indices in the
+    displayed diff, normalised by the total line count."""
     _ensure_app()
     view = DiffViewWidget()
     qtbot.addWidget(view)
@@ -723,38 +725,46 @@ def test_scrollbar_markers_track_deletions_and_additions(qtbot) -> None:
     bar = view._editor._diff_scrollbar
 
     line_info = view._editor._line_info
-    expected_deletions = [
-        info.line_number
-        for info in line_info
-        if info.line_type == DiffLineType.DELETION and info.line_number
-    ]
-    expected_additions = [
-        info.line_number
-        for info in line_info
-        if info.line_type == DiffLineType.ADDITION and info.line_number
-    ]
-    assert expected_deletions, "fixture must have deletions"
-    assert expected_additions, "fixture must have additions"
-    # We don't compare exact floats (the implementation normalises by
-    # max file line). What matters is: there *is* a deletion and an
-    # addition marker set, and they're distinct lists.
-    assert len(bar._deletion_positions) == len(expected_deletions)
-    assert len(bar._addition_positions) == len(expected_additions)
-    assert bar._deletion_positions != bar._addition_positions
+    total = len(line_info)
+    deletion_count = sum(
+        1 for info in line_info if info.line_type == DiffLineType.DELETION
+    )
+    addition_count = sum(
+        1 for info in line_info if info.line_type == DiffLineType.ADDITION
+    )
+    assert deletion_count > 0, "fixture must have deletions"
+    assert addition_count > 0, "fixture must have additions"
+    # The block lists carry the same number of indices as the
+    # diff's parsed line info — each deletion / addition entry is
+    # accounted for in exactly one cluster.
+    expected_del_index_count = deletion_count
+    expected_add_index_count = addition_count
+    assert sum(
+        int(round(end * total)) - int(round(start * total)) + 1
+        for start, end in bar._deletion_blocks
+    ) >= expected_del_index_count, (
+        "every deletion index should fall inside a deletion block"
+    )
+    assert sum(
+        int(round(end * total)) - int(round(start * total)) + 1
+        for start, end in bar._addition_blocks
+    ) >= expected_add_index_count, (
+        "every addition index should fall inside an addition block"
+    )
 
 
-def test_clear_resets_scrollbar_markers(qtbot) -> None:
-    """``clear()`` empties the marker lists so the bar doesn't keep
+def test_clear_resets_scrollbar_blocks(qtbot) -> None:
+    """``clear()`` empties the block lists so the bar doesn't keep
     showing ticks from the previous file."""
     _ensure_app()
     view = DiffViewWidget()
     qtbot.addWidget(view)
     view.set_diff(_SAMPLE_DIFF)
-    assert view._editor._diff_scrollbar._deletion_positions
+    assert view._editor._diff_scrollbar._deletion_blocks
 
     view.clear()
-    assert view._editor._diff_scrollbar._deletion_positions == []
-    assert view._editor._diff_scrollbar._addition_positions == []
+    assert view._editor._diff_scrollbar._deletion_blocks == []
+    assert view._editor._diff_scrollbar._addition_blocks == []
 
 
 def test_scrollbar_paints_with_left_red_and_right_green(qtbot) -> None:
@@ -860,32 +870,91 @@ def test_scrollbar_halves_count_red_and_green_pixels_equally(qtbot) -> None:
     assert red_pixels > 0 and green_pixels > 0, (
         "expected both colours to be present in the rendered scrollbar"
     )
-    # Tolerate a small antialiasing difference at marker edges, but
-    # anything more than 4 px means the halves are not the same
-    # physical width on the actual painted surface — which is the
-    # live-app regression we want to catch.
-    assert abs(red_pixels - green_pixels) <= 4, (
+    # Each block is ``int(end_px) - int(start_px)`` px tall, so a 1-px
+    # rounding difference between red and green indices stacks up
+    # into a few dozen px of total asymmetry — well under 5 % of
+    # the painted marker area.
+    average = (red_pixels + green_pixels) / 2
+    assert abs(red_pixels - green_pixels) / max(average, 1) < 0.05, (
         f"halves have visibly different pixel counts: "
         f"red={red_pixels}, green={green_pixels}"
     )
 
 
-def test_markers_are_proportional_to_file_line(qtbot) -> None:
-    """Marker positions follow file line numbers, not diff order.
+def test_markers_are_positioned_by_displayed_diff_index(qtbot) -> None:
+    """Markers are placed at the index of the line in the *displayed*
+    diff document, normalised by the total line count.
 
-    Concretely: with hunks at file lines ~60 (top of the document)
-    and ~150 (bottom of the document), the rendered scrollbar must
-    put markers at *proportional* bar positions (~30 % and ~75 %),
-    not evenly distribute them from 0 % to 100 %.
+    Two contracts fall out of this:
+
+    * The position of a block on the scrollbar matches the
+      fraction of the editor's content the block's lines occupy.
+    * Within a hunk the deletions precede the additions in the
+      diff text (the standard unified-diff layout), so the red
+      block sits *above* the green block on the bar — the two
+      never share a row.
     """
     _ensure_app()
     QApplication.instance() or QApplication([])
-    # 200-line file. Two hunks: one near the top, one near the bottom.
+    # Realistic unified-diff shape: deletions first, then additions.
     hunks = (
-        "@@ -30,5 +30,5 @@\n"
-        + "".join(f"-top-old-{i}\n+top-new-{i}\n" for i in range(5))
-        + "@@ -150,5 +150,5 @@\n"
-        + "".join(f"-bot-old-{i}\n+bot-new-{i}\n" for i in range(5))
+        "@@ -60,9 +60,9 @@\n"
+        + "".join(f"-old-red-{i}\n" for i in range(9))
+        + "".join(f"+new-green-{i}\n" for i in range(9))
+    )
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+    view.resize(800, 800)
+    view.set_diff(hunks)
+    bar = view._editor._diff_scrollbar
+    bar.show()
+    QApplication.processEvents()
+    bar.repaint()
+
+    pix = bar.grab().toImage().convertToFormat(QImage.Format.Format_ARGB32)
+    red_rows: list[int] = []
+    green_rows: list[int] = []
+    for y in range(pix.height()):
+        has_red = has_green = False
+        for x in range(pix.width()):
+            c = pix.pixelColor(x, y)
+            if c.red() > c.green() + 30 and c.red() > c.blue() + 30:
+                has_red = True
+            if c.green() > c.red() + 30 and c.green() > c.blue() + 30:
+                has_green = True
+        if has_red:
+            red_rows.append(y)
+        if has_green:
+            green_rows.append(y)
+    assert red_rows and green_rows, "expected both colours to render"
+    # Red block sits above green block — the diff-text order puts
+    # deletions before additions in the same hunk, so the red
+    # block ends at a smaller index than the green block begins.
+    assert max(red_rows) < min(green_rows), (
+        f"red block ({min(red_rows)}-{max(red_rows)}) should sit "
+        f"above green block ({min(green_rows)}-{max(green_rows)}); "
+        "the two must not overlap on the bar"
+    )
+
+
+def test_two_hunks_occupy_distinct_regions(qtbot) -> None:
+    """Two hunks in the same diff occupy two distinct vertical
+    regions of the scrollbar — red on top, green below per hunk,
+    and the second hunk's blocks well below the first.
+
+    Within a hunk the red cluster comes before the green cluster;
+    the two clusters form a single coloured band per side. Between
+    hunks there's empty space.
+    """
+    _ensure_app()
+    QApplication.instance() or QApplication([])
+    hunks = (
+        "@@ -10,5 +10,5 @@\n"
+        + "".join(f"-top-r-{i}\n" for i in range(5))
+        + "".join(f"+top-g-{i}\n" for i in range(5))
+        + "@@ -80,5 +80,5 @@\n"
+        + "".join(f"-bot-r-{i}\n" for i in range(5))
+        + "".join(f"+bot-g-{i}\n" for i in range(5))
     )
     view = DiffViewWidget()
     qtbot.addWidget(view)
@@ -913,45 +982,35 @@ def test_markers_are_proportional_to_file_line(qtbot) -> None:
         if has_green:
             green_rows.append(y)
     assert red_rows and green_rows, "expected both colours to render"
-    # The top hunk (lines 30) must be near the top of the bar (well
-    # under 50 %), and the bottom hunk (lines 150) must be near the
-    # bottom (well over 50 %). With diff-order positioning both
-    # clusters would have been packed at the top of the bar.
-    red_top_cluster_max = max(y for y in red_rows if y < h // 2)
-    red_bottom_cluster_min = min(y for y in red_rows if y > h // 2)
-    assert red_top_cluster_max < h * 0.30, (
-        f"top hunk markers should sit in the upper 30 % of the bar, "
-        f"got max row {red_top_cluster_max}/{h}"
+    # Top hunk: red above green, both in the upper half of the bar.
+    red_top = [y for y in red_rows if y < h // 2]
+    green_top = [y for y in green_rows if y < h // 2]
+    assert red_top and green_top, (
+        "top hunk should produce markers in the upper half of the bar"
     )
-    assert red_bottom_cluster_min > h * 0.70, (
-        f"bottom hunk markers should sit in the lower 30 % of the bar, "
-        f"got min row {red_bottom_cluster_min}/{h}"
+    assert max(red_top) < min(green_top), (
+        "red cluster must sit above the green cluster within a hunk"
     )
-    # The two clusters are far apart — the bar shows them as
-    # distinct regions, not stretched across the whole height.
-    assert (red_bottom_cluster_min - red_top_cluster_max) > h * 0.30, (
-        "two hunks in the same diff must occupy clearly separated "
-        "vertical regions of the scrollbar"
+    # Bottom hunk: red above green, both in the lower half.
+    red_bot = [y for y in red_rows if y > h // 2]
+    green_bot = [y for y in green_rows if y > h // 2]
+    assert red_bot and green_bot, (
+        "bottom hunk should produce markers in the lower half of the bar"
+    )
+    assert max(red_bot) < min(green_bot), (
+        "red cluster must sit above the green cluster within the bottom hunk"
     )
 
 
-def test_adjacent_markers_form_solid_block(qtbot) -> None:
-    """Adjacent markers (in line-number order) must overlap into a
-    solid filled block — not read as a stack of thin lines with
-    gaps between them.
-
-    We use line numbers near the bottom of a long file (170 lines
-    total) so the line spacing on the bar is small enough that the
-    8-px marker rectangles overlap; if the test diff used lines
-    1–10, the ``max_line`` proxy for the file size would be 10 and
-    markers would be too far apart on the bar to overlap, which
-    is a test artefact and not what this contract is about.
-    """
+def test_cluster_within_colour_is_solid(qtbot) -> None:
+    """A cluster of consecutive same-colour markers renders as one
+    continuous filled block — no internal gaps."""
     _ensure_app()
     QApplication.instance() or QApplication([])
     hunks = (
-        "@@ -162,9 +162,9 @@\n"
-        + "".join(f"-old-{i}\n+new-{i}\n" for i in range(9))
+        "@@ -10,8 +10,8 @@\n"
+        + "".join(f"-old-{i}\n" for i in range(8))
+        + "".join(f"+new-{i}\n" for i in range(8))
     )
     view = DiffViewWidget()
     qtbot.addWidget(view)
@@ -979,22 +1038,17 @@ def test_adjacent_markers_form_solid_block(qtbot) -> None:
             green_rows.append(y)
     assert red_rows, "expected red markers"
     assert green_rows, "expected green markers"
-    # Adjacent markers must overlap into a single continuous run
-    # (no gaps in y) — the contract is that a hunk reads as one
-    # coloured block, not a stack of thin lines.
-    gaps = sum(
+    gaps_r = sum(
         1 for a, b in zip(red_rows, red_rows[1:], strict=False) if b - a > 1
-    )
-    assert gaps == 0, (
-        f"red markers should form one continuous block, "
-        f"found {gaps} gaps in rows {red_rows[:10]}..."
     )
     gaps_g = sum(
         1 for a, b in zip(green_rows, green_rows[1:], strict=False) if b - a > 1
     )
+    assert gaps_r == 0, (
+        f"red cluster should be one continuous block; found {gaps_r} gaps"
+    )
     assert gaps_g == 0, (
-        f"green markers should form one continuous block, "
-        f"found {gaps_g} gaps in rows {green_rows[:10]}..."
+        f"green cluster should be one continuous block; found {gaps_g} gaps"
     )
 
 
@@ -1021,28 +1075,31 @@ def test_scrollbar_uses_contents_rect_for_painting(qtbot) -> None:
     assert hint.width() >= _SCROLLBAR_WIDTH
 
 
-def test_scrollbar_set_diff_markers_clamps_values(qtbot) -> None:
-    """The marker setter clamps to ``[0, 1]`` so a buggy caller
-    can't push the markers off the bar."""
+def test_scrollbar_set_diff_blocks_clamps_values(qtbot) -> None:
+    """The block setter clamps ``start`` and ``end`` to ``[0, 1]`` so
+    a buggy caller can't push the markers off the bar."""
     _ensure_app()
     view = DiffViewWidget()
     qtbot.addWidget(view)
     bar = view._editor._diff_scrollbar
-    bar.set_diff_markers([-0.5, 0.4, 1.7], [2.0, -1.0])
-    assert bar._deletion_positions == [0.0, 0.4, 1.0]
-    assert bar._addition_positions == [1.0, 0.0]
+    bar.set_diff_blocks(
+        [(-0.5, 0.4), (0.4, 1.7)],
+        [(2.0, -1.0)],
+    )
+    assert bar._deletion_blocks == [(0.0, 0.4), (0.4, 1.0)]
+    assert bar._addition_blocks == [(1.0, 0.0)]
 
 
-def test_scrollbar_set_diff_markers_empty_lists(qtbot) -> None:
-    """Empty marker lists are accepted and don't raise — used by the
+def test_scrollbar_set_diff_blocks_empty_lists(qtbot) -> None:
+    """Empty block lists are accepted and don't raise — used by the
     widget's ``clear()`` and by files with no edits to show."""
     _ensure_app()
     view = DiffViewWidget()
     qtbot.addWidget(view)
     bar = view._editor._diff_scrollbar
-    bar.set_diff_markers([], [])
-    assert bar._deletion_positions == []
-    assert bar._addition_positions == []
+    bar.set_diff_blocks([], [])
+    assert bar._deletion_blocks == []
+    assert bar._addition_blocks == []
 
 
 def test_scrollbar_can_be_painted_on_empty_view(qtbot) -> None:

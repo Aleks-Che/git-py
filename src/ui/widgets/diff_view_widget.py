@@ -134,10 +134,60 @@ _SCROLLBAR_ADDITION = QColor(70, 200, 110, 230)
 
 # Marker rectangles are drawn solid-filled rather than as thin
 # lines so adjacent markers in line-number order overlap into a
-# single visible block. 8 px is wide enough to span the typical
-# line-to-line gap on a long document yet stays well within a
-# hunk so it doesn't visually merge two unrelated hunks.
-_SCROLLBAR_MARKER_HALF_HEIGHT = 4
+# single visible block. The half-height is the radius around the
+# marker's centre position — a 16-px-tall rectangle (8 px each way)
+# comfortably spans the typical line-to-line gap on a long diff
+# while staying small enough not to merge two unrelated hunks.
+_SCROLLBAR_MARKER_HALF_HEIGHT = 8
+
+
+def _cluster_indices_to_blocks(
+    indices: list[int], total: int, gap_threshold: int = 2,
+) -> list[tuple[float, float]]:
+    """Group consecutive ``indices`` into ``(start, end)`` blocks.
+
+    Each block is a half-open range in ``[0, 1]``:
+
+    * ``start`` is the cluster's first index divided by ``total``
+      — the position of the first line.
+    * ``end`` is the cluster's last index + 1 divided by ``total``
+      — the position of the line *after* the cluster, so the block
+      visually fills the slot each line occupies on the bar.
+
+    Using ``end_index + 1`` (instead of ``end_index``) makes
+    adjacent blocks of different colours touch exactly at the
+    boundary — the red block ends where the green block begins,
+    with no gap. For the very last cluster in a colour, the +1
+    caps naturally at 1.0 and the block runs to the bottom of
+    the bar.
+
+    Two indices belong to the same cluster when their numeric
+    distance is at most ``gap_threshold``; clusters are returned
+    in ascending index order. The colour boundary within a hunk
+    (red → green) is always a separator because the two lists are
+    clustered independently.
+    """
+    if not indices:
+        return []
+    sorted_indices = sorted(indices)
+    blocks: list[tuple[float, float]] = []
+    cluster_start = sorted_indices[0]
+    cluster_end = sorted_indices[0]
+    for index in sorted_indices[1:]:
+        if index - cluster_end <= gap_threshold:
+            cluster_end = index
+            continue
+        blocks.append((
+            cluster_start / total,
+            (cluster_end + 1) / total,
+        ))
+        cluster_start = index
+        cluster_end = index
+    blocks.append((
+        cluster_start / total,
+        (cluster_end + 1) / total,
+    ))
+    return blocks
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -168,14 +218,17 @@ class _DiffScrollBar(QScrollBar):
 
     Public API
     ----------
-    set_diff_markers
-        Hand in normalised positions for deletions / additions.
+    set_diff_blocks
+        Hand in normalised ``(start, end)`` ranges for deletions /
+        additions. Each range is rendered as one solid filled block
+        so a hunk reads as a continuous coloured region rather than
+        as a stack of overlapping thin lines.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(Qt.Orientation.Vertical, parent)
-        self._deletion_positions: list[float] = []
-        self._addition_positions: list[float] = []
+        self._deletion_blocks: list[tuple[float, float]] = []
+        self._addition_blocks: list[tuple[float, float]] = []
         # Force the width through several size hints so the host
         # widget's layout manager (which manages the scrollbar when
         # it is installed via ``setVerticalScrollBar``) cannot shrink
@@ -194,22 +247,33 @@ class _DiffScrollBar(QScrollBar):
         """Don't let the host shrink us below the preferred width."""
         return QSize(_SCROLLBAR_WIDTH, super().minimumSizeHint().height())
 
-    def set_diff_markers(
+    def set_diff_blocks(
         self,
-        deletions: list[float],
-        additions: list[float],
+        deletions: list[tuple[float, float]],
+        additions: list[tuple[float, float]],
     ) -> None:
-        """Replace the marker lists. Each list holds values in ``[0, 1]``.
+        """Replace the block lists. Each entry is ``(start, end)``
+        in ``[0, 1]``. Values are clamped so callers don't have to be
+        careful about the exact ratio. The widget repaints immediately.
 
-        Values are clamped to ``[0, 1]`` so callers don't have to be
-        careful about the exact ratio. The widget repaints
-        immediately.
+        ``deletions`` blocks are drawn on the left half, ``additions``
+        on the right half. Adjacent blocks of different colours stay
+        separate because each block is exactly the size of its
+        cluster — no overlap by construction.
         """
-        self._deletion_positions = [
-            max(0.0, min(1.0, float(v))) for v in deletions
+        self._deletion_blocks = [
+            (
+                max(0.0, min(1.0, float(s))),
+                max(0.0, min(1.0, float(e))),
+            )
+            for s, e in deletions
         ]
-        self._addition_positions = [
-            max(0.0, min(1.0, float(v))) for v in additions
+        self._addition_blocks = [
+            (
+                max(0.0, min(1.0, float(s))),
+                max(0.0, min(1.0, float(e))),
+            )
+            for s, e in additions
         ]
         self.update()
 
@@ -271,28 +335,33 @@ class _DiffScrollBar(QScrollBar):
             painter.end()
             return
 
-        # 3) Markers — drawn as solid filled rectangles spanning the
-        # full half width. The rectangles are tall enough that
-        # adjacent markers (line-spacing apart on the bar) overlap
-        # into one continuous coloured block, so a hunk reads as a
-        # single bar rather than as a stack of thin lines.
-        marker_h = _SCROLLBAR_MARKER_HALF_HEIGHT * 2
-        for pos in self._deletion_positions:
-            y = int(usable_top + pos * usable_height)
+        # 3) Markers — drawn as solid filled rectangles, one per cluster
+        # of consecutive lines. Each cluster spans the full extent of
+        # its group, so a hunk reads as one continuous coloured block
+        # rather than as a stack of overlapping thin lines. Because
+        # red and green clusters are computed independently they never
+        # overlap on the bar — they sit at the actual positions of the
+        # deletions and additions in the displayed diff.
+        for start, end in self._deletion_blocks:
+            # ``end`` is the position of the line *after* the
+            # cluster, so a block for indices ``[a, b]`` spans
+            # ``y(a) .. y(b+1)`` and butts directly against the
+            # next colour's block at the boundary — no gap.
+            y_start = int(usable_top + start * usable_height)
+            y_end = int(usable_top + end * usable_height)
+            block_height = max(y_end - y_start, 3)
             painter.fillRect(
-                left_rect.left(),
-                y - _SCROLLBAR_MARKER_HALF_HEIGHT,
-                left_rect.width(),
-                marker_h,
+                left_rect.left(), y_start,
+                left_rect.width(), block_height,
                 _SCROLLBAR_DELETION,
             )
-        for pos in self._addition_positions:
-            y = int(usable_top + pos * usable_height)
+        for start, end in self._addition_blocks:
+            y_start = int(usable_top + start * usable_height)
+            y_end = int(usable_top + end * usable_height)
+            block_height = max(y_end - y_start, 3)
             painter.fillRect(
-                right_rect.left(),
-                y - _SCROLLBAR_MARKER_HALF_HEIGHT,
-                right_rect.width(),
-                marker_h,
+                right_rect.left(), y_start,
+                right_rect.width(), block_height,
                 _SCROLLBAR_ADDITION,
             )
 
@@ -460,38 +529,59 @@ class _DiffEditor(QPlainTextEdit):
         self._update_gutter_width()
 
     def update_diff_markers(self, line_info: list[ParsedDiffLine]) -> None:
-        """Push the diff's deletion/addition positions to the scrollbar.
+        """Push the diff's deletion/addition blocks to the scrollbar.
 
-        Positions follow **file line numbers**, normalised by the
-        largest line number that appears in the diff. A change at
-        file line 100 of a 1000-line document therefore lands at
-        exactly 10 % of the bar height — proportional to where it
-        lives in the file, the way a real minimap should work.
+        Markers are positioned by their **index in the displayed
+        diff document**, normalised by the total number of visible
+        lines, and then grouped into clusters of consecutive
+        indices. Each cluster becomes one solid filled block on the
+        scrollbar.
 
-        Adjacent markers in line-number order are drawn as
-        overlapping solid filled rectangles, so a hunk that touches
-        lines 61–78 reads as one continuous green bar rather than
-        as 18 separate thin lines. See :data:`_SCROLLBAR_MARKER_HALF_HEIGHT`
-        for the block thickness.
+        The index-based positioning gives two guarantees:
+
+        * **Red and green never overlap.** Within a hunk the
+          deletions precede the additions in the diff text, so
+          the red cluster always ends at a smaller index than the
+          green cluster begins. The blocks sit at the actual
+          positions of those lines in the diff — red on top,
+          green below — exactly the way they appear on screen.
+        * **Scrolling lands on the right line.** Clicking a block
+          moves the editor's viewport to that fraction of the
+          content, which *is* the line the block represents — no
+          off-by-N mismatch with file line numbers the scrollbar
+          isn't aware of.
+
+        A cluster is one or more indices with no gap between
+        adjacent entries. ``gap_threshold`` (in number of
+        intervening indices) determines where one cluster ends and
+        the next begins; with the default of 2, every non-adjacent
+        colour boundary in the diff becomes a separator between
+        blocks.
         """
-        max_line = max(
-            (info.line_number for info in line_info if info.line_number),
-            default=0,
-        )
-        if max_line <= 0:
-            self._diff_scrollbar.set_diff_markers([], [])
+        total = len(line_info)
+        if total == 0:
+            self._diff_scrollbar.set_diff_blocks([], [])
             return
-        deletions = sorted(
-            info.line_number / max_line
-            for info in line_info
-            if info.line_type == DiffLineType.DELETION and info.line_number
+        deletion_indices = [
+            index
+            for index, info in enumerate(line_info)
+            if info.line_type == DiffLineType.DELETION
+        ]
+        addition_indices = [
+            index
+            for index, info in enumerate(line_info)
+            if info.line_type == DiffLineType.ADDITION
+        ]
+        if not deletion_indices and not addition_indices:
+            self._diff_scrollbar.set_diff_blocks([], [])
+            return
+        deletion_blocks = _cluster_indices_to_blocks(
+            deletion_indices, total,
         )
-        additions = sorted(
-            info.line_number / max_line
-            for info in line_info
-            if info.line_type == DiffLineType.ADDITION and info.line_number
+        addition_blocks = _cluster_indices_to_blocks(
+            addition_indices, total,
         )
-        self._diff_scrollbar.set_diff_markers(deletions, additions)
+        self._diff_scrollbar.set_diff_blocks(deletion_blocks, addition_blocks)
 
     # ── internal slots connected to signals ───────────────────────
 
@@ -727,7 +817,7 @@ class DiffViewWidget(QWidget):
         self._editor.clear()
         self._editor.set_line_info([])
         self._editor.setExtraSelections([])
-        self._editor._diff_scrollbar.set_diff_markers([], [])
+        self._editor._diff_scrollbar.set_diff_blocks([], [])
         self._changes_only_text = ""
         self._full_document_text = ""
 
