@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from PySide6.QtCore import QCoreApplication
 from src.core.exceptions import GitError, MergeConflictError, RebaseConflictError
-from src.core.operations import checkout_branch, create_branch
+from src.core.operations import checkout_branch, checkout_commit, create_branch
 from src.core.repository import RepositoryManager
 from src.viewmodels.commands import (
     CherryPickCommand,
@@ -397,6 +397,73 @@ def test_cherry_pick_command_via_processor(
     assert "b.txt" in mgr.repo.index
     proc.undo()
     assert "b.txt" not in mgr.repo.index
+
+
+# ----- R1.3: undo must restore the detached-HEAD state --------------------
+
+
+def test_cherry_pick_undo_preserves_detached_head(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    """R1.3 / C3: cherry-pick and revert are the only operations that
+    *can* run while HEAD is detached (``git cherry-pick`` / ``git revert``
+    do not require a branch).  Undoing them must restore HEAD to the
+    pre-command SHA *and* leave HEAD detached — not silently re-attach
+    to a branch that happens to point at that SHA.
+
+    ``reset(OID, mixed)`` already preserves the detached/symbolic state
+    of HEAD in pygit2; this test pins the contract.
+    """
+    _ensure_app()
+    mgr = RepositoryManager(str(tmp_git_repo))
+    base_oid = make_commit("base", files={"a.txt": "A\n"})
+    feat_oid = make_commit("adds-b", files={"b.txt": "B\n"}, parents=[base_oid])
+
+    # Detach HEAD on ``base`` (do *not* check out a branch).
+    checkout_commit(mgr, str(base_oid))
+    assert mgr.repo.head_is_detached
+    detached_sha_before = str(mgr.repo.head.target)
+
+    # Cherry-pick onto the detached HEAD.
+    cmd = CherryPickCommand(mgr, str(feat_oid))
+    cmd.execute()
+    assert mgr.repo.head_is_detached
+    # The cherry-pick stages the change but does not move HEAD.
+    assert str(mgr.repo.head.target) == detached_sha_before
+    assert "b.txt" in mgr.repo.index
+
+    cmd.undo()
+    # Undo must restore HEAD to the original detached SHA AND keep it
+    # detached (not silently move HEAD onto ``main``).
+    assert mgr.repo.head_is_detached
+    assert str(mgr.repo.head.target) == detached_sha_before
+    assert "b.txt" not in mgr.repo.index
+
+
+def test_revert_undo_preserves_detached_head(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    """Mirror of the cherry-pick test, for :class:`RevertCommand`."""
+    _ensure_app()
+    mgr = RepositoryManager(str(tmp_git_repo))
+    base_oid = make_commit("base", files={"a.txt": "A\n"})
+    feat_oid = make_commit("change-a", files={"a.txt": "A2\n"}, parents=[base_oid])
+
+    # Detach HEAD on the second commit so revert has work to do.
+    checkout_commit(mgr, str(feat_oid))
+    assert mgr.repo.head_is_detached
+    detached_sha_before = str(mgr.repo.head.target)
+
+    cmd = RevertCommand(mgr, str(feat_oid))
+    cmd.execute()
+    assert mgr.repo.head_is_detached
+    assert str(mgr.repo.head.target) == detached_sha_before
+
+    cmd.undo()
+    assert mgr.repo.head_is_detached
+    assert str(mgr.repo.head.target) == detached_sha_before
 
 
 # ----- CommandProcessor wiring --------------------------------------------

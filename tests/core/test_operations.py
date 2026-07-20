@@ -491,6 +491,99 @@ def test_merge_x_into_y_with_detached_head_raises(committed_repo: RepositoryMana
         merge_branch(committed_repo, "main", target="main")
 
 
+# ----- R1.3: merge in detached HEAD state must leave repo untouched -------
+
+
+def test_merge_branch_in_detached_head_leaves_repo_untouched(
+    committed_repo: RepositoryManager,
+) -> None:
+    """R1.3 / C3: a merge attempted in detached HEAD state must raise a
+    domain error and must not move HEAD or the worktree.
+
+    The previous code used ``r.head.shorthand`` (which is ``"HEAD"`` on
+    a detached HEAD) as if it were a branch refname.  ``lookup_reference``
+    then raised ``KeyError`` — sometimes *after* the merge commit was
+    already created, leaving the repository in a partially-merged state.
+    The fix is to refuse detached HEAD up front.
+    """
+    base = committed_repo.head_commit.sha
+    # Create a divergent feature branch we *could* merge from.
+    create_branch(committed_repo, "feature", target_sha=base)
+    checkout_branch(committed_repo, "feature")
+    (Path(committed_repo.path) / "feature.txt").write_text("feature change\n")
+    feature_tip = commit_changes(committed_repo, "feature change").sha
+    checkout_branch(committed_repo, "main")
+    (Path(committed_repo.path) / "main.txt").write_text("main change\n")
+    main_tip = commit_changes(committed_repo, "main change").sha
+
+    # Detach HEAD on the main tip.
+    checkout_commit(committed_repo, main_tip)
+    assert committed_repo.repo.head_is_detached
+    detached_sha_before = str(committed_repo.repo.head.target)
+    # Snapshot a tracked file so we can verify the worktree is untouched.
+    workdir = Path(committed_repo.path)
+    assert (workdir / "hello.txt").is_file()
+    original_hello = (workdir / "hello.txt").read_text()
+
+    # Attempt the merge — must raise.
+    with pytest.raises(GitError, match="detached"):
+        merge_branch(committed_repo, "feature", target="main")
+
+    # HEAD stays exactly where it was — detached on the original SHA.
+    assert committed_repo.repo.head_is_detached
+    assert str(committed_repo.repo.head.target) == detached_sha_before
+    # ``main`` was not moved by the rejected merge.
+    assert (
+        str(committed_repo.repo.lookup_reference("refs/heads/main").target) == main_tip
+    )
+    # The feature branch is also unchanged.
+    assert (
+        str(committed_repo.repo.lookup_reference("refs/heads/feature").target)
+        == feature_tip
+    )
+    # Worktree content is untouched.
+    assert (workdir / "hello.txt").read_text() == original_hello
+
+
+# ----- R1.3: rebase in detached HEAD state must also raise clearly ---------
+
+
+def test_rebase_branch_raises_when_head_detached(
+    committed_repo: RepositoryManager,
+) -> None:
+    """R1.3 / C3: ``git rebase`` on a detached HEAD would either fail with
+    a confusing CLI message or silently re-attach HEAD; reject it in core
+    with a domain error and leave the repository unchanged.
+    """
+    base = committed_repo.head_commit.sha
+    create_branch(committed_repo, "feature", target_sha=base)
+    checkout_branch(committed_repo, "feature")
+    (Path(committed_repo.path) / "feature.txt").write_text("feature\n")
+    commit_changes(committed_repo, "feature change")
+
+    checkout_branch(committed_repo, "main")
+    (Path(committed_repo.path) / "main.txt").write_text("main\n")
+    main_tip = commit_changes(committed_repo, "main change").sha
+
+    checkout_commit(committed_repo, main_tip)
+    assert committed_repo.repo.head_is_detached
+    detached_sha_before = str(committed_repo.repo.head.target)
+    workdir = Path(committed_repo.path)
+    original_hello = (workdir / "hello.txt").read_text()
+
+    with pytest.raises(GitError, match="detached"):
+        rebase_branch(committed_repo, "feature")
+
+    # HEAD still detached at the original SHA, branches unchanged,
+    # worktree untouched.
+    assert committed_repo.repo.head_is_detached
+    assert str(committed_repo.repo.head.target) == detached_sha_before
+    assert (
+        str(committed_repo.repo.lookup_reference("refs/heads/main").target) == main_tip
+    )
+    assert (workdir / "hello.txt").read_text() == original_hello
+
+
 def test_ff_merge_rolls_back_target_on_checkout_failure(
     committed_repo: RepositoryManager,
 ) -> None:

@@ -658,17 +658,32 @@ class RebaseCommand(GitCommand):
 
     ``RebaseConflictError`` propagates out of :meth:`execute` so the
     processor does not push the command on failure.
+
+    Detached-HEAD handling (R1.3): ``rebase_branch`` in core rejects
+    detached HEAD up front with a domain error, so in practice
+    ``RebaseCommand`` will not run when HEAD is detached.  The undo
+    path is nevertheless written defensively: ``reset(OID, hard)``
+    preserves the detached-vs-symbolic state — a detached HEAD stays
+    detached, a symbolic HEAD stays on its branch — so the captured
+    OID is sufficient to undo regardless of how HEAD looked before
+    the command ran.
     """
 
     def __init__(self, repo: RepositoryManager, upstream: str) -> None:
         self._repo = repo
         self._upstream = upstream
         self._previous_head: str | None = None
+        # ``reset(OID)`` preserves the symbolic/detached state of HEAD,
+        # but tracking it explicitly makes the intent obvious and gives
+        # future refactors a clear hook if the underlying behaviour ever
+        # changes (R1.3 / finding C3).
+        self._previous_head_was_detached: bool = False
 
     def execute(self) -> None:
         pygit2_repo = self._repo.repo
         if not pygit2_repo.head_is_unborn:
             self._previous_head = str(pygit2_repo.head.target)
+            self._previous_head_was_detached = pygit2_repo.head_is_detached
         rebase_branch(self._repo, self._upstream)
 
     def undo(self) -> None:
@@ -680,6 +695,9 @@ class RebaseCommand(GitCommand):
             return
         if self._previous_head is None:
             return
+        # ``reset(OID)`` keeps HEAD detached if it was detached before,
+        # and re-attaches to the symbolic ref otherwise, so undoing
+        # from either starting state lands on the right HEAD shape.
         reset(self._repo, self._previous_head, mode="hard")
 
     @property
@@ -697,17 +715,26 @@ class CherryPickCommand(GitCommand):
     clears the staged changes by resetting the index to match the
     pre-pick HEAD; combined with the ``CommitCommand`` undo, the
     cherry-pick is fully reverted.
+
+    Detached-HEAD handling (R1.3): cherry-pick is allowed on a
+    detached HEAD (``git cherry-pick`` does not require a branch).
+    The captured ``_previous_head`` is the OID, and
+    ``reset(OID, mixed)`` preserves the detached/symbolic HEAD state,
+    so undo restores the repository to exactly where it was — detached
+    HEAD stays detached, symbolic HEAD stays on its branch.
     """
 
     def __init__(self, repo: RepositoryManager, sha: str) -> None:
         self._repo = repo
         self._sha = sha
         self._previous_head: str | None = None
+        self._previous_head_was_detached: bool = False
 
     def execute(self) -> None:
         pygit2_repo = self._repo.repo
         if not pygit2_repo.head_is_unborn:
             self._previous_head = str(pygit2_repo.head.target)
+            self._previous_head_was_detached = pygit2_repo.head_is_detached
         cherry_pick(self._repo, self._sha)
 
     def undo(self) -> None:
@@ -725,17 +752,25 @@ class CherryPickCommand(GitCommand):
 
 
 class RevertCommand(GitCommand):
-    """Revert ``sha``; undo by resetting --mixed (mirror of cherry-pick)."""
+    """Revert ``sha``; undo by resetting --mixed (mirror of cherry-pick).
+
+    Detached-HEAD handling (R1.3): revert is also allowed on a
+    detached HEAD. ``reset(OID, mixed)`` preserves the detached
+    state, so undo restores HEAD to the pre-revert SHA while
+    remaining detached when it started detached.
+    """
 
     def __init__(self, repo: RepositoryManager, sha: str) -> None:
         self._repo = repo
         self._sha = sha
         self._previous_head: str | None = None
+        self._previous_head_was_detached: bool = False
 
     def execute(self) -> None:
         pygit2_repo = self._repo.repo
         if not pygit2_repo.head_is_unborn:
             self._previous_head = str(pygit2_repo.head.target)
+            self._previous_head_was_detached = pygit2_repo.head_is_detached
         revert(self._repo, self._sha)
 
     def undo(self) -> None:

@@ -672,8 +672,20 @@ def rebase_branch(
 
     Implemented via the ``git rebase`` CLI because pygit2 1.x does not
     expose a high-level rebase. Requires ``git`` in ``PATH``.
+
+    Detached HEAD is rejected up front (R1.3 / finding C3): the CLI's
+    ``git rebase`` would either fail with a confusing message or, worse,
+    silently re-attach HEAD to whatever ref happens to be checked out
+    (``HEAD`` is not a branch refname). Switch to a branch first.
     """
     with unwrap(repo) as r:
+        if r.head_is_unborn:
+            raise GitError("Cannot rebase: HEAD is unborn.")
+        if r.head_is_detached:
+            raise GitError(
+                "Cannot rebase in detached HEAD state. "
+                "Switch to a branch first.",
+            )
         workdir = r.workdir
     if workdir is None:
         raise GitError("Cannot rebase a bare repository.")
