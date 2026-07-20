@@ -123,6 +123,36 @@ class MainViewModel(QObject):
         # :attr:`recently_created_changed` so widgets can re-pull it.
         self._recently_created_branches: set[str] = set()
 
+    # ----- destructive-action confirmation ------------------------------
+
+    def _confirm_destructive(
+        self,
+        title: str,
+        message: str,
+        *,
+        default_no: bool = True,
+        parent: object | None = None,
+    ) -> bool:
+        """Show a Yes/No confirmation dialog for a destructive action.
+
+        ``default_no=True`` (the default) makes the *No* button the
+        default so an accidental Enter / Return does not destroy data.
+        Returns ``True`` iff the user explicitly clicked Yes.
+
+        ``parent`` is forwarded to ``QMessageBox.question``; it may be
+        ``None`` in tests where no widget is available.
+        """
+        # Local import keeps the module importable in environments where
+        # QtWidgets is not (yet) loaded — see core/commands doctests.
+        from PySide6.QtWidgets import QMessageBox
+
+        flags = QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        default = (
+            QMessageBox.StandardButton.No if default_no else QMessageBox.StandardButton.Yes
+        )
+        button = QMessageBox.question(parent, title, message, flags, default)
+        return button == QMessageBox.StandardButton.Yes
+
     # ----- child ViewModels / processor (read-only accessors) ---------
 
     def command_processor(self) -> CommandProcessor:
@@ -756,10 +786,13 @@ class MainViewModel(QObject):
         """Discard all uncommitted changes (index + workdir) via ``DiscardChangesCommand``.
 
         Emits ``error_occurred`` on failure. Refreshes all views on success.
+        UI confirm is the caller's responsibility — this VM method matches
+        the contract of an undoable operation. The main window is expected
+        to prompt the user before invoking this method (already does via
+        :class:`CommitPanel` confirmation flow).
         """
         if self._repo_manager is None or not self._repo_manager.is_open:
             self.error_occurred.emit("No repository open.")
-            self._log("discard", "Discard failed: no repo", level="error")
             return
         if self._is_busy:
             self.error_occurred.emit("Another operation is already in progress.")

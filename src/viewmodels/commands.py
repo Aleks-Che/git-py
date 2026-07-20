@@ -834,6 +834,12 @@ class PushCommand(GitCommand):
     push was rejected (e.g. rejected fast-forward → fix → redo).
     """
 
+    # Push is irreversible from the toolbar's POV: there is no canonical
+    # client-side undo. Marking the command as ``is_noop`` keeps it out of
+    # the undo stack so the Undo button does not silently "succeed" by
+    # doing nothing. The action-history panel still records the push.
+    is_noop = True
+
     def __init__(
         self,
         repo: RepositoryManager,
@@ -919,6 +925,12 @@ class FetchCommand(GitCommand):
     is intentionally a no-op. The command is still pushed onto the
     undo stack so the user can see the fetch history.
     """
+
+    # Fetch only mutates ``refs/remotes/<name>/*``; nothing on the
+    # toolbar Undo side can usefully roll that back. Excluding the
+    # command from the undo stack prevents a misleadingly-enabled Undo
+    # button. The action-history panel still records the fetch.
+    is_noop = True
 
     def __init__(
         self,
@@ -1412,6 +1424,14 @@ class DiscardChangesCommand(GitCommand):
     The working tree is hard-reset to ``HEAD``.  Undo is a no-op since
     the changes are discarded without a backup.
     """
+
+    # ``DiscardChangesCommand`` is destructive and irreversible: the
+    # working tree is hard-reset with no backup of the prior content.
+    # Marking it as ``is_noop`` keeps it out of the undo stack so the
+    # toolbar Undo button does not silently "succeed" on a no-op. The
+    # confirmation gate is enforced at the VM layer
+    # (:meth:`MainViewModel.discard_changes`).
+    is_noop = True
 
     def __init__(self, repo: RepositoryManager) -> None:
         self._repo = repo

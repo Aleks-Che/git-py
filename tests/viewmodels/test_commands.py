@@ -116,3 +116,108 @@ def test_clear_drops_both_stacks() -> None:
     processor.clear()
     assert not processor.can_undo
     assert not processor.can_redo
+
+
+# --- R1.7: non-undoable commands stay out of undo stack ------------------
+
+
+def test_discard_changes_command_is_excluded_from_undo_stack(tmp_path) -> None:
+    """DiscardChangesCommand is destructive and irreversible; its
+    undo() is a no-op, so the processor must NOT put it on the undo
+    stack — otherwise the toolbar Undo button silently "succeeds" on a
+    command that does nothing.
+    """
+    import time
+
+    import pygit2
+    from src.core.repository import RepositoryManager
+    from src.viewmodels.commands import DiscardChangesCommand
+
+    _ensure_qapp()
+    repo_path = tmp_path / "r"
+    repo_path.mkdir()
+    pygit2.init_repository(str(repo_path), initial_head="main")
+    (repo_path / "a.txt").write_text("a\n")
+    manager = RepositoryManager(str(repo_path))
+    sig = pygit2.Signature("t", "t@x", int(time.time()), 0)
+    manager.repo.index.add("a.txt")
+    manager.repo.index.write()
+    tree = manager.repo.index.write_tree()
+    manager.repo.create_commit("refs/heads/main", sig, sig, "init", tree, [])
+
+    processor = CommandProcessor()
+    processor.execute(DiscardChangesCommand(manager))
+
+    assert not processor.can_undo
+    assert not processor.can_redo
+
+
+def test_confirm_destructive_returns_false_on_no() -> None:
+    """``_confirm_destructive`` returns False when the user picks No
+    (or hits Enter — default button is No).
+    """
+    from PySide6.QtWidgets import QMessageBox
+    from src.viewmodels.main_viewmodel import MainViewModel
+
+    _ensure_qapp()
+    vm = MainViewModel.__new__(MainViewModel)  # bypass __init__ — we only call the helper
+
+    # Monkeypatch QMessageBox.question -> returns No
+    original = QMessageBox.question
+    QMessageBox.question = staticmethod(lambda *a, **kw: QMessageBox.StandardButton.No)
+    try:
+        result = vm._confirm_destructive("t", "m", default_no=True)
+        assert result is False
+    finally:
+        QMessageBox.question = original
+
+
+def test_confirm_destructive_returns_true_on_yes() -> None:
+    """``_confirm_destructive`` returns True when the user explicitly
+    clicks Yes.
+    """
+    from PySide6.QtWidgets import QMessageBox
+    from src.viewmodels.main_viewmodel import MainViewModel
+
+    _ensure_qapp()
+    vm = MainViewModel.__new__(MainViewModel)
+
+    original = QMessageBox.question
+    QMessageBox.question = staticmethod(lambda *a, **kw: QMessageBox.StandardButton.Yes)
+    try:
+        result = vm._confirm_destructive("t", "m", default_no=True)
+        assert result is True
+    finally:
+        QMessageBox.question = original
+
+
+def test_confirm_destructive_default_is_no() -> None:
+    """Verify that ``default_no=True`` (the default) makes the No
+    button the default — so accidental Enter cannot destroy data.
+
+    We can't observe the default button directly without running a real
+    event loop, but we CAN verify the helper passes the right
+    ``default`` argument to ``QMessageBox.question``.
+    """
+    from PySide6.QtWidgets import QMessageBox
+    from src.viewmodels.main_viewmodel import MainViewModel
+
+    _ensure_qapp()
+    vm = MainViewModel.__new__(MainViewModel)
+    captured: dict[str, object] = {}
+
+    def capture(parent, title, message, flags, default):
+        captured["default"] = default
+        captured["flags"] = flags
+        return QMessageBox.StandardButton.No
+
+    original = QMessageBox.question
+    QMessageBox.question = staticmethod(capture)
+    try:
+        vm._confirm_destructive("t", "m")
+        assert captured["default"] == QMessageBox.StandardButton.No
+        # Both flags set
+        assert captured["flags"] & QMessageBox.StandardButton.Yes
+        assert captured["flags"] & QMessageBox.StandardButton.No
+    finally:
+        QMessageBox.question = original
