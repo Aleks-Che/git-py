@@ -697,25 +697,22 @@ def rebase_branch(
                 "Cannot rebase in detached HEAD state. "
                 "Switch to a branch first.",
             )
-        workdir = r.workdir
-    if workdir is None:
-        raise GitError("Cannot rebase a bare repository.")
-    git = shutil.which("git")
-    if git is None:
-        raise GitNotInstalledError("`git` CLI is not in PATH; rebase requires it.")
-    try:
-        completed = subprocess.run(
-            [git, "rebase", upstream],
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=300.0,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise GitError(f"git rebase {upstream} timed out after 300s") from exc
-    except OSError as exc:
-        raise GitError(f"Failed to spawn git: {exc}") from exc
+        if r.workdir is None:
+            raise GitError("Cannot rebase a bare repository.")
+        try:
+            completed = _run_git_in_workdir(
+                r,
+                ["rebase", upstream],
+                timeout=300.0,
+            )
+        except GitError as exc:
+            text = str(exc)
+            if "conflict" in text.lower():
+                raise RebaseConflictError(
+                    "Rebase stopped with conflicts. Resolve and run `git rebase --continue`.\n"
+                    f"{text}",
+                ) from exc
+            raise
     if completed.returncode != 0:
         if "conflict" in (completed.stderr + completed.stdout).lower():
             raise RebaseConflictError(
@@ -759,11 +756,17 @@ def is_rebase_in_progress(repo: RepositoryManager | pygit2.Repository) -> bool:
     return (gd / "rebase-apply").is_dir() or (gd / "rebase-merge").is_dir()
 
 
+def _refresh_index(repo: pygit2.Repository) -> None:
+    """Reload the in-memory index after an external Git mutation."""
+    repo.index.read(force=True)
+
+
 def _run_git_in_workdir(
     repo: pygit2.Repository,
     args: list[str],
     *,
     timeout: float = 60.0,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run ``git <args>`` in ``repo.workdir``; raise domain errors on failure.
 
@@ -779,14 +782,17 @@ def _run_git_in_workdir(
     if git is None:
         raise GitNotInstalledError("`git` CLI is not in PATH.")
     try:
-        return subprocess.run(
+        completed = subprocess.run(
             [git, *args],
             cwd=workdir,
             capture_output=True,
             text=True,
             check=False,
             timeout=timeout,
+            env=env,
         )
+        _refresh_index(repo)
+        return completed
     except subprocess.TimeoutExpired as exc:
         raise GitError(
             f"git {' '.join(args)} timed out after {timeout:.0f}s",
@@ -913,27 +919,15 @@ def complete_rebase_continue(repo: RepositoryManager | pygit2.Repository) -> boo
     with unwrap(repo) as r:
         if not is_rebase_in_progress(r):
             raise GitError("No rebase in progress.")
-        workdir = r.workdir
-    if workdir is None:
-        raise GitError("Cannot continue a rebase in a bare repository.")
-    git = shutil.which("git")
-    if git is None:
-        raise GitNotInstalledError("`git` CLI is not in PATH.")
-    env = {**os.environ, "GIT_EDITOR": "true"}
-    try:
-        completed = subprocess.run(
-            [git, "rebase", "--continue"],
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-            check=False,
+        if r.workdir is None:
+            raise GitError("Cannot continue a rebase in a bare repository.")
+        env = {**os.environ, "GIT_EDITOR": "true"}
+        completed = _run_git_in_workdir(
+            r,
+            ["rebase", "--continue"],
             timeout=300.0,
             env=env,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise GitError("git rebase --continue timed out after 300s") from exc
-    except OSError as exc:
-        raise GitError(f"Failed to spawn git: {exc}") from exc
     if completed.returncode != 0:
         if "conflict" in (completed.stderr + completed.stdout).lower():
             # Not an error per se: there are more commits to apply and
@@ -1325,22 +1319,7 @@ def unstage_changes(
         workdir = r.workdir
     if workdir is None:
         raise GitError("Cannot unstage in a bare repository.")
-    git = shutil.which("git")
-    if git is None:
-        raise GitNotInstalledError("`git` CLI is not in PATH; unstage requires it.")
-    try:
-        completed = subprocess.run(
-            [git, "reset", "HEAD", "--", path],
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30.0,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise GitError("git reset timed out after 30s") from exc
-    except OSError as exc:
-        raise GitError(f"Failed to spawn git: {exc}") from exc
+    completed = _run_git_in_workdir(r, ["reset", "HEAD", "--", path], timeout=30.0)
     if completed.returncode != 0:
         raise GitError(
             f"Failed to unstage {path!r}: "
@@ -1441,25 +1420,8 @@ def stash_push_staged(
         workdir = r.workdir
         if workdir is None:
             raise GitError("Cannot stash in a bare repository.")
-    git = shutil.which("git")
-    if git is None:
-        raise GitNotInstalledError("`git` CLI is not in PATH; partial stash requires it.")
     args = ["stash", "push", "-m", message, "--"] + staged_paths
-    try:
-        completed = subprocess.run(
-            [git, *args],
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30.0,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise GitError(
-            "git stash push timed out after 30s",
-        ) from exc
-    except OSError as exc:
-        raise GitError(f"Failed to spawn git: {exc}") from exc
+    completed = _run_git_in_workdir(r, args, timeout=30.0)
     if completed.returncode != 0:
         stderr = (completed.stderr or completed.stdout or "").strip()
         if "no local changes to save" in stderr.lower():
@@ -1754,6 +1716,7 @@ def restore_stash(
             check=False,
             timeout=30.0,
         )
+        _refresh_index(r)
     except subprocess.TimeoutExpired as exc:
         raise GitError(
             "git stash store timed out after 30s",
@@ -2128,22 +2091,7 @@ def discard_file(
     full_path = Path(workdir) / path
     if not full_path.exists() and not in_index:
         return  # nothing to discard
-    git = shutil.which("git")
-    if git is None:
-        raise GitNotInstalledError("`git` CLI is not in PATH; discard requires it.")
-    try:
-        completed = subprocess.run(
-            [git, "checkout", "HEAD", "--", path],
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30.0,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise GitError("git checkout timed out after 30s") from exc
-    except OSError as exc:
-        raise GitError(f"Failed to spawn git: {exc}") from exc
+    completed = _run_git_in_workdir(r, ["checkout", "HEAD", "--", path], timeout=30.0)
     if completed.returncode != 0:
         raise GitError(
             f"Failed to discard {path!r}: "

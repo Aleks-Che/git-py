@@ -1564,3 +1564,72 @@ def test_stage_diff_line_rejects_new_file(tmp_git_repo: Path) -> None:
 
     with pytest.raises(GitError, match="no unstaged text modification"):
         stage_diff_line(manager, "new.txt", line)
+
+
+# --- R1.6: subprocess -> in-memory index refresh -----------------------------
+
+
+def test_unstage_changes_refreshes_index_after_cli(tmp_git_repo: Path) -> None:
+    """After ``unstage_changes`` (which shells out to ``git``), the
+    in-memory ``pygit2.Repository.index`` must reflect the new state —
+    not the pre-call snapshot. Without an explicit ``index.read(force=True)``
+    the next ``status()`` call would lie about which paths are staged.
+    """
+    from src.core.operations import commit_changes, unstage_changes
+
+    manager = RepositoryManager(str(tmp_git_repo))
+    (tmp_git_repo / "tracked.txt").write_text("one\n")
+    manager.repo.index.add("tracked.txt")
+    manager.repo.index.write()
+    commit_changes(manager, "initial")
+
+    # Stage one more file
+    (tmp_git_repo / "two.txt").write_text("two\n")
+    manager.repo.index.add("two.txt")
+    manager.repo.index.write()
+    # Sanity: two.txt is now staged
+    status_before = manager.repo.status()
+    flags_before = status_before.get("two.txt", 0)
+    assert flags_before & pygit2.GIT_STATUS_INDEX_NEW
+
+    # Unstage via CLI path
+    unstage_changes(manager, "two.txt")
+
+    # Critical assertion — index was refreshed in-memory after CLI subprocess.
+    status_after = manager.repo.status()
+    flags_after = status_after.get("two.txt", 0)
+    assert not (flags_after & pygit2.GIT_STATUS_INDEX_NEW), (
+        f"expected two.txt to be unstaged after unstage_changes, "
+        f"got flags={flags_after:#x}"
+    )
+
+
+def test_stash_push_staged_refreshes_index_after_cli(tmp_git_repo: Path) -> None:
+    """After ``stash_push_staged`` (which shells out to ``git stash
+    push -- <paths>``), the in-memory index must no longer list the
+    staged paths.
+    """
+    from src.core.operations import commit_changes, stash_push_staged
+
+    manager = RepositoryManager(str(tmp_git_repo))
+    (tmp_git_repo / "a.txt").write_text("a\n")
+    manager.repo.index.add("a.txt")
+    manager.repo.index.write()
+    commit_changes(manager, "initial")
+
+    # Stage an additional file
+    (tmp_git_repo / "b.txt").write_text("b\n")
+    manager.repo.index.add("b.txt")
+    manager.repo.index.write()
+    status_before = manager.repo.status()
+    assert status_before.get("b.txt", 0) & pygit2.GIT_STATUS_INDEX_NEW
+
+    # Stash all staged changes via CLI (function stashes whatever is currently staged)
+    stash_push_staged(manager)
+
+    # In-memory index must reflect: b.txt is no longer staged.
+    status_after = manager.repo.status()
+    flags_after = status_after.get("b.txt", 0)
+    assert not (flags_after & pygit2.GIT_STATUS_INDEX_NEW), (
+        f"expected b.txt unstage after stash_push_staged, got flags={flags_after:#x}"
+    )

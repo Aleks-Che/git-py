@@ -80,6 +80,11 @@ class GitCommand(ABC):
     """
 
     _timestamp: float | None = None
+    # Commands that have no effect (or whose undo has no effect) are not
+    # entered into the undo/redo history. Subclasses may set this during
+    # ``execute`` when the outcome is known (for example, an up-to-date
+    # merge).
+    is_noop = False
 
     @abstractmethod
     def execute(self) -> None:
@@ -109,6 +114,7 @@ class CommandProcessor(QObject):
     """
 
     stack_changed = Signal()
+    error_occurred = Signal(str)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -119,7 +125,8 @@ class CommandProcessor(QObject):
         """Run ``command.execute()`` and push it onto the undo stack."""
         command.execute()
         command._timestamp = time.time()
-        self._undo_stack.append(command)
+        if not command.is_noop:
+            self._undo_stack.append(command)
         self._redo_stack.clear()
         self.stack_changed.emit()
 
@@ -128,7 +135,15 @@ class CommandProcessor(QObject):
         if not self._undo_stack:
             return
         command = self._undo_stack.pop()
-        command.undo()
+        try:
+            command.undo()
+        except Exception as exc:
+            # Keep a failed command available for a later retry.  In
+            # particular, an undo conflict must not silently erase history.
+            self._undo_stack.append(command)
+            self.error_occurred.emit(str(exc))
+            self.stack_changed.emit()
+            return
         self._redo_stack.append(command)
         self.stack_changed.emit()
 
@@ -137,9 +152,18 @@ class CommandProcessor(QObject):
         if not self._redo_stack:
             return
         command = self._redo_stack.pop()
-        command.execute()
+        try:
+            command.execute()
+        except Exception as exc:
+            # A failed redo remains redo-able; do not lose it from both
+            # stacks merely because the repository is currently conflicted.
+            self._redo_stack.append(command)
+            self.error_occurred.emit(str(exc))
+            self.stack_changed.emit()
+            return
         command._timestamp = time.time()
-        self._undo_stack.append(command)
+        if not command.is_noop:
+            self._undo_stack.append(command)
         self.stack_changed.emit()
 
     @property
@@ -207,6 +231,7 @@ class CommitCommand(GitCommand):
             from src.core.exceptions import GitError
 
             raise GitError("Commit message must not be empty.")
+        self.is_noop = self._repo.repo.head_is_unborn
         if not self._repo.repo.head_is_unborn:
             self._previous_head = str(self._repo.repo.head.target)
         else:
@@ -326,6 +351,7 @@ class CheckoutCommand(GitCommand):
                 f"({preview}{suffix}).",
             )
         self._previous_branch = previous
+        self.is_noop = self._previous_branch is None
 
     def undo(self) -> None:
         if self._previous_branch is None:
@@ -621,6 +647,7 @@ class MergeCommand(GitCommand):
                 and str(repo.head.target) != self._head_sha_before
             )
         )
+        self.is_noop = self._merge_oid is None and not self._head_moved
 
     def undo(self) -> None:
         # Up-to-date merges on the current branch do not move anything.  A

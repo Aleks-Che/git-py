@@ -6,8 +6,11 @@ for the action-history panel.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import QCoreApplication
-from src.viewmodels.commands import CommandProcessor, GitCommand
+from src.core.repository import RepositoryManager
+from src.viewmodels.commands import CommandProcessor, GitCommand, MergeCommand
 
 
 class _IncrementCommand(GitCommand):
@@ -28,8 +31,52 @@ class _IncrementCommand(GitCommand):
         self._counter -= 1
 
 
+class _FailingUndoCommand(GitCommand):
+    @property
+    def name(self) -> str:
+        return "failing undo"
+
+    def execute(self) -> None:
+        pass
+
+    def undo(self) -> None:
+        raise RuntimeError("undo failed")
+
+
 def _ensure_qapp() -> None:
     QCoreApplication.instance() or QCoreApplication([])
+
+
+def test_command_processor_undo_keeps_command_on_exception() -> None:
+    _ensure_qapp()
+    processor = CommandProcessor()
+    command = _FailingUndoCommand()
+    changes: list[None] = []
+    processor.stack_changed.connect(lambda: changes.append(None))
+
+    processor.execute(command)
+    processor.undo()
+
+    assert processor.can_undo
+    assert processor.undo_stack_snapshot()[0]["name"] == command.name
+    assert not processor.can_redo
+    assert len(changes) == 2
+
+
+def test_command_processor_no_op_undo_does_not_enter_redo_stack(tmp_git_repo: Path) -> None:
+    _ensure_qapp()
+    # A merge into the current tip is detected as up-to-date by the command.
+    from src.core.operations import commit_changes
+
+    manager = RepositoryManager(str(tmp_git_repo))
+    (tmp_git_repo / "file.txt").write_text("content\n")
+    manager.repo.index.add("file.txt")
+    manager.repo.index.write()
+    commit_changes(manager, "initial")
+    processor = CommandProcessor()
+    processor.execute(MergeCommand(manager, "HEAD"))
+    assert not processor.can_undo
+    assert not processor.can_redo
 
 
 def test_timestamp_null_before_execute() -> None:
