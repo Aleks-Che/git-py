@@ -13,7 +13,11 @@ Clicking a file in the **Changed Files** list emits
 :attr:`selected_file_changed` and :attr:`diff_ready` so the
 :class:`MainWindow` can swap the graph for a diff view in place.
 Clicking the same file again deselects it (toggle behaviour, mirroring
-the WIP panel).
+the WIP panel). **Shift** and **Ctrl** clicks build a multi-selection
+for the right-click context menu (*Apply N stashed files* /
+*Copy Diff of N files*) without disturbing the diff view — the
+selection set is what gets acted on, while the last plain-clicked
+file keeps driving the centre-column diff.
 
 The widget is bound to :class:`MainViewModel` for the commit's
 ``CommitInfo`` and to :class:`RepositoryManager` (through the VM) for
@@ -25,6 +29,7 @@ import pygit2
 from PySide6.QtCore import QRect, QSize, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -73,11 +78,9 @@ _ROW_BG = "#1E1E1E"
 # The :class:`_FileRowDelegate` reads this to paint badge + path.
 _FILE_CHANGE_ROLE = Qt.ItemDataRole.UserRole + 1
 
-
 # ---------------------------------------------------------------------------
 # Per-row painter for the changed-files list
 # ---------------------------------------------------------------------------
-
 
 class _FileRowDelegate(QStyledItemDelegate):
     """Paint a single changed-file row: badge | path.
@@ -150,7 +153,6 @@ class _FileRowDelegate(QStyledItemDelegate):
         )
 
         painter.restore()
-
 
 class CommitDetailPanel(QWidget):
     """Read-only view of a single commit, bound to :class:`MainViewModel`."""
@@ -277,7 +279,12 @@ class CommitDetailPanel(QWidget):
         )
 
         self._files = QListWidget(self)
-        self._files.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        # ExtendedSelection gives the user Shift+click (range) and
+        # Ctrl+click (toggle individual) out of the box. The diff view
+        # is driven by a separate single-file selection so the two
+        # concerns do not fight each other; see
+        # :meth:`_on_files_item_clicked`.
+        self._files.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self._files.setUniformItemSizes(True)
         self._files.setAlternatingRowColors(False)
         self._files.setItemDelegate(_FileRowDelegate(self._files))
@@ -494,34 +501,85 @@ class CommitDetailPanel(QWidget):
 
     # ----- file selection (click to show diff in place) ---------------
 
+    def _selected_paths(self) -> list[str]:
+        """Return the paths currently selected in the file list.
+
+        Order matches the row order in the list (not the click order)
+        so the multi-select menu label is deterministic across
+        re-renders. The result is the set the user intends to act on
+        for the right-click context menu.
+        """
+        paths: list[str] = []
+        for i in range(self._files.count()):
+            item = self._files.item(i)
+            if item is None:
+                continue
+            if not item.isSelected():
+                continue
+            path = item.data(Qt.ItemDataRole.UserRole)
+            if path:
+                paths.append(path)
+        return paths
+
+    def _collapse_selection_to(self, item: QListWidgetItem) -> None:
+        """Replace the current selection with just *item*.
+
+        Used by :meth:`_on_file_context_menu` to mirror the WIP
+        panel / standard file-manager behaviour: right-clicking an
+        unselected row collapses the selection to that single row
+        instead of acting on the previous selection.
+
+        Split out from :meth:`_on_file_context_menu` so the collapse
+        can be tested without invoking a modal ``QMenu``.
+        """
+        self._files.clearSelection()
+        item.setSelected(True)
+
     def _on_file_context_menu(self, position) -> None:
         item = self._files.itemAt(position)
         if item is None or self._current_sha is None:
             return
-        path = item.data(Qt.ItemDataRole.UserRole)
-        if not path:
+        clicked_path = item.data(Qt.ItemDataRole.UserRole)
+        if not clicked_path:
             return
 
-        menu = self._build_file_context_menu(path)
+        selected_paths = self._selected_paths()
+
+        # If the user right-clicked a row that is not part of the
+        # current selection, mirror the WIP panel: collapse the
+        # selection to just that row. This matches the standard
+        # Windows Explorer / GitKraken behaviour — right-clicking an
+        # unselected item does not act on the previous selection.
+        if clicked_path not in selected_paths:
+            self._collapse_selection_to(item)
+            selected_paths = [clicked_path]
+
+        menu = self._build_file_context_menu(selected_paths)
         if menu is None:
             return
         menu.exec(self._files.viewport().mapToGlobal(position))
 
-    def _build_file_context_menu(self, path: str) -> QMenu | None:
-        """Return the right-click menu for ``path`` in the current commit.
+    def _build_file_context_menu(self, paths: list[str]) -> QMenu | None:
+        """Return the right-click menu for *paths* in the current commit.
 
         Always exposes *Copy Diff* (works for regular commits and stash
         entries alike). For stash entries it also exposes
-        *Apply stashed file*. Returns ``None`` when no menu is
-        appropriate (e.g. no commit selected).
+        *Apply stashed file*. When several files are selected the
+        labels reflect the count — *Copy Diff of N files* and
+        *Apply N stashed files* — so the user can confirm what they
+        are about to act on.
+
+        Returns ``None`` when no menu is appropriate (no commit
+        selected, empty selection).
 
         Factored out of :meth:`_on_file_context_menu` so tests can
         inspect the menu structure without going through
         :meth:`QMenu.exec`.
         """
-        if self._current_sha is None:
+        if self._current_sha is None or not paths:
             return None
         is_stash = self._main_vm.is_stash_sha(self._current_sha)
+        is_multi = len(paths) > 1
 
         menu = QMenu(self)
         menu.setStyleSheet(
@@ -531,38 +589,80 @@ class CommitDetailPanel(QWidget):
             "QMenu::item:selected { background-color: #094771; }",
         )
 
-        copy_action = menu.addAction("Copy Diff")
-        copy_action.triggered.connect(
-            lambda checked=False, p=path: self._main_vm.copy_commit_file_diff(
-                self._current_sha, p,
-            ),
-        )
-
-        if is_stash:
-            apply_action = menu.addAction("Apply stashed file")
-            apply_action.triggered.connect(
-                lambda checked=False, p=path: self._main_vm.apply_stash_file(
+        if is_multi:
+            copy_label = f"Copy Diff of {len(paths)} Files"
+            copy_action = menu.addAction(copy_label)
+            copy_action.triggered.connect(
+                lambda checked=False, ps=list(paths): self._main_vm.copy_commit_files_diff(
+                    self._current_sha, ps,
+                ),
+            )
+        else:
+            copy_action = menu.addAction("Copy Diff")
+            copy_action.triggered.connect(
+                lambda checked=False, p=paths[0]: self._main_vm.copy_commit_file_diff(
                     self._current_sha, p,
                 ),
             )
 
+        if is_stash:
+            if is_multi:
+                apply_label = f"Apply {len(paths)} stashed files"
+                apply_action = menu.addAction(apply_label)
+                apply_action.triggered.connect(
+                    lambda checked=False, ps=list(paths): self._main_vm.apply_stash_files(
+                        self._current_sha, ps,
+                    ),
+                )
+            else:
+                apply_action = menu.addAction("Apply stashed file")
+                apply_action.triggered.connect(
+                    lambda checked=False, p=paths[0]: self._main_vm.apply_stash_file(
+                        self._current_sha, p,
+                    ),
+                )
+
         return menu
 
     def _on_files_item_clicked(self, item: QListWidgetItem) -> None:
-        """Toggle the file selection for diff view.
+        """Update the diff target on plain click; ignore Shift / Ctrl clicks.
 
-        Clicking the same file again deselects it. The diff view is
-        driven by :attr:`selected_file_changed` and
-        :attr:`diff_ready` — same contract as the WIP panel.
+        Plain click on the currently-only-selected file toggles the
+        diff off (matching the previous behaviour). Shift+click and
+        Ctrl+click let the user build a range / toggle selection
+        without disturbing the diff view — Qt's ``ExtendedSelection``
+        mode handles the actual selection set, and we deliberately do
+        *not* call :meth:`select_file` here because that would route
+        through :meth:`_highlight_selected_file`, which would wipe
+        the user's multi-selection.
         """
+        if item is None:
+            return
         path = item.data(Qt.ItemDataRole.UserRole)
         if not path:
             return
-        if self._selected_file == path:
+
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & (
+            Qt.KeyboardModifier.ShiftModifier
+            | Qt.KeyboardModifier.ControlModifier
+        ):
+            # Let Qt manage the selection. The diff view keeps
+            # showing whatever file the user last chose with a plain
+            # click — matching the WIP panel's behaviour for
+            # modifier-driven multi-select.
+            return
+
+        selected_paths = self._selected_paths()
+        if (
+            self._selected_file == path
+            and len(selected_paths) == 1
+            and selected_paths[0] == path
+        ):
             self.select_file(None)
             self._files.clearSelection()
-        else:
-            self.select_file(path)
+            return
+        self.select_file(path)
 
     def _highlight_selected_file(self) -> None:
         """Apply the ``:selected`` state to the chosen file row.
@@ -661,12 +761,9 @@ class CommitDetailPanel(QWidget):
                 pieces.append(patch.text or "")
         return "".join(pieces)
 
-
 __all__ = ["CommitDetailPanel"]
 
-
 # ----- module helpers (kept private) ----------------------------------
-
 
 def _split_message(message: str) -> tuple[str, str]:
     """Split a commit message into ``(subject, body)``.
@@ -692,7 +789,6 @@ def _split_message(message: str) -> tuple[str, str]:
     body_lines = lines[idx:]
     body = "\n".join(line.rstrip() for line in body_lines).rstrip()
     return subject, body
-
 
 def _format_info(info: CommitInfo) -> str:
     """Format the info block (author, committer, time, SHA, parents).
@@ -724,7 +820,6 @@ def _format_info(info: CommitInfo) -> str:
     else:
         parts.append("<b>Parents:</b> (root commit)")
     return "<br/>".join(parts)
-
 
 def _format_time(unix_ts: int) -> str:
     """Render a unix timestamp as ``YYYY-MM-DD HH:MM:SS`` in UTC.

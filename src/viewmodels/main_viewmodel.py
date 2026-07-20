@@ -703,6 +703,41 @@ class MainViewModel(QObject):
             return
         self.copy_to_clipboard(text)
 
+    def copy_commit_files_diff(self, sha: str, paths: list[str]) -> None:
+        """Copy the concatenated diffs of several files in commit ``sha``.
+
+        Multi-file counterpart of :meth:`copy_commit_file_diff`. Each
+        per-file patch is preceded by a ``# path: <p>`` header so the
+        result stays readable when pasted. Files with no diff are
+        silently skipped (the same SHA may legitimately touch a file
+        that produces no per-file patch under the current context).
+
+        An empty *paths* list is a no-op. If every file is skipped the
+        clipboard is left untouched and :attr:`error_occurred` is
+        emitted once with a summary — otherwise the concatenated text
+        is copied.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        if not paths:
+            return
+        pieces: list[str] = []
+        for path in paths:
+            try:
+                text = self.get_commit_file_diff_text(sha, path)
+            except GitError as exc:
+                self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
+                return
+            if text:
+                pieces.append(f"# path: {path}\n{text}")
+        if not pieces:
+            self.error_occurred.emit(
+                f"No diff available for {len(paths)} file(s) in {sha[:7]}",
+            )
+            return
+        self.copy_to_clipboard("\n".join(pieces))
+
     def get_workdir_diff_text(self) -> str:
         """Return the full unified diff of the working tree vs HEAD.
 
@@ -2031,6 +2066,52 @@ class MainViewModel(QObject):
             return
         self._commit_panel_view_model.refresh_status()
         self._log("stash", f"Applied {path!r} from stash {stash_sha[:8]!r}")
+
+    def apply_stash_files(self, stash_sha: str, paths: list[str]) -> None:
+        """Apply several files from the stash in one batch.
+
+        Multi-file counterpart of :meth:`apply_stash_file`. Each path is
+        applied in turn; the first failure surfaces through
+        :attr:`error_occurred` and the loop stops so the user can react
+        before the working tree is half-overwritten. The status is
+        refreshed once at the end (instead of once per file) so a
+        large batch does not stall the UI.
+
+        The right-click *Apply N stashed files* action in the
+        commit-detail panel routes through this verb.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        if not paths:
+            return
+        from src.core.operations import apply_file_from_stash
+
+        self._log(
+            "stash",
+            f"Apply {len(paths)} file(s) from stash {stash_sha[:8]!r}: "
+            f"{', '.join(paths[:6])}"
+            + ("…" if len(paths) > 6 else ""),
+        )
+        applied: list[str] = []
+        for path in paths:
+            try:
+                apply_file_from_stash(self._repo_manager, stash_sha, path)
+            except GitError as exc:
+                self.error_occurred.emit(str(exc))
+                self._log(
+                    "stash",
+                    f"Apply stash file {path!r} failed after "
+                    f"{len(applied)} successful apply(ies): {exc}",
+                    level="error",
+                )
+                return
+            applied.append(path)
+        self._commit_panel_view_model.refresh_status()
+        self._log(
+            "stash",
+            f"Applied {len(applied)} file(s) from stash {stash_sha[:8]!r}",
+        )
 
     # ----- remotes: push / pull / fetch / add / remove / clone ---------
 
