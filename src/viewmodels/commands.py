@@ -562,15 +562,41 @@ class MergeCommand(GitCommand):
         # drag-and-drop and context-menu merges — the user asked
         # for a merge, so the history should show one.
         self._no_ff = no_ff
-        self._previous_head: str | None = None
+        # The target and HEAD may be different branches.  Keep both refs,
+        # rather than only the current HEAD SHA, because core.merge_branch
+        # checks out an explicitly requested target before merging.
+        self._target_ref_name: str | None = None
+        self._target_sha_before: str | None = None
+        self._head_ref_name_before: str | None = None
+        self._head_sha_before: str | None = None
+        self._merge_oid: str | None = None
         self._head_moved = False
 
     def execute(self) -> None:
-        pygit2_repo = self._repo.repo
-        if not pygit2_repo.head_is_unborn:
-            self._previous_head = str(pygit2_repo.head.target)
-        else:
-            self._previous_head = None
+        repo = self._repo.repo
+        target_name = self._target or (None if repo.head_is_detached else repo.head.shorthand)
+        if target_name is None:
+            from src.core.exceptions import GitError
+
+            raise GitError("merge_branch requires a target branch (HEAD is detached).")
+
+        # Capture all rollback state before core.merge_branch is called.  In
+        # particular, this is the target branch's old tip, not necessarily
+        # the branch currently checked out by the user.
+        self._target_ref_name = f"refs/heads/{target_name}"
+        try:
+            target_ref = repo.lookup_reference(self._target_ref_name)
+        except (KeyError, ValueError, pygit2.GitError) as exc:
+            from src.core.exceptions import GitError
+
+            raise GitError(f"Unknown target branch: {target_name!r}.") from exc
+        self._target_sha_before = str(target_ref.target)
+        self._head_ref_name_before = None
+        self._head_sha_before = None
+        if not repo.head_is_unborn and not repo.head_is_detached:
+            self._head_ref_name_before = repo.head.name
+            self._head_sha_before = str(repo.head.target)
+
         merge_branch(
             self._repo,
             self._source,
@@ -578,18 +604,42 @@ class MergeCommand(GitCommand):
             message=self._message,
             no_ff=self._no_ff,
         )
-        if self._previous_head is None:
-            self._head_moved = False
-        else:
-            self._head_moved = str(pygit2_repo.head.target) != self._previous_head
+
+        ref_after = repo.lookup_reference(self._target_ref_name)
+        after_sha = str(ref_after.target)
+        self._merge_oid = after_sha if after_sha != self._target_sha_before else None
+        self._head_moved = (
+            self._head_ref_name_before != (None if repo.head_is_detached else repo.head.name)
+            or (
+                self._head_sha_before is not None
+                and not repo.head_is_unborn
+                and str(repo.head.target) != self._head_sha_before
+            )
+        )
 
     def undo(self) -> None:
-        if self._previous_head is None or not self._head_moved:
-            # Nothing moved (up-to-date) or the original HEAD was
-            # unborn — undo is a silent no-op so the user is not
-            # left with a half-applied state.
+        # Up-to-date merges on the current branch do not move anything.  A
+        # target merge from another branch can still have checked out the
+        # target, though, so restore HEAD whenever that checkout happened.
+        if self._target_ref_name is None or self._target_sha_before is None:
             return
-        reset(self._repo, self._previous_head, mode="hard")
+        repo = self._repo.repo
+        target_ref = repo.lookup_reference(self._target_ref_name)
+        if self._merge_oid is None and not self._head_moved:
+            return
+
+        try:
+            target_ref.set_target(self._target_sha_before)
+            if self._head_ref_name_before is not None:
+                repo.set_head(self._head_ref_name_before)
+                repo.checkout_head(strategy=pygit2.GIT_CHECKOUT_FORCE)
+            elif self._head_sha_before is not None:
+                repo.create_reference_direct("HEAD", self._head_sha_before, force=True)
+                repo.checkout_head(strategy=pygit2.GIT_CHECKOUT_FORCE)
+        except (KeyError, ValueError, pygit2.GitError) as exc:
+            from src.core.exceptions import GitError
+
+            raise GitError(f"Failed to undo merge: {exc}") from exc
 
     @property
     def name(self) -> str:

@@ -34,6 +34,7 @@ from src.core.operations import (
     abort_rebase,
     add_remote,
     checkout_branch,
+    checkout_commit,
     cherry_pick,
     commit_changes,
     complete_merge,
@@ -243,6 +244,64 @@ def test_merge_no_ff_creates_commit_on_fast_forward(
     assert set(new_head.parents) == {before_main, feat_head}
 
 
+def test_merge_x_into_y_when_head_on_z(committed_repo: RepositoryManager) -> None:
+    """An explicit target is merged without losing the branch initially checked out."""
+    base = committed_repo.head_commit.sha
+    create_branch(committed_repo, "x", target_sha=base)
+    checkout_branch(committed_repo, "x")
+    (Path(committed_repo.path) / "x.txt").write_text("x\n")
+    x_tip = commit_changes(committed_repo, "x change").sha
+
+    checkout_branch(committed_repo, "main")
+    create_branch(committed_repo, "y", target_sha=base)
+    checkout_branch(committed_repo, "y")
+    (Path(committed_repo.path) / "y.txt").write_text("y\n")
+    y_before = commit_changes(committed_repo, "y change").sha
+
+    checkout_branch(committed_repo, "main")
+    create_branch(committed_repo, "z", target_sha=base)
+    checkout_branch(committed_repo, "z")
+    (Path(committed_repo.path) / "z.txt").write_text("z\n")
+    z_before = commit_changes(committed_repo, "z change").sha
+
+    assert merge_branch(committed_repo, "x", target="y") is True
+    assert committed_repo.repo.head.shorthand == "y"
+    assert str(committed_repo.repo.lookup_reference("refs/heads/z").target) == z_before
+    merge_commit = committed_repo.repo[committed_repo.repo.head.target]
+    assert merge_commit.parent_ids == [pygit2.Oid(hex=y_before), pygit2.Oid(hex=x_tip)]
+
+
+def test_merge_x_into_y_with_detached_head_raises(committed_repo: RepositoryManager) -> None:
+    checkout_commit(committed_repo, committed_repo.head_commit.sha)
+    with pytest.raises(GitError, match="detached"):
+        merge_branch(committed_repo, "main", target="main")
+
+
+def test_ff_merge_rolls_back_target_on_checkout_failure(
+    committed_repo: RepositoryManager,
+) -> None:
+    create_branch(committed_repo, "topic")
+    checkout_branch(committed_repo, "topic")
+    (Path(committed_repo.path) / "hello.txt").write_text("topic\n")
+    topic_tip = commit_changes(committed_repo, "topic change").sha
+    checkout_branch(committed_repo, "main")
+    main_before = committed_repo.head_commit.sha
+    (Path(committed_repo.path) / "hello.txt").write_text("local edit\n")
+
+    with pytest.raises(GitError, match="Fast-forward merge failed"):
+        merge_branch(committed_repo, "topic")
+
+    assert str(committed_repo.repo.lookup_reference("refs/heads/main").target) == main_before
+    assert str(committed_repo.repo.head.target) == main_before
+    assert str(committed_repo.repo.lookup_reference("refs/heads/topic").target) == topic_tip
+
+
+def test_ff_merge_no_op_when_target_not_local_branch(committed_repo: RepositoryManager) -> None:
+    create_branch(committed_repo, "topic")
+    with pytest.raises(GitError, match="Unknown target branch"):
+        merge_branch(committed_repo, "topic", target="nonexistent")
+
+
 def test_merge_three_way_returns_true(committed_repo: RepositoryManager) -> None:
     # Two diverging branches: feature and main each add a different file,
     # then merge -> a real three-way merge creates one extra commit.
@@ -276,16 +335,7 @@ def test_merge_conflict_raises(committed_repo: RepositoryManager) -> None:
 def test_merge_unknown_source_suggests_fetch(
     committed_repo: RepositoryManager,
 ) -> None:
-    """Unknown source error must hint at fetching remote branches.
-
-    The user reported: dropping a remote branch on a local one
-    (e.g. ``renovate/npm-vite-vulnerability`` onto ``main``) failed
-    with a bare "Unknown source" message. The most common cause is
-    that the remote-tracking ref has not been fetched yet, so the
-    error message now nudges the user towards the Fetch action
-    instead of leaving them guessing why their "merge" is
-    unmergeable.
-    """
+    """Unknown source error must hint at fetching remote branches."""
     with pytest.raises(InvalidRefError) as exc_info:
         merge_branch(committed_repo, "renovate/npm-vite-vulnerability")
     message = str(exc_info.value)

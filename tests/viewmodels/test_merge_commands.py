@@ -165,10 +165,60 @@ def test_merge_command_conflict_is_not_pushed(
     assert not proc.can_undo  # failure path leaves the stack empty
 
 
+def test_merge_command_captures_target_state_for_undo(
+    committed_repo: RepositoryManager,
+) -> None:
+    _ensure_app()
+    base = committed_repo.head_commit.sha
+    create_branch(committed_repo, "x", target_sha=base)
+    checkout_branch(committed_repo, "x")
+    (Path(committed_repo.path) / "x.txt").write_text("x\n")
+    from src.core.operations import commit_changes
+
+    x_tip = commit_changes(committed_repo, "x").sha
+    checkout_branch(committed_repo, "main")
+    create_branch(committed_repo, "y", target_sha=base)
+    checkout_branch(committed_repo, "y")
+    (Path(committed_repo.path) / "y.txt").write_text("y\n")
+    y_before = commit_changes(committed_repo, "y").sha
+    checkout_branch(committed_repo, "main")
+    create_branch(committed_repo, "z", target_sha=base)
+    checkout_branch(committed_repo, "z")
+    z_before = committed_repo.head_commit.sha
+
+    cmd = MergeCommand(committed_repo, "x", target="y")
+    cmd.execute()
+    assert committed_repo.repo.head.shorthand == "y"
+    assert committed_repo.head_commit.parents == [y_before, x_tip]
+    cmd.undo()
+    assert committed_repo.repo.head.shorthand == "z"
+    assert committed_repo.head_commit.sha == z_before
+    assert str(committed_repo.repo.lookup_reference("refs/heads/y").target) == y_before
+
+
+def test_merge_command_no_ff_captures_merge_oid_for_undo(
+    committed_repo: RepositoryManager,
+) -> None:
+    _ensure_app()
+    base = committed_repo.head_commit.sha
+    create_branch(committed_repo, "feature", target_sha=base)
+    checkout_branch(committed_repo, "feature")
+    (Path(committed_repo.path) / "f.txt").write_text("f\n")
+    from src.core.operations import commit_changes
+
+    feature_tip = commit_changes(committed_repo, "feature").sha
+    checkout_branch(committed_repo, "main")
+    cmd = MergeCommand(committed_repo, "feature", no_ff=True)
+    cmd.execute()
+    merge_oid = committed_repo.head_commit.sha
+    assert cmd._merge_oid == merge_oid
+    assert committed_repo.head_commit.parents == [base, feature_tip]
+    cmd.undo()
+    assert committed_repo.head_commit.sha == base
+
 def test_merge_command_up_to_date_undo_is_noop(
     committed_repo: RepositoryManager,
 ) -> None:
-    """Merging HEAD into itself is a no-op; undo must not crash."""
     _ensure_app()
     main_sha = committed_repo.head_commit.sha
     cmd = MergeCommand(committed_repo, "main")

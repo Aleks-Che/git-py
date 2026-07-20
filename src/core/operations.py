@@ -396,6 +396,13 @@ def merge_branch(
     with unwrap(repo) as r:
         if r.head_is_unborn:
             raise GitError("Cannot merge: HEAD is unborn.")
+        current_branch = None if r.head_is_detached else r.head.shorthand
+        target_branch = target or current_branch
+        if target_branch is None:
+            raise GitError("merge_branch requires a target branch (HEAD is detached).")
+        if current_branch is None:
+            raise GitError("Cannot merge with a detached HEAD; check out a local branch first.")
+
         try:
             source_oid = r.revparse_single(source).peel(pygit2.Commit).id
         except (KeyError, pygit2.GitError, ValueError) as exc:
@@ -404,18 +411,65 @@ def merge_branch(
                 f"If this is a remote branch, fetch it first "
                 f"(Push/Pull toolbar → Fetch, or right-click the remote branch in the left panel).",
             ) from exc
-        target_name = target or r.head.shorthand
+
+        target_name = target_branch
+        target_ref_name = f"refs/heads/{target_name}"
+        try:
+            r.lookup_reference(target_ref_name)
+        except (KeyError, pygit2.GitError, ValueError) as exc:
+            raise GitError(f"Unknown target branch: {target_name!r}.") from exc
+
+        # ``merge_analysis`` always analyses against HEAD.  A caller may
+        # explicitly name another local branch (for example, merging X into
+        # Y while currently on Z), so move HEAD to that branch before doing
+        # any analysis or writing the merge commit.
+        previous_head_name = None if r.head_is_detached else r.head.name
+        previous_head_oid = None if r.head_is_unborn else str(r.head.target)
+        if current_branch != target_name:
+            try:
+                # ``set_head`` alone changes the symbolic ref but does not
+                # reliably refresh the worktree when the target ref has a
+                # different tree.  Use checkout(refname) so both HEAD and
+                # index/worktree are moved atomically.
+                r.checkout(target_ref_name, strategy=pygit2.GIT_CHECKOUT_SAFE)
+                r.index.read(force=True)
+            except pygit2.GitError as exc:
+                _rollback_head(r, previous_head_name)
+                raise GitError(
+                    f"Cannot check out merge target {target_name!r}: {exc}",
+                ) from exc
+
         analysis, _ = r.merge_analysis(source_oid)
         if analysis & pygit2.GIT_MERGE_ANALYSIS_UP_TO_DATE:
             return False
         is_fastforward = bool(analysis & pygit2.GIT_MERGE_ANALYSIS_FASTFORWARD)
         if is_fastforward and not no_ff:
+            ref = r.lookup_reference(target_ref_name)
+            previous_oid = str(ref.target)
             try:
-                ref = r.lookup_reference(f"refs/heads/{target_name}")
+                # Preflight the worktree before moving refs.  In particular,
+                # this catches SAFE refusal for a modified tracked file while
+                # the old target tip is still intact.
+                r.checkout_tree(r[source_oid].tree, strategy=pygit2.GIT_CHECKOUT_SAFE)
                 ref.set_target(source_oid)
                 r.head.set_target(source_oid)
-                r.checkout(f"refs/heads/{target_name}", strategy=pygit2.GIT_CHECKOUT_SAFE)
+                r.checkout(target_ref_name, strategy=pygit2.GIT_CHECKOUT_SAFE)
             except pygit2.GitError as exc:
+                # The ref is moved before checkout so that checkout sees the
+                # new tree.  Restore both the ref and the original HEAD when
+                # checkout refuses the worktree; otherwise a failed merge
+                # would silently lose the old target tip.
+                try:
+                    ref.set_target(previous_oid)
+                except Exception:
+                    pass
+                try:
+                    if previous_head_name is not None:
+                        r.set_head(previous_head_name)
+                    elif previous_head_oid is not None:
+                        r.create_reference_direct("HEAD", previous_head_oid, force=True)
+                except Exception:
+                    pass
                 raise GitError(f"Fast-forward merge failed: {exc}") from exc
             return False
         # Real three-way merge — either because the branches diverged
