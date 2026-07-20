@@ -87,10 +87,70 @@ def test_commit_changes_rejects_empty_message(committed_repo: RepositoryManager)
         commit_changes(committed_repo, "   ")
 
 
-def test_commit_changes_on_unborn_head_raises(tmp_git_repo: Path) -> None:
+def test_commit_changes_allows_empty_first_commit(tmp_git_repo: Path) -> None:
     mgr = RepositoryManager(str(tmp_git_repo))
-    with pytest.raises(GitError, match="unborn"):
-        commit_changes(mgr, "first")
+    info = commit_changes(mgr, "empty first commit")
+
+    assert info.parents == []
+    assert not mgr.repo.head_is_unborn
+
+
+def test_commit_changes_does_not_stage_untracked_files(
+    committed_repo: RepositoryManager,
+) -> None:
+    assert committed_repo.path is not None
+    repo = committed_repo.repo
+    before_head = repo.head.target
+    before_count = sum(1 for _ in repo.walk(before_head))
+
+    tracked = Path(committed_repo.path) / "hello.txt"
+    untracked = Path(committed_repo.path) / "untracked.txt"
+    tracked.write_text("tracked edit\n")
+    untracked.write_text("private build output\n")
+
+    info = commit_changes(committed_repo, message="m", stage_all=True)
+
+    commit = repo[pygit2.Oid(hex=info.sha)]
+    assert sum(1 for _ in repo.walk(repo.head.target)) == before_count + 1
+    assert commit.parent_ids == [before_head]
+    tracked_entry = commit.tree["hello.txt"]
+    assert repo[tracked_entry.id].data == b"tracked edit\n"
+    assert "untracked.txt" not in commit.tree
+
+    assert untracked.read_text() == "private build output\n"
+    status = repo.status()
+    assert status["untracked.txt"] & pygit2.GIT_STATUS_WT_NEW
+
+
+def test_commit_changes_allows_first_commit_in_unborn_head(tmp_git_repo: Path) -> None:
+    mgr = RepositoryManager(str(tmp_git_repo))
+    repo = mgr.repo
+    (tmp_git_repo / "a.txt").write_text("first\n")
+    repo.index.add("a.txt")
+    repo.index.write()
+    assert repo.head_is_unborn
+
+    info = commit_changes(mgr, message="first")
+
+    assert not repo.head_is_unborn
+    assert not repo.head_is_detached
+    assert repo.lookup_reference("refs/heads/main").target == pygit2.Oid(hex=info.sha)
+    commit = repo[repo.head.target]
+    assert commit.parent_ids == []
+    assert repo[commit.tree["a.txt"].id].data == b"first\n"
+
+
+def test_commit_changes_wraps_exceptions_in_git_error(
+    committed_repo: RepositoryManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise_create_commit(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ARG001
+        raise pygit2.GitError("simulated create_commit failure")
+
+    monkeypatch.setattr(pygit2.Repository, "create_commit", _raise_create_commit)
+
+    with pytest.raises(GitError, match="Commit failed: simulated create_commit failure"):
+        commit_changes(committed_repo, message="m", stage_all=False)
 
 
 # ----- branches ------------------------------------------------------------

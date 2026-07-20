@@ -141,25 +141,36 @@ def commit_changes(
     author = author or _now_signature()
     committer = committer or _now_signature()
     with unwrap(repo) as r:
-        if r.head_is_unborn:
-            raise GitError("Cannot commit: HEAD is unborn (no initial commit yet).")
-        if stage_all:
-            r.index.add_all()  # adds all modified, removes deleted — see libgit2 docs
-            r.index.write()
         try:
+            if stage_all:
+                # ``Index.add_all()`` without a pathspec also stages WT_NEW
+                # entries. Build an explicit pathspec so "stage all" means
+                # all changes to paths Git already tracks, not every file in
+                # the worktree. INDEX_NEW does not need adding again: it was
+                # already staged explicitly by the caller.
+                tracked_change_flags = _CONFLICTING_STATUS_FLAGS & ~pygit2.GIT_STATUS_INDEX_NEW
+                excluded_flags = pygit2.GIT_STATUS_WT_NEW | pygit2.GIT_STATUS_IGNORED
+                tracked_paths = [
+                    path
+                    for path, flags in r.status().items()
+                    if flags & tracked_change_flags and not flags & excluded_flags
+                ]
+                if tracked_paths:
+                    r.index.add_all(tracked_paths)
+                r.index.write()
             tree_oid = r.index.write_tree()
-            head_oid = r.head.target
+            parents = [] if r.head_is_unborn else [r.head.target]
             commit_oid = r.create_commit(
                 "HEAD",
                 author,
                 committer,
                 message,
                 tree_oid,
-                [head_oid],
+                parents,
             )
-        except pygit2.GitError as exc:
+            return _to_commit_info(r[commit_oid])
+        except (KeyError, TypeError, ValueError, pygit2.GitError) as exc:
             raise GitError(f"Commit failed: {exc}") from exc
-    return _to_commit_info(r[commit_oid])
 
 
 # ----- branches -------------------------------------------------------------

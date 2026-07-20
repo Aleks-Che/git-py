@@ -178,10 +178,11 @@ class CommitCommand(GitCommand):
     """Create a commit on ``HEAD``; undo via ``git reset --soft HEAD~1``.
 
     Captures the pre-commit HEAD SHA on :meth:`execute` so undo can move
-    the ref back. ``stage_all=False`` because :class:`CommitPanelViewModel`
-    manages the index explicitly (the user picks which files to include
-    in the commit), so the index is already in the right state when this
-    command runs.
+    the ref back. An unborn ``HEAD`` is recorded as ``None`` and is valid:
+    the core operation creates the first commit without a parent.
+    ``stage_all=False`` because :class:`CommitPanelViewModel` manages the
+    index explicitly (the user picks which files to include in the commit),
+    so the index is already in the right state when this command runs.
     """
 
     def __init__(
