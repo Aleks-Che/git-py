@@ -431,6 +431,21 @@ def test_set_repository_to_none_does_not_emit_error(qtbot) -> None:
         vm.set_repository(None)
 
 
+def test_deleted_index_does_not_crash_panel_refresh(
+    qtbot, committed_repo: RepositoryManager,
+) -> None:
+    """A missing index is reported by the panel instead of escaping a slot."""
+    _ensure_app()
+    index_path = Path(committed_repo.repo.path) / "index"
+    index_path.unlink()
+    vm = CommitPanelViewModel()
+    vm.set_repository(committed_repo, refresh=False)
+
+    with qtbot.waitSignal(vm.error_occurred, timeout=500) as blocker:
+        vm.refresh_status()
+    assert "index" in blocker.args[0].lower()
+
+
 @pytest.mark.parametrize("bad_path", ["", "does-not-exist.txt"])
 def test_stage_unknown_file_emits_error(
     qtbot, tmp_git_repo: Path, bad_path: str,

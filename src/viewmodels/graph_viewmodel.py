@@ -13,7 +13,9 @@ objects and inserted into the history before calling the engine.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 
+import pygit2
 from PySide6.QtCore import QObject, Signal
 
 from src.core.exceptions import GitError
@@ -102,7 +104,7 @@ class GraphViewModel(QObject):
         if self._repo is None or not self._repo.is_open:
             self.graph_updated.emit([])
             return
-        rows, err = self._compute_graph(self._repo)
+        rows, err = self._compute_graph(self._repo, self.error_occurred.emit)
         if err is not None:
             self.error_occurred.emit(err)
             return
@@ -111,6 +113,7 @@ class GraphViewModel(QObject):
     @staticmethod
     def _compute_graph(
         repo: RepositoryManager,
+        error_callback: Callable[[str], None] | None = None,
     ) -> tuple[list[dict], str | None]:
         """Pure data-in/data-out — safe for background threads.
 
@@ -126,7 +129,15 @@ class GraphViewModel(QObject):
         except GitError as exc:
             return [], str(exc)
 
-        stash_entries = repo.stash_list
+        try:
+            stash_entries = repo.stash_list
+        except (GitError, pygit2.GitError, OSError) as exc:
+            message = f"Stash list failed: {exc}"
+            if error_callback is not None:
+                error_callback(message)
+            # A stale/deleted stash ref must not prevent the rest of the
+            # history from being rendered for this refresh.
+            stash_entries = []
         # Find HEAD index so stashes based on HEAD can be placed above it.
         head_idx: int = 0
         if head_target is not None:

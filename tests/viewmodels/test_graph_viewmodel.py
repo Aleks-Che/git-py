@@ -111,6 +111,26 @@ def test_refresh_handles_corrupt_history_quietly(
     assert "simulated failure" in blocker.args[0]
 
 
+def test_graph_viewmodel_handles_stash_list_failure(
+    qtbot, committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    _ensure_app()
+
+    def _boom(_self):
+        from src.core.exceptions import GitError
+        raise GitError("simulated stash failure")
+
+    monkeypatch.setattr(
+        RepositoryManager,
+        "stash_list",
+        property(_boom),
+    )
+    vm = GraphViewModel(committed_repo)
+    with qtbot.waitSignal(vm.error_occurred, timeout=1000) as blocker:
+        vm.refresh_graph()
+    assert blocker.args[0] == "Stash list failed: simulated stash failure"
+
+
 # ----- select_commit ---------------------------------------------------
 
 

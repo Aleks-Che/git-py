@@ -189,6 +189,25 @@ def test_tags_includes_lightweight_and_annotated(committed_repo: RepositoryManag
     assert by_name["v0.2"].message == "release notes"
 
 
+def test_repository_tags_returns_git_error_for_missing_ref(
+    committed_repo: RepositoryManager, monkeypatch,
+) -> None:
+    """A tag deleted between listing and lookup becomes a domain error."""
+    repo = committed_repo.repo
+    head_oid = pygit2.Oid(bytes.fromhex(committed_repo.head_commit.sha))
+    repo.references.create("refs/tags/race", head_oid)
+    original_lookup = repo.lookup_reference
+
+    def _lookup(ref_name: str):
+        if ref_name == "refs/tags/race":
+            original_lookup(ref_name).delete()
+        return original_lookup(ref_name)
+
+    monkeypatch.setattr(repo, "lookup_reference", _lookup)
+    with pytest.raises(GitError, match="Cannot resolve tag"):
+        _ = committed_repo.tags
+
+
 def test_stash_list_is_empty_by_default(committed_repo: RepositoryManager) -> None:
     assert committed_repo.stash_list == []
 

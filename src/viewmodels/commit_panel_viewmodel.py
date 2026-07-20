@@ -169,7 +169,10 @@ class CommitPanelViewModel(QObject):
             return False
         try:
             self._repo.repo.revparse_single(f"HEAD:{path}")
-        except (KeyError, pygit2.GitError, ValueError):
+        except (GitError, pygit2.GitError, OSError) as exc:
+            self.error_occurred.emit(str(exc))
+            return False
+        except (KeyError, ValueError):
             return False
         return not self._is_binary(path)
 
@@ -266,11 +269,20 @@ class CommitPanelViewModel(QObject):
             self._staged_files = set()
         else:
             try:
+                # A committed repository should always have an index.  A
+                # missing one is indistinguishable from a broken index to
+                # the panel, so surface it through the normal error path
+                # instead of presenting a misleading empty status list.
+                from pathlib import Path as _Path
+
+                index_path = _Path(self._repo.repo.path) / "index"
+                if not self._repo.repo.head_is_unborn and not index_path.exists():
+                    raise OSError(f"Git index does not exist: {index_path}")
                 raw_status = self._repo.repo.status()
                 self._raw_status = dict(raw_status)
                 self._file_changes = self._repo.get_status_from_raw(raw_status)
                 self._staged_files = self._compute_staged_files_from_raw(raw_status)
-            except GitError as exc:
+            except (GitError, pygit2.GitError, OSError) as exc:
                 self.error_occurred.emit(str(exc))
                 self._file_changes = []
                 self._raw_status = {}
@@ -490,7 +502,11 @@ class CommitPanelViewModel(QObject):
         :meth:`_compute_staged_files_from_raw` to avoid a duplicate
         ``repo.status()`` call.
         """
-        return self._compute_staged_files_from_raw(self._repo.repo.status())
+        try:
+            return self._compute_staged_files_from_raw(self._repo.repo.status())
+        except (GitError, pygit2.GitError, OSError) as exc:
+            self.error_occurred.emit(str(exc))
+            return set()
 
     def _compute_and_emit_diff(self, path: str | None) -> None:
         """Compute the diff for ``path`` and emit the diff signals.

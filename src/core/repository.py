@@ -259,12 +259,17 @@ class RepositoryManager:
             if not ref_name.startswith("refs/tags/"):
                 continue
             name = ref_name[len("refs/tags/"):]
-            ref = self.repo.lookup_reference(ref_name)
-            # ``ref.peel()`` would skip straight to the target commit,
-            # losing the annotated-tag object. Look up the ref's direct
-            # target instead: it points at the tag object for annotated
-            # tags and at the commit for lightweight ones.
-            obj = self.repo[ref.target]
+            try:
+                ref = self.repo.lookup_reference(ref_name)
+                # ``ref.peel()`` would skip straight to the target commit,
+                # losing the annotated-tag object. Look up the ref's direct
+                # target instead: it points at the tag object for annotated
+                # tags and at the commit for lightweight ones.
+                obj = self.repo[ref.target]
+            except KeyError as exc:
+                # References can disappear between enumeration and lookup
+                # (for example when another process deletes a tag).
+                raise GitError(f"Cannot resolve tag {name!r}: {exc}") from exc
             if obj.type == pygit2.GIT_OBJECT_TAG:
                 tag: pygit2.Tag = obj
                 tagger = tag.tagger
