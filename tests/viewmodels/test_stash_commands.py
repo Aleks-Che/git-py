@@ -7,18 +7,17 @@ nothing to stash — that no-op path is *not* pushed onto the undo
 stack, and the command's undo is also a no-op.
 
 The :class:`StashDropCommand` and :class:`StashPopCommand` undo paths
-shell out to ``git stash store`` to put the entry back; on a
-machine without ``git`` the undo silently no-ops (matching the
-existing ``rebase_branch`` pattern).
+shell out to ``git stash store`` to put the entry back.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
+import pygit2
 import pytest
 from PySide6.QtCore import QCoreApplication
 from src.core.exceptions import GitError
-from src.core.operations import stash_push
+from src.core.operations import stash_oid_at, stash_push
 from src.core.repository import RepositoryManager
 from src.viewmodels.commands import (
     CommandProcessor,
@@ -37,6 +36,24 @@ def _make_dirty(repo: RepositoryManager) -> None:
     """Write a known line into ``hello.txt`` so the worktree is dirty."""
     assert repo.path is not None
     (Path(repo.path) / "hello.txt").write_text("wip line\n")
+
+
+def _commit_file(repo: RepositoryManager, path: str, content: str) -> None:
+    """Add one tracked file to HEAD so tests can keep unrelated dirty state."""
+    assert repo.path is not None
+    (Path(repo.path) / path).write_text(content)
+    repo.repo.index.add(path)
+    repo.repo.index.write()
+    tree = repo.repo.index.write_tree()
+    signature = pygit2.Signature("tester", "tester@example.com", 0, 0)
+    repo.repo.create_commit(
+        "HEAD",
+        signature,
+        signature,
+        f"add {path}",
+        tree,
+        [repo.repo.head.target],
+    )
 
 
 # ----- StashPushCommand -------------------------------------------------
@@ -64,8 +81,44 @@ def test_stash_push_command_undo_drops_pushed_entry(
     proc.undo()
     assert committed_repo.stash_list == []
     assert not proc.can_undo
-    # The dirty worktree state is back.
+    # With no intervening stash, Undo also reapplies the command's changes.
     assert (Path(committed_repo.path) / "hello.txt").read_text() == "wip line\n"
+
+
+def test_stash_push_undo_drops_correct_stash(committed_repo: RepositoryManager) -> None:
+    _ensure_app()
+    _make_dirty(committed_repo)
+    command = StashPushCommand(committed_repo, "ours")
+    command.execute()
+    ours_oid = stash_oid_at(committed_repo, 0)
+
+    (Path(committed_repo.path) / "hello.txt").write_text("someone else's work\n")
+    foreign_oid = stash_push(committed_repo, "foreign")
+    command.undo()
+
+    assert stash_oid_at(committed_repo, 0) == foreign_oid
+    assert ours_oid is not None
+    remaining_oids = [str(entry.commit_id) for entry in committed_repo.repo.listall_stashes()]
+    assert ours_oid not in remaining_oids
+
+
+def test_stash_push_undo_recovers_from_intervening_push(
+    committed_repo: RepositoryManager,
+) -> None:
+    _ensure_app()
+    _make_dirty(committed_repo)
+    proc = CommandProcessor()
+    proc.execute(StashPushCommand(committed_repo, "original command"))
+    original_oid = stash_oid_at(committed_repo, 0)
+
+    (Path(committed_repo.path) / "hello.txt").write_text("intervening work\n")
+    intervening_oid = stash_push(committed_repo, "intervening push")
+    proc.undo()
+
+    assert original_oid is not None
+    assert stash_oid_at(committed_repo, 0) == intervening_oid
+    assert len(committed_repo.stash_list) == 1
+    assert committed_repo.stash_list[0].message.endswith("intervening push")
 
 
 def test_stash_push_command_with_no_changes_is_a_noop(
@@ -117,9 +170,37 @@ def test_stash_pop_command_undo_restores_entry(committed_repo: RepositoryManager
     proc.execute(StashPopCommand(committed_repo, 0))
     assert committed_repo.stash_list == []
     proc.undo()
-    # The stash is back.
+    # Both the pre-pop worktree and the stash entry are back.
     assert len(committed_repo.stash_list) == 1
     assert committed_repo.stash_list[0].message.endswith("undoable pop")
+    assert (Path(committed_repo.path) / "hello.txt").read_text() == "hello, world\n"
+
+
+def test_stash_pop_undo_restores_worktree_and_stash(
+    committed_repo: RepositoryManager,
+) -> None:
+    _ensure_app()
+    _commit_file(committed_repo, "other.txt", "other base\n")
+    root = Path(committed_repo.path)
+    (root / "hello.txt").write_text("stashed tracked change\n")
+    (root / "stash-only.txt").write_text("stashed untracked file\n")
+    popped_oid = stash_push(committed_repo, "dirty pop", include_untracked=True)
+    (root / "other.txt").write_text("pre-pop dirty change\n")
+    (root / "pre-existing.txt").write_text("pre-pop untracked\n")
+
+    command = StashPopCommand(committed_repo, 0)
+    command.execute()
+    assert committed_repo.stash_list == []
+    assert (root / "hello.txt").read_text() == "stashed tracked change\n"
+    assert (root / "stash-only.txt").read_text() == "stashed untracked file\n"
+
+    command.undo()
+    assert (root / "hello.txt").read_text() == "hello, world\n"
+    assert not (root / "stash-only.txt").exists()
+    assert (root / "other.txt").read_text() == "pre-pop dirty change\n"
+    assert (root / "pre-existing.txt").read_text() == "pre-pop untracked\n"
+    assert stash_oid_at(committed_repo, 0) == popped_oid
+    assert len(committed_repo.stash_list) == 1
 
 
 def test_stash_pop_command_invalid_index_raises(committed_repo: RepositoryManager) -> None:
@@ -156,6 +237,29 @@ def test_stash_apply_command_undo_resets_worktree(committed_repo: RepositoryMana
     proc.undo()
     # The worktree is back to HEAD (the original committed content).
     assert (Path(committed_repo.path) / "hello.txt").read_text() == "hello, world\n"
+
+
+def test_stash_apply_undo_restores_worktree(committed_repo: RepositoryManager) -> None:
+    _ensure_app()
+    _commit_file(committed_repo, "other.txt", "other base\n")
+    root = Path(committed_repo.path)
+    (root / "hello.txt").write_text("stashed tracked change\n")
+    (root / "stash-only.txt").write_text("stashed untracked file\n")
+    stash_push(committed_repo, "dirty apply", include_untracked=True)
+    (root / "other.txt").write_text("pre-apply dirty change\n")
+    (root / "pre-existing.txt").write_text("pre-apply untracked\n")
+
+    command = StashApplyCommand(committed_repo, 0)
+    command.execute()
+    assert (root / "hello.txt").read_text() == "stashed tracked change\n"
+    assert (root / "stash-only.txt").read_text() == "stashed untracked file\n"
+
+    command.undo()
+    assert (root / "hello.txt").read_text() == "hello, world\n"
+    assert not (root / "stash-only.txt").exists()
+    assert (root / "other.txt").read_text() == "pre-apply dirty change\n"
+    assert (root / "pre-existing.txt").read_text() == "pre-apply untracked\n"
+    assert len(committed_repo.stash_list) == 1
 
 
 def test_stash_apply_command_invalid_index_raises(committed_repo: RepositoryManager) -> None:

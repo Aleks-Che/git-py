@@ -1555,10 +1555,175 @@ def stash_oid_at(
     return None
 
 
+def find_stash_index_by_oid(
+    repo: RepositoryManager | pygit2.Repository,
+    oid: str,
+) -> int | None:
+    """Return the current stash-list index for ``oid``, or ``None`` if absent."""
+    wanted = oid.lower()
+    with unwrap(repo) as r:
+        try:
+            for index, entry in enumerate(r.listall_stashes()):
+                entry_oid = entry.commit_id if hasattr(entry, "commit_id") else entry
+                if str(entry_oid).lower() == wanted:
+                    return index
+        except (pygit2.GitError, KeyError) as exc:
+            raise GitError(f"Stash lookup failed: {exc}") from exc
+    return None
+
+
+def snapshot_stash_apply_state(
+    repo: RepositoryManager | pygit2.Repository,
+    index: int,
+) -> tuple[dict[str, bytes], set[str], dict[str, str]]:
+    """Capture worktree and index paths that applying a stash may change.
+
+    The returned tuple contains existing worktree file contents, paths that
+    are currently absent, and serialised index entries. Limiting the
+    snapshot to paths represented by the stash is important: undoing an
+    apply must not overwrite unrelated dirty files that existed beforehand.
+    An empty index-entry string records that a path was absent from the
+    pre-apply index.
+    """
+    with unwrap(repo) as r:
+        workdir = r.workdir
+        if workdir is None:
+            raise GitError("Cannot apply a stash in a bare repository.")
+        try:
+            oid = stash_oid_at(r, index)
+            if oid is None:
+                raise GitError(f"Stash apply failed: stash index {index} was not found.")
+            stash_commit = r[pygit2.Oid(hex=oid)].peel(pygit2.Commit)
+            if not stash_commit.parents:
+                raise GitError(f"Stash apply failed: {oid} is not a valid stash commit.")
+
+            paths: set[str] = set()
+            for patch in r.diff(stash_commit.parents[0].tree, stash_commit.tree):
+                old_path = patch.delta.old_file.path
+                new_path = patch.delta.new_file.path
+                if old_path:
+                    paths.add(old_path)
+                if new_path:
+                    paths.add(new_path)
+
+            # The stash's second parent is the pre-stash index. Include
+            # those paths as well: staged-only changes can be identical in
+            # the base-to-worktree diff and would otherwise be missed.
+            if len(stash_commit.parents) >= 2:
+                for patch in r.diff(
+                    stash_commit.parents[0].tree,
+                    stash_commit.parents[1].tree,
+                ):
+                    old_path = patch.delta.old_file.path
+                    new_path = patch.delta.new_file.path
+                    if old_path:
+                        paths.add(old_path)
+                    if new_path:
+                        paths.add(new_path)
+
+            # A stash made with include_untracked=True stores untracked files
+            # in the third parent rather than in the stash commit's own tree.
+            if len(stash_commit.parents) >= 3:
+                _collect_tree_paths(r, stash_commit.parents[2].tree, paths)
+
+            root = Path(workdir)
+            path_contents: dict[str, bytes] = {}
+            missing_paths: set[str] = set()
+            index_entries: dict[str, str] = {}
+            r.index.read(force=True)
+            for path in paths:
+                full_path = root / path
+                if full_path.exists() or full_path.is_symlink():
+                    path_contents[path] = full_path.read_bytes()
+                else:
+                    missing_paths.add(path)
+                try:
+                    entry = r.index[path]
+                except KeyError:
+                    index_entries[path] = ""
+                else:
+                    index_entries[path] = f"{entry.id}:{int(entry.mode)}"
+        except GitError:
+            raise
+        except (pygit2.GitError, KeyError, ValueError, OSError) as exc:
+            raise GitError(f"Failed to snapshot stash apply state: {exc}") from exc
+    return path_contents, missing_paths, index_entries
+
+
+def _collect_tree_paths(
+    repo: pygit2.Repository,
+    tree: pygit2.Tree,
+    paths: set[str],
+    prefix: str = "",
+) -> None:
+    """Add every non-tree path below ``tree`` to ``paths``."""
+    for entry in tree:
+        path = f"{prefix}/{entry.name}" if prefix else entry.name
+        obj = repo[entry.id]
+        if isinstance(obj, pygit2.Tree):
+            _collect_tree_paths(repo, obj, paths, path)
+        else:
+            paths.add(path)
+
+
+def restore_stash_apply_state(
+    repo: RepositoryManager | pygit2.Repository,
+    path_contents: dict[str, bytes],
+    missing_paths: set[str],
+    index_entries: dict[str, str],
+) -> None:
+    """Restore a snapshot returned by :func:`snapshot_stash_apply_state`."""
+    with unwrap(repo) as r:
+        workdir = r.workdir
+        if workdir is None:
+            raise GitError("Cannot restore stash state in a bare repository.")
+        root = Path(workdir)
+        try:
+            for path, content in path_contents.items():
+                full_path = root / path
+                if full_path.is_dir() and not full_path.is_symlink():
+                    raise GitError(
+                        f"Cannot restore {path!r}: a directory now exists at that path."
+                    )
+                if full_path.is_symlink():
+                    full_path.unlink()
+                full_path.parent.mkdir(parents=True, exist_ok=True)
+                full_path.write_bytes(content)
+
+            for path in missing_paths:
+                full_path = root / path
+                if full_path.is_dir() and not full_path.is_symlink():
+                    raise GitError(
+                        f"Cannot remove applied path {path!r}: it is now a directory."
+                    )
+                if full_path.exists() or full_path.is_symlink():
+                    full_path.unlink()
+
+            r.index.read(force=True)
+            for path, serialised_entry in index_entries.items():
+                if not serialised_entry:
+                    if path in r.index:
+                        r.index.remove(path)
+                    continue
+                oid, mode = serialised_entry.rsplit(":", 1)
+                r.index.add(
+                    pygit2.IndexEntry(
+                        path,
+                        pygit2.Oid(hex=oid),
+                        pygit2.enums.FileMode(int(mode)),
+                    )
+                )
+            r.index.write()
+        except GitError:
+            raise
+        except (pygit2.GitError, KeyError, ValueError, OSError) as exc:
+            raise GitError(f"Failed to restore pre-stash worktree state: {exc}") from exc
+
+
 def restore_stash(
     repo: RepositoryManager | pygit2.Repository,
     sha: str,
-    message: str,
+    message: str = "WIP (restored)",
 ) -> None:
     """Restore a previously-dropped stash via ``git stash store``.
 
