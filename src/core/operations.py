@@ -58,6 +58,36 @@ if TYPE_CHECKING:
 _FULL_DIFF_CONTEXT_LINES = 2**31 - 1
 
 
+# Status flags that block a ``GIT_CHECKOUT_SAFE`` operation.  These
+# reflect the *conflicting* subset of libgit2's status flags — changes
+# that real ``git checkout`` would refuse to overwrite.  In particular
+# ``GIT_STATUS_WT_NEW`` (untracked files in the worktree) and
+# ``GIT_STATUS_IGNORED`` (gitignored files) are **not** in this mask:
+# untracked files do NOT block ``git checkout`` (the user can safely
+# ``git checkout`` between branches while leaving brand-new files in
+# place — the file would only block a later ``git clean`` /
+# ``git status`` would just report it).  Mirrors git's actual semantics
+# rather than the stricter "everything that isn't CURRENT" reading.
+_CONFLICTING_STATUS_FLAGS = (
+    pygit2.GIT_STATUS_INDEX_NEW
+    | pygit2.GIT_STATUS_INDEX_MODIFIED
+    | pygit2.GIT_STATUS_INDEX_DELETED
+    | pygit2.GIT_STATUS_INDEX_RENAMED
+    | pygit2.GIT_STATUS_INDEX_TYPECHANGE
+    | pygit2.GIT_STATUS_WT_MODIFIED
+    | pygit2.GIT_STATUS_WT_DELETED
+    | pygit2.GIT_STATUS_WT_RENAMED
+    | pygit2.GIT_STATUS_WT_TYPECHANGE
+    # INTENTIONALLY EXCLUDED:
+    # - GIT_STATUS_WT_NEW    (untracked — git checkout doesn't block)
+    # - GIT_STATUS_IGNORED   (gitignored  — git checkout doesn't block)
+    # - GIT_STATUS_CONFLICTED (merge in progress — caller already handles)
+    # - GIT_STATUS_WT_UNREADABLE (worktree entry is unreadable; not a
+    #   "tracked file modified" conflict per se; also excluded for
+    #   parity with `git status` UX.)
+)
+
+
 # ----- helpers --------------------------------------------------------------
 
 
@@ -225,7 +255,9 @@ def checkout_branch(
                 return {"dirty_files": dirty}
             strategy = pygit2.GIT_CHECKOUT_FORCE
 
-        previous_head = r.head.name if not r.head_is_unborn else None
+        # Snapshot HEAD before any movement so we can roll back both
+        # the symbolic/detached state AND the worktree on failure.
+        was_unborn, previous_symbolic, previous_oid = _capture_head_state(r)
 
         try:
             r.set_head(refname)
@@ -235,14 +267,14 @@ def checkout_branch(
         try:
             r.checkout_head(strategy=strategy)
         except pygit2.GitError as exc:
-            _rollback_head(r, previous_head)
+            _rollback_head_state(r, was_unborn, previous_symbolic, previous_oid)
             raise DirtyWorkTreeError(
                 f"Cannot update working tree for {name!r}: {exc}",
             ) from exc
 
         remaining = _dirty_paths(r)
         if remaining:
-            _rollback_head(r, previous_head)
+            _rollback_head_state(r, was_unborn, previous_symbolic, previous_oid)
             n = len(remaining)
             preview = ", ".join(remaining[:10])
             suffix = f" and {n - 10} more" if n > 10 else ""
@@ -253,8 +285,18 @@ def checkout_branch(
     return None
 
 
-def _rollback_head(repo: pygit2.Repository, previous_head: str | None) -> None:
-    """Restore HEAD to *previous_head* after a failed checkout."""
+def _rollback_head(
+    repo: pygit2.Repository,
+    previous_head: str | None,
+) -> None:
+    """Restore HEAD to *previous_head* after a failed checkout.
+
+    *previous_head* is the symbolic refname captured *before* the
+    checkout was attempted (``r.head.name``); ``None`` means HEAD was
+    unborn and there is nothing to roll back to.  The caller is
+    responsible for also restoring the worktree (see
+    :func:`_rollback_head_state`).
+    """
     if previous_head is None:
         return
     try:
@@ -263,9 +305,82 @@ def _rollback_head(repo: pygit2.Repository, previous_head: str | None) -> None:
         pass
 
 
+def _capture_head_state(repo: pygit2.Repository) -> tuple[bool, str | None, str | None]:
+    """Snapshot the parts of HEAD we need to roll a checkout back.
+
+    Returns ``(was_unborn, symbolic_name, oid_hex)``:
+
+    - ``was_unborn``: ``True`` when HEAD points to no commit yet.
+    - ``symbolic_name``: ``r.head.name`` (e.g. ``"refs/heads/main"``) when
+      HEAD is symbolic; ``None`` when detached or unborn.
+    - ``oid_hex``: ``str(r.head.target)`` when HEAD points at a commit;
+      ``None`` when unborn.
+    """
+    if repo.head_is_unborn:
+        return True, None, None
+    symbolic = None if repo.head_is_detached else repo.head.name
+    oid_hex = str(repo.head.target)
+    return False, symbolic, oid_hex
+
+
+def _rollback_head_state(
+    repo: pygit2.Repository,
+    was_unborn: bool,
+    symbolic: str | None,
+    oid_hex: str | None,
+) -> None:
+    """Best-effort restore of HEAD **and** the worktree.
+
+    Used as the rollback for any checkout path that may have moved
+    HEAD (branch checkout, detached checkout).  Performs three
+    independent, exception-swallowing steps so a partial failure does
+    not leave the caller worse off:
+
+    1. Restore the symbolic HEAD reference (or set HEAD directly to the
+       captured OID when HEAD was detached before the move).
+    2. Re-read the index (``force=True``) so any stale in-memory state
+       is dropped.
+    3. ``checkout_head(FORCE)`` so the worktree matches the restored
+       HEAD — this is the part the original code was missing and is the
+       reason R1.2 calls for a worktree-level rollback.
+    """
+    if was_unborn:
+        return  # nothing to restore to
+    try:
+        if symbolic is not None:
+            repo.set_head(symbolic)
+        elif oid_hex is not None:
+            # HEAD was detached (or about to become so); restore by OID
+            # rather than by refname — ``set_head`` expects a refname.
+            repo.set_head(repo[oid_hex].id)
+    except (KeyError, pygit2.GitError):
+        pass
+    try:
+        repo.index.read(force=True)
+    except (KeyError, pygit2.GitError, OSError):
+        pass
+    try:
+        repo.checkout_head(strategy=pygit2.GIT_CHECKOUT_FORCE)
+    except (KeyError, pygit2.GitError, OSError):
+        pass  # best-effort — at worst the worktree lags HEAD
+
+
 def _dirty_paths(repo: pygit2.Repository) -> list[str]:
-    """Return the list of paths with uncommitted changes (index or worktree)."""
-    return [p for p, _ in repo.status().items()]
+    """Return the list of paths with CONFLICTING changes (blocks SAFE checkout).
+
+    Excludes ``GIT_STATUS_WT_NEW`` (untracked files) and
+    ``GIT_STATUS_IGNORED`` (gitignored files): real ``git checkout``
+    does not refuse to switch branches when such files are present
+    in the worktree.  Index/staged changes (``GIT_STATUS_INDEX_*``)
+    and modifications/deletions of *tracked* worktree files
+    (``GIT_STATUS_WT_MODIFIED/DELETED/RENAMED/TYPECHANGE``) are
+    considered conflicts and remain in the returned list.
+    """
+    out: list[str] = []
+    for path, flags in repo.status().items():
+        if flags & _CONFLICTING_STATUS_FLAGS:
+            out.append(path)
+    return out
 
 
 def checkout_commit(
@@ -297,7 +412,12 @@ def checkout_commit(
                 return {"dirty_files": dirty}
             strategy = pygit2.GIT_CHECKOUT_FORCE
 
-        previous_head = r.head.name if not r.head_is_unborn else None
+        # Snapshot HEAD before any movement.  ``_capture_head_state``
+        # records *both* the symbolic refname and the underlying OID so
+        # the rollback can restore a detached HEAD too (the previous
+        # code only restored by refname, which silently did nothing
+        # when HEAD was detached or unborn — see R1.2 finding C2).
+        was_unborn, previous_symbolic, previous_oid = _capture_head_state(r)
 
         try:
             r.create_reference_direct('HEAD', commit.id, force=True)
@@ -307,14 +427,14 @@ def checkout_commit(
         try:
             r.checkout_head(strategy=strategy)
         except pygit2.GitError as exc:
-            _rollback_head(r, previous_head)
+            _rollback_head_state(r, was_unborn, previous_symbolic, previous_oid)
             raise DirtyWorkTreeError(
                 f"Cannot update working tree for {sha[:7]!r}: {exc}",
             ) from exc
 
         remaining = _dirty_paths(r)
         if remaining:
-            _rollback_head(r, previous_head)
+            _rollback_head_state(r, was_unborn, previous_symbolic, previous_oid)
             n = len(remaining)
             preview = ", ".join(remaining[:10])
             suffix = f" and {n - 10} more" if n > 10 else ""

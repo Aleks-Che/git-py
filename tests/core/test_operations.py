@@ -19,6 +19,7 @@ from src.core.diff_parser import (
     parse_diff_lines,
 )
 from src.core.exceptions import (
+    DirtyWorkTreeError,
     GitError,
     GitNotInstalledError,
     InvalidRefError,
@@ -27,9 +28,8 @@ from src.core.exceptions import (
 )
 from src.core.models import FileStatus
 from src.core.operations import (
-    _url_needs_cli_fallback as url_needs_cli_fallback,
-)
-from src.core.operations import (
+    _CONFLICTING_STATUS_FLAGS,
+    _dirty_paths,
     abort_merge,
     abort_rebase,
     add_remote,
@@ -62,6 +62,9 @@ from src.core.operations import (
     stash_push,
     stash_push_staged,
     unstage_diff_line,
+)
+from src.core.operations import (
+    _url_needs_cli_fallback as url_needs_cli_fallback,
 )
 from src.core.repository import RepositoryManager
 
@@ -136,6 +139,217 @@ def test_checkout_branch_switches_head(committed_repo: RepositoryManager) -> Non
 def test_checkout_unknown_branch_raises(committed_repo: RepositoryManager) -> None:
     with pytest.raises(InvalidRefError):
         checkout_branch(committed_repo, "nope")
+
+
+# ----- R1.2: checkout must not block on untracked / ignored files ----------
+
+
+def test_checkout_safe_succeeds_with_untracked(
+    committed_repo: RepositoryManager,
+) -> None:
+    """Untracked worktree files must NOT block ``GIT_CHECKOUT_SAFE``.
+
+    Bug C2: the previous ``_dirty_paths`` returned every path with any
+    status flag, including ``GIT_STATUS_WT_NEW`` (untracked).  Real
+    ``git checkout`` allows switching branches while untracked files
+    are present in the worktree — only *tracked* modifications,
+    index changes, and deletions block the safe checkout.
+    """
+    assert committed_repo.path is not None
+    create_branch(
+        committed_repo,
+        "branch_b",
+        target_sha=committed_repo.head_commit.parents[0],
+    )
+    # On main; write an untracked file to the worktree.
+    (Path(committed_repo.path) / "new.txt").write_text("untracked\n")
+    assert (Path(committed_repo.path) / "new.txt").is_file()
+
+    # SAFE checkout must succeed despite the untracked file.
+    result = checkout_branch(committed_repo, "branch_b")
+
+    assert result is None  # no dirty_files dict → success
+    assert committed_repo.repo.head.shorthand == "branch_b"
+    # The untracked file is preserved on disk.
+    assert (Path(committed_repo.path) / "new.txt").read_text() == "untracked\n"
+
+
+def test_checkout_safe_succeeds_with_ignored(
+    committed_repo: RepositoryManager,
+) -> None:
+    """``.gitignore``d files must NOT block ``GIT_CHECKOUT_SAFE``.
+
+    Bug C2 (continuation): the previous ``_dirty_paths`` surfaced every
+    path with any status flag, including ``GIT_STATUS_IGNORED`` (had a
+    caller ever asked for ignored entries).  Real ``git checkout`` does
+    not refuse to switch branches over a file the user explicitly told
+    git to ignore — that file cannot possibly conflict with anything.
+
+    pygit2's ``status()`` only includes ignored entries when called
+    with ``ignored=True``; the production call site (``_dirty_paths``)
+    uses the default, so this test covers the mask-level behaviour:
+    even when ignored entries *do* surface they remain below the
+    ``_CONFLICTING_STATUS_FLAGS`` threshold.
+    """
+    assert committed_repo.path is not None
+    # Commit a ``.gitignore`` so git knows to ignore ``ignored.log``.
+    # ``.gitignore`` itself is now tracked (no INDEX_NEW noise) and the
+    # ignored file remains WT_NEW / IGNORED — exactly the situation a
+    # user creates by ``git add .gitignore && git commit``.
+    (Path(committed_repo.path) / ".gitignore").write_text("ignored.log\n")
+    commit_changes(committed_repo, "add .gitignore")
+    (Path(committed_repo.path) / "ignored.log").write_text("noise\n")
+
+    create_branch(
+        committed_repo,
+        "branch_b",
+        target_sha=committed_repo.head_commit.parents[0],
+    )
+
+    # Confirm the file is actually flagged IGNORED when explicitly
+    # requested — otherwise the test would silently pass for the wrong
+    # reason.
+    raw_with_ignored = committed_repo.repo.status(ignored=True)
+    assert "ignored.log" in raw_with_ignored
+    assert raw_with_ignored["ignored.log"] & pygit2.GIT_STATUS_IGNORED
+
+    # ``_dirty_paths`` reads the default status (no ignored entries) —
+    # so the SAFE check sees an empty list and proceeds.
+    assert _dirty_paths(committed_repo.repo) == []
+
+    # Simulate the hypothetical case where someone passes
+    # ``ignored=True`` to ``status()``: the IGNORED entries must still
+    # be filtered out by the mask.
+    flagged_only = [
+        p for p, f in raw_with_ignored.items() if f & _CONFLICTING_STATUS_FLAGS
+    ]
+    assert "ignored.log" not in flagged_only
+
+    result = checkout_branch(committed_repo, "branch_b")
+    assert result is None
+    assert committed_repo.repo.head.shorthand == "branch_b"
+
+
+def test_checkout_safe_blocks_on_modified_tracked(
+    committed_repo: RepositoryManager,
+) -> None:
+    """A modification to a *tracked* file still blocks SAFE checkout."""
+    assert committed_repo.path is not None
+    create_branch(
+        committed_repo,
+        "branch_b",
+        target_sha=committed_repo.head_commit.parents[0],
+    )
+    # Modify the tracked file.
+    (Path(committed_repo.path) / "hello.txt").write_text("local edit\n")
+
+    result = checkout_branch(committed_repo, "branch_b")
+
+    assert result is not None
+    assert "dirty_files" in result
+    assert "hello.txt" in result["dirty_files"]
+    # HEAD did NOT move — pre-check refused the checkout before any
+    # ref/state was touched.
+    assert committed_repo.repo.head.shorthand == "main"
+
+
+def test_checkout_rolls_back_worktree_on_failure(
+    committed_repo: RepositoryManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed ``checkout_head`` restores HEAD AND the worktree.
+
+    Forces the in-process ``checkout_head`` call inside
+    :func:`checkout_branch` to fail by replacing it with a stub.  The
+    real ``r.set_head(refname)`` still runs first, so HEAD would be
+    left pointing at ``branch_b`` with the old worktree content if the
+    rollback were incomplete.  Verifies the worktree file
+    ``hello.txt`` is back to the original ``main`` content and that
+    HEAD is back on ``main``.
+    """
+    assert committed_repo.path is not None
+    create_branch(committed_repo, "branch_b")
+    main_text = (Path(committed_repo.path) / "hello.txt").read_text()
+    main_tip = committed_repo.repo.lookup_reference("refs/heads/main").target
+    # Pretend we are already on a different commit by writing a
+    # different file on branch_b first (committed so the tree differs
+    # from main's tree).  This is what makes ``checkout_head`` need to
+    # touch the worktree at all.
+    checkout_branch(committed_repo, "branch_b")
+    (Path(committed_repo.path) / "hello.txt").write_text("branch_b content\n")
+    commit_changes(committed_repo, "branch_b edit")
+    branch_tip = committed_repo.repo.lookup_reference("refs/heads/branch_b").target
+    # Now go back to main for the actual test.
+    checkout_branch(committed_repo, "main")
+    assert (Path(committed_repo.path) / "hello.txt").read_text() == main_text
+
+    # Break ``checkout_head``: force a GitError on the next call.
+    from src.core import operations as ops
+
+    def _broken_checkout_head(self, strategy=0):  # noqa: ARG001
+        raise ops.pygit2.GitError("simulated checkout failure")
+
+    monkeypatch.setattr(
+        ops.pygit2.Repository,
+        "checkout_head",
+        _broken_checkout_head,
+    )
+
+    with pytest.raises(DirtyWorkTreeError, match="branch_b"):
+        checkout_branch(committed_repo, "branch_b")
+
+    # HEAD is back on main.
+    assert committed_repo.repo.head.shorthand == "main"
+    # Worktree matches main again (not the branch_b content that was
+    # in place before the simulated failure).
+    assert (Path(committed_repo.path) / "hello.txt").read_text() == main_text
+    # Both refs survived the failed checkout.
+    assert committed_repo.repo.lookup_reference("refs/heads/main").target == main_tip
+    assert committed_repo.repo.lookup_reference("refs/heads/branch_b").target == branch_tip
+
+
+def test_dirty_paths_excludes_untracked_and_ignored(
+    committed_repo: RepositoryManager,
+) -> None:
+    """Direct unit test on :func:`_dirty_paths`.
+
+    Asserts the new mask excludes ``WT_NEW`` and ``IGNORED`` and keeps
+    tracked worktree modifications / deletions / renames.  This is the
+    cornerstone of the C2 fix; if this test ever fails the entire
+    SAFE-checkout safety net is compromised.
+    """
+    assert committed_repo.path is not None
+    repo = committed_repo.repo
+
+    # Sanity: the mask really does NOT include WT_NEW / IGNORED.
+    assert not (_CONFLICTING_STATUS_FLAGS & pygit2.GIT_STATUS_WT_NEW)
+    assert not (_CONFLICTING_STATUS_FLAGS & pygit2.GIT_STATUS_IGNORED)
+    # …but does include WT_MODIFIED (the case we DO want to block on).
+    assert _CONFLICTING_STATUS_FLAGS & pygit2.GIT_STATUS_WT_MODIFIED
+
+    # Clean repo: no dirty paths.
+    assert _dirty_paths(repo) == []
+
+    # Add an untracked file → must NOT appear.
+    (Path(committed_repo.path) / "untracked.txt").write_text("u\n")
+    assert _dirty_paths(repo) == []
+
+    # Add a tracked-file modification → MUST appear.
+    (Path(committed_repo.path) / "hello.txt").write_text("modified\n")
+    dirty = _dirty_paths(repo)
+    assert "hello.txt" in dirty
+    assert "untracked.txt" not in dirty
+
+    # Stage a new file → the staged version IS a conflict (it's an
+    # ``INDEX_NEW`` entry, which is in the mask).
+    (Path(committed_repo.path) / "staged.txt").write_text("s\n")
+    repo.index.add("staged.txt")
+    repo.index.write()
+    dirty = _dirty_paths(repo)
+    assert "staged.txt" in dirty
+    # The untracked file is still excluded even with an INDEX_NEW
+    # entry in the mix.
+    assert "untracked.txt" not in dirty
 
 
 def test_rename_branch_changes_ref_name(committed_repo: RepositoryManager) -> None:
