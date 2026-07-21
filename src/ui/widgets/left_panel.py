@@ -144,6 +144,31 @@ class LeftPanel(QTreeWidget):
         self.itemExpanded.connect(self._on_group_toggled)
         self.itemCollapsed.connect(self._on_group_toggled)
 
+        # R3.4 (M20): remember the user's expansion + selection between
+        # rebuilds. The references panel is fully cleared and re-populated
+        # whenever ``references_changed`` fires (HEAD switch, fetch, pull,
+        # branch create/delete, …). Without this cache the user loses
+        # whichever group they had collapsed and whichever leaf they
+        # had selected, on every refresh.
+        self._expanded_groups: set[str] = {_GROUP_BRANCHES, _GROUP_LOCAL}
+        self._selected_kind: str | None = None
+        self._selected_name: str | None = None
+        # Re-restore the selection after a clear()/rebuild cycle.
+        self.itemSelectionChanged.connect(self._on_selection_changed)
+
+    def _on_selection_changed(self) -> None:
+        """Cache the currently selected leaf's identity for the next rebuild."""
+        items = self.selectedItems()
+        if not items:
+            return
+        item = items[0]
+        kind = item.data(0, _ROLE_KIND)
+        name = item.data(0, _ROLE_NAME)
+        if kind is None or name is None:
+            return
+        self._selected_kind = str(kind)
+        self._selected_name = str(name)
+
     # ----- build / rebuild --------------------------------------------
 
     def _rebuild(self) -> None:
@@ -219,15 +244,59 @@ class LeftPanel(QTreeWidget):
         # which keeps the chevron in sync for the groups that actually
         # expand; the explicit calls below cover the groups that stay
         # collapsed (``Remote`` / ``Tags`` / ``Stash``).
-        self._group_branches.setExpanded(True)
-        self._group_local.setExpanded(True)
+        # R3.4 (M20): use the cached expansion set instead of the
+        # hard-coded defaults so the user's collapse/expand choices
+        # survive a ``references_changed`` rebuild.
+        groups_for_expansion = [
+            (_GROUP_BRANCHES, self._group_branches),
+            (_GROUP_LOCAL, self._group_local),
+            (_GROUP_REMOTE, self._group_remote),
+            (_GROUP_TAGS, self._group_tags),
+            (_GROUP_STASH, self._group_stash),
+        ]
+        for label, group in groups_for_expansion:
+            if group is None:
+                continue
+            group.setExpanded(label in self._expanded_groups)
         self._set_expand_icon(self._group_branches)
         self._set_expand_icon(self._group_local)
         self._set_expand_icon(self._group_remote)
         self._set_expand_icon(self._group_tags)
         self._set_expand_icon(self._group_stash)
 
+        # R3.4 (M20): restore the previously selected leaf by walking
+        # the new tree for the same ``(kind, name)`` pair. If the entry
+        # no longer exists (branch was deleted, stash popped, …) the
+        # selection is left empty, which is the right UX — we don't
+        # silently swap to a different branch.
+        if self._selected_kind and self._selected_name:
+            self._restore_selection(
+                self._selected_kind, self._selected_name,
+            )
+
         self._update_drag_state()
+
+    def _restore_selection(self, kind: str, name: str) -> None:
+        """Find and re-select the item with ``(kind, name)`` in the new tree."""
+        for top_index in range(self.topLevelItemCount()):
+            top = self.topLevelItem(top_index)
+            match = self._find_child(top, kind, name)
+            if match is not None:
+                self.setCurrentItem(match)
+                return
+
+    @staticmethod
+    def _find_child(
+        item: QTreeWidgetItem, kind: str, name: str,
+    ) -> QTreeWidgetItem | None:
+        for i in range(item.childCount()):
+            child = item.child(i)
+            if child.data(0, _ROLE_KIND) == kind and child.data(0, _ROLE_NAME) == name:
+                return child
+            nested = LeftPanel._find_child(child, kind, name)
+            if nested is not None:
+                return nested
+        return None
 
     def _update_drag_state(self) -> None:
         """Enable drag on local and remote-branch leaves; the drop handler is the Stage 5 stub.
@@ -306,9 +375,22 @@ class LeftPanel(QTreeWidget):
         Only group rows carry the ``_ROLE_IS_GROUP`` marker; leaves
         and the placeholder do not, so the icon update runs only on
         the rows that actually need it.
+
+        R3.4 (M20): also update the cached expansion set so the next
+        ``_rebuild`` restores the user's choice instead of falling
+        back to the "Branches + Local expanded" defaults.
         """
-        if item.data(0, _ROLE_IS_GROUP) is True:
-            self._set_expand_icon(item)
+        if item.data(0, _ROLE_IS_GROUP) is not True:
+            return
+        self._set_expand_icon(item)
+        # Map the item back to its group label via the column-0 text.
+        # The label is stable (defined as ``_GROUP_*`` constants) and
+        # the only rows that carry ``_ROLE_IS_GROUP``.
+        label = item.text(0)
+        if item.isExpanded():
+            self._expanded_groups.add(label)
+        else:
+            self._expanded_groups.discard(label)
 
     # ----- user actions ------------------------------------------------
 

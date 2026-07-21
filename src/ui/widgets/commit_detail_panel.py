@@ -25,6 +25,8 @@ the list of changed files and the per-file diff.
 """
 from __future__ import annotations
 
+import html
+
 import pygit2
 from PySide6.QtCore import QRect, QSize, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter
@@ -188,6 +190,10 @@ class CommitDetailPanel(QWidget):
         # --- message (subject) — always visible ---
         self._message = QLabel(self)
         self._message.setWordWrap(True)
+        # R3.4 (M21): commit metadata is attacker-controlled; force
+        # plain-text rendering so a malicious author name with a ``<``
+        # cannot be reinterpreted as HTML by QLabel.
+        self._message.setTextFormat(Qt.TextFormat.PlainText)
         self._message.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
             | Qt.TextInteractionFlag.TextSelectableByKeyboard,
@@ -200,6 +206,9 @@ class CommitDetailPanel(QWidget):
         self._body = QLabel(self)
         self._body.setWordWrap(True)
         self._body.setAlignment(Qt.AlignmentFlag.AlignTop)
+        # R3.4 (M21): force plain-text for the commit message body so
+        # HTML-looking commit subjects render literally.
+        self._body.setTextFormat(Qt.TextFormat.PlainText)
         self._body.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
             | Qt.TextInteractionFlag.TextSelectableByKeyboard,
@@ -235,6 +244,15 @@ class CommitDetailPanel(QWidget):
         # --- info block — always visible ---
         self._info = QLabel(self)
         self._info.setWordWrap(True)
+        # R3.4 (M21): ``_format_info`` deliberately mixes safe
+        # formatting tags (``<b>``, ``<code>``, ``<br/>``) with
+        # attacker-controlled commit metadata (author name, e-mail).
+        # We escape the metadata *before* string-interpolating it into
+        # the HTML template; the formatting tags themselves are
+        # hard-coded literals so they don't need escaping. RichText
+        # format is intentional here — the bold "Author:" / "SHA:"
+        # labels are part of the visual design.
+        self._info.setTextFormat(Qt.TextFormat.RichText)
         self._info.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
             | Qt.TextInteractionFlag.TextSelectableByKeyboard,
@@ -689,10 +707,10 @@ class CommitDetailPanel(QWidget):
         """Compute the commit-vs-parent diff for ``path`` and emit the
         diff signals.
 
-        Emits :attr:`diff_ready` with the changes-only text and
-        :attr:`diff_pair_ready` with the changes-only + full-document
-        pair, so the centre-column :class:`DiffViewWidget` has both
-        variants cached when the user toggles its toolbar.
+        Emits :attr:`diff_ready` with the changes-only text eagerly;
+        the full-document variant is computed lazily on
+        :meth:`request_full_document` because rendering 2^31 context
+        lines is expensive on large commits (R3.2 P4).
         """
         repo = self._main_vm.repository_manager()
         if repo is None or not repo.is_open:
@@ -703,15 +721,45 @@ class CommitDetailPanel(QWidget):
             changes_only = self._build_commit_diff_text(
                 repo, sha, path, context_lines=3,
             )
-            full_document = self._build_commit_diff_text(
-                repo, sha, path, context_lines=_FULL_DOCUMENT_CONTEXT_LINES,
-            )
         except GitError as exc:
             self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
             self.diff_ready.emit("")
             self.diff_pair_ready.emit("", "")
             return
+        # Cache the inputs so ``request_full_document`` can recompute
+        # the full variant lazily (R3.2 P4).
+        self._current_diff_sha = sha
+        self._current_diff_path = path
+        self._current_diff_changes_only = changes_only
         self.diff_ready.emit(changes_only)
+        # ``full_document`` is intentionally empty here — the toolbar
+        # viewer will call ``request_full_document()`` when the user
+        # toggles into full-document mode.
+        self.diff_pair_ready.emit(changes_only, "")
+
+    def request_full_document(self) -> None:
+        """Recompute the full-document diff and re-emit ``diff_pair_ready``.
+
+        R3.2 (P4): ``_compute_and_emit_diff`` used to build both
+        changes-only and full-document eagerly.  We now defer
+        ``full_document`` to this explicit request so file clicks are
+        not blocked on the expensive 2^31-context-line variant.
+        """
+        sha = getattr(self, "_current_diff_sha", None)
+        path = getattr(self, "_current_diff_path", None)
+        changes_only = getattr(self, "_current_diff_changes_only", "")
+        if sha is None or path is None or changes_only == "":
+            return
+        repo = self._main_vm.repository_manager()
+        if repo is None or not repo.is_open:
+            return
+        try:
+            full_document = self._build_commit_diff_text(
+                repo, sha, path, context_lines=_FULL_DOCUMENT_CONTEXT_LINES,
+            )
+        except GitError as exc:
+            self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
+            return
         self.diff_pair_ready.emit(changes_only, full_document)
 
     def _build_commit_diff_text(
@@ -796,26 +844,47 @@ def _format_info(info: CommitInfo) -> str:
     Times are rendered as ``YYYY-MM-DD HH:MM:SS`` from the unix
     timestamp — we don't pull the system locale in here because the
     surrounding UI is intentionally English.
+
+    R3.4 (M21): author / committer names and e-mails come straight
+    from the git object and are fully attacker-controlled (a hostile
+    commit can put ``<script>...</script>`` in the author field).
+    The string template below mixes hard-coded formatting tags
+    (``<b>``, ``<code>``, ``<br/>``) with these user values; we
+    escape only the user values, never the formatting tags.
     """
     parts: list[str] = []
     if info.author_name or info.author_email:
-        author = info.author_name or "(unknown)"
-        email = f" <{info.author_email}>" if info.author_email else ""
+        author = html.escape(info.author_name or "(unknown)")
+        email = (
+            f" &lt;{html.escape(info.author_email)}&gt;"
+            if info.author_email
+            else ""
+        )
         parts.append(f"<b>Author:</b> {author}{email}")
     if info.committer_name and (
         info.committer_name != info.author_name
         or info.committer_email != info.author_email
     ):
-        committer = info.committer_name
-        cemail = f" <{info.committer_email}>" if info.committer_email else ""
+        committer = html.escape(info.committer_name)
+        cemail = (
+            f" &lt;{html.escape(info.committer_email)}&gt;"
+            if info.committer_email
+            else ""
+        )
         parts.append(f"<b>Committer:</b> {committer}{cemail}")
     if info.author_time:
         parts.append(f"<b>Committed:</b> {_format_time(info.author_time)}")
     if info.sha:
         short = info.short_sha or info.sha[:7]
-        parts.append(f"<b>SHA:</b> <code>{info.sha}</code> ({short})")
+        # SHA values are hex strings — ``html.escape`` is a no-op on
+        # them but we apply it anyway so a future ``info.sha`` schema
+        # change can't accidentally re-introduce the XSS.
+        parts.append(
+            f"<b>SHA:</b> <code>{html.escape(info.sha)}</code> "
+            f"({html.escape(short)})",
+        )
     if info.parents:
-        parents = ", ".join(p[:7] for p in info.parents)
+        parents = ", ".join(html.escape(p[:7]) for p in info.parents)
         parts.append(f"<b>Parents:</b> {parents}")
     else:
         parts.append("<b>Parents:</b> (root commit)")
