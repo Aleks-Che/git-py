@@ -17,6 +17,7 @@ returns the per-user path Qt recommends for app config.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -122,23 +123,57 @@ def get_int(config: dict[str, Any], key: str, default: int) -> int:
 
 
 def load_config(path: Path | str) -> dict[str, Any]:
-    """Read the config from ``path``; return defaults on any failure."""
+    """Read the config from ``path``; return defaults on any failure.
+
+    A missing file, a file containing invalid JSON, *or* a file holding
+    a JSON value that is not a mapping (e.g. a list, number, scalar,
+    ``null``) is treated as "no config" and the function returns a fresh
+    copy of :data:`_DEFAULT_CONFIG`. The returned dict is always a
+    *copy* so the caller can mutate it freely without affecting other
+    callers.
+    """
     p = Path(path)
     if not p.is_file():
         return dict(_DEFAULT_CONFIG)
     try:
         with p.open("r", encoding="utf-8") as f:
-            return {**_DEFAULT_CONFIG, **json.load(f)}
+            data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return dict(_DEFAULT_CONFIG)
+    if not isinstance(data, dict):
+        # Top-level JSON must be an object to merge with defaults; lists,
+        # numbers, booleans, and ``null`` cannot be updated.
+        return dict(_DEFAULT_CONFIG)
+    return {**_DEFAULT_CONFIG, **data}
 
 
 def save_config(path: Path | str, data: dict[str, Any]) -> None:
-    """Write ``data`` as pretty-printed JSON to ``path`` (mkdir parents first)."""
+    """Write ``data`` as pretty-printed JSON to ``path`` atomically.
+
+    Parent directories are created on demand. The payload is first
+    written to a sibling ``.tmp`` file and then renamed over the
+    destination via :func:`os.replace`; on POSIX (and on Python 3.3+ on
+    Windows) the rename is atomic at the filesystem level, so a crash
+    or power loss never leaves a half-written config behind. On any
+    failure the temp file is removed.
+    """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                # fsync isn't supported on some filesystems (e.g. some FUSE
+                # mounts); the rename is still atomic, so swallow.
+                pass
+        os.replace(tmp, p)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def default_config_path() -> Path:

@@ -115,14 +115,24 @@ class RepositoryManager:
     # ----- lifecycle ---------------------------------------------------
 
     def open(self, path: str) -> None:
-        """Open an existing repository at ``path``."""
+        """Open an existing repository at ``path``.
+
+        On any failure (missing path, not a repo, ``pygit2`` error) the
+        previously open repository, if any, is left untouched: ``_repo``
+        and ``_path`` are only assigned after both ``p.exists()`` and
+        ``pygit2.Repository()`` succeed. If construction fails we still
+        clear any partial state so the manager does not expose a stale
+        handle to the next caller.
+        """
         p = Path(path)
         if not p.exists():
             raise RepositoryNotFoundError(f"Path does not exist: {path}")
         try:
-            self._repo = pygit2.Repository(str(p))
+            repo = pygit2.Repository(str(p))
         except pygit2.GitError as exc:
             raise RepositoryNotFoundError(f"Not a Git repository: {path}") from exc
+        # Atomic-ish: only commit state once construction has fully succeeded.
+        self._repo = repo
         self._path = str(p)
 
     def init(
@@ -136,11 +146,14 @@ class RepositoryManager:
         The default is an empty repo (no initial commit); ``HEAD`` is set
         up as an unborn reference pointing at ``initial_head``. Callers
         that need a starting commit should make one explicitly.
+
+        On failure the previously open repository is left untouched.
         """
         try:
-            self._repo = pygit2.init_repository(path, bare=bare, initial_head=initial_head)
+            repo = pygit2.init_repository(path, bare=bare, initial_head=initial_head)
         except pygit2.GitError as exc:
             raise GitError(f"Failed to initialize repository at {path}: {exc}") from exc
+        self._repo = repo
         self._path = str(Path(path))
 
     def clone(
@@ -157,13 +170,15 @@ class RepositoryManager:
         remotes require a ``callbacks`` object — without it, a
         :class:`src.core.exceptions.AuthError` is raised on the first
         credential prompt.
+
+        On failure the previously open repository, if any, is dropped so
+        callers do not see a stale handle.
         """
         try:
-            self._repo = pygit2.clone_repository(url, path, bare=bare, callbacks=callbacks)
+            repo = pygit2.clone_repository(url, path, bare=bare, callbacks=callbacks)
         except pygit2.GitError as exc:
-            self._repo = None
-            self._path = None
             raise GitError(f"Failed to clone {url} -> {path}: {exc}") from exc
+        self._repo = repo
         self._path = str(Path(path))
 
     def close(self) -> None:

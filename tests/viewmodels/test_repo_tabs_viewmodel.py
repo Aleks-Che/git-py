@@ -82,6 +82,45 @@ def test_remove_tab_out_of_range_is_noop(tmp_path: Path) -> None:
     assert vm.active_index == active_before
 
 
+def test_remove_tab_above_active_adjusts_active_index(tmp_path: Path) -> None:
+    """H10 — removing a tab to the left of the active one shifts the index.
+
+    With three tabs and the active tab at the rightmost position, dropping
+    the leftmost tab must shift the active index down by one so it keeps
+    pointing at the *same repository* rather than jumping onto the next
+    neighbour.
+    """
+    _ensure_app()
+    vm = RepoTabViewModel()
+    _add(vm, tmp_path, "a")
+    _add(vm, tmp_path, "b")
+    _add(vm, tmp_path, "c")
+    vm.set_active_tab(2)  # active = ``c`` (rightmost)
+    vm.remove_tab(0)       # drop ``a`` to the left of active
+    assert vm.active_index == 1
+    assert Path(vm.active_path).resolve() == (tmp_path / "c").resolve()
+
+
+def test_remove_tab_to_left_of_middle_active_decrements(tmp_path: Path) -> None:
+    """H10 — corner case where ``len(self._tabs)-1`` masking would hide the bug.
+
+    With three tabs and the active one in the middle, removing the leftmost
+    tab must decrement the active index by one. The previous
+    implementation only adjusted when ``active_index >= len(tabs)`` after
+    pop, which left the active tab pointing at the *neighbouring* repo
+    rather than the one the user originally selected.
+    """
+    _ensure_app()
+    vm = RepoTabViewModel()
+    _add(vm, tmp_path, "a")
+    _add(vm, tmp_path, "b")
+    _add(vm, tmp_path, "c")
+    vm.set_active_tab(1)  # active = ``b`` (middle)
+    vm.remove_tab(0)       # drop ``a`` to the left; ``b`` slides to index 0
+    assert vm.active_index == 0
+    assert Path(vm.active_path).resolve() == (tmp_path / "b").resolve()
+
+
 # ----- close_others -----------------------------------------------------
 
 

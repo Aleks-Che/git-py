@@ -69,16 +69,33 @@ class RepoTabViewModel(QObject):
         return len(self._tabs) - 1
 
     def remove_tab(self, index: int) -> None:
-        """Remove the tab at *index* (the repo itself is untouched)."""
+        """Remove the tab at *index* (the repo itself is untouched).
+
+        The active index is adjusted so it keeps pointing at the same
+        repository whenever possible:
+
+        * if the removed tab was to the left of the active one, the
+          active index is decremented;
+        * if the removed tab was the active one, the next tab (or the
+          previous one, when it was the rightmost) becomes active;
+        * if no tabs remain, the active index becomes -1.
+        """
         if index < 0 or index >= len(self._tabs):
             return
+        prev_active = self._active_index
         self._tabs.pop(index)
-        # Adjust active index *before* notifying the view, so the
-        # widget rebuild sees a consistent state.
-        if self._active_index >= len(self._tabs):
-            self._active_index = len(self._tabs) - 1
-        elif self._active_index == index:
-            self._active_index = min(index, len(self._tabs) - 1)
+        if not self._tabs:
+            self._active_index = -1
+        elif prev_active == index:
+            # The active tab was removed. Prefer the next tab if any,
+            # otherwise fall back to the (new) rightmost tab.
+            if index < len(self._tabs):
+                self._active_index = index  # next shifted into removed slot
+            else:
+                self._active_index = len(self._tabs) - 1
+        elif prev_active > index:
+            # Removed tab sat to the left of the active one.
+            self._active_index = prev_active - 1
         self._tabs_changed()
         self.active_tab_changed.emit(self._active_index)
 

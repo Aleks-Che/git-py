@@ -51,6 +51,47 @@ def test_open_non_git_path_raises(tmp_path: Path) -> None:
         RepositoryManager(str(not_a_repo))
 
 
+def test_open_with_nonexistent_path_does_not_leak_repo_handle(tmp_path: Path) -> None:
+    """M2 — a failed ``open()`` must not corrupt the manager's state.
+
+    Before the fix, ``open()`` assigned to ``self._repo`` *inside* the
+    ``try`` block, which meant a half-constructed object could leave the
+    manager pointing at a stale handle. After the fix the assignment
+    happens only after ``pygit2.Repository()`` returns successfully; a
+    failure leaves ``_repo`` and ``_path`` exactly as they were.
+    """
+    mgr = RepositoryManager()
+    assert mgr._repo is None
+    assert mgr._path is None
+    with pytest.raises(RepositoryNotFoundError):
+        mgr.open(str(tmp_path / "does-not-exist"))
+    assert mgr._repo is None
+    assert mgr._path is None
+    assert not mgr.is_open
+
+
+def test_open_non_git_after_successful_open_leaves_prior_repo_intact(
+    tmp_path: Path, tmp_git_repo: Path,
+) -> None:
+    """M2 — opening a non-repo on an already-open manager must keep the previous handle.
+
+    The previous implementation would only assign ``_path`` after both
+    ``p.exists()`` and ``pygit2.Repository()`` succeeded, but on failure
+    it still updated nothing else. The fix keeps the manager's state
+    untouched so the user can recover.
+    """
+    mgr = RepositoryManager(str(tmp_git_repo))
+    assert mgr.is_open
+    prior_repo = mgr.repo
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+    with pytest.raises(RepositoryNotFoundError):
+        mgr.open(str(not_a_repo))
+    assert mgr.is_open
+    assert mgr.path == str(tmp_git_repo)
+    assert mgr.repo is prior_repo
+
+
 def test_init_creates_empty_repo(tmp_path: Path) -> None:
     target = tmp_path / "new"
     mgr = RepositoryManager()
