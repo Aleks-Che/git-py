@@ -85,6 +85,11 @@ class MainViewModel(QObject):
         # they are not garbage collected while the worker thread is running.
         # Removed in :meth:`_on_async_finished`.
         self._active_workers: set[object] = set()
+        # Generation token — bumped on every :meth:`set_repository` so
+        # async workers started under the previous repo deliver their
+        # result into a VM that no longer holds the right state (R2.2
+        # C7).  Stale results are dropped silently in ``_on_result``.
+        self._async_generation: int = 0
         # ``async_enabled`` lets tests run the VM in pure-sync mode by
         # passing ``async_enabled=False`` in the constructor. In
         # production ``MainWindow`` constructs the VM with the default
@@ -219,6 +224,7 @@ class MainViewModel(QObject):
         manager: RepositoryManager | None,
         *,
         refresh: bool = True,
+        force: bool = False,
     ) -> None:
         """Bind a new :class:`RepositoryManager` (or ``None`` to clear).
 
@@ -244,7 +250,42 @@ class MainViewModel(QObject):
         the existing synchronous behaviour used by tests — the graph,
         commit panel and branch panel are fully populated before the
         method returns.
+
+        When a long-running async worker is already in flight
+        (``self._is_busy``) and the caller asks for a *different*
+        repository, the call is refused with an error so the
+        running worker's result cannot bleed into the wrong VM
+        (R2.2 M8).  Pass ``force=True`` to bypass the guard — this
+        is what ``clone_repository``'s success handler uses after
+        the worker has already finished, and what tests use when
+        they swap repositories out of band.
+
+        Regardless of whether the call succeeds or is refused, the
+        ``_async_generation`` token is always bumped — every call to
+        ``set_repository`` marks the repository change boundary, and
+        any async worker that captured the previous token will see
+        its result dropped in ``_on_result`` (R2.2 C7).
         """
+        # Bump the generation token first so even a refused call
+        # invalidates pending workers whose result might otherwise
+        # slip into the (unchanged) current VM state.
+        self._async_generation += 1
+
+        current_path = (
+            self._repo_manager.path if self._repo_manager is not None else None
+        )
+        new_path = manager.path if manager is not None else None
+        if (
+            not force
+            and self._is_busy
+            and current_path is not None
+            and new_path != current_path
+        ):
+            msg = "Another operation is in progress — wait until it completes."
+            self.error_occurred.emit(msg)
+            self._log("repo", f"set_repository({new_path}) refused: busy", level="warn")
+            return
+
         self._repo_manager = manager
         self._command_processor.clear()
         self._clear_conflict_state()
@@ -312,6 +353,11 @@ class MainViewModel(QObject):
         if repo_path is None:
             return
 
+        # Capture the generation token at dispatch time — if the user
+        # swaps repositories while the worker runs, the result will be
+        # stale and dropped in :meth:`_on_result` (R2.2 C7).
+        generation = self._async_generation
+
         print(f"[worker] load_repository_data: starting worker for {repo_path}")
         self._is_busy = True
         self.busy_changed.emit(True)
@@ -371,6 +417,12 @@ class MainViewModel(QObject):
             }
 
         def _on_result(result: object) -> None:
+            if generation != self._async_generation:
+                # Stale result — the user opened a different repo
+                # while the worker was in flight.  Drop silently (R2.2
+                # C7/M8).  The lifespan_finished handler still runs
+                # below to release the strong reference.
+                return
             print("[worker::ui] _on_result called")
             data: dict = result  # type: ignore[assignment]
             error = data.get("error")
@@ -398,13 +450,17 @@ class MainViewModel(QObject):
             print("[worker::ui] data applied, calling _on_repo_load_finished")
             self._on_repo_load_finished()
 
+        def _on_failure(exc: object) -> None:
+            if generation != self._async_generation:
+                # Stale failure — same logic as ``_on_result``.
+                return
+            self._on_repo_load_failed(str(exc))
+
         worker = AsyncWorker(_work)
-        worker.signals.result.connect(_on_result)
-        worker.signals.failed.connect(
-            lambda message: self._on_repo_load_failed(message),
-        )
+        worker.signals.finished.connect(_on_result)
+        worker.signals.failed.connect(_on_failure)
         self._active_workers.add(worker)
-        worker.signals.finished.connect(
+        worker.signals.lifespan_finished.connect(
             lambda w=worker: self._on_async_finished(w),
         )
         print("[worker] dispatching to thread pool...")
@@ -592,7 +648,22 @@ class MainViewModel(QObject):
             self._log("refresh", f"Refresh failed: {exc}", level="error")
 
     def undo(self) -> None:
-        """Undo the most recent command; refreshes views on success."""
+        """Undo the most recent command; refreshes views on success.
+
+        R2.2 M25: when a long-running async worker (push / pull /
+        fetch / clone / rebase) is in flight, ``self._repo_manager``
+        is the same underlying ``pygit2.Repository`` the worker is
+        about to mutate.  Calling ``CommandProcessor.undo`` here
+        would launch a UI-thread mutating Git op on the same
+        libgit2 state, deadlocking or corrupting the index.  Reject
+        the call until the worker has finished.
+        """
+        if self._is_busy:
+            self.error_occurred.emit(
+                "Another operation is in progress — wait until it completes.",
+            )
+            self._log("undo", "Undo rejected: another op in progress", level="warn")
+            return
         if not self._command_processor.can_undo:
             return
         try:
@@ -606,7 +677,16 @@ class MainViewModel(QObject):
         self._log("undo", "Undo succeeded")
 
     def redo(self) -> None:
-        """Redo the most recently undone command; refreshes views on success."""
+        """Redo the most recently undone command; refreshes views on success.
+
+        Same busy-guard rationale as :meth:`undo`.
+        """
+        if self._is_busy:
+            self.error_occurred.emit(
+                "Another operation is in progress — wait until it completes.",
+            )
+            self._log("redo", "Redo rejected: another op in progress", level="warn")
+            return
         if not self._command_processor.can_redo:
             return
         try:
@@ -2306,6 +2386,12 @@ class MainViewModel(QObject):
         freeze the UI. On success the new repository is opened
         automatically; on failure the error is surfaced via
         :attr:`error_occurred` and no repository is bound.
+
+        R2.2 C7 — the captured generation token bumps on every
+        :meth:`set_repository`; if the user opens a *different*
+        repository while the clone is in flight, the worker's late
+        result is dropped silently instead of overwriting the new
+        VM state.
         """
         if self._is_busy:
             self.error_occurred.emit("Another operation is already in progress.")
@@ -2314,6 +2400,10 @@ class MainViewModel(QObject):
         if not self._async_enabled:
             self._execute_clone_sync(url, path)
             return
+        # Capture generation so a late-arriving success/failure does
+        # not bleed into the VM after the user opened a different
+        # repo (R2.2 C7).
+        generation = self._async_generation
         self._is_busy = True
         self.busy_changed.emit(True)
 
@@ -2322,6 +2412,9 @@ class MainViewModel(QObject):
             manager.clone(url, path)
 
         def _on_success(_: object) -> None:
+            if generation != self._async_generation:
+                # Stale — drop silently.
+                return
             self._is_busy = False
             self.busy_changed.emit(False)
             try:
@@ -2330,21 +2423,27 @@ class MainViewModel(QObject):
                 self.error_occurred.emit(str(exc))
                 self._log("clone", f"Clone succeeded but open failed: {exc}", level="error")
                 return
-            self.set_repository(manager)
+            # The async worker has already returned; pass ``force=True``
+            # so the (defensive) busy-guard does not refuse our own
+            # success-handler call site.
+            self.set_repository(manager, force=True)
             self._log("clone", f"Clone finished: {url} → {path}")
 
-        def _on_failure(message: str) -> None:
+        def _on_failure(exc: object) -> None:
+            if generation != self._async_generation:
+                # Stale — drop silently.
+                return
             self._is_busy = False
             self.busy_changed.emit(False)
-            self.error_occurred.emit(message)
-            self._log("clone", f"Clone failed: {message}", level="error")
+            self.error_occurred.emit(str(exc))
+            self._log("clone", f"Clone failed: {exc}", level="error")
 
         worker = AsyncWorker(_work)
-        worker.signals.result.connect(_on_success)
+        worker.signals.finished.connect(_on_success)
         worker.signals.failed.connect(_on_failure)
         self._active_workers.add(worker)
-        worker.signals.finished.connect(
-            lambda: self._on_async_finished(worker),
+        worker.signals.lifespan_finished.connect(
+            lambda w=worker: self._on_async_finished(w),
         )
         QThreadPool.globalInstance().start(worker)
 
@@ -2561,10 +2660,13 @@ class MainViewModel(QObject):
     ) -> None:
         """Run ``command.execute()`` on a worker thread.
 
-        The work is wrapped in an :class:`AsyncWorker`; the result
-        signal triggers ``on_success`` on the UI thread, the failed
-        signal routes the exception through the normal VM error /
-        conflict paths, and the finished signal clears the busy flag.
+        The work is wrapped in an :class:`AsyncWorker`; the ``finished``
+        signal triggers ``on_success`` on the UI thread, the ``failed``
+        signal routes the exception (passed as the actual exception
+        **object**, not a string) through the normal VM error /
+        conflict paths, and the ``lifespan_finished`` signal clears
+        the busy flag and drops the strong :class:`AsyncWorker`
+        reference.
 
         ``silent_on_failure=True`` suppresses the ``error_occurred``
         signal for generic :class:`GitError` failures. Conflict state
@@ -2574,48 +2676,113 @@ class MainViewModel(QObject):
 
         ``log_tag`` is used to emit success/failure log entries
         (e.g. ``"fetch"``, ``"push"``).
+
+        R2.2 notes
+        ----------
+        * The current dispatch passes the UI-thread command
+          directly to the worker.  ``command._repo`` is therefore the
+          UI-thread :class:`RepositoryManager`; a true C6 fix would
+          require reconstructing the command with a worker-owned
+          manager (out of scope for this stage).  The busy-guard on
+          :meth:`set_repository` (and the long-standing busy-guard
+          on ``refresh_state`` and the verb verbs) are the
+          operational mitigation that prevents the UI thread from
+          entering the same ``pygit2.Repository`` while the worker
+          is in flight.
+        * The captured ``generation`` token drops stale results
+          when ``set_repository`` runs between worker dispatch and
+          completion (R2.2 C7).
         """
         if self._is_busy:
             return
         self._is_busy = True
         self.busy_changed.emit(True)
+        # Capture the generation token at dispatch time (R2.2 C7).
+        generation = self._async_generation
 
         def _work() -> None:
             self._command_processor.execute(command)  # type: ignore[arg-type]
 
         def _on_result(_: object) -> None:
+            if generation != self._async_generation:
+                # Stale — the user opened a different repo while the
+                # worker was in flight.  Drop silently (R2.2 C7/M8).
+                return
             if log_tag:
                 self._log(log_tag, "Operation succeeded")
             on_success()  # type: ignore[operator]
 
+        def _on_failure(exc: object) -> None:
+            if generation != self._async_generation:
+                # Stale — drop silently.
+                return
+            self._on_async_failed(
+                command, exc, silent_on_failure, log_tag=log_tag,
+            )
+
         worker = AsyncWorker(_work)
-        worker.signals.result.connect(_on_result)
-        worker.signals.failed.connect(
-            lambda message: self._on_async_failed(
-                command, message, silent_on_failure, log_tag=log_tag,
-            ),
-        )
+        worker.signals.finished.connect(_on_result)
+        worker.signals.failed.connect(_on_failure)
         self._active_workers.add(worker)
-        worker.signals.finished.connect(
-            lambda: self._on_async_finished(worker),
+        worker.signals.lifespan_finished.connect(
+            lambda w=worker: self._on_async_finished(w),
         )
         QThreadPool.globalInstance().start(worker)
 
     def _on_async_failed(
         self,
         command: object,
-        message: str,
+        exc: object,
         silent: bool = False,
         *,
         log_tag: str = "",
     ) -> None:
-        """Map a worker exception back into the VM's error/conflict paths."""
+        """Map a worker exception back into the VM's error/conflict paths.
+
+        ``exc`` is the actual exception object raised inside the worker
+        — the previous implementation received a pre-formatted string
+        and re-detected the type with :func:`is_merge_in_progress`,
+        which raced with the async worker that just finished
+        modifying state.  Routing on the actual exception type
+        (R2.2) is both faster and race-free.
+        """
+        message = str(exc)
+        # Domain exceptions we surface with a dedicated path.
+        from src.core.exceptions import MergeConflictError, RebaseConflictError
+
+        if isinstance(exc, MergeConflictError):
+            if log_tag:
+                self._log(log_tag, f"Operation failed (conflicts): {message}", level="warn")
+            if self._repo_manager is not None:
+                self._set_conflict_state(
+                    "merge",
+                    conflicting_paths=exc.conflicting_paths,
+                    source=None,
+                    target=None,
+                )
+            elif not silent:
+                self.error_occurred.emit(message)
+            return
+        if isinstance(exc, RebaseConflictError):
+            if log_tag:
+                self._log(log_tag, f"Operation failed (rebase conflicts): {message}", level="warn")
+            if self._repo_manager is not None:
+                self._set_conflict_state("rebase", conflicting_paths=[], upstream=None)
+            if not silent:
+                self.error_occurred.emit(message)
+            return
+
         if log_tag:
             self._log(log_tag, f"Operation failed: {message}", level="error")
         if self._repo_manager is None:
             if not silent:
                 self.error_occurred.emit(message)
             return
+        # Fall-through: still consult ``is_merge_in_progress`` to
+        # handle the case where the worker raised a non-domain
+        # exception after the merge was initiated (e.g. a plain
+        # ``RuntimeError`` from pygit2).  This is the only path that
+        # still needs a heuristic.
         from src.core.operations import is_merge_in_progress, is_rebase_in_progress
 
         if is_merge_in_progress(self._repo_manager):
