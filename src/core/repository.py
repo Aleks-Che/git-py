@@ -398,6 +398,46 @@ class RepositoryManager:
             result.append(self._to_commit_info(commit))
         return result
 
+    def _collect_all_tip_oids(self) -> set[pygit2.Oid]:
+        """Return the set of OIDs reachable from every local/remote/tag tip.
+
+        R3.1 (P2): shared between :meth:`get_all_history` (which
+        walks them) and :meth:`count_all_history` (which counts
+        them).  Centralised so the two stay in sync — adding a new
+        tip category (e.g. stash refs in a future stage) only needs
+        one edit.
+
+        ``KeyError``/``ValueError`` from individual lookups are
+        swallowed (a stale ref must not poison the count for the
+        rest of the repo) — matches the previous per-method
+        behaviour.
+        """
+        if self.repo.head_is_unborn:
+            return set()
+        tip_oids: set[pygit2.Oid] = set()
+        for name in self.repo.branches.local:
+            branch = self.repo.lookup_branch(name)
+            if branch.target is not None:
+                tip_oids.add(branch.target)
+        for name in self.repo.branches.remote:
+            try:
+                ref = self.repo.lookup_reference(f"refs/remotes/{name}")
+                ref = ref.resolve()
+            except (KeyError, ValueError):
+                continue
+            if ref.target is not None and isinstance(ref.target, pygit2.Oid):
+                tip_oids.add(ref.target)
+        for ref_name in self.repo.references:
+            if not ref_name.startswith("refs/tags/"):
+                continue
+            ref = self.repo.lookup_reference(ref_name)
+            try:
+                tip_oids.add(ref.peel(pygit2.Commit).id)
+            except Exception:
+                if isinstance(ref.target, pygit2.Oid):
+                    tip_oids.add(ref.target)
+        return tip_oids
+
     def get_all_history(self, max_count: int = 500) -> list[CommitInfo]:
         """Walk the full commit DAG reachable from any branch (local/remote) or tag.
 
@@ -424,28 +464,9 @@ class RepositoryManager:
         """
         if max_count <= 0 or self.repo.head_is_unborn:
             return []
-        tip_oids: set[pygit2.Oid] = set()
-        for name in self.repo.branches.local:
-            branch = self.repo.lookup_branch(name)
-            if branch.target is not None:
-                tip_oids.add(branch.target)
-        for name in self.repo.branches.remote:
-            try:
-                ref = self.repo.lookup_reference(f"refs/remotes/{name}")
-                ref = ref.resolve()
-            except (KeyError, ValueError):
-                continue
-            if ref.target is not None and isinstance(ref.target, pygit2.Oid):
-                tip_oids.add(ref.target)
-        for ref_name in self.repo.references:
-            if not ref_name.startswith("refs/tags/"):
-                continue
-            ref = self.repo.lookup_reference(ref_name)
-            try:
-                tip_oids.add(ref.peel(pygit2.Commit).id)
-            except Exception:
-                if isinstance(ref.target, pygit2.Oid):
-                    tip_oids.add(ref.target)
+        tip_oids = self._collect_all_tip_oids()
+        if not tip_oids:
+            return []
 
         revwalk = self.repo.walk(None, SORT_TOPOLOGICAL_TIME)
         for tip in tip_oids:
@@ -457,6 +478,30 @@ class RepositoryManager:
                 break
             result.append(self._to_commit_info(commit))
         return result
+
+    def count_all_history(self) -> int:
+        """Return the total number of commits reachable from any tip.
+
+        R3.1 (P2): used by the graph view to decide whether the
+        history was truncated by :meth:`get_all_history`'s
+        ``max_count`` cap.  Walks the **full** DAG (no cap) — for
+        the repositories the app targets (5 000–50 000 commits) this
+        is fast because libgit2 deduplicates ancestors internally.
+
+        Returns ``0`` for an empty / unborn repository.
+        """
+        if self.repo.head_is_unborn:
+            return 0
+        tip_oids = self._collect_all_tip_oids()
+        if not tip_oids:
+            return 0
+        revwalk = self.repo.walk(None, SORT_TOPOLOGICAL_TIME)
+        for tip in tip_oids:
+            revwalk.push(tip)
+        count = 0
+        for _commit in revwalk:
+            count += 1
+        return count
 
     def get_commit(self, sha: str) -> CommitInfo:
         """Resolve any revision (``HEAD``, branch name, short SHA, full SHA) to a commit."""

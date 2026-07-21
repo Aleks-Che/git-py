@@ -456,6 +456,15 @@ def build_graph(
     # SHA -> row index
     oid_to_row: dict[str, int] = {c.sha: i for i, c in enumerate(commits)}
 
+    # ``nodes_by_sha`` maps a commit's SHA to its index in the
+    # ``nodes`` list built by the main loop below.  R3.1 (P1):
+    # replacing the previous ``any(n.commit.sha == ...)`` linear
+    # scans over the (already-processed) ``nodes`` list — O(n²) on
+    # a 5 000-commit repo.  The dict is updated every time
+    # ``nodes.append(...)`` runs so callers always see a current
+    # snapshot.
+    nodes_by_sha: dict[str, int] = {}
+
     # Detect fork points (commits with 2+ children in the visible history)
     parent_children: dict[str, list[str]] = {}
     for commit in commits:
@@ -527,12 +536,16 @@ def build_graph(
         # does NOT cover. Building the child-lane set from
         # ``parent_children`` + the already-processed ``nodes`` list
         # is the only way to detect every such case.
+        #
+        # R3.1 (P1): use ``nodes_by_sha`` (O(1) dict lookup) instead
+        # of the previous ``for n in nodes: if n.commit.sha == ...``
+        # linear scan that made the per-commit block O(n).
         child_lane_set: set[int] = set()
         for child_sha in parent_children.get(commit.sha, []):
-            for n in nodes:
-                if n.commit is not None and n.commit.sha == child_sha:
-                    child_lane_set.add(n.lane)
-                    break
+            child_idx = nodes_by_sha.get(child_sha)
+            if child_idx is None:
+                continue
+            child_lane_set.add(nodes[child_idx].lane)
         fork_lane_set |= child_lane_set
         # Also snapshot the colour of any child lane not already in
         # ``fork_lane_colors``. ``oid_color_index`` carries the
@@ -541,14 +554,16 @@ def build_graph(
             if cl not in fork_lane_colors:
                 # Find the child SHA again to look up its colour.
                 for child_sha in parent_children.get(commit.sha, []):
-                    for n in nodes:
-                        if n.commit is not None and n.commit.sha == child_sha and n.lane == cl:
-                            fork_lane_colors[cl] = lane_color_index.get(cl)
-                            if fork_lane_colors[cl] is None:
-                                fork_lane_colors[cl] = oid_color_index.get(child_sha, cl)
-                            break
-                    if cl in fork_lane_colors:
-                        break
+                    child_idx = nodes_by_sha.get(child_sha)
+                    if child_idx is None:
+                        continue
+                    child_node = nodes[child_idx]
+                    if child_node.lane != cl:
+                        continue
+                    fork_lane_colors[cl] = lane_color_index.get(cl)
+                    if fork_lane_colors[cl] is None:
+                        fork_lane_colors[cl] = oid_color_index.get(child_sha, cl)
+                    break
         fork_merging_cells: list[CellInfo] | None = None
         if len(fork_lanes) >= 2:
             main_lane = min(fork_lanes)
@@ -637,9 +652,12 @@ def build_graph(
                     existing_parent_lane = i
                     break
 
-            parent_already_shown = any(
-                n.commit is not None and n.commit.sha == parent_sha for n in nodes
-            )
+            # R3.1 (P1): the previous implementation did a linear
+            # ``any(n.commit.sha == parent_sha for n in nodes)`` which
+            # made the whole loop O(n²) on 5 000-commit repos.  The
+            # ``nodes_by_sha`` dict lets us resolve any "is this
+            # commit already rendered?" question in O(1).
+            parent_already_shown = nodes_by_sha.get(parent_sha) is not None
 
             parent_lane: int
             was_existing: bool
@@ -808,6 +826,11 @@ def build_graph(
                 cells=cells,
             )
         )
+        # R3.1 (P1): keep the O(1) lookup dict in sync with the
+        # ``nodes`` list.  Appended at the same index so a future
+        # ``nodes_by_sha[commit.sha]`` returns the position of the
+        # node we just inserted.
+        nodes_by_sha[commit.sha] = len(nodes) - 1
 
         # --- handle lane merging ---
         if lane_merge is not None:
@@ -822,9 +845,10 @@ def build_graph(
             ending_oid = lanes[ending_l] if ending_l < len(lanes) else None
             ending_already_shown = True
             if ending_oid is not None:
-                ending_already_shown = any(
-                    n.commit is not None and n.commit.sha == ending_oid for n in nodes
-                )
+                # R3.1 (P1): ``nodes_by_sha`` replaces the previous
+                # ``any(n.commit.sha == ending_oid for n in nodes)``
+                # linear scan.
+                ending_already_shown = nodes_by_sha.get(ending_oid) is not None
 
             continues_down = not ending_already_shown
 

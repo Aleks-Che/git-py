@@ -375,6 +375,23 @@ class GraphTableWidget(QWidget):
         self._scrollbar.valueChanged.connect(self._on_scroll)
         self._scrollbar.setRange(0, 0)
 
+        # R3.1 (P2): a small overlay label that surfaces the
+        # "showing N of M (Load more)" indicator when the visible
+        # history is smaller than the full DAG.  The label is a
+        # real QWidget child so it participates in the focus
+        # chain and respects the theme's text colour.  We hide it
+        # by default and only show it when
+        # :attr:`GraphViewModel.truncated_count` is positive — see
+        # :meth:`_on_graph_updated` for the wiring.
+        self._truncation_label = QLabel("", self)
+        self._truncation_label.setStyleSheet(
+            f"color: {DARK_THEME.text_dim}; padding: 0 8px;",
+        )
+        self._truncation_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
+        self._truncation_label.hide()
+
         self._h_scrollbars: list[QScrollBar] = [
             QScrollBar(Qt.Orientation.Horizontal, self),
             QScrollBar(Qt.Orientation.Horizontal, self),
@@ -538,8 +555,75 @@ class GraphTableWidget(QWidget):
         # anchored to a row that may no longer exist.
         self._close_inline_editor()
         self._hide_branch_popup()
+        # R3.1 (P2): refresh the "showing N of M" indicator.  The
+        # visible-row count is just ``len(rows)`` (rows are filtered
+        # before emission); the truncated count lives on the
+        # ViewModel.  ``truncated_count == 0`` hides the label.
+        self._refresh_truncation_label()
         self._update_scrollbar()
         self.update()
+
+    def _refresh_truncation_label(self) -> None:
+        """Show / hide / update the R3.1 truncation indicator.
+
+        Reads :attr:`GraphViewModel.truncated_count`; renders a
+        ``"showing N of M (Load more)"`` string when the count is
+        positive, hides the label otherwise.  The (out-of-scope
+        for R3.1) "Load more" button is presented as plain text
+        so the visual contract is already correct — wiring the
+        button is a follow-up.
+        """
+        vm = self._view_model
+        truncated = 0
+        history_limit = 500
+        try:
+            truncated = int(getattr(vm, "truncated_count", 0) or 0)
+            history_limit = int(getattr(vm, "history_limit", history_limit) or history_limit)
+        except (TypeError, ValueError):
+            # Defensive: a custom VM that does not implement the
+            # new contract is treated as "no truncation", which
+            # is the same as the pre-R3.1 behaviour.
+            truncated = 0
+        visible = min(len(self._rows), history_limit)
+        if truncated <= 0:
+            self._truncation_label.hide()
+            return
+        total = visible + truncated
+        self._truncation_label.setText(
+            f"showing {visible} of {total} (Load more)",
+        )
+        self._truncation_label.adjustSize()
+        # Re-anchor in the rightmost header column so the label
+        # stays glued to the top-right corner after every layout
+        # pass.
+        self._layout_truncation_label()
+        self._truncation_label.show()
+
+    def _layout_truncation_label(self) -> None:
+        """Position :attr:`_truncation_label` in the rightmost header cell.
+
+        Called from :meth:`_refresh_truncation_label` and from
+        :meth:`resizeEvent` so the label tracks both the column
+        divider drags and the OS window-resize.
+        """
+        hh = self._cfg.header_height
+        # Anchor to the rightmost column (Commit Message).  Leave a
+        # small right margin so the text does not run into the
+        # vertical scrollbar (the bar is hidden on wide widgets
+        # but reserving the space is cheaper than querying its
+        # geometry every paint).
+        if len(self._dividers) >= 2:
+            left = self._dividers[1]
+            right = self.width() - 4
+        else:
+            left = 0
+            right = self.width() - 4
+        width = max(50, right - left)
+        # The label sits on top of the column-label text drawn in
+        # :meth:`paintEvent`, so we keep the height equal to the
+        # header row and let ``AlignVCenter`` do the vertical
+        # centring for us.
+        self._truncation_label.setGeometry(left, 0, width, hh)
 
     def _on_scroll(self, value: int) -> None:
         self._scroll_offset = value
@@ -547,6 +631,19 @@ class GraphTableWidget(QWidget):
 
     def _on_h_scroll(self, col: int, value: int) -> None:
         self._h_scrolls[col] = value
+        # The branch-stack popup is anchored to a chip's content-space
+        # rect but is rendered as a toplevel window at widget coords.
+        # Once the chip column scrolls, the popup's anchor point is
+        # stale — close it rather than render it floating in mid-air.
+        if col == 0 and self._branch_popup is not None:
+            self._hide_branch_popup()
+        # The inline ``Create Branch Here`` editor is also anchored in
+        # content coordinates; if the user scrolls the chip column
+        # while typing the editor would drift away from the chip.
+        # Hide it the moment a horizontal scroll begins — the user
+        # can re-open the menu if they still want to create a branch.
+        if col == 0 and self._inline_editor is not None:
+            self._close_inline_editor()
         self.update()
 
     def _on_external_select(self, sha: str) -> None:
@@ -918,10 +1015,14 @@ class GraphTableWidget(QWidget):
         rect = chip.get("rect")
         if rect is None:
             return
-        # Use the geometry from the chip cache; fall back to a
-        # sensible size if the chip was rendered with an unknown
-        # width (defensive — every chip we draw records a rect).
-        anchor_x = rect.x()
+        # Chip rects mix widget-y (the painter's vertical translation
+        # is ``0``) with content-x (column 0 is translated by
+        # ``-self._h_scrolls[0]``). ``setGeometry`` expects widget
+        # coordinates, so convert x by subtracting the current
+        # horizontal scroll offset of column 0. Without this the
+        # editor appears displaced from the chip by however far the
+        # column is scrolled.
+        anchor_x = rect.x() - self._h_scrolls[0]
         anchor_y = rect.y()
         anchor_w = max(160, rect.width())
         anchor_h = max(self._cfg.row_height, rect.height())
@@ -1072,25 +1173,45 @@ class GraphTableWidget(QWidget):
 
         Ties break by name so the layout is deterministic across
         reloads.
+
+        R3.2 (P7): the bucket-1 result is now read from
+        :attr:`GraphViewModel.branch_priority_for` instead of being
+        recomputed by walking HEAD's first-parent chain during
+        paint.  This keeps the chip column O(chips) instead of
+        O(chips * chain_walk) on every paint.
         """
         name = branch.get("name", "")
         if branch.get("is_head"):
             return (0, name)
-        if self._is_branch_reachable_from_head(branch):
-            return (1, name)
+        # R3.4 regression fix: the recently-created demotion must win
+        # over the source-bucket check. A branch the user just created
+        # in this session shares the first-parent tip with HEAD (so it
+        # would naturally fall in bucket 1) but we still want to demote
+        # it below the source — otherwise the prominent chip jumps to
+        # the brand-new branch every time ``create_branch`` fires.
         if name in self._recently_created_branches:
             return (2, name)
+        # Bucket 1 (source) — read from the VM cache.
+        try:
+            bucket, _ = self._view_model.branch_priority_for(name)
+            if bucket == 1:
+                return (1, name)
+        except (AttributeError, RuntimeError):
+            # Defensive: a custom VM that does not implement the
+            # new contract is treated as "no source info", which
+            # is the same as the pre-R3.2 behaviour.
+            pass
         return (3, name)
 
     def _is_branch_reachable_from_head(self, branch: dict) -> bool:
-        """Heuristic for "this is the *source* branch".
+        """Heuristic for "this is the *source* branch" — DEPRECATED in R3.2.
 
-        Walks HEAD's first-parent chain backward and reports
-        ``True`` the moment we cross a tip that matches any branch
-        in the current set of branches (a true "source branch"
-        should be on HEAD's ancestry). The walk is bounded to keep
-        the heuristic cheap — a couple of hundred commits is plenty
-        for the common "branch-from-HEAD-then-moved-HEAD" case.
+        Kept as a private helper for back-compat with tests that
+        exercise it directly.  Production code now reads the
+        precomputed ``branch_priority_cache`` via
+        :meth:`GraphViewModel.branch_priority_for`, which avoids
+        hitting pygit2 during paint (R3.2 P7).  New code should
+        use the VM API instead of this method.
         """
         repo = self._view_model.repository()
         if repo is None or not repo.is_open:
@@ -1379,6 +1500,32 @@ class GraphTableWidget(QWidget):
             y = self._row_y(row_idx)
             y_center = y + dh / 2
             if y + dh < header_h or y > self.height():
+                # Edge row at the top/bottom of the viewport — the
+                # bridge pipe above us (if any) still needs drawing.
+                # We *don't* skip ``prev_occupied`` bookkeeping for
+                # these rows, but we do compute the bookkeeping from
+                # the actual previous row (not from a stale empty
+                # set) when this is the first visible row, otherwise
+                # the bridge pipe between row_idx-1 and row_idx is
+                # silently lost. The arithmetic update at the bottom
+                # of the loop covers both visible and culled rows
+                # uniformly.
+                if row_idx > 0:
+                    prev = self._rows[row_idx - 1]
+                    prev_cells = prev.get("cells", [])
+                    prev_occupied = set()
+                    for ci, pc in enumerate(prev_cells):
+                        t = pc.get("t", _T_EMPTY)
+                        if t == _T_EMPTY or t in _downward_strip:
+                            continue
+                        prev_occupied.add(ci // 2)
+                    if (
+                        prev.get("commit") is not None
+                        or prev.get("is_uncommitted")
+                    ):
+                        prev_occupied.add(prev.get("lane", 0))
+                else:
+                    prev_occupied = set()
                 continue
 
             cells = row_data.get("cells", [])
@@ -2376,6 +2523,15 @@ class GraphTableWidget(QWidget):
         h = self.height()
         bar_w = self._scrollbar.sizeHint().width()
         self._scrollbar.setGeometry(w - bar_w, 0, bar_w, h)
+        # R3.1 (P2): the truncation indicator is anchored to the
+        # rightmost column; re-position it whenever the user
+        # resizes the window or drags a column divider (the
+        # divider drag invokes ``_update_scrollbar`` which in turn
+        # calls back into ``_layout_truncation_label`` via the
+        # ``update()`` chain — but resizing is the only path that
+        # does NOT, so we do it here explicitly).
+        if self._truncation_label.isVisible():
+            self._layout_truncation_label()
         self._update_scrollbar()
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
@@ -2406,13 +2562,45 @@ class GraphTableWidget(QWidget):
         self._update_scrollbar()
 
     def _hit_test_commit(self, x: int, y: int) -> str | None:
+        """Return the SHA at widget coordinates ``(x, y)`` or ``None``.
+
+        Connector-only rows (``sha == ""``) — the vertical lines that
+        join two non-adjacent graph cells — are deliberately skipped:
+        clicking on a pipe should not produce a SHA, otherwise the
+        user can accidentally "select" a non-existent commit when
+        they aim at the connector that crosses the row's vertical
+        centre.
+
+        The hit-test is arithmetic whenever the row height divides
+        ``scroll_y`` cleanly: this is the common case during a
+        scroll and avoids walking the row list on every click. The
+        fallback loop handles the row-height mismatch (the panel can
+        resize the row height on the fly).
+        """
         hh = self._cfg.header_height
         dh = self._cfg.row_height
         scroll_y = y - hh + self._scroll_offset
+        if scroll_y >= 0 and dh > 0:
+            row_idx = scroll_y // dh
+            if row_idx < len(self._rows):
+                row_data = self._rows[row_idx]
+                # Arithmetically confirm the click is inside the
+                # row (not in the gap below the last row). Using a
+                # strict `<` keeps the bottom-edge case consistent
+                # with the loop fallback below.
+                if scroll_y < dh * (row_idx + 1):
+                    sha = _row_sha(row_data)
+                    if sha == "":
+                        # Connector-only row — no commit here.
+                        return None
+                    return sha
         for row_idx, row_data in enumerate(self._rows):
             row_top = dh * row_idx
             if row_top <= scroll_y < row_top + dh:
-                return _row_sha(row_data)
+                sha = _row_sha(row_data)
+                if sha == "":
+                    return None
+                return sha
         return None
 
     def _branch_chip_at(self, x: int, y: int) -> dict | None:

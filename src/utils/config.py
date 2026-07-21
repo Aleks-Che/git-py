@@ -97,6 +97,11 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     # ``"full_document"``). Restored on launch, persisted on close.
     # See :class:`src.ui.widgets.diff_view_widget.DiffViewWidget`.
     "diff_view_mode": "changes_only",
+    # Maximum number of commits the graph view shows at once.  The
+    # full DAG is always walked for the search bar (lazily), but the
+    # rendered graph is capped to keep the layout cheap on big repos.
+    # R3.1 (P2): UI used to load every commit and freeze on >5k repos.
+    "graph_history_limit": 500,
 }
 
 # Valid values of the ``"diff_view_mode"`` config key. Anything else
@@ -109,6 +114,7 @@ _INT_KEYS = frozenset({
     "auto_fetch_interval_ms",
     "command_processor_history_size",
     "discard_file_max_backup_bytes",
+    "graph_history_limit",
 })
 
 
