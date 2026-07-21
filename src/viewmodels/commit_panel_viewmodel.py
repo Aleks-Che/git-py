@@ -109,6 +109,12 @@ class CommitPanelViewModel(QObject):
         self._current_diff: str | None = None
         self._commit_summary: str = ""
         self._commit_description: str = ""
+        # R3.2 (P5): batch-mode flag for the stage_all / unstage_all
+        # verbs.  When ``True``, ``stage_file`` / ``unstage_file``
+        # skip their per-file ``refresh_status`` so the batch runs in
+        # O(n) pygit2 ops instead of O(n²).  Toggled by
+        # :meth:`set_batch_refresh`.
+        self._batch_refresh: bool = False
 
     # ----- read-only state (properties) --------------------------------
 
@@ -309,6 +315,13 @@ class CommitPanelViewModel(QObject):
         On success :attr:`staged_files_changed` is emitted (via
         :meth:`refresh_status`). Errors are surfaced through
         :attr:`error_occurred`.
+
+        R3.2 (P5): when ``_batch_refresh`` is enabled (set by
+        :meth:`set_batch_refresh` from
+        :meth:`MainViewModel.stage_all_unstaged`) the per-file
+        :meth:`refresh_status` and side-diff refresh are skipped
+        so the batch runs in O(n) pygit2 ops instead of O(n²).  The
+        batch owner is responsible for the trailing refresh.
         """
         if self._repo is None or not self._repo.is_open:
             return
@@ -321,8 +334,71 @@ class CommitPanelViewModel(QObject):
         except (pygit2.GitError, OSError, KeyError) as exc:
             self.error_occurred.emit(f"Failed to stage {path!r}: {exc}")
             return
+        if self._batch_refresh:
+            return
         self.refresh_status()
         self._refresh_selected_file_side(path, prefer_staged=True)
+
+    def set_batch_refresh(self, enabled: bool) -> None:
+        """Suppress per-file refreshes inside ``stage_file`` / ``unstage_file``.
+
+        R3.2 (P5): the batch verbs in :class:`MainViewModel` flip
+        this on while iterating, then call :meth:`refresh_status`
+        exactly once at the end.  This keeps a 1000-file batch
+        O(n) pygit2 operations instead of O(n²) (each per-file
+        call used to refresh the full status independently).
+        """
+        self._batch_refresh = bool(enabled)
+
+    def recompute_selected_diff(self) -> None:
+        """Refresh the selected file's diff and keep the side coherent.
+
+        R3.2 (P5): when the batch verbs (``stage_all_unstaged`` /
+        ``unstage_all_staged``) finish, the per-file
+        :meth:`stage_file` / :meth:`unstage_file` no longer refresh
+        the selected side inline.  This method is the batch's
+        trailing re-emit: it re-runs :meth:`_compute_and_emit_diff`
+        and, if the previously-selected side is now empty (e.g.
+        unstaging switched the file from staged → unstaged and the
+        user was on the staged side), flips to the side that still
+        has the change.  ``selected_file_changed`` is also emitted so
+        :class:`MainWindow` re-evaluates the line-action mode (the
+        per-file refresh used to do this implicitly via the side
+        change).
+        """
+        path = self._selected_file
+        if path is None:
+            return
+        # If the side the user was on no longer has changes (the file
+        # moved staged ↔ unstaged), flip to the side that does.
+        if self._selected_file_staged and path not in self._staged_files:
+            self._selected_file_staged = False
+            self.selected_file_changed.emit(path)
+        elif (
+            not self._selected_file_staged
+            and path in self._staged_files
+            and path not in self._raw_status_with_unstaged()
+        ):
+            self._selected_file_staged = True
+            self.selected_file_changed.emit(path)
+        self._compute_and_emit_diff(path)
+
+    def _raw_status_with_unstaged(self) -> set[str]:
+        """Return the set of paths that have working-tree changes.
+
+        R3.2 (P5): helper for :meth:`recompute_selected_diff` —
+        ``_raw_status`` carries the pygit2 flag bitfield, so we
+        inspect the WT_* bits to decide whether the file has
+        worktree-only changes.
+        """
+        wt = (
+            pygit2.GIT_STATUS_WT_MODIFIED
+            | pygit2.GIT_STATUS_WT_DELETED
+            | pygit2.GIT_STATUS_WT_NEW
+            | pygit2.GIT_STATUS_WT_RENAMED
+            | pygit2.GIT_STATUS_WT_TYPECHANGE
+        )
+        return {p for p, flag in self._raw_status.items() if flag & wt}
 
     @staticmethod
     def _is_deleted_from_disk(repo: RepositoryManager, path: str) -> bool:
@@ -349,6 +425,10 @@ class CommitPanelViewModel(QObject):
         they're dropped from the index instead.
 
         Errors are surfaced through :attr:`error_occurred`.
+
+        R3.2 (P5): when ``_batch_refresh`` is enabled, the per-file
+        trailing refresh is skipped — see :meth:`stage_file` and
+        :meth:`set_batch_refresh` for the rationale.
         """
         if self._repo is None or not self._repo.is_open:
             return
@@ -358,6 +438,8 @@ class CommitPanelViewModel(QObject):
             unstage_changes(self._repo, path)
         except GitError as exc:
             self.error_occurred.emit(f"Failed to unstage {path!r}: {exc}")
+            return
+        if self._batch_refresh:
             return
         self.refresh_status()
         self._refresh_selected_file_side(path, prefer_staged=False)
@@ -511,10 +593,14 @@ class CommitPanelViewModel(QObject):
     def _compute_and_emit_diff(self, path: str | None) -> None:
         """Compute the diff for ``path`` and emit the diff signals.
 
-        Emits both :attr:`diff_ready` (with the changes-only text) and
-        :attr:`diff_pair_ready` (with the changes-only + full-document
-        pair) so older listeners and the new :class:`DiffViewWidget`
-        toolbar stay in sync.
+        Emits :attr:`diff_ready` (changes-only text) eagerly so the
+        default diff view is responsive; the *full document* variant
+        is computed lazily on :meth:`request_full_document` because
+        rendering 2^31 context lines is expensive on large files
+        (R3.2 P4). For backwards compatibility we still emit
+        :attr:`diff_pair_ready` with an empty ``full_document`` here
+        and rely on the widget to call :meth:`request_full_document`
+        when the user toggles into full-document mode.
 
         For untracked files the "full document" view is just the file
         itself, so both variants are identical to avoid showing an
@@ -531,11 +617,6 @@ class CommitPanelViewModel(QObject):
                 staged=self._selected_file_staged,
                 context_lines=3,
             )
-            full_document = self.build_diff_text(
-                path,
-                staged=self._selected_file_staged,
-                context_lines=_FULL_DOCUMENT_CONTEXT_LINES,
-            )
         except GitError as exc:
             self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
             self._current_diff = ""
@@ -543,8 +624,45 @@ class CommitPanelViewModel(QObject):
             self.diff_pair_ready.emit("", "")
             return
         self._current_diff = changes_only
+        # Track the selected path so a subsequent ``request_full_document``
+        # can recompute the full variant lazily (R3.2 P4).
+        self._current_diff_path = path
+        self._current_diff_staged = self._selected_file_staged
         self.diff_ready.emit(changes_only)
-        self.diff_pair_ready.emit(changes_only, full_document)
+        # Full document is intentionally empty here — the widget will
+        # trigger ``request_full_document()`` on mode switch.  We send
+        # an empty second slot so listeners that compare both strings
+        # still receive *some* signal.
+        self.diff_pair_ready.emit(changes_only, "")
+
+    def request_full_document(self) -> None:
+        """Recompute and emit the full-document diff for the current selection.
+
+        R3.2 (P4): ``_compute_and_emit_diff`` used to build both
+        changes-only and full-document eagerly.  ``full_document`` is
+        expensive (2^31 context lines) and only matters when the user
+        has toggled the right-panel viewer into "full document" mode,
+        so we now defer it to this explicit request.  Emits
+        :attr:`diff_pair_ready` with the recomputed text.
+        """
+        path = getattr(self, "_current_diff_path", None)
+        if (
+            self._repo is None
+            or not self._repo.is_open
+            or path is None
+            or self._current_diff == ""
+        ):
+            return
+        try:
+            full_document = self.build_diff_text(
+                path,
+                staged=self._current_diff_staged,
+                context_lines=_FULL_DOCUMENT_CONTEXT_LINES,
+            )
+        except GitError as exc:
+            self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
+            return
+        self.diff_pair_ready.emit(self._current_diff, full_document)
 
     def build_diff_text(
         self,

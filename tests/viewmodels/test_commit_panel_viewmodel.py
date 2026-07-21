@@ -560,9 +560,9 @@ def test_build_diff_text_accepts_context_lines(
 def test_select_file_emits_diff_pair_ready(
     qtbot, committed_repo: RepositoryManager,
 ) -> None:
-    """Selecting a file emits the ``diff_pair_ready`` signal with both
-    the changes-only and full-document variants so the diff view can
-    toggle modes without re-running Git."""
+    """Selecting a file emits the ``diff_pair_ready`` signal eagerly
+    with the changes-only variant; the full-document variant is built
+    lazily on :meth:`request_full_document` (R3.2 P4)."""
     from pathlib import Path
     _ensure_app()
     (Path(committed_repo.path) / "hello.txt").write_text("changed\n")
@@ -571,11 +571,22 @@ def test_select_file_emits_diff_pair_ready(
 
     with qtbot.waitSignal(vm.diff_pair_ready, timeout=500) as blocker:
         vm.select_file("hello.txt")
-    changes_only, full_document = blocker.args
-    # Both variants are non-empty and contain the change.
+    changes_only, full_document_initial = blocker.args
+    # The eager emission only carries the changes-only variant.
     assert changes_only
-    assert full_document
     assert "+changed" in changes_only
+    assert full_document_initial == "", (
+        "R3.2 P4: full_document is now lazy; the eager emission must "
+        "leave the second slot empty"
+    )
+
+    # After ``request_full_document``, the pair is re-emitted with
+    # both variants populated.
+    with qtbot.waitSignal(vm.diff_pair_ready, timeout=2000) as blocker:
+        vm.request_full_document()
+    changes_only2, full_document = blocker.args
+    assert changes_only2 == changes_only
+    assert full_document
     assert "+changed" in full_document
     # The full-document variant is at least as long as the
     # changes-only one (more context = more lines).

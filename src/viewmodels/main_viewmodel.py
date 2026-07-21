@@ -594,10 +594,26 @@ class MainViewModel(QObject):
         from individual ``stage_file`` calls are routed through
         :attr:`error_occurred` (the VM's normal error path) so a
         single bad file does not abort the rest of the batch.
+
+        R3.2 (P5): the inner ``stage_file`` calls now share a
+        single trailing :meth:`refresh_status`, which keeps a 1000-
+        file batch O(n) pygit2 ops instead of O(n²) (each per-file
+        ``stage_file`` used to refresh the full status independently).
         """
         unstaged = self._commit_panel_view_model.unstaged_paths()
-        for path in unstaged:
-            self._commit_panel_view_model.stage_file(path)
+        try:
+            self._commit_panel_view_model.set_batch_refresh(True)
+            for path in unstaged:
+                self._commit_panel_view_model.stage_file(path)
+        finally:
+            self._commit_panel_view_model.set_batch_refresh(False)
+        # Single trailing refresh — replaces the N refreshes that
+        # ``stage_file`` used to emit (R3.2 P5).
+        self._commit_panel_view_model.refresh_status()
+        # Re-emit the selected file's diff so the preview pane tracks
+        # the new staged/unstaged side once.  Without this the side
+        # would remain stale until the user re-selects the file.
+        self._commit_panel_view_model.recompute_selected_diff()
 
     def unstage_all_staged(self) -> None:
         """Unstage every currently-staged file in one call.
@@ -606,10 +622,20 @@ class MainViewModel(QObject):
         Each file is reset via :meth:`CommitPanelViewModel.unstage_file`;
         individual errors are surfaced through :attr:`error_occurred`
         but do not abort the batch.
+
+        R3.2 (P5): trailing refresh is hoisted out of the loop (see
+        :meth:`stage_all_unstaged` for the same change).
         """
         staged = self._commit_panel_view_model.staged_files()
-        for path in staged:
-            self._commit_panel_view_model.unstage_file(path)
+        try:
+            self._commit_panel_view_model.set_batch_refresh(True)
+            for path in staged:
+                self._commit_panel_view_model.unstage_file(path)
+        finally:
+            self._commit_panel_view_model.set_batch_refresh(False)
+        # Single trailing refresh — replaces the N refreshes.
+        self._commit_panel_view_model.refresh_status()
+        self._commit_panel_view_model.recompute_selected_diff()
 
     # ----- commit-graph selection (drives the right panel) ------------
 
@@ -766,9 +792,6 @@ class MainViewModel(QObject):
         self._log("checkout", f"Checkout commit {sha[:7]!r} — detached HEAD")
         self._is_busy = True
         self.busy_changed.emit(True)
-        from PySide6.QtCore import QEventLoop
-        from PySide6.QtWidgets import QApplication
-        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
         command = CheckoutCommitCommand(self._repo_manager, sha)
         try:
             self._command_processor.execute(command)
@@ -1175,9 +1198,6 @@ class MainViewModel(QObject):
             pass  # diagnostic only — never block the actual operation
         self._is_busy = True
         self.busy_changed.emit(True)
-        from PySide6.QtCore import QEventLoop
-        from PySide6.QtWidgets import QApplication
-        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
         command = CheckoutCommand(self._repo_manager, name)
         try:
             self._command_processor.execute(command)
@@ -1297,9 +1317,6 @@ class MainViewModel(QObject):
         command = FetchCommand(self._repo_manager, remote_name, branch_name)
         self._is_busy = True
         self.busy_changed.emit(True)
-        from PySide6.QtCore import QEventLoop
-        from PySide6.QtWidgets import QApplication
-        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
         try:
             self._command_processor.execute(command)  # type: ignore[arg-type]
         except GitError as exc:
@@ -1435,9 +1452,6 @@ class MainViewModel(QObject):
 
         self._is_busy = True
         self.busy_changed.emit(True)
-        from PySide6.QtCore import QEventLoop
-        from PySide6.QtWidgets import QApplication
-        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
         try:
             self._command_processor.execute(
                 FetchCommand(self._repo_manager, remote_name, branch_name),
@@ -2593,6 +2607,7 @@ class MainViewModel(QObject):
         )
 
         self._log("conflict", f"Resolving conflict in {path!r}")
+
         try:
             full_path = Path(self._repo_manager.path) / path
             full_path.parent.mkdir(parents=True, exist_ok=True)
