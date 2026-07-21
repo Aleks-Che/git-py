@@ -621,10 +621,8 @@ class MainWindow(QMainWindow):
         # The commit-detail panel surfaces its own errors via a public
         # ``error_occurred`` signal; route both branches to the existing
         # error/log handlers so a diff failure does not silently disappear.
+        # The ``_log_widget`` branch is wired below, once the widget exists.
         self._right_panel._commit_detail.error_occurred.connect(self._on_error)
-        self._right_panel._commit_detail.error_occurred.connect(
-            self._log_widget.append_log,
-        )
 
         top = QSplitter(self)
         top.addWidget(self._left_panel)
@@ -659,6 +657,9 @@ class MainWindow(QMainWindow):
 
         self._log_widget = LogWidget(self)
         self._log_widget.setMaximumHeight(180)
+        self._right_panel._commit_detail.error_occurred.connect(
+            self._log_widget.append_log,
+        )
 
         self._action_history = ActionHistoryWidget(DARK_THEME, self)
         self._action_history.setMaximumHeight(180)
