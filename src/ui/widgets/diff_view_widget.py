@@ -1083,9 +1083,16 @@ class DiffViewWidget(QWidget):
         block = self._editor.document().findBlockByLineNumber(target_idx)
         if not block.isValid():
             return
-        cursor = QTextCursor(block)
 
+        # Re-derive the cursor inside the singleShot callback instead of
+        # capturing it in the closure — the document may have changed
+        # between scheduling and firing (R2.6 / M23).
         def _do_scroll() -> None:
+            doc = self._editor.document()
+            block_now = doc.findBlockByLineNumber(target_idx)
+            if not block_now.isValid():
+                return
+            cursor = QTextCursor(block_now)
             self._editor.setTextCursor(cursor)
             self._editor.ensureCursorVisible()
 

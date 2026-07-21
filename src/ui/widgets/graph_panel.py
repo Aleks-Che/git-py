@@ -1244,6 +1244,13 @@ class GraphTableWidget(QWidget):
     # ------------------------------------------------------------------
 
     def paintEvent(self, event) -> None:  # noqa: N802
+        # H14: invalidate the chip-rect cache on every repaint so a
+        # click after a scroll / resize / row-count change is
+        # always hit-tested against the rects that are currently
+        # visible. Without this, the cache can hold rects computed
+        # for a different ``_scroll_offset`` and the popup fires
+        # for the wrong chip.
+        self._branch_chip_rects.clear()
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w = self.width()
@@ -2973,7 +2980,10 @@ class BranchStackPopup(QFrame):
             parent,
             Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint,
         )
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        # H13: Mark for deletion on close so the popup object does not
+        # linger after the user dismisses it; the next hover opens a
+        # fresh instance instead of colliding with the old one.
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setObjectName("BranchStackPopup")
         # ``Qt.Tool`` pops the window above normal widgets but keeps
         # it out of the task bar (typical behaviour for transient

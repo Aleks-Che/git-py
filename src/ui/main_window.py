@@ -1307,10 +1307,22 @@ class MainWindow(QMainWindow):
             self._graph_table.scroll_to_commit(results[0])
 
     def _on_busy_changed(self, busy: bool) -> None:
-        """Show / hide the spinner and toggle the re-entrancy guard."""
+        """Show / hide the spinner and toggle the re-entrancy guard.
+
+        On busy=False, re-evaluate undo/redo from the command processor and
+        re-enable close if a repo is open (R2.3 / R2.6 M13).
+        """
         self._busy_spinner.setVisible(busy)
         if busy:
             self._status.showMessage("Working…")
+        else:
+            # Restore enabled state for undo/redo based on actual
+            # command-processor state; close action is enabled only if
+            # a repo is open.
+            self._action_undo.setEnabled(self._main_vm.command_processor().can_undo)
+            self._action_redo.setEnabled(self._main_vm.command_processor().can_redo)
+            self._action_close.setEnabled(self._main_vm.repository_manager() is not None)
+            self._status.clearMessage()
         # Disable the toolbar buttons that could race with the worker.
         remote_actions = (
             self._action_fetch,
@@ -1578,22 +1590,49 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _open_remote_manage_dialog(self) -> None:
-        """Show the :class:`RemoteManageDialog`; reflect changes via the VM."""
+        """Show the :class:`RemoteManageDialog`; reflect changes via the VM.
+
+        On ``dialog.exec()`` return / close, the lambda hooks are
+        explicitly disconnected so a subsequent dialog instance receives
+        a fresh slate (R2.6 / M14).
+        """
         repo = self._main_vm.repository_manager()
         if repo is None or not repo.is_open:
             return
         dialog = RemoteManageDialog(self)
         dialog.set_remotes(self._main_vm.list_remotes())
-        dialog.add_requested.connect(
-            lambda name, url: self._main_vm.add_remote(name, url),
-        )
-        dialog.remove_requested.connect(
-            lambda name: self._main_vm.remove_remote(name),
-        )
+
+        def on_add(name, url):
+            self._main_vm.add_remote(name, url)
+
+        def on_remove(name):
+            self._main_vm.remove_remote(name)
+
+        def on_stack():
+            dialog.set_remotes(self._main_vm.list_remotes())
+
+        dialog.add_requested.connect(on_add)
+        dialog.remove_requested.connect(on_remove)
         # Refresh the table after a successful add / remove.
-        self._main_vm.command_processor().stack_changed.connect(
-            lambda: dialog.set_remotes(self._main_vm.list_remotes()),
-        )
+        processor = self._main_vm.command_processor()
+        processor.stack_changed.connect(on_stack)
+
+        def _cleanup(_result):
+            try:
+                dialog.add_requested.disconnect(on_add)
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                dialog.remove_requested.disconnect(on_remove)
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                processor.stack_changed.disconnect(on_stack)
+            except (RuntimeError, TypeError):
+                pass
+            dialog.deleteLater()
+
+        dialog.finished.connect(_cleanup)
         dialog.exec()
 
     def _show_about(self) -> None:

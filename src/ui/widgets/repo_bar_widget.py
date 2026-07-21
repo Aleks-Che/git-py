@@ -37,13 +37,17 @@ class _CloseTabButton(QWidget):
     Because it is a plain ``QWidget`` (not ``QPushButton``), no
     style‑sheet or platform‑style padding is added — the tab bar
     sees exactly the size we report.
+
+    The :attr:`clicked_signal` carries no payload (H16): the index
+    of the tab to close is resolved at emit-time by the slot via
+    :meth:`QTabBar.tabAt` so a stale cached index cannot survive a
+    drag-and-drop reorder of the tab bar.
     """
 
-    clicked_signal = Signal(int)
+    clicked_signal = Signal(QPoint)
 
-    def __init__(self, tab_index: int, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._tab_index = tab_index
         self._hovered = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedSize(14, 14)
@@ -66,7 +70,11 @@ class _CloseTabButton(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked_signal.emit(self._tab_index)
+            # H16: ship the click position (in *tab-bar* coordinates)
+            # so the slot can call ``QTabBar.tabAt(pos)`` and resolve
+            # the current tab — the index is no longer cached on the
+            # button instance and therefore survives DnD reorder.
+            self.clicked_signal.emit(event.pos())
 
     def paintEvent(self, _event: object) -> None:  # noqa: N802
         if not self._hovered:
@@ -156,7 +164,10 @@ class RepoBarWidget(QWidget):
         elif isinstance(obj, _CloseTabButton):
             if event.type() == QEvent.Type.Enter:
                 self._hide_timer.stop()
-                self._set_hovered_tab(obj._tab_index)
+                # Resolve the hovered tab from the button's screen
+                # position in the tab bar (H16 — no cached index).
+                local_pos = obj.mapTo(self._tab_bar, QPoint(0, 0))
+                self._set_hovered_tab(self._tab_bar.tabAt(local_pos))
             elif event.type() == QEvent.Type.Leave:
                 self._hide_timer.start()
         return super().eventFilter(obj, event)
@@ -190,7 +201,9 @@ class RepoBarWidget(QWidget):
         self._sync_tab_bar_index(self._vm.active_index)
 
     def _install_close_button(self, index: int) -> None:
-        btn = _CloseTabButton(index, self._tab_bar)
+        btn = _CloseTabButton(self._tab_bar)
+        # H16: tab index is no longer cached on the button — the slot
+        # resolves it via ``tabAt`` on every click.
         btn.clicked_signal.connect(self._on_tab_close_requested)
         btn.installEventFilter(self)
         self._tab_bar.setTabButton(
@@ -208,7 +221,22 @@ class RepoBarWidget(QWidget):
         if 0 <= index < self._tab_bar.count():
             self._vm.set_active_tab(index)
 
-    def _on_tab_close_requested(self, index: int) -> None:
+    def _on_tab_close_requested(self, local_pos: QPoint) -> None:
+        """Resolve the clicked tab via :meth:`QTabBar.tabAt` (H16).
+
+        The position is delivered in the tab-bar's local coordinate
+        system (the button re-broadcast ``mousePressEvent``'s
+        ``event.pos()``); we then call ``tabAt`` so the index is
+        always the *current* one — a drag-and-drop reorder or an
+        external :meth:`removeTab` cannot leave a stale cached
+        index behind.
+
+        Falls back to ``-1`` so the VM sees "no such tab" instead of
+        a bogus close.
+        """
+        index = self._tab_bar.tabAt(local_pos)
+        if index < 0 or index >= self._tab_bar.count():
+            return
         self._vm.remove_tab(index)
 
     def _on_active_tab_changed(self, index: int) -> None:

@@ -921,7 +921,11 @@ class LeftPanel(QTreeWidget):
         menu = QMenu(self)
         for action in actions:
             menu.addAction(action)
-        menu.exec(event.position().toPoint())
+        # H15: ``QMenu.exec`` expects a *global* screen position; pass
+        # the drop point in viewport-relative coordinates and map it
+        # up to global screen coordinates so the menu actually
+        # appears under the cursor.
+        menu.exec(self.viewport().mapToGlobal(event.position().toPoint()))
         event.acceptProposedAction()
 
     def _on_drop(
