@@ -712,8 +712,23 @@ class MainViewModel(QObject):
 
         Same busy-guard rationale as :meth:`undo` (now via
         :func:`_guard_mutation`).
+
+        Special cases:
+        - For commands that ran on the worker thread (Push, Pull, Fetch,
+          AddRemote, RemoveRemote), the redo also runs via ``_run_async``
+          — network re-do cannot block the UI thread.
+        - For ``MergeCommand`` / ``PullCommand`` whose previous execute
+          left a conflict-state, emit ``error_occurred("Resolve conflicts
+          before redoing merge.")`` and skip the redo.
         """
         if not self._command_processor.can_redo:
+            return
+        cmd = self._command_processor.peek_redo_command()
+        # Conflict redo rejection (M6)
+        if cmd is not None and getattr(cmd, "_had_conflict_in_execute", False):
+            self.error_occurred.emit(
+                "Resolve conflicts before redoing merge."
+            )
             return
         try:
             self._command_processor.redo()

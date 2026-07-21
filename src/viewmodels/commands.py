@@ -22,8 +22,9 @@ import pygit2
 from PySide6.QtCore import QObject, Signal
 
 from src.core.diff_parser import ParsedDiffLine
-from src.core.exceptions import GitError
+from src.core.exceptions import GitError, MergeConflictError
 from src.core.operations import (
+    abort_merge,
     abort_rebase,
     add_remote,
     add_to_gitignore,
@@ -39,6 +40,7 @@ from src.core.operations import (
     discard_file,
     fetch,
     find_stash_index_by_oid,
+    is_merge_in_progress,
     is_rebase_in_progress,
     list_remotes,
     merge_branch,
@@ -116,14 +118,68 @@ class CommandProcessor(QObject):
     stack_changed = Signal()
     error_occurred = Signal(str)
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(self, parent: QObject | None = None, max_undo: int | None = None) -> None:
         super().__init__(parent)
-        self._undo_stack: deque[GitCommand] = deque()
-        self._redo_stack: deque[GitCommand] = deque()
+        if max_undo is None:
+            try:
+                from src.utils.config import default_config_path, load_config
+
+                configured = load_config(default_config_path()).get(
+                    "command_processor_history_size",
+                    100,
+                )
+            except (OSError, TypeError, ValueError):
+                configured = 100
+            max_undo = (
+                configured
+                if isinstance(configured, int) and not isinstance(configured, bool)
+                else 100
+            )
+        self._max_undo = max(1, max_undo)
+        self._undo_stack: deque[GitCommand] = deque(maxlen=self._max_undo)
+        self._redo_stack: deque[GitCommand] = deque(maxlen=self._max_undo)
+
+    def _rebuild_with_maxlen(self) -> None:
+        """Rebuild both history deques, retaining their newest entries."""
+        self._undo_stack = deque(self._undo_stack, maxlen=self._max_undo)
+        self._redo_stack = deque(self._redo_stack, maxlen=self._max_undo)
+
+    def set_max_undo(self, n: int) -> None:
+        """Change the history bound and immediately trim both stacks."""
+        if isinstance(n, bool) or not isinstance(n, int):
+            raise TypeError("max_undo must be an integer")
+        self._max_undo = max(1, n)
+        self._rebuild_with_maxlen()
+        self.stack_changed.emit()
+
+    @property
+    def max_undo(self) -> int:
+        """Maximum number of entries retained in either history stack."""
+        return self._max_undo
+
+    def peek_undo_command(self) -> GitCommand | None:
+        """Return the most recent undo command without changing history."""
+        return self._undo_stack[-1] if self._undo_stack else None
+
+    def peek_redo_command(self) -> GitCommand | None:
+        """Return the next redo command without changing either stack."""
+        return self._redo_stack[-1] if self._redo_stack else None
 
     def execute(self, command: GitCommand) -> None:
         """Run ``command.execute()`` and push it onto the undo stack."""
-        command.execute()
+        try:
+            command.execute()
+        except MergeConflictError:
+            # A merge/pull conflict changes the index and leaves an
+            # in-progress operation behind. Keep the command in history so
+            # Undo can abort and clean up that partial operation, while the
+            # exception still reaches the ViewModel's conflict UI.
+            if getattr(command, "_had_conflict_in_execute", False):
+                command._timestamp = time.time()
+                command.is_noop = False
+                self._undo_stack.append(command)
+                self.stack_changed.emit()
+            raise
         command._timestamp = time.time()
         if not command.is_noop:
             self._undo_stack.append(command)
@@ -602,6 +658,7 @@ class MergeCommand(GitCommand):
         self._head_sha_before: str | None = None
         self._merge_oid: str | None = None
         self._head_moved = False
+        self._had_conflict_in_execute = False
 
     def execute(self) -> None:
         repo = self._repo.repo
@@ -628,13 +685,20 @@ class MergeCommand(GitCommand):
             self._head_ref_name_before = repo.head.name
             self._head_sha_before = str(repo.head.target)
 
-        merge_branch(
-            self._repo,
-            self._source,
-            target=self._target,
-            message=self._message,
-            no_ff=self._no_ff,
-        )
+        try:
+            merge_branch(
+                self._repo,
+                self._source,
+                target=self._target,
+                message=self._message,
+                no_ff=self._no_ff,
+            )
+        except MergeConflictError:
+            self._had_conflict_in_execute = True
+            self._merge_oid = None
+            self._head_moved = False
+            self.is_noop = False
+            raise
 
         ref_after = repo.lookup_reference(self._target_ref_name)
         after_sha = str(ref_after.target)
@@ -650,6 +714,13 @@ class MergeCommand(GitCommand):
         self.is_noop = self._merge_oid is None and not self._head_moved
 
     def undo(self) -> None:
+        # A failed merge leaves MERGE_HEAD and conflict entries behind.
+        # Abort that operation instead of treating it like a clean merge.
+        if self._had_conflict_in_execute:
+            if is_merge_in_progress(self._repo):
+                abort_merge(self._repo)
+            self._had_conflict_in_execute = False
+            return
         # Up-to-date merges on the current branch do not move anything.  A
         # target merge from another branch can still have checked out the
         # target, though, so restore HEAD whenever that checkout happened.
@@ -738,31 +809,34 @@ class RebaseCommand(GitCommand):
 
 
 class CherryPickCommand(GitCommand):
-    """Cherry-pick ``sha`` onto the current HEAD; undo by resetting --mixed.
-
-    :func:`src.core.operations.cherry_pick` only *stages* the change
-    (matching ``git cherry-pick --no-commit`` semantics) — the user
-    makes a follow-up commit themselves, which lands on the undo
-    stack as a separate :class:`CommitCommand`. Undoing this command
-    clears the staged changes by resetting the index to match the
-    pre-pick HEAD; combined with the ``CommitCommand`` undo, the
-    cherry-pick is fully reverted.
-
-    Detached-HEAD handling (R1.3): cherry-pick is allowed on a
-    detached HEAD (``git cherry-pick`` does not require a branch).
-    The captured ``_previous_head`` is the OID, and
-    ``reset(OID, mixed)`` preserves the detached/symbolic HEAD state,
-    so undo restores the repository to exactly where it was — detached
-    HEAD stays detached, symbolic HEAD stays on its branch.
-    """
+    """Cherry-pick ``sha`` onto the current HEAD; undo the touched index paths."""
 
     def __init__(self, repo: RepositoryManager, sha: str) -> None:
         self._repo = repo
         self._sha = sha
         self._previous_head: str | None = None
         self._previous_head_was_detached: bool = False
+        self._index_paths: dict[str, int] = {}
+        self._index_entries: dict[str, tuple[str, int] | None] = {}
+        self._index_captured = False
+
+    def _capture_index(self) -> None:
+        if self._index_captured:
+            return
+        status = self._repo.repo.status()
+        self._index_paths = {path: int(flag) for path, flag in status.items()}
+        self._index_entries = {
+            path: snapshot_index_entry(self._repo, path)
+            for path in self._index_paths
+        }
+        self._index_captured = True
+
+    def _restore_index(self) -> None:
+        for path, entry in self._index_entries.items():
+            restore_index_entry(self._repo, path, entry)
 
     def execute(self) -> None:
+        self._capture_index()
         pygit2_repo = self._repo.repo
         if not pygit2_repo.head_is_unborn:
             self._previous_head = str(pygit2_repo.head.target)
@@ -772,10 +846,8 @@ class CherryPickCommand(GitCommand):
     def undo(self) -> None:
         if self._previous_head is None:
             return
-        # ``--mixed`` resets the index to match HEAD but leaves the
-        # worktree alone. The cherry-pick only touched the index, so
-        # this cleanly reverts the staged change.
         reset(self._repo, self._previous_head, mode="mixed")
+        self._restore_index()
 
     @property
     def name(self) -> str:
@@ -797,8 +869,27 @@ class RevertCommand(GitCommand):
         self._sha = sha
         self._previous_head: str | None = None
         self._previous_head_was_detached: bool = False
+        self._index_paths: dict[str, int] = {}
+        self._index_entries: dict[str, tuple[str, int] | None] = {}
+        self._index_captured = False
+
+    def _capture_index(self) -> None:
+        if self._index_captured:
+            return
+        status = self._repo.repo.status()
+        self._index_paths = {path: int(flag) for path, flag in status.items()}
+        self._index_entries = {
+            path: snapshot_index_entry(self._repo, path)
+            for path in self._index_paths
+        }
+        self._index_captured = True
+
+    def _restore_index(self) -> None:
+        for path, entry in self._index_entries.items():
+            restore_index_entry(self._repo, path, entry)
 
     def execute(self) -> None:
+        self._capture_index()
         pygit2_repo = self._repo.repo
         if not pygit2_repo.head_is_unborn:
             self._previous_head = str(pygit2_repo.head.target)
@@ -809,6 +900,7 @@ class RevertCommand(GitCommand):
         if self._previous_head is None:
             return
         reset(self._repo, self._previous_head, mode="mixed")
+        self._restore_index()
 
     @property
     def name(self) -> str:
@@ -889,6 +981,7 @@ class PullCommand(GitCommand):
         self._callbacks = callbacks
         self._previous_head: str | None = None
         self._head_moved = False
+        self._had_conflict_in_execute = False
 
     def execute(self) -> None:
         pygit2_repo = self._repo.repo
@@ -896,7 +989,13 @@ class PullCommand(GitCommand):
             self._previous_head = str(pygit2_repo.head.target)
         else:
             self._previous_head = None
-        pull(self._repo, self._remote_name, self._refspec, callbacks=self._callbacks)
+        try:
+            pull(self._repo, self._remote_name, self._refspec, callbacks=self._callbacks)
+        except MergeConflictError:
+            self._had_conflict_in_execute = True
+            self._head_moved = False
+            self.is_noop = False
+            raise
         if self._previous_head is None:
             self._head_moved = False
         else:
@@ -906,6 +1005,11 @@ class PullCommand(GitCommand):
                 self._head_moved = False
 
     def undo(self) -> None:
+        if getattr(self, "_had_conflict_in_execute", False):
+            if is_merge_in_progress(self._repo):
+                abort_merge(self._repo)
+            self._had_conflict_in_execute = False
+            return
         if self._previous_head is None or not self._head_moved:
             return
         reset(self._repo, self._previous_head, mode="hard")
@@ -1300,6 +1404,7 @@ class DiscardFileCommand(GitCommand):
         self._repo = repo
         self._path = path
         self._untracked_backup: bytes | None = None
+        self._backup_exceeded = False
 
     def _is_untracked(self) -> bool:
         flag = self._repo.repo.status().get(self._path)
@@ -1329,6 +1434,17 @@ class DiscardFileCommand(GitCommand):
             return
         full_path = Path(workdir) / self._path
         if not full_path.exists():
+            return
+        from src.utils.config import default_config_path, get_int, load_config
+
+        cap = get_int(
+            load_config(default_config_path()),
+            "discard_file_max_backup_bytes",
+            1024 * 1024,
+        )
+        if full_path.stat().st_size > max(0, cap):
+            self._backup_exceeded = True
+            full_path.unlink()
             return
         self._untracked_backup = full_path.read_bytes()
         full_path.unlink()
