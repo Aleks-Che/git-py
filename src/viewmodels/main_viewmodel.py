@@ -32,6 +32,8 @@ error_occurred(str)
 """
 from __future__ import annotations
 
+import functools
+
 from PySide6.QtCore import QObject, QThreadPool, QTimer, Signal
 
 from src.core.diff_parser import ParsedDiffLine
@@ -49,6 +51,34 @@ from src.viewmodels.branch_panel_viewmodel import BranchPanelViewModel
 from src.viewmodels.commands import CommandProcessor
 from src.viewmodels.commit_panel_viewmodel import CommitPanelViewModel
 from src.viewmodels.graph_viewmodel import GraphViewModel
+
+
+def _guard_mutation(method):
+    """Reject the verb with an ``error_occurred`` emission while async busy.
+
+    R2.3 (H7/H8) — every mutating verb must refuse to run while a
+    long-running async worker is in flight on the same VM.  Wrapping
+    the verb with this decorator keeps the busy-guard check in one
+    place instead of being copy-pasted at the top of each call site
+    (and silently missed by new verbs).
+
+    The decorator short-circuits the call by emitting
+    :attr:`MainViewModel.error_occurred` and returning early; the
+    wrapped method is **not** invoked at all.  ``undo`` / ``redo``
+    historically had their own inline checks; both are also routed
+    through this decorator now (R2.3 refactor).
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if self._is_busy:
+            self.error_occurred.emit(
+                "Another operation is in progress — wait until it completes.",
+            )
+            self._log("busy", f"{method.__name__} rejected: another op in progress", level="warn")
+            return None
+        return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class MainViewModel(QObject):
@@ -469,6 +499,7 @@ class MainViewModel(QObject):
 
     # ----- verb commands ----------------------------------------------
 
+    @_guard_mutation
     def commit_changes(self, message: str) -> None:
         """Create a new commit on ``HEAD`` via :class:`CommitCommand`.
 
@@ -647,6 +678,7 @@ class MainViewModel(QObject):
             self.error_occurred.emit(f"Failed to refresh: {exc}")
             self._log("refresh", f"Refresh failed: {exc}", level="error")
 
+    @_guard_mutation
     def undo(self) -> None:
         """Undo the most recent command; refreshes views on success.
 
@@ -657,13 +689,11 @@ class MainViewModel(QObject):
         would launch a UI-thread mutating Git op on the same
         libgit2 state, deadlocking or corrupting the index.  Reject
         the call until the worker has finished.
+
+        R2.3 — the busy-guard is now centralised in
+        :func:`_guard_mutation`; the inline check from R2.2 has
+        been removed for consistency with the other verbs.
         """
-        if self._is_busy:
-            self.error_occurred.emit(
-                "Another operation is in progress — wait until it completes.",
-            )
-            self._log("undo", "Undo rejected: another op in progress", level="warn")
-            return
         if not self._command_processor.can_undo:
             return
         try:
@@ -676,17 +706,13 @@ class MainViewModel(QObject):
         self._commit_panel_view_model.refresh_selected_diff()
         self._log("undo", "Undo succeeded")
 
+    @_guard_mutation
     def redo(self) -> None:
         """Redo the most recently undone command; refreshes views on success.
 
-        Same busy-guard rationale as :meth:`undo`.
+        Same busy-guard rationale as :meth:`undo` (now via
+        :func:`_guard_mutation`).
         """
-        if self._is_busy:
-            self.error_occurred.emit(
-                "Another operation is in progress — wait until it completes.",
-            )
-            self._log("redo", "Redo rejected: another op in progress", level="warn")
-            return
         if not self._command_processor.can_redo:
             return
         try:
@@ -936,6 +962,7 @@ class MainViewModel(QObject):
         self._refresh_all_views()
         self._log("stash", f"File {path!r} stashed")
 
+    @_guard_mutation
     def ignore_pattern(self, pattern: str) -> None:
         """Add a pattern to ``.gitignore`` via :class:`IgnoreCommand`."""
         if self._repo_manager is None or not self._repo_manager.is_open:
@@ -954,6 +981,7 @@ class MainViewModel(QObject):
         self._commit_panel_view_model.refresh_status()
         self._log("gitignore", f"Pattern {pattern!r} added to .gitignore")
 
+    @_guard_mutation
     def delete_file_from_disk(self, path: str) -> None:
         """Delete a file from disk; refreshes the commit panel after."""
         if self._repo_manager is None or not self._repo_manager.is_open:
@@ -1149,6 +1177,7 @@ class MainViewModel(QObject):
         self._log("checkout", f"Checkout {name!r} succeeded — HEAD is now {name}")
         return True
 
+    @_guard_mutation
     def checkout_remote_branch(self, remote_name: str) -> bool:
         """Create a local tracking branch from ``remote_name`` and switch to it.
 
@@ -1267,7 +1296,12 @@ class MainViewModel(QObject):
             self.busy_changed.emit(False)
 
         self._log("fetch", "Fetch succeeded")
-        self._refresh_all_views()
+        # M9 — no ``_refresh_all_views()`` here.  The final
+        # ``self.checkout_branch(local_name)`` below is the
+        # authoritative refresh for this verb; refreshing earlier
+        # races with the follow-up lookup / fast-forward logic and
+        # is unnecessary work.  The previous extra refresh has
+        # been removed (R2.3 M9).
 
         # Look up the (now-updated) remote tracking ref.
         remote_info = next(
@@ -1550,6 +1584,7 @@ class MainViewModel(QObject):
             return False
         return True
 
+    @_guard_mutation
     def create_branch(self, name: str, target_sha: str | None = None) -> None:
         """Create a local branch via :class:`CreateBranchCommand`."""
         if self._repo_manager is None or not self._repo_manager.is_open:
@@ -1608,6 +1643,7 @@ class MainViewModel(QObject):
         self._log("branch", f"Branch {name!r} created at {target_sha[:7]}")
         return True
 
+    @_guard_mutation
     def delete_branch(self, name: str, force: bool = False) -> None:
         """Delete a local branch via :class:`DeleteBranchCommand`."""
         if self._repo_manager is None or not self._repo_manager.is_open:
@@ -1659,6 +1695,7 @@ class MainViewModel(QObject):
         self.delete_branch(local_name)
         self.delete_remote_branch(remote_branch_name)
 
+    @_guard_mutation
     def create_tag(
         self,
         name: str,
@@ -1684,6 +1721,7 @@ class MainViewModel(QObject):
         self._refresh_all_views()
         self._log("tag", f"Tag {name!r} created")
 
+    @_guard_mutation
     def rename_branch(self, old_name: str, new_name: str, force: bool = False) -> None:
         """Rename a local branch via :class:`RenameBranchCommand`."""
         if self._repo_manager is None or not self._repo_manager.is_open:
@@ -1904,6 +1942,7 @@ class MainViewModel(QObject):
             return ""
         return repo.head.shorthand
 
+    @_guard_mutation
     def cherry_pick(self, sha: str) -> None:
         """Cherry-pick ``sha`` onto HEAD via :class:`CherryPickCommand`.
 
@@ -1937,6 +1976,7 @@ class MainViewModel(QObject):
         self._commit_panel_view_model.refresh_status()
         self._log("cherry-pick", f"Cherry-pick {sha[:7]!r} staged")
 
+    @_guard_mutation
     def revert(self, sha: str) -> None:
         """Revert ``sha`` via :class:`RevertCommand`.
 
@@ -2158,6 +2198,7 @@ class MainViewModel(QObject):
         stash_list = self._repo_manager.stash_list
         return any(s.sha == sha for s in stash_list)
 
+    @_guard_mutation
     def apply_stash_file(self, stash_sha: str, path: str) -> None:
         """Apply a single file from the stash identified by ``stash_sha``.
 
@@ -2180,6 +2221,7 @@ class MainViewModel(QObject):
         self._commit_panel_view_model.refresh_status()
         self._log("stash", f"Applied {path!r} from stash {stash_sha[:8]!r}")
 
+    @_guard_mutation
     def apply_stash_files(self, stash_sha: str, paths: list[str]) -> None:
         """Apply several files from the stash in one batch.
 
@@ -2500,6 +2542,7 @@ class MainViewModel(QObject):
             pass
         self.fetch_changes("origin", silent=True)
 
+    @_guard_mutation
     def resolve_conflict(self, path: str, resolution: str) -> None:
         """Write ``resolution`` to ``path``, stage it, and check for more conflicts.
 
@@ -2600,6 +2643,48 @@ class MainViewModel(QObject):
             return
         self._clear_conflict_state()
         self._refresh_all_views()
+
+    @_guard_mutation
+    def complete_merge_after_conflict(self, source: str, parent_oid: str | None = None) -> None:
+        """Finalise a resolved merge via :class:`CompleteMergeCommand`.
+
+        Constructs and executes :class:`CompleteMergeCommand`, which
+        calls :func:`src.core.operations.complete_merge` to write the
+        merge commit. The command captures ``parent_oid`` so undo
+        can hard-reset HEAD and the worktree back to the pre-merge
+        SHA — making the conflict-resolution flow reversible through
+        the standard toolbar Undo.
+
+        ``parent_oid`` defaults to ``self._repo_manager.repo.head.target``
+        captured at call time (the pre-merge HEAD). The caller can
+        override it (e.g. when the user reopens the dialog and the
+        VM has already moved HEAD elsewhere) — passing an explicit
+        value keeps the undo path anchored to the SHA the merge
+        actually replaced.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            self._log("merge", "Complete merge failed: no repository open", level="error")
+            return
+        if parent_oid is None:
+            parent_oid = str(self._repo_manager.repo.head.target)
+        from src.viewmodels.commands import CompleteMergeCommand
+
+        self._log("merge", f"Complete merge (source={source!r}, parent={parent_oid[:7]})")
+        command = CompleteMergeCommand(
+            self._repo_manager,
+            source=source,
+            parent_oid=parent_oid,
+        )
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("merge", f"Complete merge failed: {exc}", level="error")
+            return
+        self._clear_conflict_state()
+        self._refresh_all_views()
+        self._log("merge", "Complete merge succeeded")
 
     def conflict_state(self) -> dict | None:
         """Return a copy of the current conflict state, or ``None``."""

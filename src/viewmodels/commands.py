@@ -1497,12 +1497,52 @@ class CreateTagCommand(GitCommand):
         return f"create tag {self._name}{suffix}"
 
 
+class CompleteMergeCommand(GitCommand):
+    """Finalize a conflict-resolved merge by creating the merge commit.
+
+    Undo: hard-reset HEAD back to the pre-merge parent OID captured
+    before the merge commit was created. The worktree is also reset
+    by the hard-reset — caller is expected to have a worktree they
+    can re-populate from the resolved tree if needed.
+    """
+
+    def __init__(
+        self,
+        repo_manager,
+        source: str,
+        parent_oid: str,
+        message: str | None = None,
+    ) -> None:
+        self._repo = repo_manager
+        self._source = source  # ref / branch / SHA being merged in
+        self._parent_oid = parent_oid  # pre-merge HEAD SHA — undo target
+        self._message = message
+        self._merge_oid: str | None = None
+
+    @property
+    def name(self) -> str:
+        return "CompleteMerge"
+
+    def execute(self) -> None:
+        from src.core.operations import complete_merge
+
+        self._merge_oid = complete_merge(
+            self._repo, source=self._source, message=self._message
+        )
+    def undo(self) -> None:
+        from src.core.operations import reset as core_reset
+        # Hard reset to pre-merge HEAD. Worktree is also reset —
+        # caller should re-populate from the resolved tree if needed.
+        core_reset(self._repo, target=self._parent_oid, mode="hard")
+
+
 __all__ = [
     "AddRemoteCommand",
     "CheckoutCommand",
     "CheckoutCommitCommand",
     "CherryPickCommand",
     "CommandProcessor",
+    "CompleteMergeCommand",
     "CommitCommand",
     "CreateBranchCommand",
     "CreateTagCommand",
