@@ -136,11 +136,16 @@ def parse_diff(
 
 
 def _blob_line_count(repo: pygit2.Repository | None, oid: pygit2.Oid) -> int:
-    """Count newlines in the blob identified by ``oid`` (0 for an empty/missing blob)."""
+    """Count text lines, returning 0 for missing or binary blobs."""
     if repo is None or not oid:
         return 0
     try:
-        return repo[oid].data.count(b"\n")
+        data = repo[oid].data
+        if b"\x00" in data:
+            return 0
+        if not data:
+            return 0
+        return data.count(b"\n") + (0 if data.endswith(b"\n") else 1)
     except KeyError:
         return 0
 

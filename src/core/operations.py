@@ -112,12 +112,6 @@ def _to_commit_info(commit: pygit2.Commit) -> CommitInfo:
     )
 
 
-def _ensure_clean(repo: pygit2.Repository) -> None:
-    """Raise :class:`DirtyWorkTreeError` if ``repo`` has any index/worktree changes."""
-    if any(repo.status()):
-        raise DirtyWorkTreeError("Working tree has uncommitted changes.")
-
-
 # ----- commit ---------------------------------------------------------------
 
 
@@ -987,7 +981,13 @@ def revert(
     repo: RepositoryManager | pygit2.Repository,
     sha: str,
 ) -> CommitInfo:
-    """Revert the commit at ``sha`` (creates a new commit that undoes it)."""
+    """Apply the inverse of ``sha`` to the index and worktree.
+
+    A successful operation returns the current ``HEAD`` commit information;
+    it does not create a commit. If the inverse cannot be applied cleanly,
+    :class:`MergeConflictError` is raised and the caller must resolve and
+    commit the staged result.
+    """
     with unwrap(repo) as r:
         if r.head_is_unborn:
             raise GitError("Cannot revert: HEAD is unborn.")
@@ -1291,7 +1291,11 @@ def _patch_text_for_path(diff: pygit2.Diff, path: str) -> str:
     pieces: list[str] = []
     for patch in diff:
         delta = patch.delta
-        if delta.new_file.path == path or delta.old_file.path == path:
+        normalized_path = path.casefold() if os.name == "nt" else path
+        if (
+            (delta.new_file.path or "").casefold() == normalized_path
+            or (delta.old_file.path or "").casefold() == normalized_path
+        ):
             pieces.append(patch.text or "")
     return "".join(pieces)
 
@@ -1387,10 +1391,9 @@ def stash_push(
     vs. plain ``git stash``.
 
     ``paths`` is an optional whitelist of working-tree paths to stash.
-    When non-empty only the listed paths participate in the stash
-    (matching ``git stash -- <path>`` semantics). The implementation
-    passes the list straight to :meth:`pygit2.Repository.stash` which
-    accepts a ``paths=`` keyword.
+    When supplied, the list is passed to :meth:`pygit2.Repository.stash` as
+    ``paths=``. The exact path-filtering and worktree reset semantics are
+    therefore those of the installed pygit2 version.
     """
     with unwrap(repo) as r:
         try:

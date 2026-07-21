@@ -96,9 +96,9 @@ _BRANCH_COLOR_OVERRIDES: dict[str, int] = {
 }
 """Case-insensitive mapping from branch name # colour palette index."""
 
+# DEPRECATED: retained for compatibility; HEAD highlighting is now handled
+# by the graph layout's regular color assignment.
 HEAD_SPECIAL_COLOR_INDEX: int = 8
-"""Colour index used for commits that HEAD directly points to (orange)."""
-
 
 def _pick_branch_color(name: str) -> int:
     """Return a deterministic palette index for *name*.
@@ -328,6 +328,7 @@ class ColorAssigner:
         self._used_colors: set[int] = set()
         self._main_lane: int | None = None
         self._main_color: int = 1  # main/master → blue via overrides
+        # Legacy bookkeeping retained for compatibility with the old lane API.
         self._in_fork: bool = False
 
     # -- public API --------------------------------------------------------
@@ -370,9 +371,11 @@ class ColorAssigner:
         return self.assign_color(lane, branch_name)
 
     def begin_fork(self) -> None:
+        """Legacy hook retained for compatibility with old callers."""
         self._in_fork = True
 
     def end_fork(self) -> None:
+        """Legacy hook retained for compatibility with old callers."""
         self._in_fork = False
 
     def release_lane(self, lane: int) -> None:
@@ -1557,10 +1560,8 @@ class BranchRef:
 
 
 def _build_refs_map(
-    branches: list[BranchInfo],
     tags: list,
     head_target_sha: str | None,
-    head_shorthand: str | None,
 ) -> dict[str, list[str]]:
     """Map SHA -> list of ref chip labels (HEAD, tag names)."""
     result: dict[str, list[str]] = {}
@@ -1601,8 +1602,8 @@ def _subject(message: str) -> str:
 
 
 def _is_valid_sha(s: str) -> bool:
-    """Return ``True`` if *s* looks like a full hex SHA-1 (40 hex chars)."""
-    return len(s) == 40 and all(c in "0123456789abcdef" for c in s)
+    """Return ``True`` for a full SHA-1 or SHA-256 hexadecimal object ID."""
+    return len(s) in (40, 64) and all(c in "0123456789abcdefABCDEF" for c in s)
 
 
 __all__ = [

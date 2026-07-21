@@ -5,7 +5,6 @@ config JSON, lets the user edit them, and saves back on accept.
 """
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
 
@@ -24,6 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.ui.dialogs.clone_dialog import SshKeyDialog, _find_ssh_keygen
 from src.utils.config import load_config, save_config
 
 
@@ -150,18 +150,8 @@ class SettingsDialog(QDialog):
 
     def _on_generate_ssh(self) -> None:
         """Open a small dialog to generate an ed25519 key pair."""
-        from src.ui.dialogs.clone_dialog import SshKeyDialog
-
         dialog = SshKeyDialog(self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            return
-        # After the SshKeyDialog is dismissed, check if it generated a key.
-        # We use a simple approach: ask the user to navigate to the file.
-        # For a better UX we could connect to key_generated signal,
-        # but SshKeyDialog only shows the public key text. We'll just
-        # let the user browse manually if they generated a new key.
-        # Instead, let's reimplement a simpler inline gen dialog here.
-        self._do_generate_ssh()
+        dialog.exec()
 
     def _do_generate_ssh(self) -> None:
         priv_default = self._ssh_priv_edit.text().strip() or str(
@@ -187,7 +177,7 @@ class SettingsDialog(QDialog):
             return
 
         pub_path = priv_path.with_suffix(priv_path.suffix + ".pub")
-        ssh_keygen = self._find_ssh_keygen()
+        ssh_keygen = _find_ssh_keygen()
         if ssh_keygen is None:
             QMessageBox.warning(
                 self,
@@ -225,28 +215,6 @@ class SettingsDialog(QDialog):
             self,
             "SSH Key Generated",
             f"Key pair created:\nPrivate: {priv_path}\nPublic:  {pub_path}",
-        )
-
-    @staticmethod
-    def _find_ssh_keygen() -> str | None:
-        return (
-            subprocess.run(
-                ["where", "ssh-keygen"] if os.name == "nt" else ["which", "ssh-keygen"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            .stdout.strip()
-            .splitlines()[0:1]
-            .pop(0)
-            if subprocess.run(
-                ["where", "ssh-keygen"] if os.name == "nt" else ["which", "ssh-keygen"],
-                capture_output=True,
-                text=True,
-                check=False,
-            ).returncode
-            == 0
-            else None
         )
 
 

@@ -1,4 +1,7 @@
-"""Commit graph widget: renders the DAG of commits as a custom Qt scene.
+"""Legacy commit graph widget.
+
+# DEPRECATED: replaced by GraphPanel. Kept temporarily for compatibility
+# with older integrations; new UI code must use GraphTableWidget.
 
 Stage 2 implementation. The widget subscribes to a
 :class:`src.viewmodels.graph_viewmodel.GraphViewModel` and rebuilds

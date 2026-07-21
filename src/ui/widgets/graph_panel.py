@@ -43,7 +43,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from hashlib import md5
 
 from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QPointF, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -59,7 +58,6 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
-    QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -76,6 +74,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.graph_v2 import BRANCH_PALETTE, UNCOMMITTED_COLOR_INDEX, _pick_branch_color
+from src.utils.avatar import make_avatar_pixmap
 from src.utils.theme import DARK_THEME, Theme
 from src.viewmodels.graph_viewmodel import GraphViewModel
 
@@ -432,8 +431,8 @@ class GraphTableWidget(QWidget):
         if rcc_signal is not None:
             rcc_signal.connect(self._on_recently_created_changed)
 
-        self._dump_shortcut = QShortcut("Ctrl+Shift+D", self)
-        self._dump_shortcut.activated.connect(self._dump_graph)
+        # Debug graph dumps are available only through explicit tooling;
+        # do not ship a production keyboard shortcut for them.
 
     # ------------------------------------------------------------------
     # public API
@@ -2146,66 +2145,10 @@ class GraphTableWidget(QWidget):
         *,
         shape: str = "square",
     ) -> QPixmap:
-        if not seed:
-            seed = "?"
+        seed = seed or "?"
         cache_key = f"{seed}_{size}_{shape}"
         if cache_key not in self._avatar_cache:
-            h_bytes = md5(seed.encode()).digest()
-            fg = QColor(self._AVATAR_COLORS[h_bytes[0] % len(self._AVATAR_COLORS)])
-            bg = QColor("#F4F4F4")
-
-            grid = [[False] * 5 for _ in range(5)]
-            bits = int.from_bytes(h_bytes[3:6], "big")
-            for row in range(5):
-                for col in range(3):
-                    if bits & (1 << (row * 3 + col)):
-                        grid[row][col] = True
-                        grid[row][4 - col] = True
-
-            pix = QPixmap(size, size)
-            pix.fill(Qt.GlobalColor.transparent)
-            painter = QPainter(pix)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-            margin = 1.0
-            d = size - margin * 2
-            clip = QPainterPath()
-            if shape == "circle":
-                clip.addEllipse(margin, margin, d, d)
-            else:
-                clip.addRoundedRect(margin, margin, d, d, 3, 3)
-            painter.setClipPath(clip)
-
-            painter.setBrush(QBrush(bg))
-            painter.setPen(QPen(Qt.PenStyle.NoPen))
-            painter.drawRect(0, 0, size, size)
-
-            # Snap identicon cells to integer pixel boundaries so the
-            # mirrored 5x5 pattern stays symmetric after AA. With cell =
-            # size/5 = 3.8 (size=19), the leftmost column ends with a
-            # partial-coverage pixel while the rightmost does not, which
-            # the eye reads as a leftward shift of the pattern. Drawing
-            # the grid inside the largest 5-aligned square that fits in
-            # the clip (e.g. 15x15 with 3px cells for size=19) keeps
-            # every cell edge on a pixel boundary.
-            grid_diameter = max(5, int(d) // 5 * 5)
-            cell_px = grid_diameter // 5
-            grid_offset = (size - grid_diameter) / 2.0
-
-            painter.setBrush(QBrush(fg))
-            for row in range(5):
-                for col in range(5):
-                    if grid[row][col]:
-                        painter.drawRect(
-                            int(col * cell_px + grid_offset),
-                            int(row * cell_px + grid_offset),
-                            cell_px,
-                            cell_px,
-                        )
-
-            painter.setClipping(False)
-            painter.end()
-            self._avatar_cache[cache_key] = pix
+            self._avatar_cache[cache_key] = make_avatar_pixmap(seed, size, shape=shape)
         return self._avatar_cache[cache_key]
 
     # ------------------------------------------------------------------
@@ -2656,7 +2599,7 @@ class GraphTableWidget(QWidget):
         return None
 
     def _dump_graph(self) -> None:
-        """Save a diagnostic JSON dump of the current graph layout (Ctrl+Shift+D)."""
+        """Save a diagnostic JSON dump of the current graph layout."""
         rows_data: list[dict] = []
         for idx, row_data in enumerate(self._rows):
             commit = row_data.get("commit")

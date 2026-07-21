@@ -13,7 +13,7 @@ Layout:
 
 * **Top:** :class:`QToolBar` with Fetch / Pull / Push (Stage 6+).
 * **Left:** :class:`LeftPanel` — branches / tags / stash tree.
-* **Centre:** :class:`GraphWidget` (Stage 2).
+* **Centre:** :class:`GraphTableWidget` (the current graph panel).
 * **Right:** :class:`RightPanel` — hidden until the user picks a
   commit or the WIP node in the graph. When shown it shows one of
   two views (commit-input or commit-detail) selected by
@@ -92,6 +92,7 @@ from src.utils.config import (
     save_config,
     save_graph_column_widths,
 )
+from src.utils.debug_mode import debug_print
 from src.utils.theme import DARK_THEME
 from src.viewmodels.main_viewmodel import MainViewModel
 from src.viewmodels.repo_tabs_viewmodel import RepoTabViewModel
@@ -221,16 +222,16 @@ class MainWindow(QMainWindow):
         on a worker thread so the graph and side panels populate without
         freezing the UI.
         """
-        print("[repo] _open_repository_async start")
+        debug_print("[repo] _open_repository_async start")
         self._repo_manager = manager
-        print("[repo] calling set_repository(refresh=False)...")
+        debug_print("[repo] calling set_repository(refresh=False)...")
         self._main_vm.set_repository(manager, refresh=False)
-        print("[repo] set_repository done, status:", manager.path)
+        debug_print("[repo] set_repository done, status:", manager.path)
         self._status.showMessage(f"Repository: {manager.path}")
         self._action_close.setEnabled(manager is not None)
-        print("[repo] calling load_repository_data...")
+        debug_print("[repo] calling load_repository_data...")
         self._main_vm.load_repository_data()
-        print("[repo] _open_repository_async done")
+        debug_print("[repo] _open_repository_async done")
 
     def graph_view_model(self) -> object:
         """Expose the graph ViewModel for Stage 2 test wiring."""

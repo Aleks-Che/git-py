@@ -47,3 +47,5 @@ Reason: undoing them is either meaningless (no recovery path) or infeasible for 
 - **`delete_file_from_disk(path)`** — user has explicitly opted out of undo via the destructive-action confirm dialog. Recorded in `ActionHistoryWidget`'s non-undoable history instead.
 - **`apply_stash_file(stash_oid, path)` / `apply_stash_files(...)`** — application of a stash to a specific path is irreversible for the worktree side; the original stash entry remains in the stash list, so the user can re-apply from there if desired. Undo-via-CommandProcessor wouldn't help.
 - **`stage_file(path)` / `unstage_file(path)`** — single-path index mutations triggered by every checkbox click. Bypassing for ergonomics (CommandProcessor push per click would flood the undo stack). Batch operations still use `GitCommand`.
+- **`fetch_changes(...)` while busy** — rejected before command construction and reported through `error_occurred`; no repository mutation occurs, so there is no command to undo.
+- **`refresh_state()`** — read-only synchronization of ViewModel state from the repository; it does not mutate Git state and is intentionally outside `CommandProcessor`.

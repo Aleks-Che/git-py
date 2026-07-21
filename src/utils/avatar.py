@@ -24,6 +24,29 @@ from hashlib import md5
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QBrush, QColor, QPainter, QPainterPath, QPen, QPixmap
 
+
+def initials(name: str | None) -> str:
+    """Return 1-2 letter initials from a name, or ``?`` if empty."""
+    if not name:
+        return "?"
+    parts = name.strip().split()
+    if not parts:
+        return "?"
+    if len(parts) == 1:
+        return parts[0][0].upper()
+    return (parts[0][0] + parts[-1][0]).upper()
+
+
+def avatar_color(name: str | None) -> tuple[int, int, int]:
+    """Return a deterministic RGB color for a name."""
+    if not name:
+        return (128, 128, 128)
+    import colorsys
+
+    h = hash(name) % 360
+    r, g, b = colorsys.hls_to_rgb(h / 360.0, 0.5, 0.5)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
 # A small palette of solid colours for the avatar foreground. Picked
 # to look distinct from the branch palette colours used elsewhere.
 _AVATAR_COLORS: tuple[str, ...] = (

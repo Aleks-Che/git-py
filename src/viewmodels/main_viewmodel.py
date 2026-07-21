@@ -47,6 +47,7 @@ from src.core.models import RemoteInfo
 from src.core.repository import RepositoryManager
 from src.utils.async_worker import AsyncWorker
 from src.utils.config import default_config_path, load_author_signature, load_config
+from src.utils.debug_mode import debug_print
 from src.viewmodels.branch_panel_viewmodel import BranchPanelViewModel
 from src.viewmodels.commands import CommandProcessor
 from src.viewmodels.commit_panel_viewmodel import CommitPanelViewModel
@@ -324,7 +325,7 @@ class MainViewModel(QObject):
         # previous run's "newly created" set so the chip-priority
         # logic doesn't carry stale state across repositories.
         self._recently_created_branches = set()
-        self.recently_created_changed.emit(self._recently_created_branches)
+        self.recently_created_changed.emit(set(self._recently_created_branches))
         if self._selected_commit_sha is not None:
             self._selected_commit_sha = None
             self.selection_changed.emit(None)
@@ -367,14 +368,14 @@ class MainViewModel(QObject):
         if self._repo_manager is None or not self._repo_manager.is_open:
             return
         if not self._async_enabled:
-            print("[worker] async disabled, running sync...")
+            debug_print("[worker] async disabled, running sync...")
             _t0 = _time.monotonic()
             self._graph_view_model.refresh_graph()
-            print(f"[worker] sync refresh_graph took {_time.monotonic() - _t0:.2f}s")
+            debug_print(f"[worker] sync refresh_graph took {_time.monotonic() - _t0:.2f}s")
             self._commit_panel_view_model.refresh_status()
-            print(f"[worker] sync refresh_status took {_time.monotonic() - _t0:.2f}s")
+            debug_print(f"[worker] sync refresh_status took {_time.monotonic() - _t0:.2f}s")
             self._branch_panel_view_model.refresh()
-            print(f"[worker] sync refresh took {_time.monotonic() - _t0:.2f}s")
+            debug_print(f"[worker] sync refresh took {_time.monotonic() - _t0:.2f}s")
             return
         if self._is_busy:
             return
@@ -388,7 +389,7 @@ class MainViewModel(QObject):
         # stale and dropped in :meth:`_on_result` (R2.2 C7).
         generation = self._async_generation
 
-        print(f"[worker] load_repository_data: starting worker for {repo_path}")
+        debug_print(f"[worker] load_repository_data: starting worker for {repo_path}")
         self._is_busy = True
         self.busy_changed.emit(True)
 
@@ -398,46 +399,46 @@ class MainViewModel(QObject):
             never accessed from the main thread, avoiding libgit2's
             thread-safety issues."""
             import time as _wt
-            print(f"[worker::bg] _work started, opening repo: {repo_path}")
+            debug_print(f"[worker::bg] _work started, opening repo: {repo_path}")
             _t0 = _wt.monotonic()
             worker_repo = RepositoryManager()
             worker_repo.open(repo_path)
-            print(f"[worker::bg] open took {_wt.monotonic() - _t0:.2f}s")
+            debug_print(f"[worker::bg] open took {_wt.monotonic() - _t0:.2f}s")
             try:
-                print("[worker::bg] _compute_graph...")
+                debug_print("[worker::bg] _compute_graph...")
                 _t1 = _wt.monotonic()
                 rows, err = GraphViewModel._compute_graph(worker_repo)
                 _elapsed = _wt.monotonic() - _t1
                 _nrows = len(rows) if rows else 0
-                print(f"[worker::bg] _compute_graph took {_elapsed:.2f}s, rows={_nrows}")
+                debug_print(f"[worker::bg] _compute_graph took {_elapsed:.2f}s, rows={_nrows}")
                 if err is not None:
                     return {"error": err}
-                print("[worker::bg] _compute_status_data...")
+                debug_print("[worker::bg] _compute_status_data...")
                 _t2 = _wt.monotonic()
                 file_changes, staged, raw_status = (
                     CommitPanelViewModel._compute_status_data(worker_repo)
                 )
                 _elapsed2 = _wt.monotonic() - _t2
                 _nchanges = len(file_changes)
-                print(
+                debug_print(
                     f"[worker::bg] _compute_status_data took {_elapsed2:.2f}s, "
                     f"changes={_nchanges}"
                 )
-                print("[worker::bg] _compute_branch_data...")
+                debug_print("[worker::bg] _compute_branch_data...")
                 _t3 = _wt.monotonic()
                 branch_data = (
                     BranchPanelViewModel._compute_branch_data(worker_repo)
                 )
                 _elapsed3 = _wt.monotonic() - _t3
                 _nbranches = len(branch_data.get("local_branches", []))
-                print(
+                debug_print(
                     f"[worker::bg] _compute_branch_data took {_elapsed3:.2f}s, "
                     f"branches={_nbranches}"
                 )
-                print(f"[worker::bg] total work time: {_wt.monotonic() - _t0:.2f}s")
+                debug_print(f"[worker::bg] total work time: {_wt.monotonic() - _t0:.2f}s")
             finally:
                 worker_repo.close()
-                print(f"[worker::bg] worker_repo closed, total: {_wt.monotonic() - _t0:.2f}s")
+                debug_print(f"[worker::bg] worker_repo closed, total: {_wt.monotonic() - _t0:.2f}s")
             return {
                 "rows": rows,
                 "file_changes": file_changes,
@@ -453,7 +454,7 @@ class MainViewModel(QObject):
                 # C7/M8).  The lifespan_finished handler still runs
                 # below to release the strong reference.
                 return
-            print("[worker::ui] _on_result called")
+            debug_print("[worker::ui] _on_result called")
             data: dict = result  # type: ignore[assignment]
             error = data.get("error")
             if error is not None:
@@ -461,7 +462,7 @@ class MainViewModel(QObject):
                 return
             # Apply the pre-computed data on the main thread — signal
             # emissions happen here, not in the worker.
-            print("[worker::ui] applying data to VMs...")
+            debug_print("[worker::ui] applying data to VMs...")
             rows: list = data["rows"]
             file_changes: list = data["file_changes"]
             staged: set = data["staged"]
@@ -477,7 +478,7 @@ class MainViewModel(QObject):
                 sorted(staged),
             )
             self._branch_panel_view_model._apply_branch_data(branch_data)
-            print("[worker::ui] data applied, calling _on_repo_load_finished")
+            debug_print("[worker::ui] data applied, calling _on_repo_load_finished")
             self._on_repo_load_finished()
 
         def _on_failure(exc: object) -> None:
@@ -493,9 +494,9 @@ class MainViewModel(QObject):
         worker.signals.lifespan_finished.connect(
             lambda w=worker: self._on_async_finished(w),
         )
-        print("[worker] dispatching to thread pool...")
+        debug_print("[worker] dispatching to thread pool...")
         QThreadPool.globalInstance().start(worker)
-        print("[worker] dispatched")
+        debug_print("[worker] dispatched")
 
     # ----- verb commands ----------------------------------------------
 
@@ -679,19 +680,13 @@ class MainViewModel(QObject):
         Also a useful escape hatch for manual refresh — the toolbar
         or a keyboard shortcut can be wired to it later.
 
-        No-op when no repository is open (the panels already reflect
-        the empty state) and when a long-running async operation is
-        in flight (refreshing during a rebase / merge would race
-        with the worker thread). The latter is the same re-entrancy
-        guard the toolbar buttons rely on via :attr:`busy_changed`.
+        No-op when no repository is open or when a long-running async
+        operation is in flight. In either case the current panel state is
+        preserved; callers can retry after the operation completes.
 
-        :class:`GitError` from any of the child ViewModels is already
-        routed through :attr:`error_occurred` by the children
-        themselves, so it never reaches this method. A non-``GitError``
-        (e.g. an :class:`OSError` when ``.git/`` was removed while
-        the window was inactive) is caught here and surfaced the same
-        way; the VM state is left unchanged so a subsequent valid
-        refresh can still succeed.
+        Child ViewModels route expected :class:`GitError` instances through
+        :attr:`error_occurred`; this method catches those errors and emits a
+        user-facing refresh failure while leaving existing state intact.
         """
         if self._repo_manager is None or not self._repo_manager.is_open:
             return
@@ -1639,7 +1634,7 @@ class MainViewModel(QObject):
         # branches share a commit (the source branch keeps the
         # prominent chip until a later operation re-orders them).
         self._recently_created_branches.add(name)
-        self.recently_created_changed.emit(self._recently_created_branches)
+        self.recently_created_changed.emit(set(self._recently_created_branches))
         # The GraphViewModel forwards the same payload to the graph
         # widget. We emit on both so direct subscribers of either
         # signal observe the update without depending on the chain.
@@ -1665,7 +1660,7 @@ class MainViewModel(QObject):
         # as a session creation so the chip-priority logic stays
         # consistent regardless of which entry point built the branch.
         self._recently_created_branches.add(name)
-        self.recently_created_changed.emit(self._recently_created_branches)
+        self.recently_created_changed.emit(set(self._recently_created_branches))
         self._graph_view_model.update_recently_created(
             self._recently_created_branches,
         )
@@ -2385,6 +2380,8 @@ class MainViewModel(QObject):
                 self.error_occurred.emit("No repository open.")
             return
         if self._is_busy:
+            if not silent:
+                self.error_occurred.emit("Another operation is in progress.")
             return
         from src.viewmodels.commands import FetchCommand
 

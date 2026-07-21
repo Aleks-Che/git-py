@@ -11,6 +11,7 @@ vocabulary.
 from __future__ import annotations
 
 import contextlib
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -52,7 +53,7 @@ def unwrap(repo_or_manager: RepositoryManager | pygit2.Repository) -> Iterator[p
         yield repo_or_manager
 
 
-def _delta_status(delta: pygit2.DiffDelta, parent_tree: pygit2.Tree | None) -> FileStatus:
+def _delta_status(delta: pygit2.DiffDelta) -> FileStatus:
     """Translate a single ``pygit2`` delta into a :class:`FileStatus`.
 
     The decision tree follows what ``git status`` / ``git diff`` show
@@ -548,7 +549,7 @@ class RepositoryManager:
             path = new_path or old_path
             if path is None:
                 continue
-            status = _delta_status(delta, parent_tree)
+            status = _delta_status(delta)
             result.append(FileChange(path=path, status=status))
         return result
 
@@ -639,7 +640,11 @@ class RepositoryManager:
         pieces: list[str] = []
         for patch in diff:
             delta = patch.delta
-            if (delta.new_file.path == path) or (delta.old_file.path == path):
+            normalized_path = path.casefold() if os.name == "nt" else path
+            if (
+                (delta.new_file.path or "").casefold() == normalized_path
+                or (delta.old_file.path or "").casefold() == normalized_path
+            ):
                 pieces.append(patch.text or "")
         return "".join(pieces)
 

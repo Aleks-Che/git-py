@@ -184,25 +184,14 @@ class SshKeyDialog(QDialog):
 
 def _find_ssh_keygen() -> str | None:
     """Return the absolute path of ``ssh-keygen`` on PATH, or ``None``."""
-    return (
-        subprocess.run(  # noqa: S603 - intentional subprocess
-            ["where", "ssh-keygen"] if os.name == "nt" else ["which", "ssh-keygen"],  # noqa: S607
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        .stdout.strip()
-        .splitlines()[0:1]
-        .pop(0)
-        if subprocess.run(  # noqa: S603 - intentional subprocess
-            ["where", "ssh-keygen"] if os.name == "nt" else ["which", "ssh-keygen"],  # noqa: S607
-            capture_output=True,
-            text=True,
-            check=False,
-        ).returncode
-        == 0
-        else None
+    completed = subprocess.run(  # noqa: S603 - intentional subprocess
+        ["where", "ssh-keygen"] if os.name == "nt" else ["which", "ssh-keygen"],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
     )
+    lines = completed.stdout.strip().splitlines()
+    return lines[0] if completed.returncode == 0 and lines else None
 
 
 class CloneDialog(QDialog):

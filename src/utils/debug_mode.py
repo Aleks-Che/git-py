@@ -20,6 +20,18 @@ import os
 from typing import Any
 
 _DEBUG_ENV = "GIT_PY_GRAPH_DEBUG"
+_DEBUG = bool(int(os.environ.get("GIT_PY_DEBUG", "0")))
+
+
+def is_debug() -> bool:
+    """Return whether general diagnostic output is enabled."""
+    return _DEBUG
+
+
+def debug_print(*args, **kwargs) -> None:
+    """Print diagnostic output only when ``GIT_PY_DEBUG=1``."""
+    if _DEBUG:
+        print(*args, **kwargs)
 
 
 def is_debug_mode() -> bool:

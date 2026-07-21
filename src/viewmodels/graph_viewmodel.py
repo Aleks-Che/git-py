@@ -436,7 +436,7 @@ class GraphViewModel(QObject):
         rows = graph_to_dicts(layout)
 
         # Enrich rows with refs and branch_refs for the widget.
-        refs_by_sha = _build_refs_map(branches, tags, head_target, head_shorthand)
+        refs_by_sha = _build_refs_map(tags, head_target)
         branch_refs_by_sha = _build_branch_refs_map(branches)
         for idx, row in enumerate(rows):
             commit = row.get("commit")
