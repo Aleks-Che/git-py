@@ -214,6 +214,6 @@ def test_complete_merge_command_execute_routes_through_complete_merge(tmp_path: 
 
 def test_development_rules_documents_exemptions() -> None:
     """docs/DEVELOPMENT_RULES.md must list the operations outside GitCommand."""
-    text = Path("/root/projects/git-py/docs/DEVELOPMENT_RULES.md").read_text()
+    text = (Path(__file__).resolve().parents[2] / "docs" / "DEVELOPMENT_RULES.md").read_text()
     for op in ("_move_branch_ref", "delete_file_from_disk", "apply_stash_file", "stage_file"):
         assert op in text, f"Missing exemption for {op}"

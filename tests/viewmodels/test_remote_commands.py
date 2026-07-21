@@ -5,17 +5,23 @@ Covers :class:`PushCommand`, :class:`PullCommand`, :class:`FetchCommand`,
 operations are exercised against a local bare ``origin`` repo (no
 real network), so the test suite is fully hermetic.
 
-The contracts being tested:
+The contracts being tested (R1.6 / R1.7 — see
+``docs/updates/update1/VERIFICATION.md`` §5.3):
 
-* ``PushCommand`` / ``FetchCommand`` undo is a no-op (push and fetch
-  only modify server-side / remote-tracking refs — nothing local to
-  rewind). The command is still pushed onto the undo stack so the
-  history panel shows the action.
-* ``PullCommand`` undo captures the pre-pull HEAD SHA and rewinds via
-  ``reset --hard``. On an up-to-date pull the undo is a no-op.
-* ``AddRemoteCommand`` undo removes the freshly-added remote; it
+* :class:`PushCommand` / :class:`FetchCommand` carry ``is_noop = True``
+  and are therefore NOT pushed onto the undo stack by
+  :class:`CommandProcessor` (the action-history panel still records
+  them). A client-side undo of a push/fetch is either impossible or
+  meaningless, so we surface that explicitly via
+  ``proc.can_undo == False`` rather than letting the toolbar silently
+  "succeed" by doing nothing.
+* :class:`PullCommand` undo captures the pre-pull HEAD SHA and rewinds
+  via ``reset --hard``; on an up-to-date pull the undo is a no-op. A
+  pull that raises :class:`MergeConflictError` STAYS on the undo
+  stack so ``undo()`` can abort the in-progress merge.
+* :class:`AddRemoteCommand` undo removes the freshly-added remote; it
   never destroys a remote that pre-existed.
-* ``RemoveRemoteCommand`` undo re-adds the remote with the captured
+* :class:`RemoveRemoteCommand` undo re-adds the remote with the captured
   URL.
 """
 from __future__ import annotations
@@ -122,7 +128,29 @@ def test_push_command_unknown_remote_raises(committed_repo: RepositoryManager) -
         PushCommand(committed_repo, "no-such", "refs/heads/main").execute()
 
 
-def test_push_command_via_processor_can_be_redone(origin_and_clone) -> None:
+def test_push_command_via_processor_records_but_does_not_push_to_undo(
+    origin_and_clone,
+) -> None:
+    """Push is a no-op for undo and is NOT pushed onto the undo stack.
+
+    New contract (R1.7 — ``PushCommand`` / ``FetchCommand`` carry
+    ``is_noop = True`` so :class:`CommandProcessor` does not put
+    them on the undo stack).  The action-history panel still
+    records the push via the separate history mechanism, but the
+    toolbar ``Undo`` button must not "succeed" by doing nothing on
+    a push.  Pin that contract here so a regression that removes
+    ``is_noop`` from :class:`PushCommand` (and re-enables the
+    silently-succeeding undo) fails this test.
+
+    The previous version of this test
+    (``test_push_command_via_processor_can_be_redone``) asserted
+    that ``proc.can_undo`` was True after a push and that
+    ``proc.redo()`` re-ran the execute.  Both assumptions are now
+    wrong: the command is excluded from the undo stack entirely
+    (so neither ``can_undo`` nor ``can_redo`` reflects a pushed
+    push), and ``redo()`` would not re-issue a command that was
+    never on either stack.
+    """
     _ensure_app()
     _origin, clone = origin_and_clone
     assert clone.path is not None
@@ -135,10 +163,16 @@ def test_push_command_via_processor_can_be_redone(origin_and_clone) -> None:
     commit_changes(clone, "add g")
     proc = CommandProcessor()
     proc.execute(PushCommand(clone, "origin", f"refs/heads/{branch}"))
-    assert proc.can_undo
-    # Redo must re-run execute (it's a fresh push of the same ref).
+    # Push is excluded from the undo stack (no point in silently
+    # succeeding an undo against a command that cannot be undone).
+    assert not proc.can_undo
+    assert not proc.can_redo
+    # A subsequent redo of an empty stack is a no-op — the test
+    # would catch a regression that silently mutated the stack
+    # during execute.
     proc.redo()
-    assert proc.can_undo
+    assert not proc.can_undo
+    assert not proc.can_redo
 
 
 # ----- PullCommand ----------------------------------------------------------
@@ -211,9 +245,16 @@ def test_pull_command_up_to_date_undo_is_noop(origin_and_clone) -> None:
     assert clone.head_commit.sha == head_sha
 
 
-def test_pull_command_conflict_is_not_pushed(tmp_git_repo: Path) -> None:
-    """A pull that conflicts leaves the index in conflict; the command
-    is not pushed onto the undo stack (the processor re-raises)."""
+def test_pull_command_conflict_stays_in_undo_stack(tmp_git_repo: Path) -> None:
+    """A pull that conflicts stays on the undo stack; ``undo()`` aborts.
+
+    New contract (R1.6 / R1.7 — the processor keeps the failing
+    :class:`PullCommand` on the undo stack so ``undo()`` can abort
+    the partial merge). The previous contract discarded the
+    command on failure; this test pins the new behaviour so a
+    regression that drops the command from history breaks here
+    rather than at the conflict-resolution UI.
+    """
     _ensure_app()
     origin_path = tmp_git_repo / "origin.git"
     clone_path = tmp_git_repo / "clone"
@@ -253,6 +294,10 @@ def test_pull_command_conflict_is_not_pushed(tmp_git_repo: Path) -> None:
     cmd = PullCommand(second_mgr, "origin", f"refs/heads/{branch}")
     with pytest.raises(GitError):
         proc.execute(cmd)
+    # New contract: the failed pull command is kept on the undo
+    # stack so ``undo()`` can abort the in-progress merge.
+    assert proc.can_undo
+    proc.undo()
     assert not proc.can_undo
 
 
@@ -286,15 +331,24 @@ def test_fetch_command_brings_remote_branches(origin_and_clone) -> None:
 
 
 def test_fetch_command_undo_is_noop(origin_and_clone) -> None:
+    """Fetch carries ``is_noop = True`` and never enters the undo stack.
+
+    Fetch only mutates ``refs/remotes/<name>/*`` and there is no
+    useful client-side rollback for that, so the command is
+    marked ``is_noop`` (R1.7) — :class:`CommandProcessor` does
+    not put it on the undo stack. ``undo()`` is therefore a no-op
+    here.  The previous version of this test asserted
+    ``proc.can_undo`` after the fetch, which contradicted the
+    updated contract; this version pins the new contract.
+    """
     _ensure_app()
     _origin, clone = origin_and_clone
     branch = next(b.name for b in clone.branches if b.is_head)
     proc = CommandProcessor()
     proc.execute(FetchCommand(clone, "origin"))
-    assert proc.can_undo
-    # Undo: nothing to do, but it must not raise and must clear undo
-    # flag (or rather: leave the command on the stack — undo is
-    # defined as a no-op here).
+    # Fetch is excluded from the undo stack.
+    assert not proc.can_undo
+    # ``undo()`` against an empty stack is a no-op (must not raise).
     proc.undo()
     # The remote branch we just fetched is still there.
     assert any(b.name == f"origin/{branch}" for b in clone.branches)

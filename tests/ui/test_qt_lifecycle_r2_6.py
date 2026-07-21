@@ -4,10 +4,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 def test_branch_popup_uses_wa_delete_on_close_true() -> None:
     """BranchStackPopup is configured with ``Qt.WA_DeleteOnClose = True``."""
-    src = Path("/root/projects/git-py/src/ui/widgets/graph_panel.py").read_text()
+    src = (_REPO_ROOT / "src" / "ui" / "widgets" / "graph_panel.py").read_text()
     # Match: any setAttribute(...WA_DeleteOnClose, True...) inside
     # BranchStackPopup class body. The flag may be referenced as
     # ``Qt.WA_DeleteOnClose`` or ``Qt.WidgetAttribute.WA_DeleteOnClose``.
@@ -25,7 +27,7 @@ def test_branch_popup_uses_wa_delete_on_close_true() -> None:
 def test_left_panel_drop_uses_exec_with_viewport() -> None:
     """Drop-menu in left_panel.py uses ``QMenu.exec`` (not popup) and
     routes through ``viewport().mapToGlobal`` (H15)."""
-    src = Path("/root/projects/git-py/src/ui/widgets/left_panel.py").read_text()
+    src = (_REPO_ROOT / "src" / "ui" / "widgets" / "left_panel.py").read_text()
     # Find a QMenu.exec(...) call with viewport().mapToGlobal(...)
     pattern_exec = re.compile(
         r"\.exec\(\s*[^)]*viewport\(\)\.mapToGlobal\(", re.DOTALL,
@@ -46,7 +48,7 @@ def test_repo_bar_widget_no_saved_tab_index_attribute() -> None:
     """repo_bar_widget.py must not store tab_index in _CloseTabButton
     (H16 — close handler must resolve index via tabAt).
     """
-    src = Path("/root/projects/git-py/src/ui/widgets/repo_bar_widget.py").read_text()
+    src = (_REPO_ROOT / "src" / "ui" / "widgets" / "repo_bar_widget.py").read_text()
     pattern = re.compile(r"_tab_index", re.DOTALL)
     matches = pattern.findall(src)
     assert not matches, (
@@ -60,7 +62,7 @@ def test_diff_view_widget_do_scroll_rederives_cursor_per_tick() -> None:
     singleShot callback, NOT capture it in a closure (M23 — stale-cursor
     fix).
     """
-    src = Path("/root/projects/git-py/src/ui/widgets/diff_view_widget.py").read_text()
+    src = (_REPO_ROOT / "src" / "ui" / "widgets" / "diff_view_widget.py").read_text()
     # Look for the _do_scroll definition. Must NOT have a captured cursor.
     pattern_fn = re.compile(r"def _do_scroll\(\)\s*->.*?\n(?:[ \t].*?\n)+", re.DOTALL)
     fn_match = pattern_fn.search(src)

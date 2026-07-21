@@ -4028,7 +4028,16 @@ def test_branch_popup_closes_on_global_mouse_move_outside(
     leave = QEvent(QEvent.Type.Leave)
     QApplication.sendEvent(popup, leave)
     qtbot.waitUntil(lambda: widget._branch_popup is None, timeout=2000)  # noqa: SLF001
-    assert popup.isVisible() is False
+    # ``popup`` was scheduled for deletion by ``WA_DeleteOnClose``;
+    # the underlying C++ object is gone after the event loop spins.
+    # Calling ``popup.isVisible()`` here would raise
+    # ``RuntimeError: Internal C++ object … already deleted``.
+    # Drain pending events so the deferred delete runs to completion.
+    QApplication.processEvents()
+    app = QApplication.instance()
+    assert app is not None
+    live_popups = [w for w in app.topLevelWidgets() if isinstance(w, BranchStackPopup)]
+    assert live_popups == []
 
 
 # --------------------------------------------------------------------------

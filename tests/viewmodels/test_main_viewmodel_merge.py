@@ -4,9 +4,18 @@ The contract is the same as the other mutating verbs:
 
 * The call routes through :class:`CommandProcessor` (Undo / Redo work).
 * A conflict is captured into :attr:`MainViewModel.conflict_state`
-  and the failed command is **not** pushed onto the undo stack.
-* ``abort_*`` methods clear the conflict state without touching the
-  undo stack.
+  and the failed command **stays** on the undo stack so the user can
+  abort via ``undo()`` (R1.6 / R1.7). ``proc.can_undo`` is therefore
+  ``True`` after a conflict; ``proc.undo()`` runs
+  :meth:`MergeCommand.undo` which performs the abort
+  (``git merge --abort``) and moves the command to the redo stack.
+  The VM's :attr:`conflict_state` is **not** cleared by ``undo()``
+  on its own — callers that want the VM state to drop should use
+  :meth:`MainViewModel.abort_merge` (the explicit path).
+* :meth:`MainViewModel.abort_merge` is the explicit abort path that
+  clears the VM conflict state; the undo stack semantics above
+  provide the implicit one (no state clear, just the underlying
+  ``git merge --abort``).
 * :meth:`MainViewModel.set_repository` clears the conflict state when
   the user opens a different repository.
 """
@@ -99,6 +108,13 @@ def test_merge_branch_no_ff_creates_merge_commit_on_fast_forward(
 def test_merge_branch_conflict_emits_conflict_state(
     committed_repo: RepositoryManager,
 ) -> None:
+    """A conflicting merge fills ``conflict_state`` AND stays on undo.
+
+    New contract (R1.6 / R1.7): the failed command is kept on the
+    undo stack so the user can abort via ``undo()``.  Both
+    ``conflict_state_changed`` and ``proc.can_undo == True`` are
+    observed after the conflict.
+    """
     _ensure_app()
     _build_conflict(committed_repo)
     vm = MainViewModel()
@@ -108,7 +124,6 @@ def test_merge_branch_conflict_emits_conflict_state(
 
     vm.merge_branch("feature")
 
-    assert not vm.command_processor().can_undo
     assert states, "conflict_state_changed should have fired"
     state = states[-1]
     assert state["in_progress"] is True
@@ -116,6 +131,9 @@ def test_merge_branch_conflict_emits_conflict_state(
     assert "hello.txt" in state["conflicting_paths"]
     assert state["source"] == "feature"
     assert vm.conflict_state() is not None
+    # The failed merge command stays on the undo stack so the
+    # user can abort via ``undo()`` (R1.6 / R1.7).
+    assert vm.command_processor().can_undo
 
 
 def test_merge_branch_without_repo_emits_error() -> None:
@@ -172,22 +190,36 @@ def test_merge_branch_unknown_remote_source_hint_includes_fetch(
 def test_abort_merge_clears_conflict_state(
     committed_repo: RepositoryManager,
 ) -> None:
+    """``proc.undo()`` on a conflicted merge performs the abort.
+
+    New contract (R1.6 / R1.7): the failed merge command stays on
+    the undo stack so the user can abort via ``undo()``. ``undo()``
+    runs ``MergeCommand.undo()`` which calls ``core.abort_merge``
+    internally — no separate ``vm.abort_merge()`` call is needed.
+    After ``undo()``, the command is moved to the redo stack
+    (``can_redo``).
+    """
     _ensure_app()
     _build_conflict(committed_repo)
     vm = MainViewModel()
     vm.set_repository(committed_repo)
-    states: list[dict] = []
-    vm.conflict_state_changed.connect(states.append)
     vm.merge_branch("feature")
     assert vm.conflict_state() is not None
+    # R1.6: the failed merge is kept on the undo stack so the user
+    # can abort via ``undo()``.
+    assert vm.command_processor().can_undo
 
-    vm.abort_merge()
-    assert vm.conflict_state() is None
-    assert states[-1]["in_progress"] is False
-    # The worktree is back to the main version.
+    # Abort via the processor (NOT ``vm.abort_merge()`` — that path
+    # still works, but the new contract is that ``undo()`` does the
+    # abort).
+    proc = vm.command_processor()
+    proc.undo()
+    # The undo moved the command to the redo stack.
+    assert not proc.can_undo
+    assert proc.can_redo
+    # The worktree is back to the main version — ``MergeCommand.undo``
+    # ran ``core.abort_merge``.
     assert (Path(committed_repo.path) / "hello.txt").read_text() == "main side\n"
-    # Abort must not push anything onto the undo stack.
-    assert not vm.command_processor().can_undo
 
 
 def test_abort_merge_without_in_progress_emits_error(
@@ -218,7 +250,15 @@ def test_resolve_conflict_writes_file_and_finalizes_merge(
     assert (Path(committed_repo.path) / "hello.txt").read_text() == "resolved!\n"
     # A merge commit was created.
     assert len(committed_repo.head_commit.parents) == 2
-    assert not vm.command_processor().can_undo  # the failed merge was never pushed
+    # R1.1 variant (a): the conflicting merge command IS kept on
+    # the undo stack (so the user can still abort via undo if the
+    # complete_merge path ever needs to roll back).  The merge
+    # commit itself was created by ``complete_merge`` outside the
+    # command processor, so the *successful* completion is visible
+    # via the parent count above.  What is no longer in conflict
+    # is the index — ``resolve_conflict`` cleared the in-progress
+    # merge state on success.
+    assert vm.command_processor().can_undo
 
 
 def test_resolve_conflict_keeps_state_when_other_paths_remain(
@@ -233,10 +273,20 @@ def test_resolve_conflict_keeps_state_when_other_paths_remain(
     checkout_branch(committed_repo, "feature")
     (Path(committed_repo.path) / "hello.txt").write_text("feature hi\n")
     (Path(committed_repo.path) / "world.txt").write_text("feature w\n")
+    # R1.4: stage both files explicitly so they end up in the commit.
+    # Without this, ``world.txt`` stays untracked and the merge would
+    # only conflict on ``hello.txt`` — the test asserts both paths in
+    # the conflict state.
+    committed_repo.repo.index.add("hello.txt")
+    committed_repo.repo.index.add("world.txt")
+    committed_repo.repo.index.write()
     commit_changes(committed_repo, "feature: hi+world")
     checkout_branch(committed_repo, "main")
     (Path(committed_repo.path) / "hello.txt").write_text("main hi\n")
     (Path(committed_repo.path) / "world.txt").write_text("main w\n")
+    committed_repo.repo.index.add("hello.txt")
+    committed_repo.repo.index.add("world.txt")
+    committed_repo.repo.index.write()
     commit_changes(committed_repo, "main: hi+world")
 
     vm = MainViewModel()
@@ -331,7 +381,12 @@ def test_cherry_pick_clean_stages_in_index(
     from src.core.operations import commit_changes, create_branch
 
     create_branch(committed_repo, "feature", target_sha=committed_repo.head_commit.sha)
+    # R1.4: ``commit_changes`` no longer stages untracked files
+    # automatically. Stage ``f.txt`` explicitly so it lands in the
+    # feature commit (and the cherry-pick can find it).
     (Path(committed_repo.path) / "f.txt").write_text("f\n")
+    committed_repo.repo.index.add("f.txt")
+    committed_repo.repo.index.write()
     commit_changes(committed_repo, "add f")
     feature_sha = next(
         b.target_sha for b in committed_repo.branches if b.name == "feature"
@@ -546,7 +601,12 @@ def test_merge_async_threshold_routes_to_worker(
     from src.core.operations import commit_changes, create_branch
 
     create_branch(committed_repo, "feature")
+    # R1.4: ``commit_changes`` no longer stages untracked files
+    # automatically. Stage ``f.txt`` explicitly so the diff between
+    # ``main`` and ``feature`` is non-empty (1 file > threshold 0).
     (Path(committed_repo.path) / "f.txt").write_text("f\n")
+    committed_repo.repo.index.add("f.txt")
+    committed_repo.repo.index.write()
     commit_changes(committed_repo, "add f")
 
     vm = MainViewModel(async_enabled=True, merge_async_threshold=0)

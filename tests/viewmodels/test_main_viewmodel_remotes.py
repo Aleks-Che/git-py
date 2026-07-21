@@ -208,7 +208,11 @@ def test_push_changes_sync_path(origin_and_clone) -> None:
     vm.busy_changed.connect(busy.append)
     vm.push_changes("origin", f"refs/heads/{branch}")
     assert busy == []  # sync
-    assert vm.command_processor().can_undo
+    # Push is non-undoable (R1.7 — ``is_noop``) so the command is
+    # routed through the processor for the action-history panel but
+    # is NOT pushed onto the undo stack.
+    assert not vm.command_processor().can_undo
+    assert not vm.command_processor().can_redo
 
 
 def test_push_changes_without_repo_emits_error() -> None:

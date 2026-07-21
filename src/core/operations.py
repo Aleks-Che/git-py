@@ -623,9 +623,16 @@ def merge_branch(
             try:
                 r.merge(source_oid)
             except pygit2.GitError as exc:
+                # Restore only the symbolic HEAD.  Do not checkout: libgit2's
+                # conflict markers, index, and MERGE_HEAD must remain for the
+                # resolve_conflict -> complete_merge workflow.
+                if previous_head_name is not None:
+                    r.set_head(previous_head_name)
                 raise GitError(f"Merge failed: {exc}") from exc
             conflicts = _collect_conflicts(r)
             if conflicts:
+                if previous_head_name is not None:
+                    r.set_head(previous_head_name)
                 raise MergeConflictError(
                     f"Merge of {source!r} produced conflicts in {len(conflicts)} file(s).",
                     conflicting_paths=conflicts,
@@ -650,6 +657,9 @@ def merge_branch(
             )
             ref = r.lookup_reference(f"refs/heads/{target_name}")
             ref.set_target(merge_oid)
+            r.checkout_head(
+                strategy=pygit2.GIT_CHECKOUT_SAFE | pygit2.GIT_CHECKOUT_RECREATE_MISSING,
+            )
         except pygit2.GitError as exc:
             raise GitError(f"Failed to create merge commit: {exc}") from exc
     return True
@@ -889,6 +899,9 @@ def complete_merge(
             )
             ref = r.lookup_reference(f"refs/heads/{target_name}")
             ref.set_target(merge_oid)
+            r.checkout_head(
+                strategy=pygit2.GIT_CHECKOUT_SAFE | pygit2.GIT_CHECKOUT_RECREATE_MISSING,
+            )
         except pygit2.GitError as exc:
             raise GitError(f"Failed to create merge commit: {exc}") from exc
         # Clear in-progress state so is_merge_in_progress() returns False

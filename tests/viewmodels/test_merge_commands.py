@@ -3,9 +3,23 @@
 
 Each command is round-tripped through ``undo`` to lock in the
 expected behaviour: a successful undo must restore the repository to
-the state it was in *before* :meth:`execute` was called. Conflict
-paths assert that the command is **not** pushed onto the undo stack
-(``CommandProcessor.execute`` re-raises without appending on failure).
+the state it was in *before* :meth:`execute` was called.
+
+Conflict-path semantics (R1.6 / R1.7 — see
+``docs/updates/update1/VERIFICATION.md`` §5.3):
+
+* A :class:`MergeCommand` / :class:`PullCommand` that raises
+  :class:`MergeConflictError` is **kept** on the undo stack by
+  :class:`CommandProcessor`. The next ``undo()`` aborts the
+  partial merge (via ``git merge --abort`` / ``abort_merge``),
+  leaving the repository in its pre-merge state. This is what
+  the conflict-resolution UI uses to cancel a merge the user
+  decided not to finish.
+* Non-undoable commands (:class:`PushCommand`,
+  :class:`FetchCommand`) are still routed through the processor
+  for the action-history panel, but carry ``is_noop = True`` and
+  are NOT pushed onto the undo stack — so ``undo()`` is a no-op
+  for them.
 """
 from __future__ import annotations
 
@@ -153,21 +167,49 @@ def test_merge_command_three_way_with_target_suffix_in_name(
     assert cmd.name == "merge feature into main"
 
 
-def test_merge_command_conflict_is_not_pushed(
+def test_merge_command_conflict_stays_in_undo_stack(
     committed_repo: RepositoryManager,
 ) -> None:
+    """A conflicting merge stays on the undo stack; ``undo()`` aborts it.
+
+    New contract (R1.6 / R1.7 — processor keeps the command in the
+    undo stack on conflict, undo = abort). The previous contract
+    expected the command to be discarded; this test pins the
+    updated behaviour so the merge-completion flow can keep using
+    ``undo()`` to abort a partial merge.
+    """
     _ensure_app()
     _conflict_branches(committed_repo)
     proc = CommandProcessor()
     cmd = MergeCommand(committed_repo, "feature")
     with pytest.raises(MergeConflictError):
         proc.execute(cmd)
-    assert not proc.can_undo  # failure path leaves the stack empty
+    # New contract: the failed command stays in the undo stack so
+    # the user can abort via ``undo()``.
+    assert proc.can_undo
+    # ``proc.undo()`` aborts the in-progress merge via
+    # ``cmd.undo()`` and moves the command to the redo stack.
+    proc.undo()
+    # The undo consumed the entry from the undo stack — but it
+    # landed on the redo stack, so ``can_redo`` is now True.
+    assert not proc.can_undo
+    assert proc.can_redo
 
 
 def test_merge_command_captures_target_state_for_undo(
     committed_repo: RepositoryManager,
 ) -> None:
+    """Undo restores the target ref to its pre-merge tip; HEAD on target.
+
+    R1.1 variant (a) contract (VERIFICATION.md §3): ``merge_branch``
+    checks out the target branch (``y``) when the user is on a
+    different branch (``z``), performs the merge there, and leaves
+    ``HEAD`` on ``y``.  ``refs/heads/y`` advances to the merge
+    commit; ``refs/heads/z`` is unchanged.  Undo rewinds
+    ``refs/heads/y`` to its pre-merge tip via the captured SHA, and
+    restores HEAD back to ``z`` (the branch the user was on before
+    the command ran).
+    """
     _ensure_app()
     base = committed_repo.head_commit.sha
     create_branch(committed_repo, "x", target_sha=base)
@@ -188,12 +230,30 @@ def test_merge_command_captures_target_state_for_undo(
 
     cmd = MergeCommand(committed_repo, "x", target="y")
     cmd.execute()
+    # R1.1 variant (a): HEAD moved to ``y`` (the explicit target),
+    # the worktree now matches the merged tree (x.txt + y.txt).
     assert committed_repo.repo.head.shorthand == "y"
-    assert committed_repo.head_commit.parents == [y_before, x_tip]
+    assert (Path(committed_repo.path) / "x.txt").exists()
+    assert (Path(committed_repo.path) / "y.txt").exists()
+    # The ``y`` ref advanced to the merge commit.
+    post_y = committed_repo.repo.lookup_reference("refs/heads/y")
+    assert str(post_y.target) != y_before
+    merge_commit = committed_repo.repo[post_y.target]
+    assert [str(p) for p in merge_commit.parent_ids] == [y_before, x_tip]
+    # ``refs/heads/z`` was never involved.
+    assert (
+        str(committed_repo.repo.lookup_reference("refs/heads/z").target) == z_before
+    )
+
     cmd.undo()
+    # Undo restores ``refs/heads/y`` to ``y_before`` AND puts HEAD
+    # back on ``z`` (the branch the user was on before the command
+    # ran).
+    assert (
+        str(committed_repo.repo.lookup_reference("refs/heads/y").target) == y_before
+    )
     assert committed_repo.repo.head.shorthand == "z"
-    assert committed_repo.head_commit.sha == z_before
-    assert str(committed_repo.repo.lookup_reference("refs/heads/y").target) == y_before
+    assert str(committed_repo.repo.head.target) == z_before
 
 
 def test_merge_command_no_ff_captures_merge_oid_for_undo(
