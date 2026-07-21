@@ -797,6 +797,8 @@ def _run_git_in_workdir(
             cwd=workdir,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=timeout,
             env=env,
@@ -1726,6 +1728,8 @@ def restore_stash(
             cwd=workdir,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=30.0,
         )
@@ -2009,16 +2013,22 @@ def pull(
     """Fetch + merge ``remote_name``/``refspec`` into the current branch.
 
     Returns ``True`` for a real merge, ``False`` for up-to-date/fast-forward.
+    Raises :class:`GitError` when the current branch has no configured upstream.
     """
-    fetch(repo, remote_name, [refspec] if refspec else None, callbacks=callbacks)
     with unwrap(repo) as r:
         if r.head_is_unborn:
             return False
-        upstream_name = r.head.shorthand
-        try:
-            upstream_ref = r.lookup_reference(f"refs/remotes/{remote_name}/{upstream_name}")
-        except KeyError:
-            return False
+        branch_name = r.head.shorthand
+        local_branch = r.branches.local.get(branch_name)
+        upstream_ref = local_branch.upstream if local_branch is not None else None
+        if upstream_ref is None:
+            raise GitError(
+                f"No upstream branch configured for {branch_name}. Set upstream with git branch "
+                "--set-upstream-to or configure remote tracking."
+            )
+    fetch(repo, remote_name, [refspec] if refspec else None, callbacks=callbacks)
+    with unwrap(repo) as r:
+        upstream_ref = r.lookup_reference(upstream_ref.name)
     return merge_branch(repo, str(upstream_ref.target))
 
 

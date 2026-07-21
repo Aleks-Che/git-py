@@ -68,6 +68,19 @@ _SGR_MAP: dict[int, str] = {
 _SGR_RE = re.compile(r"\x1b\[([\d;]*)m")
 
 
+def _decode_terminal_output(raw: bytes) -> str:
+    """Decode shell output, falling back to the platform filesystem encoding."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(sys.getfilesystemencoding(), errors="replace")
+
+
+def _encode_terminal_input(text: str) -> bytes:
+    """Encode shell input using the platform filesystem encoding."""
+    return text.encode(sys.getfilesystemencoding(), errors="replace")
+
+
 def _ansi_to_html(text: str, theme: Theme) -> str:
     """Convert ``text`` containing ANSI SGR sequences to HTML.
 
@@ -181,7 +194,7 @@ class TerminalWidget(QWidget):
 
     def _start_shell(self, cwd: str) -> None:
         shell = "cmd.exe" if sys.platform == "win32" else os.environ.get("SHELL", "/bin/bash")
-        args: list[str] = [] if sys.platform == "win32" else ["-i"]
+        args = ["/Q", "/K", "chcp 65001 >nul"] if sys.platform == "win32" else ["-i"]
         proc = QProcess(self)
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
         proc.setWorkingDirectory(str(cwd))
@@ -228,16 +241,13 @@ class TerminalWidget(QWidget):
             f"<span style='color: {self._theme.accent}; font-weight: bold'>"
             f"> {text}</span><br>"
         )
-        self._process.write((text + "\r\n").encode("utf-8"))
+        self._process.write(_encode_terminal_input(text + "\r\n"))
 
     def _on_stdout(self) -> None:
         if self._process is None:
             return
         data = self._process.readAllStandardOutput().data()
-        try:
-            text = data.decode("utf-8", errors="replace")
-        except UnicodeDecodeError:
-            text = data.decode("latin-1", errors="replace")
+        text = _decode_terminal_output(data)
         html = _ansi_to_html(text, self._theme).replace("\n", "<br>").replace("\r", "")
         self._append_html(html)
 
@@ -245,10 +255,7 @@ class TerminalWidget(QWidget):
         if self._process is None:
             return
         data = self._process.readAllStandardError().data()
-        try:
-            text = data.decode("utf-8", errors="replace")
-        except UnicodeDecodeError:
-            text = data.decode("latin-1", errors="replace")
+        text = _decode_terminal_output(data)
         html = (
             f"<span style='color: #E8685A'>"
             f"{_ansi_to_html(text, self._theme)}</span>"
@@ -263,6 +270,7 @@ class TerminalWidget(QWidget):
             f"<span style='color: #8B8B8B'>"
             f"[process exited with code {exit_code}]</span><br>"
         )
+        self._process = None
 
     def _on_error(self, error: QProcess.ProcessError) -> None:
         msgs = {
