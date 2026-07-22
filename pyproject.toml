@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "git-py"
+version = "0.1.0"
+description = "GitKraken-like Git client in Python (PySide6 + pygit2)."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "git-py contributors" }]
+dependencies = [
+    "PySide6>=6.5",
+    "pygit2>=1.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-qt>=4.2",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.3",
+]
+
+[tool.setuptools]
+packages = [
+    "src",
+    "src.core",
+    "src.viewmodels",
+    "src.ui",
+    "src.ui.widgets",
+    "src.ui.dialogs",
+    "src.utils",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+qt_api = "pyside6"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
