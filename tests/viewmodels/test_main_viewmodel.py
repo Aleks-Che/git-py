@@ -1,7 +1,7 @@
 """Stage 0: verify the ViewModel stubs and the shared AppSignals singleton."""
 from __future__ import annotations
 
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 from src.utils.signals import app_signals
 
 
@@ -18,12 +18,12 @@ def test_viewmodel_stubs_importable() -> None:
 
 
 def test_app_signals_singleton() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
     assert app_signals() is app_signals()
 
 
 def test_app_signals_exposes_expected_signals() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
     signals = app_signals()
     assert hasattr(signals, "repository_changed")
     assert hasattr(signals, "operation_finished")

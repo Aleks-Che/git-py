@@ -18,14 +18,14 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 from src.core.exceptions import GitError
 from src.core.repository import RepositoryManager
 from src.viewmodels.main_viewmodel import MainViewModel
 
 
 def _ensure_app() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 def test_refresh_state_noop_without_repo() -> None:

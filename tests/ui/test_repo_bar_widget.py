@@ -37,14 +37,15 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QCoreApplication, QPoint
+from PySide6.QtCore import QPoint
 from PySide6.QtGui import QAction
+from PySide6.QtWidgets import QApplication
 from src.ui.widgets.repo_bar_widget import RepoBarWidget
 from src.viewmodels.repo_tabs_viewmodel import RepoTabViewModel
 
 
 def _ensure_app() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 def _make_repo(name: str) -> str:

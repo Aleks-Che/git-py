@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pygit2
 import pytest
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 from src.core.diff_parser import DiffLineType, parse_diff_lines
 from src.core.models import FileStatus
 from src.core.repository import RepositoryManager
@@ -19,7 +19,7 @@ from src.viewmodels.main_viewmodel import MainViewModel
 
 
 def _ensure_app() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 # ----- lifecycle / binding -----------------------------------------------

@@ -19,15 +19,14 @@ The tests verify the enablement contract and the click → VM wiring
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QCoreApplication
 from PySide6.QtGui import QKeySequence
-from PySide6.QtWidgets import QToolBar
+from PySide6.QtWidgets import QApplication, QToolBar
 from src.core.repository import RepositoryManager
 from src.ui.main_window import MainWindow
 
 
 def _ensure_app() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 def _find_toolbar(window: MainWindow, object_name: str) -> QToolBar:

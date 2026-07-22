@@ -5,8 +5,7 @@ and stays in sync with :class:`CommandProcessor` state changes.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QCoreApplication
-from PySide6.QtWidgets import QTreeWidgetItem
+from PySide6.QtWidgets import QApplication, QTreeWidgetItem
 from src.ui.widgets.action_history_widget import ActionHistoryWidget
 from src.viewmodels.commands import CommandProcessor, GitCommand
 
@@ -29,7 +28,7 @@ class _LabelCommand(GitCommand):
 
 
 def _ensure_qapp() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 def _collect_leaves(root: QTreeWidgetItem) -> list[str]:

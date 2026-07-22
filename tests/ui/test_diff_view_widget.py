@@ -16,7 +16,7 @@ deletions, context, and the hunk separator.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QCoreApplication, QEvent, QPointF, Qt
+from PySide6.QtCore import QEvent, QPointF, Qt
 from PySide6.QtGui import QImage, QMouseEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
@@ -55,7 +55,7 @@ _SAMPLE_DIFF = (
 
 
 def _ensure_app() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 # ----- structure: HEADER lines are stripped -------------------------

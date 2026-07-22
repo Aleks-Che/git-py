@@ -5,7 +5,7 @@ import inspect
 from pathlib import Path
 
 import pygit2
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 from src.core import diff_parser, graph_v2, operations, repository
 from src.core.repository import RepositoryManager
 from src.utils import avatar, debug_mode
@@ -13,7 +13,7 @@ from src.viewmodels.main_viewmodel import MainViewModel
 
 
 def _qapp() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 def _repo(tmp_path: Path) -> RepositoryManager:

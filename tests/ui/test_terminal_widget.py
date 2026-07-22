@@ -8,14 +8,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QCoreApplication, QProcess
+from PySide6.QtCore import QProcess
+from PySide6.QtWidgets import QApplication
 from src.ui.main_window import MainWindow
 from src.ui.widgets.terminal_widget import TerminalWidget, _ansi_to_html
 from src.utils.theme import DARK_THEME
 
 
 def _ensure_app() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 # ----- ANSI parser --------------------------------------------------

@@ -105,8 +105,8 @@ def test_commit_changes_does_not_stage_untracked_files(
 
     tracked = Path(committed_repo.path) / "hello.txt"
     untracked = Path(committed_repo.path) / "untracked.txt"
-    tracked.write_text("tracked edit\n")
-    untracked.write_text("private build output\n")
+    tracked.write_bytes(b"tracked edit\n")
+    untracked.write_bytes(b"private build output\n")
 
     info = commit_changes(committed_repo, message="m", stage_all=True)
 
@@ -125,7 +125,7 @@ def test_commit_changes_does_not_stage_untracked_files(
 def test_commit_changes_allows_first_commit_in_unborn_head(tmp_git_repo: Path) -> None:
     mgr = RepositoryManager(str(tmp_git_repo))
     repo = mgr.repo
-    (tmp_git_repo / "a.txt").write_text("first\n")
+    (tmp_git_repo / "a.txt").write_bytes(b"first\n")
     repo.index.add("a.txt")
     repo.index.write()
     assert repo.head_is_unborn
@@ -1357,7 +1357,7 @@ def test_fetch_from_local_origin_still_works(
 def _make_partial_line_repo(path: Path) -> RepositoryManager:
     manager = RepositoryManager(str(path))
     signature = pygit2.Signature("tester", "tester@example.com", int(time.time()), 0)
-    (path / "lines.txt").write_text("start\nend\n")
+    (path / "lines.txt").write_bytes(b"start\nend\n")
     manager.repo.index.add("lines.txt")
     manager.repo.index.write()
     tree = manager.repo.index.write_tree()
@@ -1422,7 +1422,7 @@ def _index_text(manager: RepositoryManager) -> str:
 
 def test_stage_diff_lines_preserves_click_order(tmp_git_repo: Path) -> None:
     manager = _make_partial_line_repo(tmp_git_repo)
-    (tmp_git_repo / "lines.txt").write_text("start\n1\n2\n3\n4\n5\nend\n")
+    (tmp_git_repo / "lines.txt").write_bytes(b"start\n1\n2\n3\n4\n5\nend\n")
 
     clicked = ["5", "1", "2", "4", "3"]
     staged: list[str] = []
@@ -1435,7 +1435,7 @@ def test_stage_diff_lines_preserves_click_order(tmp_git_repo: Path) -> None:
 
 def test_unstage_diff_line_returns_only_clicked_line(tmp_git_repo: Path) -> None:
     manager = _make_partial_line_repo(tmp_git_repo)
-    (tmp_git_repo / "lines.txt").write_text("start\n1\n2\n3\nend\n")
+    (tmp_git_repo / "lines.txt").write_bytes(b"start\n1\n2\n3\nend\n")
     for value in ("3", "1", "2"):
         stage_diff_line(manager, "lines.txt", _diff_line(manager, f"+{value}"))
 
@@ -1451,7 +1451,7 @@ def test_unstage_diff_line_returns_only_clicked_line(tmp_git_repo: Path) -> None
 
 def test_stage_diff_line_can_remove_one_original_line(tmp_git_repo: Path) -> None:
     manager = _make_partial_line_repo(tmp_git_repo)
-    (tmp_git_repo / "lines.txt").write_text("start\n")
+    (tmp_git_repo / "lines.txt").write_bytes(b"start\n")
 
     stage_diff_line(
         manager,
@@ -1468,7 +1468,7 @@ def test_stage_diff_line_can_remove_one_original_line(tmp_git_repo: Path) -> Non
 
 def test_stage_diff_line_resolves_next_filtered_addition(tmp_git_repo: Path) -> None:
     manager = _make_partial_line_repo(tmp_git_repo)
-    (tmp_git_repo / "lines.txt").write_text("start\n1\n2\n3\nend\n")
+    (tmp_git_repo / "lines.txt").write_bytes(b"start\n1\n2\n3\nend\n")
 
     stage_diff_line(manager, "lines.txt", _filtered_diff_line(manager, "+1"))
     second = _filtered_diff_line(manager, "+2")
@@ -1481,7 +1481,7 @@ def test_stage_diff_line_resolves_next_filtered_addition(tmp_git_repo: Path) -> 
 
 def test_stage_diff_line_resolves_next_filtered_deletion(tmp_git_repo: Path) -> None:
     manager = _make_partial_line_repo(tmp_git_repo)
-    (tmp_git_repo / "lines.txt").write_text("start\n1\n2\n3\nend\n")
+    (tmp_git_repo / "lines.txt").write_bytes(b"start\n1\n2\n3\nend\n")
     manager.repo.index.add("lines.txt")
     manager.repo.index.write()
     tree = manager.repo.index.write_tree()
@@ -1494,7 +1494,7 @@ def test_stage_diff_line_resolves_next_filtered_deletion(tmp_git_repo: Path) -> 
         tree,
         [manager.repo.head.target],
     )
-    (tmp_git_repo / "lines.txt").write_text("start\nend\n")
+    (tmp_git_repo / "lines.txt").write_bytes(b"start\nend\n")
 
     stage_diff_line(
         manager,
@@ -1521,7 +1521,7 @@ def test_stage_diff_line_resolves_next_filtered_deletion(tmp_git_repo: Path) -> 
 def test_stage_diff_line_resolves_filtered_full_document_row(tmp_git_repo: Path) -> None:
     manager = _make_partial_line_repo(tmp_git_repo)
     base_lines = [f"line-{index}" for index in range(20)]
-    (tmp_git_repo / "lines.txt").write_text("\n".join(base_lines) + "\n")
+    (tmp_git_repo / "lines.txt").write_bytes(("\n".join(base_lines) + "\n").encode())
     manager.repo.index.add("lines.txt")
     manager.repo.index.write()
     tree = manager.repo.index.write_tree()
@@ -1536,7 +1536,7 @@ def test_stage_diff_line_resolves_filtered_full_document_row(tmp_git_repo: Path)
     )
     worktree_lines = base_lines[:2] + ["first-added"] + base_lines[2:16]
     worktree_lines += ["second-added"] + base_lines[16:]
-    (tmp_git_repo / "lines.txt").write_text("\n".join(worktree_lines) + "\n")
+    (tmp_git_repo / "lines.txt").write_bytes(("\n".join(worktree_lines) + "\n").encode())
 
     stage_diff_line(
         manager,

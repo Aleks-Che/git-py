@@ -27,7 +27,8 @@ from pathlib import Path
 from typing import Any
 
 import pygit2
-from PySide6.QtCore import QCoreApplication, QEventLoop, QThreadPool, QTimer
+from PySide6.QtCore import QEventLoop, QThreadPool, QTimer
+from PySide6.QtWidgets import QApplication
 from src.core.repository import RepositoryManager
 from src.utils.async_worker import AsyncWorker
 from src.viewmodels.main_viewmodel import MainViewModel
@@ -37,7 +38,7 @@ from src.viewmodels.main_viewmodel import MainViewModel
 
 
 def _ensure_app() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 def _drain_async_ops(timeout_ms: int = 5_000) -> None:

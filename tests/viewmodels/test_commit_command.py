@@ -14,14 +14,14 @@ from pathlib import Path
 
 import pygit2
 import pytest
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 from src.core.repository import RepositoryManager
 from src.viewmodels.commands import CommandProcessor, CommitCommand
 from src.viewmodels.main_viewmodel import MainViewModel
 
 
 def _ensure_app() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 def _sig() -> pygit2.Signature:

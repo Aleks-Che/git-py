@@ -1,7 +1,7 @@
 """Stage R2.4 — undo-семантика: deque-bounded undo, config defaults."""
 from __future__ import annotations
 
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 from src.viewmodels.commands import CommandProcessor, GitCommand
 
 
@@ -22,7 +22,7 @@ class _IncrementCommand(GitCommand):
 
 
 def _ensure_qapp() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 def test_command_processor_undo_stack_is_bounded_deque() -> None:

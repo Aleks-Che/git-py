@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QGraphicsItem,
     QGraphicsPathItem,
     QGraphicsSimpleTextItem,
+    QMenu,
 )
 from src.core.repository import RepositoryManager
 from src.ui.widgets.graph_widget import GraphWidget
@@ -1879,6 +1880,10 @@ def test_right_click_on_branch_chip_routes_to_branch_menu(
         lambda sha, pos: commit_called.append(sha),
         raising=False,
     )
+    # Safety net: if the chip hit-test ever regresses and the call falls
+    # through to the commit path, the real ``QMenu.exec`` would block the
+    # test run forever.  No-op it so a regression fails instead of hangs.
+    monkeypatch.setattr(QMenu, "exec", lambda self, *args, **kwargs: None)
 
     pos = _chip_viewport_pos(widget, head_sha, "feature")
     widget._on_context_menu(pos)  # noqa: SLF001

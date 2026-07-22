@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 from src.core.exceptions import DirtyWorkTreeError, GitError, InvalidRefError
 from src.core.operations import create_branch
 from src.core.repository import RepositoryManager
@@ -26,7 +26,7 @@ from src.viewmodels.commands import (
 
 
 def _ensure_app() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 def _add_worktree_change(repo: RepositoryManager) -> None:

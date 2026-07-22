@@ -6,13 +6,13 @@ from pathlib import Path
 
 import pygit2
 import pytest
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 from src.core.repository import RepositoryManager
 from src.viewmodels.main_viewmodel import MainViewModel
 
 
 def _ensure_qapp() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 def _make_committed_repo(tmp_path: Path) -> RepositoryManager:
@@ -214,6 +214,8 @@ def test_complete_merge_command_execute_routes_through_complete_merge(tmp_path: 
 
 def test_development_rules_documents_exemptions() -> None:
     """docs/DEVELOPMENT_RULES.md must list the operations outside GitCommand."""
-    text = (Path(__file__).resolve().parents[2] / "docs" / "DEVELOPMENT_RULES.md").read_text()
+    text = (Path(__file__).resolve().parents[2] / "docs" / "DEVELOPMENT_RULES.md").read_text(
+        encoding="utf-8",
+    )
     for op in ("_move_branch_ref", "delete_file_from_disk", "apply_stash_file", "stage_file"):
         assert op in text, f"Missing exemption for {op}"

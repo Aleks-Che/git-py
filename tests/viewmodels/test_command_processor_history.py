@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 from src.core.repository import RepositoryManager
 from src.viewmodels.commands import CommandProcessor, GitCommand, MergeCommand
 
@@ -44,7 +44,7 @@ class _FailingUndoCommand(GitCommand):
 
 
 def _ensure_qapp() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 def test_command_processor_undo_keeps_command_on_exception() -> None:

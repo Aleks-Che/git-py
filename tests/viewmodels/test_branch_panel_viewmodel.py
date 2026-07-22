@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 import pygit2
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 from src.core.models import BranchInfo, StashInfo, TagInfo
 from src.core.operations import create_branch, stash_push
 from src.core.repository import RepositoryManager
@@ -19,7 +19,7 @@ from src.viewmodels.branch_panel_viewmodel import BranchPanelViewModel
 
 
 def _ensure_app() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 def _sig() -> pygit2.Signature:

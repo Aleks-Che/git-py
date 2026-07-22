@@ -8,7 +8,7 @@ arrive in Stages 3+.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 from src.viewmodels.commands import CommandProcessor, GitCommand
 
 
@@ -31,7 +31,7 @@ class _IncrementCommand(GitCommand):
 
 def _ensure_qapp() -> None:
     """``CommandProcessor`` is a ``QObject``; its signals need an app."""
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 def test_command_processor_starts_empty() -> None:

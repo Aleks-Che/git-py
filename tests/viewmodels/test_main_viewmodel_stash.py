@@ -14,14 +14,13 @@ import time
 from pathlib import Path
 
 import pygit2
-from PySide6.QtCore import QCoreApplication
 from PySide6.QtWidgets import QApplication
 from src.core.repository import RepositoryManager
 from src.viewmodels.main_viewmodel import MainViewModel
 
 
 def _ensure_app() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 def _make_dirty(repo: RepositoryManager, text: str = "wip\n") -> None:

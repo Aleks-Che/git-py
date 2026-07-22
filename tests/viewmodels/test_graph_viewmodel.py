@@ -12,14 +12,14 @@ from pathlib import Path
 
 import pygit2
 import pytest
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 from src.core.repository import RepositoryManager
 from src.viewmodels.graph_viewmodel import GraphViewModel
 
 
 def _ensure_app() -> None:
     """Make sure a QCoreApplication exists for signal delivery."""
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 # ----- binding / refresh -----------------------------------------------

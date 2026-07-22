@@ -14,9 +14,19 @@ history shape (merge targets, conflict scenarios, ...).
 """
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable
 from pathlib import Path
+
+# PySide6 ≥ 6.7 no longer ships bundled fonts, so an offscreen run falls
+# back to a wide built-in font and every pixel-exact assertion (chip
+# hit-tests, label elision) breaks. Point Qt at the OS font directory
+# *before* the first QApplication initialises the font database.
+if os.name == "nt" and "QT_QPA_FONTDIR" not in os.environ:
+    _win_fonts = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Fonts"
+    if _win_fonts.is_dir():
+        os.environ["QT_QPA_FONTDIR"] = str(_win_fonts)
 
 import pygit2
 import pytest
@@ -27,7 +37,11 @@ from src.core.repository import RepositoryManager
 def tmp_git_repo(tmp_path: Path) -> Path:
     """Create and return the path to a fresh, empty Git repository."""
     repo_path = tmp_path / "repo"
-    pygit2.init_repository(str(repo_path), initial_head="main")
+    repo = pygit2.init_repository(str(repo_path), initial_head="main")
+    # Hermetic repos: a developer's global ``core.autocrlf=true`` makes
+    # checkouts write CRLF into the worktree and breaks byte-exact
+    # assertions against blob contents (test_r1_1_merge_mid_state).
+    repo.config["core.autocrlf"] = False
     return repo_path
 
 

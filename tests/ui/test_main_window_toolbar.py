@@ -12,13 +12,13 @@ from __future__ import annotations
 import time
 
 import pygit2
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 from src.core.repository import RepositoryManager
 from src.ui.main_window import MainWindow
 
 
 def _ensure_app() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 def _sig() -> pygit2.Signature:

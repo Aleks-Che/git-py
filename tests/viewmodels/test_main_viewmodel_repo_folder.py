@@ -19,13 +19,12 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from PySide6.QtCore import QCoreApplication
 from PySide6.QtWidgets import QApplication
 from src.viewmodels.main_viewmodel import MainViewModel
 
 
 def _ensure_app() -> None:
-    QCoreApplication.instance() or QCoreApplication([])
+    QApplication.instance() or QApplication([])
 
 
 def _clipboard_text() -> str:
