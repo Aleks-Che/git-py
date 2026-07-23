@@ -4419,3 +4419,197 @@ def test_three_branches_render_only_one_visible_chip(
     assert release_alpha == 0, (
         f"origin/release chip should NOT be drawn (alpha 0), got {release_alpha}"
     )
+
+
+# ----- update2 stage C: cherry-pick / drop / edit-message menu actions -----
+
+
+def _build_commit_menu(qtbot, mgr):
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+    menu = widget._build_node_menu(mgr.head_commit.sha, "commit")  # noqa: SLF001
+    qtbot.addWidget(menu)
+    return widget, menu
+
+
+def test_commit_menu_has_history_actions(qtbot, tmp_git_repo: Path) -> None:
+    """The commit context menu exposes Cherry-pick / Drop / Edit."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    _widget, menu = _build_commit_menu(qtbot, mgr)
+    labels = [a.text() for a in menu.actions()]
+    assert "Cherry-pick commit" in labels
+    assert "Drop commit" in labels
+    assert "Edit commit message…" in labels
+
+
+def test_commit_menu_cherry_pick_emits_sha(qtbot, tmp_git_repo: Path) -> None:
+    mgr = _make_committed_repo(tmp_git_repo)
+    widget, menu = _build_commit_menu(qtbot, mgr)
+    action = next(a for a in menu.actions() if a.text() == "Cherry-pick commit")
+    with qtbot.waitSignal(
+        widget.cherry_pick_commit_requested, timeout=1000,
+    ) as blocker:
+        action.trigger()
+    assert blocker.args == [mgr.head_commit.sha]
+
+
+def test_commit_menu_drop_emits_sha(qtbot, tmp_git_repo: Path) -> None:
+    mgr = _make_committed_repo(tmp_git_repo)
+    widget, menu = _build_commit_menu(qtbot, mgr)
+    action = next(a for a in menu.actions() if a.text() == "Drop commit")
+    assert action.isEnabled()
+    with qtbot.waitSignal(
+        widget.drop_commit_requested, timeout=1000,
+    ) as blocker:
+        action.trigger()
+    assert blocker.args == [mgr.head_commit.sha]
+
+
+def test_commit_menu_drop_disabled_for_merge_commit(qtbot, tmp_git_repo: Path) -> None:
+    """Drop is disabled on merge commits (v1 limitation)."""
+    mgr = _make_merge_repo(tmp_git_repo)
+    widget, menu = _build_commit_menu(qtbot, mgr)
+    action = next(a for a in menu.actions() if a.text() == "Drop commit")
+    assert not action.isEnabled()
+
+
+def test_commit_menu_edit_message_emits_sha(qtbot, tmp_git_repo: Path) -> None:
+    mgr = _make_committed_repo(tmp_git_repo)
+    widget, menu = _build_commit_menu(qtbot, mgr)
+    action = next(a for a in menu.actions() if a.text() == "Edit commit message…")
+    with qtbot.waitSignal(
+        widget.edit_commit_message_requested, timeout=1000,
+    ) as blocker:
+        action.trigger()
+    assert blocker.args == [mgr.head_commit.sha]
+
+
+# ----- update2 stage D: shift multi-selection + squash menu -----------------
+
+
+def _make_linear_repo(path: Path, n: int = 4) -> RepositoryManager:
+    mgr = RepositoryManager(str(path))
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    parents = []
+    for i in range(n):
+        (path / "f.txt").write_text(f"content {i}\n")
+        mgr.repo.index.add("f.txt")
+        mgr.repo.index.write()
+        tree = mgr.repo.index.write_tree()
+        oid = mgr.repo.create_commit(
+            "refs/heads/main", sig, sig, f"commit {i}", tree, parents,
+        )
+        parents = [oid]
+    return mgr
+
+
+def _click_commit_row(widget, row_idx: int, modifiers=Qt.KeyboardModifier.NoModifier):
+    y = widget._row_y(row_idx) + 5  # noqa: SLF001
+    event = QMouseEvent(
+        QEvent.Type.MouseButtonPress,
+        QPoint(60, int(y)),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        modifiers,
+    )
+    widget.mousePressEvent(event)  # noqa: SLF001
+
+
+def test_shift_click_selects_contiguous_range(qtbot, tmp_git_repo: Path) -> None:
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_linear_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    _click_commit_row(widget, 0)
+    _click_commit_row(widget, 2, modifiers=Qt.KeyboardModifier.ShiftModifier)
+
+    shas = widget.selected_shas()
+    assert len(shas) == 3
+    assert shas[0] == mgr.head_commit.sha  # newest first
+    assert widget.selected_sha() == shas[2]  # last clicked
+
+
+def test_plain_click_collapses_range(qtbot, tmp_git_repo: Path) -> None:
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_linear_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    _click_commit_row(widget, 0)
+    _click_commit_row(widget, 2, modifiers=Qt.KeyboardModifier.ShiftModifier)
+    assert len(widget.selected_shas()) == 3
+    _click_commit_row(widget, 1)
+    assert widget.selected_shas() == [widget.selected_sha()]
+
+
+def test_multi_select_menu_squash_enabled_and_emits(qtbot, tmp_git_repo: Path) -> None:
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_linear_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    _click_commit_row(widget, 0)
+    _click_commit_row(widget, 2, modifiers=Qt.KeyboardModifier.ShiftModifier)
+    shas = widget.selected_shas()
+
+    menu = widget._build_multi_select_menu(shas)  # noqa: SLF001
+    qtbot.addWidget(menu)
+    action = next(a for a in menu.actions() if a.text() == "Squash (3) commits")
+    assert action.isEnabled()
+    with qtbot.waitSignal(widget.squash_commits_requested, timeout=1000) as blocker:
+        action.trigger()
+    assert blocker.args == [shas]
+
+
+def test_multi_select_menu_squash_disabled_with_merge_in_range(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    from src.ui.widgets.graph_panel import GraphTableWidget
+
+    mgr = _make_merge_repo(tmp_git_repo)
+    vm = GraphViewModel(mgr)
+    widget = GraphTableWidget(vm)
+    widget.resize(900, 400)
+    qtbot.addWidget(widget)
+    widget.show()
+    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
+        vm.refresh_graph()
+
+    # Rows: 0 = merge commit (tip), 1 = main2, ... select rows 0..2 so
+    # the range includes the merge commit.
+    _click_commit_row(widget, 0)
+    _click_commit_row(widget, 2, modifiers=Qt.KeyboardModifier.ShiftModifier)
+    shas = widget.selected_shas()
+    assert len(shas) == 3
+
+    menu = widget._build_multi_select_menu(shas)  # noqa: SLF001
+    qtbot.addWidget(menu)
+    action = next(a for a in menu.actions() if a.text() == "Squash (3) commits")
+    assert not action.isEnabled()
+    assert action.toolTip()

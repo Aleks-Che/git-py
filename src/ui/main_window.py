@@ -517,6 +517,14 @@ class MainWindow(QMainWindow):
         self._graph_table.checkout_commit_requested.connect(
             self._main_vm.checkout_commit,
         )
+        self._graph_table.cherry_pick_commit_requested.connect(
+            self._main_vm.cherry_pick_commit,
+        )
+        self._graph_table.drop_commit_requested.connect(self._on_drop_commit)
+        self._graph_table.edit_commit_message_requested.connect(
+            self._on_edit_commit_message,
+        )
+        self._graph_table.squash_commits_requested.connect(self._on_squash_commits)
         self._graph_table.copy_diff_requested.connect(self._on_copy_diff)
         self._graph_table.discard_changes_requested.connect(self._on_discard_changes)
         self._graph_table.stash_apply_requested.connect(self._on_stash_apply_graph)
@@ -842,6 +850,77 @@ class MainWindow(QMainWindow):
             return
         self._main_vm.copy_to_clipboard(sha)
         self._status.showMessage(f"Copied commit {sha[:7]}", 3000)
+
+    def _confirm_history_rewrite(self, sha: str, action: str) -> bool:
+        """Warn when ``sha`` was already pushed; return the user's consent."""
+        if not self._main_vm.is_commit_pushed(sha):
+            return True
+        answer = QMessageBox.question(
+            self,
+            action,
+            f"Commit {sha[:7]} is already pushed to a remote.\n"
+            f"{action} rewrites published history and may break other "
+            "people's clones.\n\nContinue anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _on_drop_commit(self, sha: str) -> None:
+        """Drop a commit from the graph context menu (with push guard)."""
+        if not sha or not self._confirm_history_rewrite(sha, "Drop commit"):
+            return
+        self._main_vm.drop_commit(sha)
+
+    def _on_edit_commit_message(self, sha: str) -> None:
+        """Prompt for a new message and reword the commit (with push guard)."""
+        if not sha:
+            return
+        details = self._main_vm.graph_view_model().get_commit_details(sha)
+        current = details.message if details is not None else ""
+        from PySide6.QtWidgets import QInputDialog
+
+        text, ok = QInputDialog.getMultiLineText(
+            self,
+            "Edit commit message",
+            f"New message for {sha[:7]}:",
+            current,
+        )
+        if not ok or not text.strip():
+            return
+        if not self._confirm_history_rewrite(sha, "Edit commit message"):
+            return
+        self._main_vm.edit_commit_message(sha, text)
+
+    def _on_squash_commits(self, shas: list) -> None:
+        """Squash a multi-selected commit range (with push guard).
+
+        ``shas`` arrive newest-first from the graph. The combined
+        default message joins the range messages newest → oldest.
+        """
+        shas = list(shas)
+        if len(shas) < 2:
+            return
+        # If the OLDEST commit of the range is not pushed, none of
+        # the newer ones can be (they are its descendants).
+        if not self._confirm_history_rewrite(shas[-1], "Squash commits"):
+            return
+        gvm = self._main_vm.graph_view_model()
+        parts = []
+        for sha in shas:
+            details = gvm.get_commit_details(sha)
+            parts.append(details.message.strip() if details is not None else sha[:7])
+        from PySide6.QtWidgets import QInputDialog
+
+        text, ok = QInputDialog.getMultiLineText(
+            self,
+            "Squash commits",
+            f"Squash {len(shas)} commits into one. Message:",
+            "\n\n".join(parts),
+        )
+        if not ok or not text.strip():
+            return
+        self._main_vm.squash_commits(shas, text)
 
     def _on_discard_changes(self, sha: str) -> None:
         """Discard all uncommitted changes (from graph WIP context menu)."""

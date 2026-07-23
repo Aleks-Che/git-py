@@ -954,8 +954,16 @@ def complete_rebase_continue(repo: RepositoryManager | pygit2.Repository) -> boo
 def cherry_pick(
     repo: RepositoryManager | pygit2.Repository,
     sha: str,
+    *,
+    create_commit: bool = False,
 ) -> CommitInfo:
-    """Cherry-pick ``sha`` onto the current HEAD."""
+    """Cherry-pick ``sha`` onto the current HEAD.
+
+    By default the change is only staged (HEAD does not move) — the
+    caller follows up with a regular commit. With ``create_commit``
+    the staged result is committed immediately with the original
+    message and authorship (committer is the current user).
+    """
     with unwrap(repo) as r:
         if r.head_is_unborn:
             raise GitError("Cannot cherry-pick: HEAD is unborn.")
@@ -972,6 +980,13 @@ def cherry_pick(
             raise MergeConflictError(
                 f"Cherry-pick of {sha!r} produced conflicts.",
                 conflicting_paths=conflicts,
+            )
+        if create_commit:
+            return commit_changes(
+                r,
+                commit.message,
+                author=commit.author,
+                stage_all=False,
             )
         head = r[r.head.target]
     return _to_commit_info(head)
@@ -1007,6 +1022,372 @@ def revert(
             )
         head = r[r.head.target]
     return _to_commit_info(head)
+
+
+def drop_commit(
+    repo: RepositoryManager | pygit2.Repository,
+    sha: str,
+) -> None:
+    """Remove ``sha`` from the current branch's history.
+
+    * ``sha`` is the branch tip → ``reset --hard`` to its parent.
+    * Otherwise → ``git rebase --onto <sha>^ <sha>`` via the CLI (the
+      plain rebase flattens merge commits between ``sha`` and HEAD —
+      merge commits in between are not preserved).
+
+    Merge commits and the root commit cannot be dropped. Detached HEAD
+    is rejected up front (the rebase CLI would re-attach HEAD
+    confusingly). A conflicting replay raises
+    :class:`RebaseConflictError` — the caller resolves and continues
+    via :func:`complete_rebase_continue` or aborts via
+    :func:`abort_rebase`.
+    """
+    with unwrap(repo) as r:
+        if r.head_is_unborn:
+            raise GitError("Cannot drop a commit: HEAD is unborn.")
+        if r.head_is_detached:
+            raise GitError(
+                "Cannot drop a commit in detached HEAD state. "
+                "Switch to a branch first.",
+            )
+        try:
+            commit = r.revparse_single(sha).peel(pygit2.Commit)
+        except (KeyError, pygit2.GitError, ValueError) as exc:
+            raise InvalidRefError(f"Unknown revision: {sha!r}") from exc
+        if len(commit.parent_ids) > 1:
+            raise GitError("Cannot drop a merge commit.")
+        if not commit.parent_ids:
+            raise GitError("Cannot drop the root commit.")
+        if r.head.target == commit.id:
+            reset(r, str(commit.parent_ids[0]), mode="hard")
+            return
+        if not r.descendant_of(r.head.target, commit.id):
+            raise GitError(
+                f"Commit {sha[:7]} is not an ancestor of HEAD; "
+                "only commits on the current branch can be dropped.",
+            )
+        full_sha = str(commit.id)
+        completed = _run_git_in_workdir(
+            r,
+            ["rebase", "--onto", f"{full_sha}^", full_sha],
+            timeout=300.0,
+        )
+    if completed.returncode != 0:
+        if "conflict" in (completed.stderr + completed.stdout).lower():
+            raise RebaseConflictError(
+                f"Drop of {sha[:7]} stopped with conflicts. "
+                "Resolve and run `git rebase --continue`.\n"
+                f"{completed.stderr}",
+            )
+        raise GitError(
+            f"Drop commit failed: "
+            f"{completed.stderr.strip() or completed.stdout.strip()}",
+        )
+
+
+def edit_commit_message(
+    repo: RepositoryManager | pygit2.Repository,
+    sha: str,
+    message: str,
+) -> CommitInfo:
+    """Rewrite the message of ``sha`` and return the new commit.
+
+    * ``sha`` is the branch tip → pure-pygit2 amend: a new commit with
+      the same tree/parents/authorship replaces the tip (the index and
+      worktree are *not* touched, unlike ``git commit --amend``).
+    * Otherwise → interactive rebase (``reword``) via generated
+      sequence/message editor scripts. Trees are replayed unchanged,
+      so conflicts are impossible.
+
+    Detached HEAD is rejected up front.
+    """
+    if not message or not message.strip():
+        raise GitError("Commit message must not be empty.")
+    with unwrap(repo) as r:
+        if r.head_is_unborn:
+            raise GitError("Cannot edit a commit message: HEAD is unborn.")
+        if r.head_is_detached:
+            raise GitError(
+                "Cannot edit a commit message in detached HEAD state. "
+                "Switch to a branch first.",
+            )
+        try:
+            commit = r.revparse_single(sha).peel(pygit2.Commit)
+        except (KeyError, pygit2.GitError, ValueError) as exc:
+            raise InvalidRefError(f"Unknown revision: {sha!r}") from exc
+        if r.head.target == commit.id:
+            # ``create_commit("HEAD", ...)`` would trip libgit2's
+            # fast-forward check (the old tip is not a parent of the
+            # amended commit), so create the commit unattached and
+            # move the branch ref explicitly.
+            new_oid = r.create_commit(
+                None,
+                commit.author,
+                _now_signature(),
+                message,
+                commit.tree_id,
+                list(commit.parent_ids),
+            )
+            r.head.set_target(new_oid, "amend: rewrite commit message")
+            return _to_commit_info(r[new_oid])
+        if not r.descendant_of(r.head.target, commit.id):
+            raise GitError(
+                f"Commit {sha[:7]} is not an ancestor of HEAD; "
+                "only commits on the current branch can be reworded.",
+            )
+        new_info = _reword_via_interactive_rebase(r, commit, message)
+    return new_info
+
+
+def _reword_via_interactive_rebase(
+    r: pygit2.Repository,
+    commit: pygit2.Commit,
+    message: str,
+) -> CommitInfo:
+    """Reword ``commit`` via ``git rebase -i`` with scripted editors.
+
+    ``GIT_SEQUENCE_EDITOR`` rewrites the todo list (``pick`` →
+    ``reword`` for the target line); ``GIT_EDITOR`` replaces the
+    commit message file with the new text. Both helper scripts and
+    the message payload live in a temp dir so no shell quoting is
+    involved.
+    """
+    import sys
+    import tempfile
+
+    full_sha = str(commit.id)
+    tmp = Path(tempfile.mkdtemp(prefix="git_py_reword_"))
+    try:
+        seq_script = tmp / "seq_editor.py"
+        seq_script.write_text(
+            "import sys\n"
+            f"target = {full_sha[:7]!r}\n"
+            "path = sys.argv[1]\n"
+            "with open(path, encoding='utf-8') as fh:\n"
+            "    lines = fh.readlines()\n"
+            "with open(path, 'w', encoding='utf-8') as fh:\n"
+            "    for line in lines:\n"
+            "        parts = line.split()\n"
+            "        if (\n"
+            "            len(parts) >= 2\n"
+            "            and parts[0] == 'pick'\n"
+            "            and target.startswith(parts[1])\n"
+            "        ):\n"
+            "            line = line.replace('pick', 'reword', 1)\n"
+            "        fh.write(line)\n",
+            encoding="utf-8",
+        )
+        msg_file = tmp / "message.txt"
+        msg_file.write_text(message, encoding="utf-8")
+        msg_script = tmp / "msg_editor.py"
+        msg_script.write_text(
+            "import shutil\n"
+            "import sys\n"
+            f"shutil.copyfile({str(msg_file)!r}, sys.argv[1])\n",
+            encoding="utf-8",
+        )
+        python = sys.executable or "python"
+        env = {
+            **os.environ,
+            "GIT_SEQUENCE_EDITOR": f'"{python}" "{seq_script}"',
+            "GIT_EDITOR": f'"{python}" "{msg_script}"',
+        }
+        if not commit.parent_ids:
+            base_args = ["rebase", "-i", "--root"]
+        else:
+            base_args = ["rebase", "-i", f"{full_sha}^"]
+        completed = _run_git_in_workdir(r, base_args, timeout=300.0, env=env)
+        if completed.returncode != 0:
+            raise GitError(
+                f"Edit commit message failed: "
+                f"{completed.stderr.strip() or completed.stdout.strip()}",
+            )
+        rewritten = r.revparse_single(full_sha)
+        return _to_commit_info(rewritten.peel(pygit2.Commit))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def is_commit_pushed(
+    repo: RepositoryManager | pygit2.Repository,
+    sha: str,
+) -> bool:
+    """Return ``True`` when ``sha`` is reachable from any remote ref.
+
+    Used by the UI to warn before history-rewriting operations (drop,
+    reword, squash) on commits that were already published.
+    """
+    with unwrap(repo) as r:
+        try:
+            commit = r.revparse_single(sha).peel(pygit2.Commit)
+        except (KeyError, pygit2.GitError, ValueError) as exc:
+            raise InvalidRefError(f"Unknown revision: {sha!r}") from exc
+        for name in r.listall_references():
+            if not name.startswith("refs/remotes/"):
+                continue
+            tip = r.references[name].target
+            if tip == commit.id or r.descendant_of(tip, commit.id):
+                return True
+    return False
+
+
+def squash_commits(
+    repo: RepositoryManager | pygit2.Repository,
+    shas: list[str],
+    message: str,
+) -> CommitInfo:
+    """Squash a contiguous first-parent chain of commits into one.
+
+    ``shas`` are ordered newest → oldest (graph order) and must form
+    an unbroken chain: every commit's first parent is the next entry.
+    Merge commits inside the range are rejected, and the oldest entry
+    must have a parent (the squash base).
+
+    * Range top == branch tip → ``reset --soft`` to the base + one
+      commit (cannot conflict).
+    * Otherwise → interactive rebase (``squash`` lines) via scripted
+      editors; a conflicting replay raises
+      :class:`RebaseConflictError`.
+
+    Returns the resulting squashed commit.
+    """
+    if not message or not message.strip():
+        raise GitError("Commit message must not be empty.")
+    if len(shas) < 2:
+        raise GitError("Squash requires at least two commits.")
+    with unwrap(repo) as r:
+        if r.head_is_unborn:
+            raise GitError("Cannot squash commits: HEAD is unborn.")
+        if r.head_is_detached:
+            raise GitError(
+                "Cannot squash commits in detached HEAD state. "
+                "Switch to a branch first.",
+            )
+        commits: list[pygit2.Commit] = []
+        for sha in shas:
+            try:
+                commits.append(r.revparse_single(sha).peel(pygit2.Commit))
+            except (KeyError, pygit2.GitError, ValueError) as exc:
+                raise InvalidRefError(f"Unknown revision: {sha!r}") from exc
+        for i, commit in enumerate(commits):
+            if len(commit.parent_ids) > 1:
+                raise GitError(
+                    f"Cannot squash merge commit {str(commit.id)[:7]}.",
+                )
+            if i + 1 < len(commits):
+                nxt = commits[i + 1]
+                if not commit.parent_ids or commit.parent_ids[0] != nxt.id:
+                    raise GitError(
+                        "Selected commits do not form a contiguous chain.",
+                    )
+        oldest = commits[-1]
+        if not oldest.parent_ids:
+            raise GitError("Cannot squash the root commit.")
+        if (
+            r.head.target != commits[0].id
+            and not r.descendant_of(r.head.target, commits[0].id)
+        ):
+            raise GitError(
+                "Selected commits are not ancestors of HEAD; "
+                "only commits on the current branch can be squashed.",
+            )
+        base_sha = str(oldest.parent_ids[0])
+        if r.head.target == commits[0].id:
+            reset(r, base_sha, mode="soft")
+            return commit_changes(r, message, stage_all=False)
+        new_oid = _squash_via_interactive_rebase(
+            r,
+            [str(c.id) for c in reversed(commits)],
+            base_sha,
+            message,
+        )
+        return _to_commit_info(r[new_oid])
+
+
+def _squash_via_interactive_rebase(
+    r: pygit2.Repository,
+    range_shas_oldest_first: list[str],
+    base_sha: str,
+    message: str,
+) -> pygit2.Oid:
+    """Squash ``range_shas_oldest_first`` via ``git rebase -i``.
+
+    ``GIT_SEQUENCE_EDITOR`` keeps the oldest range commit as ``pick``
+    and marks the rest ``squash``; ``GIT_EDITOR`` replaces the
+    combined squash message with ``message``. Helper scripts and the
+    message payload live in a temp dir (no shell quoting). Returns
+    the OID of the squashed commit (the new head of the replayed
+    range — found by walking back from the new HEAD by the number of
+    commits that followed the range).
+    """
+    import sys
+    import tempfile
+
+    tmp = Path(tempfile.mkdtemp(prefix="git_py_squash_"))
+    try:
+        seq_script = tmp / "seq_editor.py"
+        seq_script.write_text(
+            "import sys\n"
+            f"oldest = {range_shas_oldest_first[0][:7]!r}\n"
+            f"range_shas = {[s[:7] for s in range_shas_oldest_first]!r}\n"
+            "path = sys.argv[1]\n"
+            "with open(path, encoding='utf-8') as fh:\n"
+            "    lines = fh.readlines()\n"
+            "with open(path, 'w', encoding='utf-8') as fh:\n"
+            "    for line in lines:\n"
+            "        parts = line.split()\n"
+            "        if len(parts) >= 2 and parts[0] == 'pick':\n"
+            "            for short in range_shas:\n"
+            "                if short.startswith(parts[1]) and short != oldest:\n"
+            "                    line = line.replace('pick', 'squash', 1)\n"
+            "                    break\n"
+            "        fh.write(line)\n",
+            encoding="utf-8",
+        )
+        msg_file = tmp / "message.txt"
+        msg_file.write_text(message, encoding="utf-8")
+        msg_script = tmp / "msg_editor.py"
+        msg_script.write_text(
+            "import shutil\n"
+            "import sys\n"
+            f"shutil.copyfile({str(msg_file)!r}, sys.argv[1])\n",
+            encoding="utf-8",
+        )
+        python = sys.executable or "python"
+        env = {
+            **os.environ,
+            "GIT_SEQUENCE_EDITOR": f'"{python}" "{seq_script}"',
+            "GIT_EDITOR": f'"{python}" "{msg_script}"',
+        }
+        completed = _run_git_in_workdir(
+            r,
+            ["rebase", "-i", base_sha],
+            timeout=300.0,
+            env=env,
+        )
+        if completed.returncode != 0:
+            if "conflict" in (completed.stderr + completed.stdout).lower():
+                raise RebaseConflictError(
+                    "Squash stopped with conflicts. "
+                    "Resolve and run `git rebase --continue`.\n"
+                    f"{completed.stderr}",
+                )
+            raise GitError(
+                f"Squash failed: "
+                f"{completed.stderr.strip() or completed.stdout.strip()}",
+            )
+        # The squashed commit is the first commit on the rebased base
+        # (the range always starts at the base): walk to the child of
+        # the base along first parents.
+        tip = r[r.head.target]
+        chain = [tip]
+        while chain[-1].parent_ids and str(chain[-1].parent_ids[0]) != base_sha:
+            chain.append(r[chain[-1].parent_ids[0]])
+        if str(chain[-1].parent_ids[0] if chain[-1].parent_ids else "") != base_sha:
+            raise GitError("Squash result sanity check failed: base not found.")
+        return chain[-1].id
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def snapshot_index_entry(

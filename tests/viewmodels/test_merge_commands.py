@@ -33,6 +33,8 @@ from src.core.repository import RepositoryManager
 from src.viewmodels.commands import (
     CherryPickCommand,
     CommandProcessor,
+    DropCommitCommand,
+    EditCommitMessageCommand,
     MergeCommand,
     RebaseCommand,
     RevertCommand,
@@ -556,3 +558,152 @@ def test_unknown_source_raises_and_does_not_push(
     with pytest.raises(GitError):
         proc.execute(cmd)
     assert not proc.can_undo
+
+
+# ----- update2 stage C: CherryPick(auto) / DropCommit / EditMessage --------
+
+
+def test_cherry_pick_command_auto_commit_moves_head_and_undoes(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    """With ``auto_commit=True`` the pick is committed immediately."""
+    _ensure_app()
+    from src.core.operations import reset
+
+    mgr = RepositoryManager(str(tmp_git_repo))
+    base_oid = make_commit("base", files={"a.txt": "A\n"})
+    feat_oid = make_commit("adds-b", files={"b.txt": "B\n"}, parents=[base_oid])
+    reset(mgr, str(base_oid), mode="hard")
+
+    proc = CommandProcessor()
+    cmd = CherryPickCommand(mgr, str(feat_oid), auto_commit=True)
+    proc.execute(cmd)
+    assert mgr.head_commit.sha != str(base_oid)
+    assert mgr.head_commit.message.strip() == "adds-b"
+    assert mgr.head_commit.parents == [str(base_oid)]
+    assert proc.can_undo
+
+    proc.undo()
+    assert mgr.head_commit.sha == str(base_oid)
+
+
+def test_drop_commit_command_removes_commit_and_undoes(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    _ensure_app()
+    mgr = RepositoryManager(str(tmp_git_repo))
+    c1 = make_commit("c1", files={"a.txt": "A\n"})
+    c2 = make_commit("c2", files={"b.txt": "B\n"}, parents=[c1])
+    c3 = make_commit("c3", files={"c.txt": "C\n"}, parents=[c2])
+
+    proc = CommandProcessor()
+    cmd = DropCommitCommand(mgr, str(c2))
+    proc.execute(cmd)
+    history = [c.sha for c in mgr.get_all_history()]
+    assert str(c2) not in history
+    assert mgr.head_commit.sha != str(c3)
+    assert proc.can_undo
+    assert proc.undo_stack_snapshot()[-1]["name"] == f"drop commit {str(c2)[:7]}"
+
+    proc.undo()
+    history_after = [c.sha for c in mgr.get_all_history()]
+    assert str(c2) in history_after
+    assert mgr.head_commit.sha == str(c3)
+
+
+def test_drop_commit_command_merge_rejected_not_pushed(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    _ensure_app()
+    mgr = RepositoryManager(str(tmp_git_repo))
+    root = make_commit("root", files={"a.txt": "A\n"})
+    side = make_commit("side", files={"b.txt": "B\n"}, parents=[root], ref="refs/heads/side")
+    merge = make_commit("merge", parents=[root, side])
+
+    proc = CommandProcessor()
+    with pytest.raises(GitError, match="merge commit"):
+        proc.execute(DropCommitCommand(mgr, str(merge)))
+    assert not proc.can_undo
+    assert mgr.head_commit.sha == str(merge)
+
+
+def test_edit_commit_message_command_rewords_and_undoes(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    _ensure_app()
+    mgr = RepositoryManager(str(tmp_git_repo))
+    c1 = make_commit("c1", files={"a.txt": "A\n"})
+    c2 = make_commit("c2", files={"b.txt": "B\n"}, parents=[c1])
+
+    proc = CommandProcessor()
+    cmd = EditCommitMessageCommand(mgr, str(c2), "c2 renamed")
+    proc.execute(cmd)
+    assert mgr.head_commit.sha != str(c2)
+    assert mgr.head_commit.message.strip() == "c2 renamed"
+
+    proc.undo()
+    assert mgr.head_commit.sha == str(c2)
+    assert mgr.head_commit.message.strip() == "c2"
+
+
+def test_edit_commit_message_command_empty_rejected(
+    committed_repo: RepositoryManager,
+) -> None:
+    _ensure_app()
+    proc = CommandProcessor()
+    with pytest.raises(GitError, match="must not be empty"):
+        proc.execute(
+            EditCommitMessageCommand(
+                committed_repo, committed_repo.head_commit.sha, "  ",
+            ),
+        )
+    assert not proc.can_undo
+
+
+def test_squash_commits_command_squashes_and_undoes(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    _ensure_app()
+    from src.viewmodels.commands import SquashCommitsCommand
+
+    mgr = RepositoryManager(str(tmp_git_repo))
+    c1 = make_commit("c1", files={"a.txt": "A\n"})
+    c2 = make_commit("c2", files={"b.txt": "B\n"}, parents=[c1])
+    c3 = make_commit("c3", files={"c.txt": "C\n"}, parents=[c2])
+
+    proc = CommandProcessor()
+    cmd = SquashCommitsCommand(mgr, [str(c3), str(c2)], "c2+c3 squashed")
+    proc.execute(cmd)
+    assert mgr.head_commit.message.strip() == "c2+c3 squashed"
+    assert mgr.head_commit.parents == [str(c1)]
+    assert proc.can_undo
+    assert proc.undo_stack_snapshot()[-1]["name"] == "squash 2 commits"
+
+    proc.undo()
+    assert mgr.head_commit.sha == str(c3)
+    history = [c.message.strip() for c in mgr.get_all_history()]
+    assert history == ["c3", "c2", "c1"]
+
+
+def test_squash_commits_command_invalid_range_not_pushed(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    _ensure_app()
+    from src.viewmodels.commands import SquashCommitsCommand
+
+    mgr = RepositoryManager(str(tmp_git_repo))
+    c1 = make_commit("c1", files={"a.txt": "A\n"})
+    c2 = make_commit("c2", files={"b.txt": "B\n"}, parents=[c1])
+    c3 = make_commit("c3", files={"c.txt": "C\n"}, parents=[c2])
+
+    proc = CommandProcessor()
+    with pytest.raises(GitError, match="contiguous chain"):
+        proc.execute(SquashCommitsCommand(mgr, [str(c3), str(c1)], "nope"))
+    assert not proc.can_undo
+    assert mgr.head_commit.sha == str(c3)

@@ -2001,6 +2001,143 @@ class MainViewModel(QObject):
         self._log("cherry-pick", f"Cherry-pick {sha[:7]!r} staged")
 
     @_guard_mutation
+    def cherry_pick_commit(self, sha: str) -> None:
+        """Cherry-pick ``sha`` and commit the result immediately.
+
+        Graph context-menu variant of :meth:`cherry_pick`: the staged
+        result is committed with the original message and authorship.
+        On conflict the staging is left as-is and the VM transitions
+        into the conflict state.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            self._log("cherry-pick", f"Cherry-pick {sha[:7]!r} failed: no repo", level="error")
+            return
+        from src.viewmodels.commands import CherryPickCommand
+
+        self._log("cherry-pick", f"Cherry-pick+commit {sha[:7].rstrip()}")
+        command = CherryPickCommand(self._repo_manager, sha, auto_commit=True)
+        try:
+            self._command_processor.execute(command)
+        except MergeConflictError as exc:
+            self._log("cherry-pick", f"Cherry-pick {sha[:7]!r} produced conflicts", level="warn")
+            self._set_conflict_state(
+                "cherry-pick",
+                conflicting_paths=exc.conflicting_paths,
+                sha=sha,
+            )
+            return
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("cherry-pick", f"Cherry-pick {sha[:7]!r} failed: {exc}", level="error")
+            return
+        self._refresh_all_views()
+        self._log("cherry-pick", f"Cherry-pick {sha[:7]!r} committed")
+
+    @_guard_mutation
+    def drop_commit(self, sha: str) -> None:
+        """Drop ``sha`` from the current branch via :class:`DropCommitCommand`.
+
+        Undoable through the command processor (reset to the captured
+        pre-drop HEAD). A conflicting replay surfaces the rebase
+        conflict state.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            self._log("drop", f"Drop {sha[:7]!r} failed: no repo", level="error")
+            return
+        from src.viewmodels.commands import DropCommitCommand
+
+        self._log("drop", f"Drop commit {sha[:7].rstrip()}")
+        command = DropCommitCommand(self._repo_manager, sha)
+        try:
+            self._command_processor.execute(command)
+        except RebaseConflictError as exc:
+            self._log("drop", f"Drop {sha[:7]!r} produced conflicts", level="warn")
+            self._set_conflict_state(
+                "rebase",
+                conflicting_paths=[],
+                op="drop",
+                sha=sha,
+            )
+            self.error_occurred.emit(str(exc))
+            return
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("drop", f"Drop {sha[:7]!r} failed: {exc}", level="error")
+            return
+        self._refresh_all_views()
+        self._log("drop", f"Drop {sha[:7]!r} succeeded")
+
+    @_guard_mutation
+    def edit_commit_message(self, sha: str, message: str) -> None:
+        """Rewrite ``sha``'s message via :class:`EditCommitMessageCommand`."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            self._log("reword", f"Edit message {sha[:7]!r} failed: no repo", level="error")
+            return
+        from src.viewmodels.commands import EditCommitMessageCommand
+
+        self._log("reword", f"Edit message of {sha[:7].rstrip()}")
+        command = EditCommitMessageCommand(self._repo_manager, sha, message)
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("reword", f"Edit message {sha[:7]!r} failed: {exc}", level="error")
+            return
+        self._refresh_all_views()
+        self._log("reword", f"Edit message {sha[:7]!r} succeeded")
+
+    def is_commit_pushed(self, sha: str) -> bool:
+        """Return ``True`` when ``sha`` is reachable from any remote ref.
+
+        Non-mutating query used by the UI to warn before history
+        rewrites (drop / reword / squash) on published commits.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            return False
+        from src.core.operations import is_commit_pushed as _is_pushed
+
+        try:
+            return _is_pushed(self._repo_manager, sha)
+        except GitError:
+            return False
+
+    @_guard_mutation
+    def squash_commits(self, shas: list[str], message: str) -> None:
+        """Squash a contiguous chain of commits via :class:`SquashCommitsCommand`.
+
+        ``shas`` are ordered newest → oldest (graph selection order).
+        A conflicting replay surfaces the rebase conflict state.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            self._log("squash", "Squash failed: no repo", level="error")
+            return
+        from src.viewmodels.commands import SquashCommitsCommand
+
+        self._log("squash", f"Squash {len(shas)} commits")
+        command = SquashCommitsCommand(self._repo_manager, shas, message)
+        try:
+            self._command_processor.execute(command)
+        except RebaseConflictError as exc:
+            self._log("squash", "Squash produced conflicts", level="warn")
+            self._set_conflict_state(
+                "rebase",
+                conflicting_paths=[],
+                op="squash",
+            )
+            self.error_occurred.emit(str(exc))
+            return
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("squash", f"Squash failed: {exc}", level="error")
+            return
+        self._refresh_all_views()
+        self._log("squash", f"Squash {len(shas)} commits succeeded")
+
+    @_guard_mutation
     def revert(self, sha: str) -> None:
         """Revert ``sha`` via :class:`RevertCommand`.
 

@@ -217,6 +217,12 @@ class GraphTableWidget(QWidget):
 
     commit_selected = Signal(str)
     checkout_commit_requested = Signal(str)
+    cherry_pick_commit_requested = Signal(str)
+    drop_commit_requested = Signal(str)
+    edit_commit_message_requested = Signal(str)
+    # Multi-select range verb: payload is the selected SHAs, newest
+    # first (graph order), validated squashed-range by the menu.
+    squash_commits_requested = Signal(list)
     copy_diff_requested = Signal(str)
     stash_apply_requested = Signal(str)
     stash_pop_requested = Signal(str)
@@ -284,6 +290,11 @@ class GraphTableWidget(QWidget):
 
         self._rows: list[dict] = []
         self._selected_sha: str | None = None
+        # Multi-selection for range verbs (Squash N commits). Built by
+        # Shift+click: ``_selection_anchor`` is the first clicked row,
+        # ``_selected_shas`` the contiguous row range (newest first).
+        self._selected_shas: list[str] = []
+        self._selection_anchor: str | None = None
         self._hovered_sha: str | None = None
         self._scroll_offset = 0
         self._h_scrolls: list[int] = [0, 0, 0]
@@ -451,8 +462,24 @@ class GraphTableWidget(QWidget):
     def selected_sha(self) -> str | None:
         return self._selected_sha
 
+    def selected_shas(self) -> list[str]:
+        """All selected SHAs (multi-select range; newest first)."""
+        return list(self._selected_shas)
+
     def set_selected_sha(self, sha: str | None) -> None:
+        sha = sha or None
+        if (
+            sha is not None
+            and sha == self._selected_sha
+            and sha in self._selected_shas
+        ):
+            # VM echo of the widget's own click (or Shift+click) —
+            # keep the multi-selection range intact.
+            self.update()
+            return
         self._selected_sha = sha
+        self._selected_shas = [sha] if sha else []
+        self._selection_anchor = sha
         self.update()
 
     def row_count(self) -> int:
@@ -793,11 +820,70 @@ class GraphTableWidget(QWidget):
         sha = self._hit_test_commit(x, y)
         if sha is None:
             return
+        if len(self._selected_shas) >= 2:
+            if sha in self._selected_shas:
+                menu = self._build_multi_select_menu(self._selected_shas)
+                menu.exec(self.mapToGlobal(position))
+                return
+            # Right-click outside the range collapses the selection to
+            # the clicked row (predictable escape from multi-select).
+            self._selected_shas = [sha]
+            self._selection_anchor = sha
+            self._selected_sha = sha
+            self.update()
         row_data = self._row_by_sha(sha)
         kind = _row_kind(row_data) if row_data else "commit"
 
         menu = self._build_node_menu(sha, kind)
         menu.exec(self.mapToGlobal(position))
+
+    def _build_multi_select_menu(self, shas: list[str]) -> QMenu:
+        """Build the :class:`QMenu` for a multi-selected commit range.
+
+        Exposed (single-underscore) for synchronous tests, mirroring
+        :meth:`_build_node_menu`. Currently the only range verb is
+        ``Squash (N) commits``; it is disabled (with a reason tooltip)
+        when the range is not a squashable first-parent chain.
+        """
+        ok, reason = self._squash_range_validity(shas)
+        menu = QMenu(self)
+        squash_action = menu.addAction(f"Squash ({len(shas)}) commits")
+        squash_action.setEnabled(ok)
+        if not ok:
+            squash_action.setToolTip(reason)
+        squash_action.triggered.connect(
+            lambda checked=False, s=list(shas): self.squash_commits_requested.emit(s),
+        )
+        return menu
+
+    def _squash_range_validity(self, shas: list[str]) -> tuple[bool, str]:
+        """Check the selected range against the squash preconditions.
+
+        Returns ``(ok, reason)``; ``reason`` explains a ``False`` and
+        mirrors the core ``squash_commits`` rejections so the menu
+        item's tooltip matches the eventual domain error.
+        """
+        if len(shas) < 2:
+            return False, "Select at least two commits"
+        rows = []
+        for sha in shas:
+            row_data = self._row_by_sha(sha)
+            if row_data is None:
+                return False, "Selection is out of date — refresh the graph"
+            rows.append(row_data)
+        if any(_row_kind(rd) != "commit" for rd in rows):
+            return False, "Stash/WIP rows cannot be squashed"
+        for i, row_data in enumerate(rows):
+            parents = (row_data.get("commit") or {}).get("parents", [])
+            if len(parents) > 1:
+                return False, "Merge commits cannot be squashed"
+            if i + 1 < len(rows):
+                next_sha = (rows[i + 1].get("commit") or {}).get("sha")
+                if not parents or parents[0] != next_sha:
+                    return False, "Selected commits are not a contiguous chain"
+        if not (rows[-1].get("commit") or {}).get("parents"):
+            return False, "The root commit cannot be squashed"
+        return True, ""
 
     def _build_node_menu(self, sha: str, kind: str) -> QMenu:
         """Build the :class:`QMenu` for a node row (commit/stash/WIP).
@@ -823,6 +909,9 @@ class GraphTableWidget(QWidget):
           :attr:`copy_diff_requested`. The WIP marker has no real
           SHA so the "Copy SHA" verb is intentionally absent.
         * ``commit`` — :attr:`checkout_commit_requested` /
+          :attr:`cherry_pick_commit_requested` /
+          :attr:`drop_commit_requested` (disabled for merge commits) /
+          :attr:`edit_commit_message_requested` /
           :attr:`copy_diff_requested` /
           :attr:`copy_commit_sha_requested` (the row's full SHA).
         """
@@ -869,6 +958,25 @@ class GraphTableWidget(QWidget):
             checkout_action.triggered.connect(
                 lambda checked=False, s=sha: self.checkout_commit_requested.emit(s),
             )
+            cherry_pick_action = menu.addAction("Cherry-pick commit")
+            cherry_pick_action.triggered.connect(
+                lambda checked=False, s=sha: self.cherry_pick_commit_requested.emit(s),
+            )
+            row_data = self._row_by_sha(sha)
+            parents = (row_data or {}).get("commit", {}).get("parents", [])
+            is_merge = len(parents) > 1
+            drop_action = menu.addAction("Drop commit")
+            drop_action.setEnabled(not is_merge)
+            if is_merge:
+                drop_action.setToolTip("Dropping merge commits is not supported")
+            drop_action.triggered.connect(
+                lambda checked=False, s=sha: self.drop_commit_requested.emit(s),
+            )
+            edit_msg_action = menu.addAction("Edit commit message…")
+            edit_msg_action.triggered.connect(
+                lambda checked=False, s=sha: self.edit_commit_message_requested.emit(s),
+            )
+            menu.addSeparator()
             copy_diff_action = menu.addAction("Copy diff")
             copy_diff_action.triggered.connect(
                 lambda checked=False, s=sha: self.copy_diff_requested.emit(s),
@@ -1627,7 +1735,7 @@ class GraphTableWidget(QWidget):
             if y + dh < header_h or y > self.height():
                 continue
             sha = _row_sha(row_data)
-            is_selected = sha == self._selected_sha
+            is_selected = sha == self._selected_sha or sha in self._selected_shas
             is_hovered = sha == self._hovered_sha
             if is_selected or is_hovered:
                 bg_color = self._cfg.selected_bg_color if is_selected else self._cfg.hover_bg_color
@@ -1998,7 +2106,7 @@ class GraphTableWidget(QWidget):
         color = _cell_color(color_index) if not is_uncommitted else QColor(self._cfg.wip_color)
         sha = _row_sha(row_data)
         kind = _row_kind(row_data)
-        is_selected = sha == self._selected_sha
+        is_selected = sha == self._selected_sha or sha in self._selected_shas
         is_stash = kind == "stash"
 
         painter.save()
@@ -2070,6 +2178,7 @@ class GraphTableWidget(QWidget):
                 _row_author(row_data),
                 av_size,
                 shape="circle",
+                inner_border=False,
             )
             painter.drawPixmap(
                 QPointF(cx - av_size / 2.0, y_center - av_size / 2.0),
@@ -2144,11 +2253,14 @@ class GraphTableWidget(QWidget):
         size: int = 14,
         *,
         shape: str = "square",
+        inner_border: bool = True,
     ) -> QPixmap:
         seed = seed or "?"
-        cache_key = f"{seed}_{size}_{shape}"
+        cache_key = f"{seed}_{size}_{shape}_{inner_border}"
         if cache_key not in self._avatar_cache:
-            self._avatar_cache[cache_key] = make_avatar_pixmap(seed, size, shape=shape)
+            self._avatar_cache[cache_key] = make_avatar_pixmap(
+                seed, size, shape=shape, inner_border=inner_border,
+            )
         return self._avatar_cache[cache_key]
 
     # ------------------------------------------------------------------
@@ -2191,6 +2303,14 @@ class GraphTableWidget(QWidget):
         if y >= hh:
             sha = self._hit_test_commit(x, y)
             if sha is not None:
+                if (
+                    event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                    and self._selection_anchor is not None
+                ):
+                    self._extend_selection_to(sha)
+                else:
+                    self._selection_anchor = sha
+                    self._selected_shas = [sha]
                 self._selected_sha = sha
                 self.update()
                 self._view_model.select_commit(sha)
@@ -2199,6 +2319,27 @@ class GraphTableWidget(QWidget):
                 return
 
         super().mousePressEvent(event)
+
+    def _extend_selection_to(self, sha: str) -> None:
+        """Grow the multi-selection to cover ``_selection_anchor``..``sha``.
+
+        The range follows the visible row order (newest first) and
+        includes every row between the two ends; squash-side
+        validation filters out rows that cannot participate.
+        """
+        idx_by_sha = {_row_sha(r): i for i, r in enumerate(self._rows)}
+        anchor_idx = idx_by_sha.get(self._selection_anchor)
+        target_idx = idx_by_sha.get(sha)
+        if anchor_idx is None or target_idx is None:
+            self._selection_anchor = sha
+            self._selected_shas = [sha]
+            return
+        lo, hi = min(anchor_idx, target_idx), max(anchor_idx, target_idx)
+        self._selected_shas = [
+            row_sha
+            for r in self._rows[lo : hi + 1]
+            if (row_sha := _row_sha(r))
+        ]
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
         """Double-click on a branch chip → checkout the branch.

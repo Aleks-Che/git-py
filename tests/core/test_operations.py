@@ -41,7 +41,10 @@ from src.core.operations import (
     complete_rebase_continue,
     create_branch,
     delete_branch,
+    drop_commit,
+    edit_commit_message,
     fetch,
+    is_commit_pushed,
     is_merge_in_progress,
     is_rebase_in_progress,
     list_remotes,
@@ -54,6 +57,7 @@ from src.core.operations import (
     reset,
     restore_stash,
     revert,
+    squash_commits,
     stage_diff_line,
     stash_apply,
     stash_drop,
@@ -1633,3 +1637,209 @@ def test_stash_push_staged_refreshes_index_after_cli(tmp_git_repo: Path) -> None
     assert not (flags_after & pygit2.GIT_STATUS_INDEX_NEW), (
         f"expected b.txt unstage after stash_push_staged, got flags={flags_after:#x}"
     )
+
+
+# ----- update2 stage C: cherry-pick+commit / drop / reword / pushed ---------
+
+
+def test_cherry_pick_create_commit_moves_head(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    mgr = RepositoryManager(str(tmp_git_repo))
+    base = make_commit("base", files={"a.txt": "A\n"})
+    tip = make_commit("tip", files={"c.txt": "C\n"}, parents=[base])
+    # Cherry-pick `base`'s change shape onto tip via a side commit.
+    side = make_commit("adds b", files={"b.txt": "B\n"}, parents=[base], ref="refs/heads/side")
+    info = cherry_pick(mgr, str(side), create_commit=True)
+    assert info.message.strip() == "adds b"
+    assert mgr.head_commit.sha == info.sha
+    assert mgr.head_commit.parents == [str(tip)]
+    # Author is preserved from the picked commit.
+    assert mgr.repo[mgr.repo.head.target].author.email == "tester@example.com"
+
+
+def test_drop_commit_tip_resets_hard(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    mgr = RepositoryManager(str(tmp_git_repo))
+    base = make_commit("base", files={"a.txt": "A\n"})
+    tip = make_commit("tip", files={"b.txt": "B\n"}, parents=[base])
+    drop_commit(mgr, str(tip))
+    assert mgr.head_commit.sha == str(base)
+    assert not (tmp_git_repo / "b.txt").exists()
+
+
+def test_drop_commit_middle_rebases_children(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    mgr = RepositoryManager(str(tmp_git_repo))
+    c1 = make_commit("c1", files={"a.txt": "A\n"})
+    c2 = make_commit("c2", files={"b.txt": "B\n"}, parents=[c1])
+    c3 = make_commit("c3", files={"c.txt": "C\n"}, parents=[c2])
+    drop_commit(mgr, str(c2))
+    history = [c.sha for c in mgr.get_all_history()]
+    assert str(c2) not in history
+    assert mgr.head_commit.sha != str(c3)  # rewritten
+    assert mgr.head_commit.parents == [str(c1)]
+    assert (tmp_git_repo / "c.txt").exists()
+    assert not (tmp_git_repo / "b.txt").exists()
+
+
+def test_drop_commit_merge_and_root_rejected(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    mgr = RepositoryManager(str(tmp_git_repo))
+    root = make_commit("root", files={"a.txt": "A\n"})
+    side = make_commit("side", files={"b.txt": "B\n"}, parents=[root], ref="refs/heads/side")
+    merge = make_commit("merge", parents=[root, side])
+    with pytest.raises(GitError, match="merge commit"):
+        drop_commit(mgr, str(merge))
+    with pytest.raises(GitError, match="root commit"):
+        drop_commit(mgr, str(root))
+
+
+def test_drop_commit_not_on_current_branch_rejected(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    mgr = RepositoryManager(str(tmp_git_repo))
+    base = make_commit("base", files={"a.txt": "A\n"})
+    make_commit("tip", files={"c.txt": "C\n"}, parents=[base])
+    side = make_commit("side", files={"b.txt": "B\n"}, parents=[base], ref="refs/heads/side")
+    with pytest.raises(GitError, match="not an ancestor of HEAD"):
+        drop_commit(mgr, str(side))
+
+
+def test_edit_commit_message_tip_amends_without_touching_index(
+    committed_repo: RepositoryManager,
+) -> None:
+    tip = committed_repo.head_commit
+    tree_before = committed_repo.repo[committed_repo.repo.head.target].tree_id
+    info = edit_commit_message(committed_repo, tip.sha, "new subject\n\nbody")
+    assert info.message.startswith("new subject")
+    assert committed_repo.head_commit.sha == info.sha
+    assert committed_repo.head_commit.parents == tip.parents
+    assert committed_repo.repo[committed_repo.repo.head.target].tree_id == tree_before
+
+
+def test_edit_commit_message_middle_rewords_chain(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    mgr = RepositoryManager(str(tmp_git_repo))
+    c1 = make_commit("c1", files={"a.txt": "A\n"})
+    c2 = make_commit("c2 old", files={"b.txt": "B\n"}, parents=[c1])
+    c3 = make_commit("c3", files={"c.txt": "C\n"}, parents=[c2])
+    edit_commit_message(mgr, str(c2), "c2 new")
+    history = {c.sha: c for c in mgr.get_all_history()}
+    assert str(c2) not in history  # rewritten sha
+    assert mgr.head_commit.sha != str(c3)
+    # The child chain is preserved (c3's rewrite still descends from c1).
+    assert mgr.head_commit.message.strip() == "c3"
+    parent_of_rewritten_tip = mgr.repo[mgr.repo.head.target].parents[0]
+    assert parent_of_rewritten_tip.message.strip() == "c2 new"
+    assert str(parent_of_rewritten_tip.parents[0].id) == str(c1)
+
+
+def test_edit_commit_message_empty_rejected(committed_repo: RepositoryManager) -> None:
+    with pytest.raises(GitError, match="must not be empty"):
+        edit_commit_message(committed_repo, committed_repo.head_commit.sha, "  ")
+
+
+def test_is_commit_pushed(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    mgr = RepositoryManager(str(tmp_git_repo))
+    base = make_commit("base", files={"a.txt": "A\n"})
+    tip = make_commit("tip", files={"b.txt": "B\n"}, parents=[base])
+    assert not is_commit_pushed(mgr, str(base))
+    assert not is_commit_pushed(mgr, str(tip))
+    # Publish base on a remote-tracking ref.
+    mgr.repo.references.create("refs/remotes/origin/main", base)
+    assert is_commit_pushed(mgr, str(base))
+    assert not is_commit_pushed(mgr, str(tip))
+
+
+# ----- update2 stage D: squash_commits --------------------------------------
+
+
+def test_squash_commits_tip_range_soft_reset(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    mgr = RepositoryManager(str(tmp_git_repo))
+    c1 = make_commit("c1", files={"a.txt": "A\n"})
+    c2 = make_commit("c2", files={"b.txt": "B\n"}, parents=[c1])
+    c3 = make_commit("c3", files={"c.txt": "C\n"}, parents=[c2])
+    info = squash_commits(mgr, [str(c3), str(c2)], "c2+c3 squashed")
+    assert info.message.strip() == "c2+c3 squashed"
+    assert info.parents == [str(c1)]
+    assert mgr.head_commit.sha == info.sha
+    # Tree contains all changes.
+    assert (tmp_git_repo / "b.txt").exists()
+    assert (tmp_git_repo / "c.txt").exists()
+    history = [c.message.strip() for c in mgr.get_all_history()]
+    assert history == ["c2+c3 squashed", "c1"]
+
+
+def test_squash_commits_middle_range_rebases(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    mgr = RepositoryManager(str(tmp_git_repo))
+    c1 = make_commit("c1", files={"a.txt": "A\n"})
+    c2 = make_commit("c2", files={"b.txt": "B\n"}, parents=[c1])
+    c3 = make_commit("c3", files={"c.txt": "C\n"}, parents=[c2])
+    c4 = make_commit("c4", files={"d.txt": "D\n"}, parents=[c3])
+    info = squash_commits(mgr, [str(c3), str(c2)], "c2+c3 squashed")
+    assert info.parents == [str(c1)]
+    assert mgr.head_commit.sha != str(c4)
+    assert mgr.head_commit.message.strip() == "c4"
+    assert mgr.head_commit.parents == [info.sha]
+    messages = [c.message.strip() for c in mgr.get_all_history()]
+    assert messages == ["c4", "c2+c3 squashed", "c1"]
+
+
+def test_squash_commits_broken_chain_rejected(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    mgr = RepositoryManager(str(tmp_git_repo))
+    c1 = make_commit("c1", files={"a.txt": "A\n"})
+    c2 = make_commit("c2", files={"b.txt": "B\n"}, parents=[c1])
+    c3 = make_commit("c3", files={"c.txt": "C\n"}, parents=[c2])
+    with pytest.raises(GitError, match="contiguous chain"):
+        squash_commits(mgr, [str(c3), str(c1)], "nope")
+
+
+def test_squash_commits_merge_rejected(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    mgr = RepositoryManager(str(tmp_git_repo))
+    root = make_commit("root", files={"a.txt": "A\n"})
+    side = make_commit("side", files={"b.txt": "B\n"}, parents=[root], ref="refs/heads/side")
+    merge = make_commit("merge", parents=[root, side])
+    with pytest.raises(GitError, match="merge commit"):
+        squash_commits(mgr, [str(merge), str(root)], "nope")
+
+
+def test_squash_commits_root_rejected(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    mgr = RepositoryManager(str(tmp_git_repo))
+    c1 = make_commit("c1", files={"a.txt": "A\n"})
+    c2 = make_commit("c2", files={"b.txt": "B\n"}, parents=[c1])
+    with pytest.raises(GitError, match="root commit"):
+        squash_commits(mgr, [str(c2), str(c1)], "nope")
+
+
+def test_squash_commits_single_rejected(committed_repo: RepositoryManager) -> None:
+    with pytest.raises(GitError, match="at least two"):
+        squash_commits(committed_repo, [committed_repo.head_commit.sha], "nope")

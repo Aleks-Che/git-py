@@ -2135,3 +2135,248 @@ def test_build_graph_horizontal_pipe_carries_pipe_color_in_wire_dict() -> None:
         "synthetic history produced no HORIZONTAL_PIPE cell — adjust the "
         "test fixtures so at least one crossing exists"
     )
+
+
+# ---- update2 B3: fork-connector pipe colour must be the fork point's own ----
+
+
+def test_fork_connector_pipe_uses_fork_point_own_color() -> None:
+    """Vertical under a fork-point commit uses the commit's own colour.
+
+    Regression (update2 B3, kilocode ``22149292``): the fork connector
+    was built with a ``main_color`` snapshotted from the lane cache
+    BEFORE the commit's own colour was decided, so the half-cell under
+    the commit dot (plus the inter-row bridge) was painted in the
+    child branch's colour whenever the fork point had its own branch
+    name (deterministic ``_pick_branch_color``).
+    """
+    # Newest first: a1 (mainline above, no branch -> main colour 1),
+    # b1 (side branch "side"), f (fork point, branch "dev" -> colour 0).
+    commits = [
+        _c("a1", parents=["f"]),
+        _c("b1", parents=["f"]),
+        _c("f", parents=["p"]),
+        _c("p", parents=[]),
+    ]
+    branches = [
+        _b("main", "a1", is_head=True),
+        _b("side", "b1"),
+        _b("dev", "f"),
+    ]
+    layout = build_graph(commits, branches)
+    nodes = {n.commit.sha: n for n in layout.nodes}
+
+    f_node = nodes["f"]
+    assert f_node.color_index == _pick_branch_color("dev")
+    main_cell = f_node.cells[f_node.lane * 2]
+    assert main_cell.cell_type == CellType.TEE_RIGHT
+    assert main_cell.pipe_color_index == f_node.color_index, (
+        f"fork-connector pipe colour {main_cell.pipe_color_index} != "
+        f"fork point's own colour {f_node.color_index}; the half-cell "
+        "under the commit is painted in a child branch's colour"
+    )
+    # The pipe continues seamlessly: the row below (parent "p") must
+    # carry the same colour on that lane.
+    p_node = nodes["p"]
+    p_cell = p_node.cells[f_node.lane * 2]
+    assert p_cell.color_index == f_node.color_index
+
+
+# ---- update2 B1/B2: no foreign half-cell past a fork-connector bend ----
+
+
+def _build_merge_fork_with_cross_and_stash():
+    """Topology mirroring sql-skill ``8ee78fc``.
+
+    M is a merge AND a fork point: children c_main (lane 0), c_side
+    (lane 1), c_stash (lane 2); second parent p2 lands on the freed
+    fork lane 1 -> CROSS(d=-1); fork connector continues right to the
+    stash bend at lane 2.
+    """
+    commits = [
+        _c("cm", parents=["m"]),
+        _c("cs", parents=["m"]),
+        _c("st", parents=["m"], kind="stash"),
+        _c("m", parents=["p1", "p2"]),
+        _c("p1", parents=["r"]),
+        _c("p2", parents=["r"]),
+        _c("r", parents=[]),
+    ]
+    branches = [_b("main", "cm", is_head=True)]
+    return build_graph(commits, branches)
+
+
+def test_cross_bend_no_stale_half_cell_to_the_right() -> None:
+    """Half-cell right of a CROSS bend takes the NEXT segment's colour.
+
+    Regression (update2 B1, sql-skill ``8ee78fc``): the horizontal
+    cell left of the CROSS was painted in the forking branch's colour
+    and its right half stuck out past the bend, so the track toward
+    the stash stayed branch-coloured for an extra half-cell.
+    """
+    layout = _build_merge_fork_with_cross_and_stash()
+    nodes = {n.commit.sha: n for n in layout.nodes}
+    m = nodes["m"]
+    cross_col = None
+    for col, cell in enumerate(m.cells):
+        if cell.cell_type == CellType.CROSS:
+            cross_col = col
+            break
+    assert cross_col is not None, "expected a CROSS cell on M's row"
+    merge_left = None
+    for col, cell in enumerate(m.cells):
+        if cell.cell_type == CellType.MERGE_LEFT:
+            merge_left = (col, cell.color_index)
+    assert merge_left is not None, "expected a stash MERGE_LEFT bend on M's row"
+    stash_col, stash_color = merge_left
+    assert stash_col > cross_col
+    prev = m.cells[cross_col - 1]
+    assert prev.cell_type in (CellType.HORIZONTAL, CellType.HORIZONTAL_PIPE)
+    assert prev.color_index == stash_color, (
+        f"half-cell right of the CROSS keeps colour {prev.color_index} "
+        f"instead of following the next segment ({stash_color})"
+    )
+
+
+def _build_merge_fork_with_parent_beyond_stash():
+    """Topology mirroring sql-skill ``460f62c``.
+
+    M is a merge AND a fork point: children c_main (lane 0), stash
+    (lane 2); lane 1 hosts an unrelated continuing branch; second
+    parent p2 already lives on lane 3 (to the RIGHT of the stash
+    bend), so the parent connector's horizontal track crosses the
+    fork connector's span.
+    """
+    commits = [
+        _c("cm", parents=["m"]),
+        _c("o1", parents=["o0"]),
+        _c("st", parents=["m"], kind="stash"),
+        _c("x2", parents=["p2"]),
+        _c("m", parents=["p1", "p2"]),
+        _c("p1", parents=["o0"]),
+        _c("p2", parents=["o0"]),
+        _c("o0", parents=[]),
+    ]
+    branches = [_b("main", "cm", is_head=True)]
+    return build_graph(commits, branches)
+
+
+def test_merge_left_bend_no_foreign_half_cell_into_the_void() -> None:
+    """No foreign horizontal survives left of an upward fork bend.
+
+    Regression (update2 B2, sql-skill ``460f62c``): the parent
+    connector's horizontal one cell left of the stash's MERGE_LEFT
+    bend painted a half-cell in the neighbour branch's colour past
+    the bend into empty space.
+    """
+    layout = _build_merge_fork_with_parent_beyond_stash()
+    nodes = {n.commit.sha: n for n in layout.nodes}
+    m = nodes["m"]
+    bend_col = None
+    for col, cell in enumerate(m.cells):
+        if cell.cell_type == CellType.MERGE_LEFT:
+            bend_col = col
+            break
+    assert bend_col is not None, "expected a stash MERGE_LEFT bend on M's row"
+    prev = m.cells[bend_col - 1]
+    assert prev.cell_type in (CellType.EMPTY, CellType.PIPE), (
+        f"foreign {prev.cell_type.name} (c={prev.color_index}) left of "
+        "the stash bend paints a half-cell into the void"
+    )
+
+
+# ---- update2 B4: merge colour owns the row up to the CROSS ----
+
+
+def _build_merge_fork_cross_with_beyond_child():
+    """Topology mirroring kilocode ``9c0e4f76``.
+
+    D is a merge AND a fork point: children c_main (lane 0), c_side
+    (lane 2), c_far (lane 3); lane 1 hosts an unrelated continuing
+    branch; second parent p2 lands on the freed fork lane 2 ->
+    CROSS(d=-1). The fork connector continues past the CROSS to the
+    far child at lane 3.
+    """
+    commits = [
+        _c("cm", parents=["d"]),
+        _c("o1", parents=["o0"]),
+        _c("cs", parents=["d"]),
+        _c("cf", parents=["d"]),
+        _c("d", parents=["p1", "p2"]),
+        _c("p1", parents=["o0"]),
+        _c("p2", parents=["o0"]),
+        _c("o0", parents=[]),
+    ]
+    branches = [_b("main", "cm", is_head=True), _b("side", "cs")]
+    return build_graph(commits, branches)
+
+
+def test_merge_colour_owns_horizontal_up_to_cross() -> None:
+    """Merge colour owns the horizontal track up to the CROSS cell.
+
+    Update2 B4 (kilocode ``9c0e4f76``): the fork connector repainted
+    the commit->CROSS span in the forking branch's colour.  Per the
+    agreed priority rule the merge colour owns the horizontal; the
+    branch colour appears only going up from the CROSS.
+    """
+    layout = _build_merge_fork_cross_with_beyond_child()
+    nodes = {n.commit.sha: n for n in layout.nodes}
+    d = nodes["d"]
+    cross_col = None
+    cross = None
+    for col, cell in enumerate(d.cells):
+        if cell.cell_type == CellType.CROSS:
+            cross_col, cross = col, cell
+            break
+    assert cross is not None, "expected a CROSS cell on D's row"
+    merge_color = cross.color_index
+    # Every horizontal-bearing cell from the commit to the CROSS must
+    # carry the merge colour.  The cell immediately left of the CROSS
+    # is excluded: its right half sticks out past the bend and
+    # legitimately carries the NEXT fork segment's colour (B1).
+    for col in range(d.lane * 2, cross_col - 1):
+        cell = d.cells[col]
+        if cell.cell_type in (
+            CellType.TEE_RIGHT,
+            CellType.HORIZONTAL,
+            CellType.HORIZONTAL_PIPE,
+        ):
+            assert cell.color_index == merge_color, (
+                f"col {col}: {cell.cell_type.name} colour {cell.color_index} "
+                f"!= merge colour {merge_color}"
+            )
+    # At least one intermediate cell must have been checked (the
+    # synthetic CROSS sits two lanes right of the commit).
+    assert cross_col - d.lane * 2 >= 3
+    # Branch colour goes UP only.
+    assert cross.pipe_color_index != merge_color
+
+
+def test_no_gap_between_cross_and_next_fork_bend() -> None:
+    """The fork segment continues from the CROSS to the next bend.
+
+    The fork connector stops one cell early before its rightmost
+    bend, assuming an intermediate pipe/tee covers the gap; when the
+    previous bend is a CROSS nothing paints that cell, leaving a hole
+    in the track (kilocode ``9c0e4f76``, col 11).
+    """
+    layout = _build_merge_fork_cross_with_beyond_child()
+    nodes = {n.commit.sha: n for n in layout.nodes}
+    d = nodes["d"]
+    cross_col = None
+    merge_left_col = None
+    merge_left_color = None
+    for col, cell in enumerate(d.cells):
+        if cell.cell_type == CellType.CROSS:
+            cross_col = col
+        elif cell.cell_type == CellType.MERGE_LEFT:
+            merge_left_col, merge_left_color = col, cell.color_index
+    assert cross_col is not None and merge_left_col is not None
+    assert merge_left_col > cross_col
+    for col in range(cross_col + 1, merge_left_col):
+        cell = d.cells[col]
+        assert cell.cell_type in (CellType.HORIZONTAL, CellType.HORIZONTAL_PIPE), (
+            f"col {col}: hole ({cell.cell_type.name}) between CROSS and "
+            "the next fork bend"
+        )
+        assert cell.color_index == merge_left_color

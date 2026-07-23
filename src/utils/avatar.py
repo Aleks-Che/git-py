@@ -68,7 +68,7 @@ _INNER_BORDER_COLOR = "#FFFFFF"
 
 
 def make_avatar_pixmap(
-    seed: str, size: int, *, shape: str = "square",
+    seed: str, size: int, *, shape: str = "square", inner_border: bool = True,
 ) -> QPixmap:
     """Return a ``size``×``size`` identicon pixmap for ``seed``.
 
@@ -76,6 +76,10 @@ def make_avatar_pixmap(
     ``"circle"`` (circular clip). The seed is normally the author's
     email; fall back to the author's name, then to ``"?"`` when
     neither is available.
+
+    ``inner_border`` draws a thin white matte ring near the edge; it
+    suits larger square badges but eats too much of small circular
+    node avatars, so graph callers pass ``False``.
     """
     if not seed:
         seed = "?"
@@ -116,29 +120,46 @@ def make_avatar_pixmap(
     painter.setPen(QPen(Qt.PenStyle.NoPen))
     painter.drawRect(QRectF(0, 0, size, size))
 
-    # Filled cells.
+    # Filled cells. For the circle shape snap cells to integer pixel
+    # boundaries inside the largest 5-aligned square that fits the
+    # clip: a full-bleed grid (cell = size/5 = 3.8 px at size 19) is
+    # sliced by the circular clip at the mid-edges and corners, which
+    # reads as a cropped avatar.
+    if shape == "circle":
+        grid_diameter = max(5, int(d) // 5 * 5)
+        snapped_cell = grid_diameter // 5
+        grid_offset = (size - grid_diameter) / 2.0
     painter.setBrush(QBrush(fg))
     for row in range(5):
         for col in range(5):
             if grid[row][col]:
-                painter.drawRect(QRectF(col * cell, row * cell, cell, cell))
+                if shape == "circle":
+                    painter.drawRect(
+                        int(col * snapped_cell + grid_offset),
+                        int(row * snapped_cell + grid_offset),
+                        snapped_cell,
+                        snapped_cell,
+                    )
+                else:
+                    painter.drawRect(QRectF(col * cell, row * cell, cell, cell))
 
     # White inner matte — a thin white ring inset from the avatar
     # edge so the badge reads as a framed square against the dark
     # panel background. Drawn on top of the cells so the ring stays
     # continuous regardless of which cells are filled.
-    painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
-    painter.setPen(QPen(QColor(_INNER_BORDER_COLOR), _INNER_BORDER_PEN_WIDTH))
-    inset = _INNER_BORDER_INSET
-    inner = size - inset * 2
-    if shape == "circle":
-        painter.drawEllipse(QRectF(inset, inset, inner, inner))
-    else:
-        painter.drawRoundedRect(
-            QRectF(inset, inset, inner, inner),
-            max(0.0, _RECT_RADIUS - 1.0),
-            max(0.0, _RECT_RADIUS - 1.0),
-        )
+    if inner_border:
+        painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        painter.setPen(QPen(QColor(_INNER_BORDER_COLOR), _INNER_BORDER_PEN_WIDTH))
+        inset = _INNER_BORDER_INSET
+        inner = size - inset * 2
+        if shape == "circle":
+            painter.drawEllipse(QRectF(inset, inset, inner, inner))
+        else:
+            painter.drawRoundedRect(
+                QRectF(inset, inset, inner, inner),
+                max(0.0, _RECT_RADIUS - 1.0),
+                max(0.0, _RECT_RADIUS - 1.0),
+            )
 
     painter.end()
     return pix

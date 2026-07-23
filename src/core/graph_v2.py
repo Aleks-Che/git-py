@@ -568,6 +568,7 @@ def build_graph(
                         fork_lane_colors[cl] = oid_color_index.get(child_sha, cl)
                     break
         fork_merging_cells: list[CellInfo] | None = None
+        fork_merging_lanes: list[tuple[int, int]] = []
         if len(fork_lanes) >= 2:
             main_lane = min(fork_lanes)
             merging_lanes: list[tuple[int, int]] = []
@@ -597,6 +598,7 @@ def build_graph(
                 lane_color_index,
                 max_lane,
             )
+            fork_merging_lanes = list(merging_lanes)
 
             for ml, _ in merging_lanes:
                 if ml < len(lanes):
@@ -800,6 +802,47 @@ def build_graph(
         # TEE_UP / MERGE_LEFT at other fork lanes, and PIPE at
         # unrelated lanes) is merged in.
         if fork_merging_cells is not None:
+            # The fork connector was built BEFORE the commit's own
+            # colour was decided: its ``main_color`` came from the
+            # lane cache, i.e. the colour of the child that registered
+            # the main lane.  The vertical segment under the commit
+            # dot must match the pipe that continues to the first
+            # parent (``final_color_index``, which ``lane_color_index``
+            # carries into the rows below) — otherwise the half-cell
+            # under the commit is painted in a child branch's colour
+            # (e.g. kilocode ``22149292``).
+            main_fc_idx = lane * 2
+            if main_fc_idx < len(fork_merging_cells):
+                fc_main = fork_merging_cells[main_fc_idx]
+                if fc_main.cell_type == CellType.TEE_RIGHT:
+                    if fc_main.pipe_color_index != final_color_index:
+                        fork_merging_cells[main_fc_idx] = CellInfo(
+                            fc_main.cell_type,
+                            color_index=fc_main.color_index,
+                            pipe_color_index=final_color_index,
+                            direction=fc_main.direction,
+                        )
+                elif (
+                    fc_main.cell_type == CellType.PIPE
+                    and fc_main.color_index != final_color_index
+                ):
+                    fork_merging_cells[main_fc_idx] = CellInfo.pipe(final_color_index)
+            # Priority rule (update2 B4): when the row carries CROSS
+            # cells (a second parent landed on a fork lane) the MERGE
+            # connector owns the horizontal track between the commit
+            # and each CROSS — the forking branch's colour appears
+            # only going up from the CROSS and on fork segments beyond
+            # it.  ``_build_row_cells`` already wrote the merge
+            # connector in the second parent's colour, so the fork
+            # connector must not overwrite those columns.
+            merge_own_cols: set[int] = set()
+            for col_e, cell_e in enumerate(cells):
+                if cell_e.cell_type != CellType.CROSS:
+                    continue
+                if cell_e.direction == -1:
+                    merge_own_cols.update(range(lane * 2, col_e))
+                elif cell_e.direction == 1:
+                    merge_own_cols.update(range(col_e + 1, lane * 2 + 1))
             while len(cells) < len(fork_merging_cells):
                 cells.append(CellInfo.empty())
             for fci, fc in enumerate(fork_merging_cells):
@@ -814,7 +857,86 @@ def build_graph(
                     CellType.CROSS,
                 ):
                     continue
+                if fci in merge_own_cols and existing.cell_type in (
+                    CellType.TEE_RIGHT,
+                    CellType.TEE_LEFT,
+                    CellType.HORIZONTAL,
+                    CellType.HORIZONTAL_PIPE,
+                ):
+                    continue
                 cells[fci] = fc
+
+            # --- half-cell cleanup past fork-connector bends ---------
+            # Even/odd column geometry makes every horizontal cell
+            # paint half a cell into the next column's span.  For most
+            # bends the bend cell itself repaints that overshoot
+            # (TEE_UP draws its own horizontal).  Two bend kinds do
+            # not, leaving a foreign-coloured half-cell past the bend:
+            #
+            # * ``CROSS`` with ``direction == -1``: the stub covers the
+            #   span arriving from the commit in the merge colour, but
+            #   the left neighbour cell's right half sticks out past
+            #   the bend in the forking branch's colour.  That half
+            #   belongs to the NEXT fork segment (e.g. the stash lane)
+            #   — recolour it (sql-skill ``8ee78fc``, update2 B1).
+            #
+            # * ``MERGE_LEFT`` (upward bend, end of the segment): a
+            #   foreign horizontal surviving from the parent connector
+            #   paints half a cell into the void past the bend —
+            #   drop the horizontal part (keep any vertical pipe)
+            #   (sql-skill ``460f62c``, update2 B2).
+            for mi, (ml, ml_color) in enumerate(fork_merging_lanes):
+                bend_idx = ml * 2
+                prev_idx = bend_idx - 1
+                if bend_idx >= len(cells) or prev_idx < 0:
+                    continue
+                bend = cells[bend_idx]
+                prev = cells[prev_idx]
+                if bend.cell_type == CellType.CROSS and bend.direction == -1:
+                    next_color = (
+                        fork_merging_lanes[mi + 1][1]
+                        if mi + 1 < len(fork_merging_lanes)
+                        else bend.color_index
+                    )
+                    if (
+                        prev.cell_type == CellType.HORIZONTAL
+                        and prev.color_index != next_color
+                    ):
+                        cells[prev_idx] = CellInfo.horizontal(next_color)
+                    elif (
+                        prev.cell_type == CellType.HORIZONTAL_PIPE
+                        and prev.color_index != next_color
+                    ):
+                        cells[prev_idx] = CellInfo.horizontal_pipe(
+                            next_color, prev.pipe_color_index
+                        )
+                    # The fork connector stopped one cell early before
+                    # its next bend assuming an intermediate pipe/tee
+                    # covers the gap; a CROSS bend paints nothing
+                    # rightward, so fill the hole up to the next bend.
+                    if mi + 1 < len(fork_merging_lanes):
+                        next_bend_idx = fork_merging_lanes[mi + 1][0] * 2
+                        for gap_idx in range(bend_idx + 1, next_bend_idx):
+                            if gap_idx >= len(cells):
+                                break
+                            gap_cell = cells[gap_idx]
+                            if gap_cell.cell_type == CellType.EMPTY:
+                                cells[gap_idx] = CellInfo.horizontal(next_color)
+                            elif gap_cell.cell_type == CellType.PIPE:
+                                cells[gap_idx] = CellInfo.horizontal_pipe(
+                                    next_color, gap_cell.color_index
+                                )
+                elif bend.cell_type == CellType.MERGE_LEFT:
+                    if (
+                        prev.cell_type == CellType.HORIZONTAL
+                        and prev.color_index != ml_color
+                    ):
+                        cells[prev_idx] = CellInfo.empty()
+                    elif (
+                        prev.cell_type == CellType.HORIZONTAL_PIPE
+                        and prev.color_index != ml_color
+                    ):
+                        cells[prev_idx] = CellInfo.pipe(prev.pipe_color_index)
 
         branch_names = oid_to_branches.get(commit.sha, [])
         is_head = head_oid is not None and head_oid == commit.sha

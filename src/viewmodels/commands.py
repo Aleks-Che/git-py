@@ -38,6 +38,8 @@ from src.core.operations import (
     delete_tag,
     discard_changes,
     discard_file,
+    drop_commit,
+    edit_commit_message,
     fetch,
     find_stash_index_by_oid,
     is_merge_in_progress,
@@ -56,6 +58,7 @@ from src.core.operations import (
     revert,
     snapshot_index_entry,
     snapshot_stash_apply_state,
+    squash_commits,
     stage_diff_line,
     stash_apply,
     stash_drop,
@@ -809,11 +812,17 @@ class RebaseCommand(GitCommand):
 
 
 class CherryPickCommand(GitCommand):
-    """Cherry-pick ``sha`` onto the current HEAD; undo the touched index paths."""
+    """Cherry-pick ``sha`` onto the current HEAD; undo the touched index paths.
 
-    def __init__(self, repo: RepositoryManager, sha: str) -> None:
+    With ``auto_commit`` the staged result is committed immediately
+    (original message + authorship); undo still rewinds to the
+    captured HEAD.
+    """
+
+    def __init__(self, repo: RepositoryManager, sha: str, *, auto_commit: bool = False) -> None:
         self._repo = repo
         self._sha = sha
+        self._auto_commit = auto_commit
         self._previous_head: str | None = None
         self._previous_head_was_detached: bool = False
         self._index_paths: dict[str, int] = {}
@@ -841,7 +850,7 @@ class CherryPickCommand(GitCommand):
         if not pygit2_repo.head_is_unborn:
             self._previous_head = str(pygit2_repo.head.target)
             self._previous_head_was_detached = pygit2_repo.head_is_detached
-        cherry_pick(self._repo, self._sha)
+        cherry_pick(self._repo, self._sha, create_commit=self._auto_commit)
 
     def undo(self) -> None:
         if self._previous_head is None:
@@ -853,6 +862,100 @@ class CherryPickCommand(GitCommand):
     def name(self) -> str:
         short = self._sha[:7] if len(self._sha) >= 7 else self._sha
         return f"cherry-pick {short}"
+
+
+class DropCommitCommand(GitCommand):
+    """Drop ``sha`` from the current branch; undo by resetting.
+
+    Mirrors :class:`RebaseCommand`: pre-drop HEAD is captured, undo
+    aborts an in-flight rebase (conflict) or hard-resets back.
+    """
+
+    def __init__(self, repo: RepositoryManager, sha: str) -> None:
+        self._repo = repo
+        self._sha = sha
+        self._previous_head: str | None = None
+
+    def execute(self) -> None:
+        pygit2_repo = self._repo.repo
+        if not pygit2_repo.head_is_unborn:
+            self._previous_head = str(pygit2_repo.head.target)
+        drop_commit(self._repo, self._sha)
+
+    def undo(self) -> None:
+        if is_rebase_in_progress(self._repo):
+            abort_rebase(self._repo)
+            return
+        if self._previous_head is None:
+            return
+        reset(self._repo, self._previous_head, mode="hard")
+
+    @property
+    def name(self) -> str:
+        short = self._sha[:7] if len(self._sha) >= 7 else self._sha
+        return f"drop commit {short}"
+
+
+class EditCommitMessageCommand(GitCommand):
+    """Rewrite ``sha``'s message; undo by resetting to the captured HEAD."""
+
+    def __init__(self, repo: RepositoryManager, sha: str, message: str) -> None:
+        self._repo = repo
+        self._sha = sha
+        self._message = message
+        self._previous_head: str | None = None
+
+    def execute(self) -> None:
+        pygit2_repo = self._repo.repo
+        if not pygit2_repo.head_is_unborn:
+            self._previous_head = str(pygit2_repo.head.target)
+        edit_commit_message(self._repo, self._sha, self._message)
+
+    def undo(self) -> None:
+        if is_rebase_in_progress(self._repo):
+            abort_rebase(self._repo)
+            return
+        if self._previous_head is None:
+            return
+        reset(self._repo, self._previous_head, mode="hard")
+
+    @property
+    def name(self) -> str:
+        short = self._sha[:7] if len(self._sha) >= 7 else self._sha
+        return f"edit message {short}"
+
+
+class SquashCommitsCommand(GitCommand):
+    """Squash a contiguous chain of commits; undo by resetting.
+
+    Pre-squash HEAD is captured; undo aborts an in-flight rebase
+    (conflict) or hard-resets back — the template proven by
+    :class:`RebaseCommand` / :class:`DropCommitCommand`.
+    """
+
+    def __init__(self, repo: RepositoryManager, shas: list[str], message: str) -> None:
+        self._repo = repo
+        self._shas = list(shas)
+        self._message = message
+        self._previous_head: str | None = None
+
+    def execute(self) -> None:
+        pygit2_repo = self._repo.repo
+        if not pygit2_repo.head_is_unborn:
+            self._previous_head = str(pygit2_repo.head.target)
+        squash_commits(self._repo, self._shas, self._message)
+
+    def undo(self) -> None:
+        if is_rebase_in_progress(self._repo):
+            abort_rebase(self._repo)
+            return
+        if self._previous_head is None:
+            return
+        reset(self._repo, self._previous_head, mode="hard")
+
+    @property
+    def name(self) -> str:
+        return f"squash {len(self._shas)} commits"
 
 
 class RevertCommand(GitCommand):

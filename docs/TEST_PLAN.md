@@ -93,6 +93,28 @@
 - `test_no_pipe_from_horizontal_into_stash_below` (UI, pixel-level): горизонтальный сегмент в строке над стэшем не утекает в стэш.
 - `test_root_commit_does_not_draw_stub_below_itself` (UI, pixel-level): под корневым коммитом нет stub-а в пустое пространство.
 
+### Приоритеты цветов на merge+fork строке (update2, `tests/core/test_graph_v2.py`)
+Синтетические топологии повторяют реальные репозитории (см. `docs/FEATURES.md`, «Матрица приоритетов цветов»):
+- `test_fork_connector_pipe_uses_fork_point_own_color`: вертикаль под форк-пойнтом с собственным именем ветки — в цвете самого коммита, а не дочерней ветки (kilocode `22149292`).
+- `test_cross_bend_no_stale_half_cell_to_the_right`: полклетки справа от `CROSS(d=-1)` — в цвете следующего fork-сегмента, а не ветки слева (sql-skill `8ee78fc`).
+- `test_merge_left_bend_no_foreign_half_cell_into_the_void`: слева от `MERGE_LEFT` не выживает чужая горизонталь родительского коннектора (sql-skill `460f62c`).
+- `test_merge_colour_owns_horizontal_up_to_cross`: весь спан коммит→`CROSS` — в цвете merge (второго родителя); цвет ветки — только вертикаль вверх (kilocode `9c0e4f76`).
+- `test_no_gap_between_cross_and_next_fork_bend`: между `CROSS` и следующим fork-изгибом нет дыры в колее (kilocode `9c0e4f76`, col 11).
+- Ручная верификация: `python tools/dump_graph_cells.py <repo> <sha>...` на `sql-skill` (`8ee78fc7`, `460f62cd`) и `kilocode` (`22149292`, `9c0e4f76`).
+
+### Аватары (`tests/core/test_avatar.py`)
+- `test_circle_avatar_edge_cells_fully_visible`: центры всех заполненных ячеек identicon в круглом аватаре (size=19) имеют цвет fg — регрессия update1 (обрезка клипом).
+- `test_circle_avatar_grid_fits_inside_clip`: pixel-snapped сетка целиком внутри круглого клипа.
+- `test_circle_avatar_no_inner_border_by_default_for_graph`: без белого матового кольца при `inner_border=False`.
+- `test_square_badge_keeps_full_bleed_grid_and_border`: квадратный бейдж правой панели не регрессировал.
+
+### Операции над историей из контекстного меню графа (update2)
+- Core (`tests/core/test_operations.py`): `cherry_pick(create_commit=True)` двигает HEAD и сохраняет автора; `drop_commit` tip (reset --hard) и середина (rebase --onto) с undo-совместимостью; запреты drop/edit для merge/root/not-ancestor; `edit_commit_message` tip (pygit2 amend без затрагивания index) и середина (interactive rebase reword); `is_commit_pushed` по refs/remotes; `squash_commits` tip-диапазона (reset --soft) и в середине (interactive rebase squash), невалидные диапазоны.
+- Команды (`tests/viewmodels/test_merge_commands.py`): `CherryPickCommand(auto_commit)`, `DropCommitCommand`, `EditCommitMessageCommand`, `SquashCommitsCommand` — execute + undo через CommandProcessor; ошибки валидации не пушатся в undo-стек.
+- UI-меню (`tests/ui/test_graph_widget.py`): меню коммита содержит «Cherry-pick commit» / «Drop commit» / «Edit commit message…»; «Drop commit» disabled на merge-коммите; trigger испускает сигнал с sha.
+- Мультивыделение (`tests/ui/test_graph_widget.py`): Shift+клик выбирает непрерывный диапазон (newest-first), обычный клик сбрасывает; меню «Squash (N) commits» с корректным N испускает `squash_commits_requested(list)`; disabled для диапазона с merge-коммитом.
+- Предохранитель «запушено»: `MainWindow._confirm_history_rewrite` — QMessageBox (default No) перед drop/edit/squash, если коммит достижим из remote-refs.
+
 ## 4. Производительность
 - Синтетический тест: генерируем репозиторий с 5000 коммитов (линейная история + множественные ветвления), замеряем время построения раскладки графа (должно быть < 1 секунды) и FPS при прокрутке.
 - Мониторинг потребления памяти при открытии крупного репозитория.
