@@ -463,7 +463,7 @@ class CommitDetailPanel(QWidget):
             self._body_scroll.verticalScrollBar().setValue(0)
             self._body_scroll.setVisible(False)
 
-        self._info.setText(_format_info(info))
+        self._info.setText(_format_info(info, self._main_vm.branch_of_commit(info.sha)))
         self._set_avatar_for(info)
 
         # File list.
@@ -838,8 +838,15 @@ def _split_message(message: str) -> tuple[str, str]:
     body = "\n".join(line.rstrip() for line in body_lines).rstrip()
     return subject, body
 
-def _format_info(info: CommitInfo) -> str:
-    """Format the info block (author, committer, time, SHA, parents).
+def _format_info(
+    info: CommitInfo,
+    branch: str | None = None,
+) -> str:
+    """Format the info block (author, committer, time, SHA, parents, branch).
+
+    ``branch`` is the name of the branch the commit belongs to
+    (``git name-rev`` semantics), supplied by the ViewModel; ``None``
+    omits the line.
 
     Times are rendered as ``YYYY-MM-DD HH:MM:SS`` from the unix
     timestamp — we don't pull the system locale in here because the
@@ -850,7 +857,9 @@ def _format_info(info: CommitInfo) -> str:
     commit can put ``<script>...</script>`` in the author field).
     The string template below mixes hard-coded formatting tags
     (``<b>``, ``<code>``, ``<br/>``) with these user values; we
-    escape only the user values, never the formatting tags.
+    escape only the user values, never the formatting tags. Branch
+    names get the same treatment — git allows ``<``/``>`` in refnames
+    only via ``check-ref-format`` loopholes, but we escape anyway.
     """
     parts: list[str] = []
     if info.author_name or info.author_email:
@@ -888,6 +897,8 @@ def _format_info(info: CommitInfo) -> str:
         parts.append(f"<b>Parents:</b> {parents}")
     else:
         parts.append("<b>Parents:</b> (root commit)")
+    if branch:
+        parts.append(f"<b>Branch:</b> {html.escape(branch)}")
     return "<br/>".join(parts)
 
 def _format_time(unix_ts: int) -> str:

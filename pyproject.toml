@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "git-py"
-version = "0.1.0"
+version = "0.11.1"
 description = "GitKraken-like Git client in Python (PySide6 + pygit2)."
 readme = "README.md"
 license = { file = "LICENSE" }

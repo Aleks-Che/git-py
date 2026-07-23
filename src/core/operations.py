@@ -1231,6 +1231,46 @@ def is_commit_pushed(
     return False
 
 
+def branch_of_commit(
+    repo: RepositoryManager | pygit2.Repository,
+    sha: str,
+) -> str | None:
+    """Return the name of the branch ``sha`` belongs to, or ``None``.
+
+    Uses ``git name-rev`` semantics — the nearest branch by ancestor
+    traversal, which is git's canonical answer to "which branch is
+    this commit on".  Local heads are tried first; when no local
+    branch contains the commit the nearest remote-tracking branch is
+    returned instead.  Ancestry suffixes (``~N`` / ``^N``) are
+    stripped.  One or two short-lived ``git`` spawns per call —
+    clicking a commit must not walk every ref with
+    ``descendant_of`` (that froze the UI on repos with hundreds of
+    remote branches).
+    """
+    with unwrap(repo) as r:
+        try:
+            r.revparse_single(sha).peel(pygit2.Commit)
+        except (KeyError, pygit2.GitError, ValueError) as exc:
+            raise InvalidRefError(f"Unknown revision: {sha!r}") from exc
+        for pattern in ("refs/heads/*", "refs/remotes/*"):
+            completed = _run_git_in_workdir(
+                r,
+                ["name-rev", "--name-only", "--no-undefined", f"--refs={pattern}", sha],
+                timeout=10.0,
+            )
+            if completed.returncode != 0:
+                continue
+            name = completed.stdout.strip()
+            if not name:
+                continue
+            # name-rev emits e.g. "main~12" or "remotes/origin/topic^2~1".
+            name = re.split(r"[~^]", name, maxsplit=1)[0]
+            if name.startswith("remotes/"):
+                name = name[len("remotes/"):]
+            return name
+    return None
+
+
 def squash_commits(
     repo: RepositoryManager | pygit2.Repository,
     shas: list[str],
@@ -2604,6 +2644,7 @@ def apply_file_from_stash(
 
 __all__ = [
     "abort_merge",
+    "branch_of_commit",
     "abort_rebase",
     "add_remote",
     "add_to_gitignore",

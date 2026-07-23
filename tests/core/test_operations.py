@@ -33,6 +33,7 @@ from src.core.operations import (
     abort_merge,
     abort_rebase,
     add_remote,
+    branch_of_commit,
     checkout_branch,
     checkout_commit,
     cherry_pick,
@@ -1763,6 +1764,35 @@ def test_is_commit_pushed(
     mgr.repo.references.create("refs/remotes/origin/main", base)
     assert is_commit_pushed(mgr, str(base))
     assert not is_commit_pushed(mgr, str(tip))
+
+
+def test_branch_of_commit_local_and_remote(
+    tmp_git_repo: Path,
+    make_commit,
+) -> None:
+    mgr = RepositoryManager(str(tmp_git_repo))
+    base = make_commit("base", files={"a.txt": "A\n"})
+    tip = make_commit("tip", files={"b.txt": "B\n"}, parents=[base])
+    # The branch tip itself is named after its branch.
+    assert branch_of_commit(mgr, str(tip)) == "main"
+    # A branch parked at ``base`` is the nearest ref for it (distance
+    # zero beats ``main~1``).
+    mgr.repo.references.create("refs/heads/feature", base)
+    assert branch_of_commit(mgr, str(base)) == "feature"
+    # A commit no local branch contains falls back to the nearest
+    # remote-tracking branch (without the ``remotes/`` prefix).
+    remote_only = make_commit(
+        "remote only", files={"c.txt": "C\n"}, parents=[tip],
+        ref="refs/remotes/origin/topic",
+    )
+    assert branch_of_commit(mgr, str(remote_only)) == "origin/topic"
+
+
+def test_branch_of_commit_unknown_sha_raises(
+    committed_repo: RepositoryManager,
+) -> None:
+    with pytest.raises(InvalidRefError):
+        branch_of_commit(committed_repo, "f" * 40)
 
 
 # ----- update2 stage D: squash_commits --------------------------------------

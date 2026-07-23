@@ -857,6 +857,21 @@ def build_graph(
                     merge_own_cols.update(range(lane * 2, col_e))
                 elif cell_e.direction == 1:
                     merge_own_cols.update(range(col_e + 1, lane * 2 + 1))
+            # Left-merge protection (update2 follow-up): when the commit
+            # is BOTH a fork point (children on lanes to the right) AND
+            # a merge whose parent sits on a lane to the LEFT, the fork
+            # connector's plain PIPE cells would clobber the merge
+            # connector drawn by ``_build_row_cells`` — the TEE junction
+            # on the parent's lane and the HORIZONTAL_PIPE crossings in
+            # between — leaving a disconnected stub that crosses one
+            # parallel pipe and breaks off (kilocode ``a87ddecf``).
+            left_merge_cols: set[int] = set()
+            left_merge_color: int | None = None
+            for _psha, pl, _wex, pcol, _ash in parent_lanes:
+                if pl < lane and pl not in fork_lane_set:
+                    left_merge_cols.update(range(pl * 2, lane * 2))
+                    if left_merge_color is None:
+                        left_merge_color = pcol
             while len(cells) < len(fork_merging_cells):
                 cells.append(CellInfo.empty())
             for fci, fc in enumerate(fork_merging_cells):
@@ -878,7 +893,23 @@ def build_graph(
                     CellType.HORIZONTAL_PIPE,
                 ):
                     continue
+                if (
+                    fci in left_merge_cols
+                    and fc.cell_type == CellType.PIPE
+                    and existing.cell_type != CellType.EMPTY
+                ):
+                    continue
                 cells[fci] = fc
+            # The fork's TEE_RIGHT at the commit cell replaced the
+            # left-merge TEE_LEFT, which used to paint the half-cell
+            # between the commit dot and the connector.  Bridge that
+            # span so the merge line still reaches the commit.
+            if (
+                left_merge_color is not None
+                and lane > 0
+                and cells[lane * 2 - 1].cell_type == CellType.EMPTY
+            ):
+                cells[lane * 2 - 1] = CellInfo.horizontal(left_merge_color)
 
             # --- half-cell cleanup past fork-connector bends ---------
             # Even/odd column geometry makes every horizontal cell

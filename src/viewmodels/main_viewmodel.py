@@ -2104,6 +2104,22 @@ class MainViewModel(QObject):
         except GitError:
             return False
 
+    def branch_of_commit(self, sha: str) -> str | None:
+        """Return the name of the branch ``sha`` belongs to, or ``None``.
+
+        Non-mutating query for the commit detail panel's "Branch:"
+        line; ``None`` when no repository is open or the sha is
+        unknown (e.g. the synthetic WIP row).
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            return None
+        from src.core.operations import branch_of_commit as _branch_of
+
+        try:
+            return _branch_of(self._repo_manager, sha)
+        except GitError:
+            return None
+
     @_guard_mutation
     def squash_commits(self, shas: list[str], message: str) -> None:
         """Squash a contiguous chain of commits via :class:`SquashCommitsCommand`.

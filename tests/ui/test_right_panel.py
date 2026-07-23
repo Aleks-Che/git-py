@@ -23,7 +23,7 @@ from pathlib import Path
 import pygit2
 from PySide6.QtGui import QColor
 from src.core.diff_parser import DiffLineType
-from src.core.models import FileStatus
+from src.core.models import CommitInfo, FileStatus
 from src.core.repository import RepositoryManager
 from src.ui.main_window import MainWindow
 from src.ui.widgets.diff_view_widget import DiffLineActionMode
@@ -1769,3 +1769,41 @@ def test_commit_detail_plain_click_wipes_multi_selection(
     detail._on_files_item_clicked(detail._files.item(2))
     assert detail._selected_paths() == ["c.txt"]
     assert detail.selected_file() == "c.txt"
+
+
+# ----- commit detail info block: Branch line ------------------------------
+
+
+def _detail_info() -> CommitInfo:
+    return CommitInfo(
+        sha="a" * 40,
+        short_sha="aaaaaaa",
+        message="subject",
+        author_name="tester",
+        author_email="t@example.com",
+        author_time=1752463496,
+        committer_name="tester",
+        committer_email="t@example.com",
+        committer_time=1752463496,
+        parents=["b" * 40],
+    )
+
+
+def test_format_info_shows_branch() -> None:
+    from src.ui.widgets.commit_detail_panel import _format_info
+
+    text = _format_info(_detail_info(), "main")
+    assert "<b>Branch:</b> main" in text
+
+
+def test_format_info_omits_branch_when_unknown() -> None:
+    from src.ui.widgets.commit_detail_panel import _format_info
+
+    assert "<b>Branch:</b>" not in _format_info(_detail_info())
+
+
+def test_format_info_escapes_branch_name() -> None:
+    from src.ui.widgets.commit_detail_panel import _format_info
+
+    text = _format_info(_detail_info(), "we<branch>")
+    assert "we&lt;branch&gt;" in text

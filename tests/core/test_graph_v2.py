@@ -2389,3 +2389,71 @@ def test_no_gap_between_cross_and_next_fork_bend() -> None:
         "(direction=-1), otherwise it protrudes half a cell past the bend"
     )
     assert last.to_dict().get("d") == -1
+
+
+def test_fork_commit_with_left_merge_keeps_connector() -> None:
+    """A commit that is BOTH a fork point (children on lanes to the
+    right) AND a merge whose second parent sits on a lane to the LEFT
+    must keep its merge connector. The fork connector's plain PIPE
+    cells must not clobber the junction at the parent's lane, the
+    HORIZONTAL_PIPE crossing and the half-cell reaching the commit dot
+    (kilocode ``a87ddecf`` — merge of ``origin/main`` into a side
+    branch with another branch forked from the merge commit: the line
+    went left from the commit, crossed one parallel pipe and broke
+    off before reaching main).
+    """
+    a = "a" * 40
+    b = "b" * 40
+    c = "c" * 40
+    d = "d" * 40
+    p = "e" * 40  # parallel branch — holds the lane between main and the merge
+    t = "f" * 40  # topic branch — child of the merge commit
+    n1 = "0" * 40  # side-branch continuation — second child of the merge
+    m = "1" * 40  # the merge commit (fork point + left second parent)
+    s = "2" * 40  # side branch — first parent of the merge
+    commits = [
+        _c(d, parents=[c], ts=10),
+        _c(p, parents=[b], ts=9),
+        _c(t, parents=[m], ts=8),
+        _c(n1, parents=[m], ts=7),
+        _c(m, parents=[s, c], ts=6),
+        _c(s, parents=[a], ts=5),
+        _c(c, parents=[b], ts=4),
+        _c(b, parents=[a], ts=3),
+        _c(a, ts=2),
+    ]
+    branches = [
+        _b("main", d, is_head=True),
+        _b("parallel", p),
+        _b("topic", t),
+        _b("side", n1),
+    ]
+    layout = build_graph(commits, branches)
+    nodes = {n.commit.sha: n for n in layout.nodes}
+    m_node = nodes[m]
+    main_color = nodes[d].color_index
+    p_color = nodes[p].color_index
+    assert m_node.lane == 2
+    cells = m_node.cells
+    # Continuity: no gap between the second parent's lane (0) and the
+    # commit lane (2).
+    for col in range(0, 5):
+        assert cells[col].cell_type != CellType.EMPTY, (
+            f"col {col} is EMPTY — the left merge connector is broken"
+        )
+    # Junction on the second parent's lane: vertical main pipe + the
+    # merge horizontal arriving from the right.
+    assert cells[0].cell_type == CellType.TEE_RIGHT
+    assert cells[0].color_index == main_color
+    assert cells[1].cell_type == CellType.HORIZONTAL
+    assert cells[1].color_index == main_color
+    # The parallel branch's pipe is crossed, not overwritten.
+    assert cells[2].cell_type == CellType.HORIZONTAL_PIPE
+    assert cells[2].color_index == main_color
+    assert cells[2].pipe_color_index == p_color
+    # The half-cell reaching the commit dot (the fork's TEE_RIGHT at
+    # the commit cell replaced the merge's TEE_LEFT).
+    assert cells[3].cell_type == CellType.HORIZONTAL
+    assert cells[3].color_index == main_color
+    # The fork connector owns the commit cell (branch to the right).
+    assert cells[4].cell_type == CellType.TEE_RIGHT

@@ -34,3 +34,14 @@
 - Симптом (оба на kilocode): `9c0e4f76` и `5c7978c2` — линия продолжается вправо на полклетки за `MERGE_LEFT`-изгиб в пустоту. Причина: заливка дыры (правило 4 этапа B4) писала полноширинную odd-ячейку перед изгибом.
 - Фикс: `CellInfo.direction` для `HORIZONTAL`/`HORIZONTAL_PIPE` (`d=-1` — рисовать только левую половину спана, «right-trimmed»); заливка помечает последнюю ячейку перед изгибом; рендер `_trimmed_horiz_len` в `graph_panel._draw_cell_row`. Wire-формат: ключ `d` в `to_dict`.
 - Тест: `test_no_gap_between_cross_and_next_fork_bend` дополнен проверкой `direction == -1` и сериализации. 1180 passed.
+
+## Follow-up 2 (2026-07-23): обрыв левого мерджа при fork'е из того же коммита
+- Симптом (kilocode `a87ddecf`): коммит одновременно fork-точка (ребёнок на лейне справа) и мердж со вторым родителем на лейне 0 слева. Линия уходила влево от коммита, пересекала один параллельный пайп и обрывалась: fork-коннектор затирал своими `PIPE` ячейками `TEE_RIGHT`-стыковку на лейне родителя (col 0), `HORIZONTAL_PIPE`-пересечение (col 2), а его `TEE_RIGHT` в ячейке коммита заменял `TEE_LEFT` мерджа — дыра на col 3.
+- Фикс: `left_merge_cols` в оверлее fork-коннектора — колонки левого мердж-коннектора защищены от перезаписи plain-PIPE; после цикла полуклетка `lane*2-1` заливается `HORIZONTAL`, если fork занял ячейку коммита.
+- Тест: `test_fork_commit_with_left_merge_keeps_connector` (синтетика: main + parallel + topic/side дети мерджа). 1181 passed.
+
+## Follow-up 3 (2026-07-23): ветка коммита в правой панели
+- Инфо-блок коммита (`commit_detail_panel._format_info`) показывает строку `Branch:` — ветка, которой принадлежит коммит.
+- Core: `operations.branch_of_commit(repo, sha) -> str | None` через `git name-rev --name-only --no-undefined --refs=...`: сначала local heads, затем remote-tracking (префикс `remotes/` срезается); суффиксы `~N`/`^N` убираются. VM: `branch_of_commit(sha)`.
+- Первая версия (`branches_containing` через `descendant_of` по всем refs) удалена: подвисала на репо с сотнями remote-веток и выдавала бессмысленную простыню «Remote: …+28 more». name-rev — 1–2 git-вызова, ~350 мс.
+- Тесты: core (2: local/remote fallback, unknown sha), UI (3: рендер, пропуск, escape). 1186 passed.
