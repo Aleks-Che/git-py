@@ -29,3 +29,8 @@
 - Core: `squash_commits` — tip-диапазон через `reset --soft`, середина через interactive rebase (`squash`-строки, scripted editors).
 - Команда/VM: `SquashCommitsCommand`, `squash_commits(shas, message)`; диалог объединённого сообщения; push-guard по самому старому коммиту.
 - Тесты: core (6), команда (2), UI (4).
+
+## Follow-up (2026-07-23): выступ горизонтали за изгибом
+- Симптом (оба на kilocode): `9c0e4f76` и `5c7978c2` — линия продолжается вправо на полклетки за `MERGE_LEFT`-изгиб в пустоту. Причина: заливка дыры (правило 4 этапа B4) писала полноширинную odd-ячейку перед изгибом.
+- Фикс: `CellInfo.direction` для `HORIZONTAL`/`HORIZONTAL_PIPE` (`d=-1` — рисовать только левую половину спана, «right-trimmed»); заливка помечает последнюю ячейку перед изгибом; рендер `_trimmed_horiz_len` в `graph_panel._draw_cell_row`. Wire-формат: ключ `d` в `to_dict`.
+- Тест: `test_no_gap_between_cross_and_next_fork_bend` дополнен проверкой `direction == -1` и сериализации. 1180 passed.

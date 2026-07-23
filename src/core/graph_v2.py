@@ -189,6 +189,15 @@ class CellInfo:
             d["c"] = self.color_index
         if self.cell_type == CellType.CROSS and self.direction:
             d["d"] = self.direction
+        if self.cell_type in (
+            CellType.HORIZONTAL,
+            CellType.HORIZONTAL_PIPE,
+        ) and self.direction:
+            # Trimmed horizontal: ``-1`` paints only the left half of
+            # the cell's span (stops at the next lane centre), ``+1``
+            # only the right half.  Used for the incoming cell of an
+            # up-bend so the track does not protrude past the bend.
+            d["d"] = self.direction
         return d
 
     @staticmethod
@@ -220,12 +229,17 @@ class CellInfo:
         return CellInfo(CellType.MERGE_LEFT, color_index=color)
 
     @staticmethod
-    def horizontal(color: int) -> CellInfo:
-        return CellInfo(CellType.HORIZONTAL, color_index=color)
+    def horizontal(color: int, direction: int = 0) -> CellInfo:
+        return CellInfo(CellType.HORIZONTAL, color_index=color, direction=direction)
 
     @staticmethod
-    def horizontal_pipe(h_color: int, p_color: int) -> CellInfo:
-        return CellInfo(CellType.HORIZONTAL_PIPE, color_index=h_color, pipe_color_index=p_color)
+    def horizontal_pipe(h_color: int, p_color: int, direction: int = 0) -> CellInfo:
+        return CellInfo(
+            CellType.HORIZONTAL_PIPE,
+            color_index=h_color,
+            pipe_color_index=p_color,
+            direction=direction,
+        )
 
     @staticmethod
     def tee_right(color: int) -> CellInfo:
@@ -914,17 +928,25 @@ def build_graph(
                     # its next bend assuming an intermediate pipe/tee
                     # covers the gap; a CROSS bend paints nothing
                     # rightward, so fill the hole up to the next bend.
+                    # The last filled cell (immediately left of the
+                    # bend) is right-trimmed (``direction=-1``) — a
+                    # full-width odd cell would paint a half-cell past
+                    # the bend into the void (kilocode ``9c0e4f76``
+                    # col 11, ``5c7978c2`` col 11).
                     if mi + 1 < len(fork_merging_lanes):
                         next_bend_idx = fork_merging_lanes[mi + 1][0] * 2
                         for gap_idx in range(bend_idx + 1, next_bend_idx):
                             if gap_idx >= len(cells):
                                 break
                             gap_cell = cells[gap_idx]
+                            trim = -1 if gap_idx == next_bend_idx - 1 else 0
                             if gap_cell.cell_type == CellType.EMPTY:
-                                cells[gap_idx] = CellInfo.horizontal(next_color)
+                                cells[gap_idx] = CellInfo.horizontal(
+                                    next_color, direction=trim
+                                )
                             elif gap_cell.cell_type == CellType.PIPE:
                                 cells[gap_idx] = CellInfo.horizontal_pipe(
-                                    next_color, gap_cell.color_index
+                                    next_color, gap_cell.color_index, direction=trim
                                 )
                 elif bend.cell_type == CellType.MERGE_LEFT:
                     if (

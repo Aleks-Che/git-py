@@ -2862,7 +2862,10 @@ def _draw_cell_row(
         elif t == _T_MERGE_LEFT:
             _draw_merge_left(painter, x, y_center, half_h, edge_width, color, lane_w)
         elif t == _T_HORIZONTAL:
-            _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
+            _draw_horiz_line(
+                painter, x, y_center,
+                _trimmed_horiz_len(cell, lane_w), edge_width, color,
+            )
         elif t == _T_HORIZONTAL_PIPE:
             _draw_vert_line(
                 painter,
@@ -2874,7 +2877,10 @@ def _draw_cell_row(
                 top_half_h=node_radius,
                 bottom_half_h=bot_half_h,
             )
-            _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
+            _draw_horiz_line(
+                painter, x, y_center,
+                _trimmed_horiz_len(cell, lane_w), edge_width, color,
+            )
         elif t == _T_TEE_RIGHT:
             vert_color = p_color if has_pipe_color else color
             _draw_vert_line(
@@ -2958,6 +2964,23 @@ def _draw_cell_row(
                     edge_width,
                     color,
                 )
+
+
+def _trimmed_horiz_len(cell: dict, lane_w: float) -> float:
+    """Horizontal length for HORIZONTAL / HORIZONTAL_PIPE cells.
+
+    ``d == -1`` trims the right half (the segment stops at the next
+    lane centre) — used for the incoming cell of an up-bend so the
+    track does not protrude half a cell past the bend into the void.
+    ``d == +1`` trims the left half (mirror; reserved). Default is the
+    full lane width.
+    """
+    d = cell.get("d", 0)
+    if d == -1:
+        return lane_w / 2
+    if d == 1:
+        return -lane_w / 2
+    return lane_w
 
 
 def _draw_vert_line(

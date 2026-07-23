@@ -2380,3 +2380,12 @@ def test_no_gap_between_cross_and_next_fork_bend() -> None:
             "the next fork bend"
         )
         assert cell.color_index == merge_left_color
+    # The last cell before the bend must be right-trimmed so it does
+    # not paint a half-cell past the bend into the void (kilocode
+    # ``9c0e4f76`` col 11, ``5c7978c2`` col 11).
+    last = d.cells[merge_left_col - 1]
+    assert last.direction == -1, (
+        "incoming horizontal before an up-bend must be right-trimmed "
+        "(direction=-1), otherwise it protrudes half a cell past the bend"
+    )
+    assert last.to_dict().get("d") == -1

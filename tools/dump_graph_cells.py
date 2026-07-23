@@ -8,12 +8,12 @@ Usage:  python tools/dump_graph_cells.py <repo_path> <sha_prefix> [sha_prefix...
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from src.core.graph_v2 import BRANCH_PALETTE, CellType, build_graph  # noqa: E402
@@ -24,7 +24,9 @@ from src.core.repository import RepositoryManager  # noqa: E402
 def main() -> None:
     repo_path, targets = sys.argv[1], sys.argv[2:]
     repo = RepositoryManager(repo_path)
-    history = repo.get_all_history(max_count=500)
+    history = repo.get_all_history(
+        max_count=int(os.environ.get("GIT_PY_DUMP_LIMIT", "6000")),
+    )
     branches = repo.branches
     head_target = str(repo.repo.head.target) if not repo.repo.head_is_detached else None
 
@@ -94,7 +96,7 @@ def main() -> None:
                 CellType.TEE_UP, CellType.CROSS,
             ):
                 desc += f",p={cell.pipe_color_index}"
-            if cell.cell_type == CellType.CROSS:
+            if cell.direction:
                 desc += f",d={cell.direction}"
             desc += f" {colour(cell.color_index)}"
             if cell.cell_type in (
