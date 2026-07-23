@@ -48,7 +48,7 @@ from src.core.exceptions import (
     NetworkError,
     RebaseConflictError,
 )
-from src.core.models import CommitInfo, RemoteInfo
+from src.core.models import BranchAttribution, CommitInfo, RemoteInfo
 from src.core.repository import RepositoryManager, unwrap
 
 if TYPE_CHECKING:
@@ -1231,43 +1231,110 @@ def is_commit_pushed(
     return False
 
 
+def _name_rev(repo: pygit2.Repository, sha: str, refs: str) -> str | None:
+    """``git name-rev --name-only`` of ``sha`` against ``refs``.
+
+    Returns the raw name (with any ``~N`` / ``^N`` ancestry suffix) or
+    ``None`` when no ref in the pattern contains the commit.
+    """
+    completed = _run_git_in_workdir(
+        repo,
+        ["name-rev", "--name-only", "--no-undefined", f"--refs={refs}", sha],
+        timeout=10.0,
+    )
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
 def branch_of_commit(
     repo: RepositoryManager | pygit2.Repository,
     sha: str,
-) -> str | None:
-    """Return the name of the branch ``sha`` belongs to, or ``None``.
+) -> BranchAttribution | None:
+    """Return the branch ``sha`` was developed on, or ``None``.
 
-    Uses ``git name-rev`` semantics — the nearest branch by ancestor
-    traversal, which is git's canonical answer to "which branch is
-    this commit on".  Local heads are tried first; when no local
-    branch contains the commit the nearest remote-tracking branch is
-    returned instead.  Ancestry suffixes (``~N`` / ``^N``) are
-    stripped.  One or two short-lived ``git`` spawns per call —
-    clicking a commit must not walk every ref with
-    ``descendant_of`` (that froze the UI on repos with hundreds of
-    remote branches).
+    "Developed on" = *first-parent lineage* semantics: a commit
+    belongs to a branch when it sits on that branch's first-parent
+    chain (committed there directly, or a merge/squash commit landing
+    there).  ``git name-rev`` encodes exactly this in its suffix:
+    ``main~10`` is on the chain, while ``main~78^2`` went through a
+    merge's second parent (kilocode ``95d4ab67``: developed on
+    ``feat/cli-assistant-links``, contained in ``origin/main`` only
+    as ``~78^2``).
+
+    The result's ``certain`` flag separates structural facts from
+    heuristics:
+
+    * ``certain=True`` — the commit lies on the returned branch's
+      first-parent chain (tip or ``name~N``).  Caveat: commits that
+      landed via a *fast-forward* merge are indistinguishable from
+      direct commits — git records no authorship branch.
+    * ``certain=False`` — the commit is reachable from the branch
+      only through a merge (``^`` in the suffix); the nearest
+      existing ref won, the true source branch may be gone.
+
+    Priority: current branch → ``main``/``master`` (local, then
+    ``origin/``) → nearest local branch → nearest remote-tracking
+    branch.  Ancestry suffixes are stripped.  A few short-lived
+    ``git`` spawns per call — clicking a commit must not walk every
+    ref with ``descendant_of`` (that froze the UI on repos with
+    hundreds of remote branches).
     """
     with unwrap(repo) as r:
         try:
             r.revparse_single(sha).peel(pygit2.Commit)
         except (KeyError, pygit2.GitError, ValueError) as exc:
             raise InvalidRefError(f"Unknown revision: {sha!r}") from exc
-        for pattern in ("refs/heads/*", "refs/remotes/*"):
-            completed = _run_git_in_workdir(
+
+        priority: list[tuple[str, str]] = []  # (full ref, display name)
+        try:
+            head_name = r.head.name
+        except pygit2.GitError:
+            head_name = ""
+        if head_name.startswith("refs/heads/"):
+            priority.append((head_name, head_name[len("refs/heads/"):]))
+        for trunk in ("main", "master"):
+            priority.append((f"refs/heads/{trunk}", trunk))
+            priority.append((f"refs/remotes/origin/{trunk}", f"origin/{trunk}"))
+        seen: set[str] = set()
+        for ref, display in priority:
+            if ref in seen:
+                continue
+            seen.add(ref)
+            try:
+                r.references[ref]
+            except KeyError:
+                continue
+            # Cheap pre-filter: a trunk that does not contain the
+            # commit at all can never name it (~20 ms vs ~150 ms for
+            # a name-rev that comes back "undefined").
+            contained = _run_git_in_workdir(
                 r,
-                ["name-rev", "--name-only", "--no-undefined", f"--refs={pattern}", sha],
+                ["merge-base", "--is-ancestor", sha, ref],
                 timeout=10.0,
             )
-            if completed.returncode != 0:
+            if contained.returncode != 0:
                 continue
-            name = completed.stdout.strip()
-            if not name:
+            name = _name_rev(r, sha, ref)
+            # ``^`` in the suffix means the path left the first-parent
+            # chain (through a merge's non-first parent) — the commit
+            # was not developed on this branch.
+            if name is not None and "^" not in name:
+                return BranchAttribution(display, certain=True)
+
+        for pattern in ("refs/heads/*", "refs/remotes/*"):
+            name = _name_rev(r, sha, pattern)
+            if name is None:
                 continue
-            # name-rev emits e.g. "main~12" or "remotes/origin/topic^2~1".
+            # The nearest branch whose OWN first-parent chain carries
+            # the commit (``feature`` / ``feature~3``) is a structural
+            # answer; a ``^`` detour marks a reachability-only match.
+            certain = "^" not in name
+            # name-rev emits e.g. "topic~3^2" or "remotes/origin/topic".
             name = re.split(r"[~^]", name, maxsplit=1)[0]
             if name.startswith("remotes/"):
                 name = name[len("remotes/"):]
-            return name
+            return BranchAttribution(name, certain)
     return None
 
 

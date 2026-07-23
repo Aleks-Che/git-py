@@ -43,7 +43,7 @@ from src.core.exceptions import (
     RebaseConflictError,
     RepositoryNotFoundError,
 )
-from src.core.models import RemoteInfo
+from src.core.models import BranchAttribution, RemoteInfo
 from src.core.repository import RepositoryManager
 from src.utils.async_worker import AsyncWorker
 from src.utils.config import default_config_path, load_author_signature, load_config
@@ -158,6 +158,11 @@ class MainViewModel(QObject):
         # ``set_repository`` and refreshed via
         # :attr:`recently_created_changed` so widgets can re-pull it.
         self._recently_created_branches: set[str] = set()
+        # Memoized ``branch_of_commit`` answers — the git subprocesses
+        # behind one lookup add up to ~0.7 s on a large repo, so repeat
+        # clicks on the same commit must not re-run them.  Cleared on
+        # every repository change.
+        self._branch_of_commit_cache: dict[str, BranchAttribution | None] = {}
 
     # ----- destructive-action confirmation ------------------------------
 
@@ -326,6 +331,7 @@ class MainViewModel(QObject):
         # logic doesn't carry stale state across repositories.
         self._recently_created_branches = set()
         self.recently_created_changed.emit(set(self._recently_created_branches))
+        self._branch_of_commit_cache.clear()
         if self._selected_commit_sha is not None:
             self._selected_commit_sha = None
             self.selection_changed.emit(None)
@@ -2104,21 +2110,27 @@ class MainViewModel(QObject):
         except GitError:
             return False
 
-    def branch_of_commit(self, sha: str) -> str | None:
-        """Return the name of the branch ``sha`` belongs to, or ``None``.
+    def branch_of_commit(self, sha: str) -> BranchAttribution | None:
+        """Return the branch attribution for ``sha``, or ``None``.
 
         Non-mutating query for the commit detail panel's "Branch:"
         line; ``None`` when no repository is open or the sha is
-        unknown (e.g. the synthetic WIP row).
+        unknown (e.g. the synthetic WIP row).  The ``certain`` flag
+        tells the UI whether the name is a structural fact
+        (first-parent chain) or a nearest-ref reconstruction.
         """
         if self._repo_manager is None or not self._repo_manager.is_open:
             return None
+        if sha in self._branch_of_commit_cache:
+            return self._branch_of_commit_cache[sha]
         from src.core.operations import branch_of_commit as _branch_of
 
         try:
-            return _branch_of(self._repo_manager, sha)
+            result = _branch_of(self._repo_manager, sha)
         except GitError:
-            return None
+            result = None
+        self._branch_of_commit_cache[sha] = result
+        return result
 
     @_guard_mutation
     def squash_commits(self, shas: list[str], message: str) -> None:

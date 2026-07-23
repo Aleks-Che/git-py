@@ -26,7 +26,7 @@ from src.core.exceptions import (
     MergeConflictError,
     RebaseConflictError,
 )
-from src.core.models import FileStatus
+from src.core.models import BranchAttribution, FileStatus
 from src.core.operations import (
     _CONFLICTING_STATUS_FLAGS,
     _dirty_paths,
@@ -1773,19 +1773,38 @@ def test_branch_of_commit_local_and_remote(
     mgr = RepositoryManager(str(tmp_git_repo))
     base = make_commit("base", files={"a.txt": "A\n"})
     tip = make_commit("tip", files={"b.txt": "B\n"}, parents=[base])
-    # The branch tip itself is named after its branch.
-    assert branch_of_commit(mgr, str(tip)) == "main"
-    # A branch parked at ``base`` is the nearest ref for it (distance
-    # zero beats ``main~1``).
+    # The branch tip itself is named after its branch — certain.
+    assert branch_of_commit(mgr, str(tip)) == BranchAttribution("main", True)
+    # Trunk priority: ``base`` lives on main even though a feature
+    # branch is parked exactly at it (distance zero).
     mgr.repo.references.create("refs/heads/feature", base)
-    assert branch_of_commit(mgr, str(base)) == "feature"
+    assert branch_of_commit(mgr, str(base)) == BranchAttribution("main", True)
+    # A commit only the feature branch contains falls through the
+    # trunk checks to the nearest local branch.
+    feature_only = make_commit(
+        "feature work", files={"f.txt": "F\n"}, parents=[base],
+        ref="refs/heads/feature",
+    )
+    assert branch_of_commit(mgr, str(feature_only)) == BranchAttribution("feature", True)
+    # First-parent semantics: a feature commit MERGED into main is
+    # still a feature commit (``main~1^2`` leaves the first-parent
+    # chain); the merge commit itself is a main commit.
+    merge = make_commit("merge feature", parents=[tip, feature_only])
+    assert branch_of_commit(mgr, str(feature_only)) == BranchAttribution("feature", True)
+    assert branch_of_commit(mgr, str(merge)) == BranchAttribution("main", True)
+    # Source branch deleted after the merge: the commit is reachable
+    # only through a merge's second parent — the nearest ref is a
+    # reconstruction, not a fact.
+    mgr.repo.references.delete("refs/heads/feature")
+    assert branch_of_commit(mgr, str(feature_only)) == BranchAttribution("main", False)
     # A commit no local branch contains falls back to the nearest
-    # remote-tracking branch (without the ``remotes/`` prefix).
+    # remote-tracking branch (without the ``remotes/`` prefix); it is
+    # that branch's tip, so the answer is certain.
     remote_only = make_commit(
         "remote only", files={"c.txt": "C\n"}, parents=[tip],
         ref="refs/remotes/origin/topic",
     )
-    assert branch_of_commit(mgr, str(remote_only)) == "origin/topic"
+    assert branch_of_commit(mgr, str(remote_only)) == BranchAttribution("origin/topic", True)
 
 
 def test_branch_of_commit_unknown_sha_raises(

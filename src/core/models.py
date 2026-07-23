@@ -9,6 +9,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import NamedTuple
+
+
+class BranchAttribution(NamedTuple):
+    """Result of :func:`src.core.operations.branch_of_commit`.
+
+    ``certain`` is ``True`` when the commit lies on the returned
+    branch's *first-parent chain* (a structural fact — the branch
+    tip itself, or ``name~N`` with no ``^`` detour through a merge).
+    ``False`` means the name was reconstructed heuristically: the
+    commit is only reachable from that branch through a merge, and
+    the nearest existing ref won (the true source branch may have
+    been deleted or renamed — git records no authorship branch).
+    """
+
+    name: str
+    certain: bool
 
 
 class FileStatus(str, Enum):

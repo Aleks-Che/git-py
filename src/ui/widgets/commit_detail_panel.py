@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.exceptions import GitError
-from src.core.models import CommitInfo, FileChange
+from src.core.models import BranchAttribution, CommitInfo, FileChange
 from src.ui.widgets.file_list_model import (
     DEFAULT_PATH_TEXT_COLOR,
     PATH_TEXT_COLOR,
@@ -840,13 +840,15 @@ def _split_message(message: str) -> tuple[str, str]:
 
 def _format_info(
     info: CommitInfo,
-    branch: str | None = None,
+    branch: BranchAttribution | None = None,
 ) -> str:
     """Format the info block (author, committer, time, SHA, parents, branch).
 
-    ``branch`` is the name of the branch the commit belongs to
-    (``git name-rev`` semantics), supplied by the ViewModel; ``None``
-    omits the line.
+    ``branch`` is the commit's branch attribution, supplied by the
+    ViewModel; ``None`` omits the line.  A ``certain`` attribution
+    (the commit lies on the branch's first-parent chain) renders as
+    ``Branch:``; a heuristic nearest-ref reconstruction renders as
+    ``Reconstructed branch:`` so the user can tell fact from guess.
 
     Times are rendered as ``YYYY-MM-DD HH:MM:SS`` from the unix
     timestamp — we don't pull the system locale in here because the
@@ -898,7 +900,8 @@ def _format_info(
     else:
         parts.append("<b>Parents:</b> (root commit)")
     if branch:
-        parts.append(f"<b>Branch:</b> {html.escape(branch)}")
+        label = "Branch:" if branch.certain else "Reconstructed branch:"
+        parts.append(f"<b>{label}</b> {html.escape(branch.name)}")
     return "<br/>".join(parts)
 
 def _format_time(unix_ts: int) -> str:

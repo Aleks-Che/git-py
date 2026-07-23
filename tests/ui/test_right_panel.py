@@ -23,7 +23,7 @@ from pathlib import Path
 import pygit2
 from PySide6.QtGui import QColor
 from src.core.diff_parser import DiffLineType
-from src.core.models import CommitInfo, FileStatus
+from src.core.models import BranchAttribution, CommitInfo, FileStatus
 from src.core.repository import RepositoryManager
 from src.ui.main_window import MainWindow
 from src.ui.widgets.diff_view_widget import DiffLineActionMode
@@ -1792,18 +1792,26 @@ def _detail_info() -> CommitInfo:
 def test_format_info_shows_branch() -> None:
     from src.ui.widgets.commit_detail_panel import _format_info
 
-    text = _format_info(_detail_info(), "main")
+    text = _format_info(_detail_info(), BranchAttribution("main", True))
     assert "<b>Branch:</b> main" in text
+
+
+def test_format_info_marks_reconstructed_branch() -> None:
+    from src.ui.widgets.commit_detail_panel import _format_info
+
+    text = _format_info(_detail_info(), BranchAttribution("origin/feat-x", False))
+    assert "<b>Reconstructed branch:</b> origin/feat-x" in text
 
 
 def test_format_info_omits_branch_when_unknown() -> None:
     from src.ui.widgets.commit_detail_panel import _format_info
 
     assert "<b>Branch:</b>" not in _format_info(_detail_info())
+    assert "Reconstructed branch" not in _format_info(_detail_info())
 
 
 def test_format_info_escapes_branch_name() -> None:
     from src.ui.widgets.commit_detail_panel import _format_info
 
-    text = _format_info(_detail_info(), "we<branch>")
+    text = _format_info(_detail_info(), BranchAttribution("we<branch>", False))
     assert "we&lt;branch&gt;" in text
