@@ -609,13 +609,23 @@ class MainWindow(QMainWindow):
         cp_vm = self._main_vm.commit_panel_view_model()
         cp_vm.selected_file_changed.connect(self._on_commit_file_selected)
         cp_vm.diff_ready.connect(self._on_diff_ready)
-        # The full-document variant is pre-computed in the same VM
-        # call as the changes-only diff so the diff view can toggle
-        # between its two display modes without a round-trip to Git.
-        cp_vm.diff_pair_ready.connect(self._on_diff_pair_ready)
+        # The full-document variant is computed lazily (R3.2 P4): the
+        # pair arrives with an empty full-document slot, and we ask
+        # the emitting source for the expensive variant when the user
+        # toggles the viewer into FULL_DOCUMENT mode. The source is
+        # tracked per-emission because both right-panel views feed
+        # this same slot.
+        self._diff_source = None
+        self._requesting_full_document = False
+        cp_vm.diff_pair_ready.connect(
+            lambda changes_only, full_document: self._on_diff_pair_ready(
+                changes_only, full_document, cp_vm,
+            ),
+        )
         self._diff_view.line_action_requested.connect(
             self._on_diff_line_action_requested,
         )
+        self._diff_view.view_mode_changed.connect(self._on_diff_view_mode_changed)
 
         # The commit-detail panel emits the same signal pair so a
         # file click in either right-panel view swaps the graph for
@@ -625,7 +635,9 @@ class MainWindow(QMainWindow):
         )
         self._right_panel._commit_detail.diff_ready.connect(self._on_diff_ready)
         self._right_panel._commit_detail.diff_pair_ready.connect(
-            self._on_diff_pair_ready,
+            lambda changes_only, full_document: self._on_diff_pair_ready(
+                changes_only, full_document, self._right_panel._commit_detail,
+            ),
         )
         # The commit-detail panel surfaces its own errors via a public
         # ``error_occurred`` signal; route both branches to the existing
@@ -805,11 +817,55 @@ class MainWindow(QMainWindow):
         self._diff_view.set_diff(text)
 
     def _on_diff_pair_ready(
-        self, changes_only: str, full_document: str,
+        self,
+        changes_only: str,
+        full_document: str,
+        source,  # noqa: ANN001 - CommitPanelViewModel | CommitDetailPanel
     ) -> None:
-        """Hand the pre-computed (changes-only, full-document) pair to
-        the diff widget so toggling its toolbar is instantaneous."""
+        """Hand the (changes-only, full-document) pair to the diff widget.
+
+        ``source`` is the object that emitted the pair (the WIP commit
+        panel VM or the commit-detail panel); it is remembered so the
+        lazily-computed full-document variant (R3.2 P4) can later be
+        requested from the same place.
+        """
+        self._diff_source = source
         self._diff_view.set_diff_pair(changes_only, full_document)
+        # Selecting another file while already in FULL_DOCUMENT mode
+        # arrives with an empty full-document slot — fetch it now so
+        # the view does not stay blank.
+        self._maybe_request_full_document()
+
+    def _on_diff_view_mode_changed(self, mode: DiffViewMode) -> None:
+        """Fetch the lazy full-document diff on first toggle (R3.2 P4)."""
+        if mode == DiffViewMode.FULL_DOCUMENT:
+            self._maybe_request_full_document()
+
+    def _maybe_request_full_document(self) -> None:
+        """Ask the active diff source for the full-document variant.
+
+        Only fires when the viewer is in FULL_DOCUMENT mode, a
+        changes-only diff is loaded, and the full variant is still
+        missing. The re-entrancy flag breaks the signal loop:
+        ``request_full_document`` re-emits ``diff_pair_ready``, which
+        lands back in :meth:`_on_diff_pair_ready`.
+        """
+        if self._requesting_full_document:
+            return
+        if self._diff_view.view_mode() != DiffViewMode.FULL_DOCUMENT:
+            return
+        if not self._diff_view.has_changes_only():
+            return
+        if self._diff_view.has_full_document():
+            return
+        source = self._diff_source
+        if source is None:
+            return
+        self._requesting_full_document = True
+        try:
+            source.request_full_document()
+        finally:
+            self._requesting_full_document = False
 
     def _on_copy_diff(self, sha: str) -> None:
         """Copy the full unified diff to the system clipboard."""

@@ -966,6 +966,19 @@ class DiffViewWidget(QWidget):
         """Return the currently active :class:`DiffViewMode`."""
         return self._view_mode
 
+    def has_changes_only(self) -> bool:
+        """Whether a non-empty changes-only diff is loaded."""
+        return bool(self._changes_only_text)
+
+    def has_full_document(self) -> bool:
+        """Whether a non-empty full-document variant is loaded.
+
+        The full-document text is computed lazily (R3.2 P4); the
+        :class:`MainWindow` uses this probe to decide whether it must
+        ask the active diff source for ``request_full_document()``.
+        """
+        return bool(self._full_document_text)
+
     def set_view_mode(self, mode: DiffViewMode) -> None:
         """Switch the active mode and re-render.
 

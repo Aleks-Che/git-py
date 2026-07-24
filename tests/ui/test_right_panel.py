@@ -21,12 +21,13 @@ import time
 from pathlib import Path
 
 import pygit2
+from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QColor
 from src.core.diff_parser import DiffLineType
 from src.core.models import BranchAttribution, CommitInfo, FileStatus
 from src.core.repository import RepositoryManager
 from src.ui.main_window import MainWindow
-from src.ui.widgets.diff_view_widget import DiffLineActionMode
+from src.ui.widgets.diff_view_widget import DiffLineActionMode, DiffViewMode
 from src.ui.widgets.file_list_model import (
     PATH_TEXT_COLOR,
     STATUS_BADGE,
@@ -53,6 +54,62 @@ def _make_dirty_repo(path: Path) -> RepositoryManager:
     mgr = _make_committed_repo(path)
     (path / "f.txt").write_text("v2\n")
     return mgr
+
+
+def _make_repo_with_body_commit(path: Path) -> RepositoryManager:
+    """A repo whose single commit has both a subject and a body."""
+    mgr = RepositoryManager(str(path))
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    (path / "f.txt").write_text("v1\n")
+    mgr.repo.index.add("f.txt")
+    mgr.repo.index.write()
+    tree = mgr.repo.index.write_tree()
+    mgr.repo.create_commit(
+        "refs/heads/main", sig, sig, "subject line\n\nbody paragraph\n", tree, [],
+    )
+    return mgr
+
+
+def _make_two_commit_repo(path: Path) -> RepositoryManager:
+    """Two commits; ``c2`` rewrites the middle line of two 20-line files.
+
+    The change sits far enough from both file ends that a 3-context-line
+    diff omits the first/last lines, so the full-document variant is
+    observably larger than the changes-only one.
+    """
+    mgr = RepositoryManager(str(path))
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    f_lines = [f"line {i}" for i in range(20)]
+    g_lines = [f"g row {i}" for i in range(20)]
+    (path / "f.txt").write_text("\n".join(f_lines) + "\n")
+    (path / "g.txt").write_text("\n".join(g_lines) + "\n")
+    mgr.repo.index.add("f.txt")
+    mgr.repo.index.add("g.txt")
+    mgr.repo.index.write()
+    tree = mgr.repo.index.write_tree()
+    c1 = mgr.repo.create_commit("refs/heads/main", sig, sig, "c1", tree, [])
+    (path / "f.txt").write_text(
+        "\n".join(f_lines).replace("line 10", "line 10 changed") + "\n",
+    )
+    (path / "g.txt").write_text(
+        "\n".join(g_lines).replace("g row 10", "g row 10 changed") + "\n",
+    )
+    mgr.repo.index.add("f.txt")
+    mgr.repo.index.add("g.txt")
+    mgr.repo.index.write()
+    tree = mgr.repo.index.write_tree()
+    mgr.repo.create_commit("refs/heads/main", sig, sig, "c2", tree, [c1])
+    return mgr
+
+
+def _click_file_row(detail, path: str) -> None:  # noqa: ANN001 - CommitDetailPanel
+    """Plain-click the changed-file row for ``path`` in the detail panel."""
+    for i in range(detail._files.count()):  # noqa: SLF001
+        item = detail._files.item(i)  # noqa: SLF001
+        if item is not None and item.data(Qt.ItemDataRole.UserRole) == path:
+            detail._on_files_item_clicked(item)  # noqa: SLF001
+            return
+    raise AssertionError(f"{path!r} not found in the changed-files list")
 
 
 # ----- selection_changed signal contract ---------------------------------
@@ -313,6 +370,169 @@ def test_commit_detail_panel_showing_new_commit_clears_selection(
 
     detail.show_commit(head_sha)
     assert detail.selected_file() is None
+
+
+# ----- commit-detail layout: info pinned to bottom, 50/50 split --------
+
+
+def _info_bottom_gap(detail) -> int:  # noqa: ANN001 - CommitDetailPanel
+    """Pixels between the info label's bottom edge and the top pane's."""
+    top = detail._splitter.widget(0)  # noqa: SLF001
+    bottom = detail._info.mapTo(  # noqa: SLF001
+        top, QPoint(0, detail._info.height()),  # noqa: SLF001
+    ).y()
+    return top.height() - bottom
+
+
+def test_commit_detail_info_pinned_to_bottom_without_body(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A commit with no message body must still render the info block
+    at the bottom edge of the top pane (not right under the subject)."""
+    mgr = _make_committed_repo(tmp_git_repo)  # message "first" — no body
+    head_sha = mgr.head_commit.sha
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = RightPanel(vm)
+    qtbot.addWidget(panel)
+    panel.resize(420, 800)
+    panel.show()
+
+    vm.select_commit(head_sha)
+    detail = panel._commit_detail
+    assert not detail._body_scroll.isVisible()
+    assert _info_bottom_gap(detail) <= 6
+
+
+def test_commit_detail_info_pinned_to_bottom_with_body(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """With a body present the scroll area fills the middle and the
+    info block stays pinned to the bottom edge as well."""
+    mgr = _make_repo_with_body_commit(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = RightPanel(vm)
+    qtbot.addWidget(panel)
+    panel.resize(420, 800)
+    panel.show()
+
+    vm.select_commit(head_sha)
+    detail = panel._commit_detail
+    assert detail._body_scroll.isVisible()
+    assert _info_bottom_gap(detail) <= 6
+
+
+def test_commit_detail_splitter_defaults_to_even_split(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The message+info pane and the changed-files pane start at 50/50."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    vm = MainViewModel()
+    vm.set_repository(mgr)
+    panel = RightPanel(vm)
+    qtbot.addWidget(panel)
+    panel.resize(420, 800)
+    panel.show()
+
+    vm.select_commit(head_sha)
+    sizes = panel._commit_detail._splitter.sizes()  # noqa: SLF001
+    assert all(s > 0 for s in sizes)
+    assert abs(sizes[0] - sizes[1]) <= 8
+
+
+# ----- lazy full-document diff (R3.2 P4 wiring regression) --------------
+
+
+def test_full_document_loads_on_mode_toggle_for_commit_file(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Toggling the viewer to FULL_DOCUMENT must fetch the lazy
+    full-document variant from the commit-detail panel — previously
+    ``view_mode_changed`` had no listener, so the mode stayed blank."""
+    mgr = _make_two_commit_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(head_sha)  # noqa: SLF001
+    detail = window._right_panel._commit_detail  # noqa: SLF001
+    _click_file_row(detail, "f.txt")
+    # R3.2 P4 laziness: only the changes-only variant is loaded eagerly.
+    assert window._diff_view.has_changes_only()  # noqa: SLF001
+    assert not window._diff_view.has_full_document()  # noqa: SLF001
+    assert "line 0" not in window._diff_view.toPlainText()  # noqa: SLF001
+
+    window._diff_view.set_view_mode(DiffViewMode.FULL_DOCUMENT)  # noqa: SLF001
+
+    assert window._diff_view.has_full_document()  # noqa: SLF001
+    text = window._diff_view.toPlainText()  # noqa: SLF001
+    assert "line 0" in text
+    assert "line 10 changed" in text
+
+
+def test_full_document_loads_for_wip_file_on_mode_toggle(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Same lazy-fetch contract for the WIP commit-panel source."""
+    mgr = _make_committed_repo(tmp_git_repo)
+    base = [f"base {i}" for i in range(20)]
+    (tmp_git_repo / "f.txt").write_text("\n".join(base) + "\n")
+    mgr.repo.index.add("f.txt")
+    mgr.repo.index.write()
+    tree = mgr.repo.index.write_tree()
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    mgr.repo.create_commit(
+        "refs/heads/main", sig, sig, "expand", tree, [mgr.repo.head.target],
+    )
+    (tmp_git_repo / "f.txt").write_text(
+        "\n".join(base).replace("base 10", "base 10 dirty") + "\n",
+    )
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(WIP_SHA)  # noqa: SLF001
+    cp_vm = window._main_vm.commit_panel_view_model()  # noqa: SLF001
+    cp_vm.select_file("f.txt")
+    assert window._diff_view.has_changes_only()  # noqa: SLF001
+    assert not window._diff_view.has_full_document()  # noqa: SLF001
+
+    window._diff_view.set_view_mode(DiffViewMode.FULL_DOCUMENT)  # noqa: SLF001
+
+    assert window._diff_view.has_full_document()  # noqa: SLF001
+    text = window._diff_view.toPlainText()  # noqa: SLF001
+    assert "base 0" in text
+    assert "base 10 dirty" in text
+
+
+def test_full_document_follows_file_selection_while_in_full_mode(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Clicking another file while already in FULL_DOCUMENT mode must
+    auto-fetch that file's full variant instead of going blank."""
+    mgr = _make_two_commit_repo(tmp_git_repo)
+    head_sha = mgr.head_commit.sha
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(mgr)
+    window._main_vm.select_commit(head_sha)  # noqa: SLF001
+    detail = window._right_panel._commit_detail  # noqa: SLF001
+    _click_file_row(detail, "f.txt")
+    window._diff_view.set_view_mode(DiffViewMode.FULL_DOCUMENT)  # noqa: SLF001
+    assert window._diff_view.has_full_document()  # noqa: SLF001
+
+    _click_file_row(detail, "g.txt")
+
+    assert window._diff_view.has_full_document()  # noqa: SLF001
+    text = window._diff_view.toPlainText()  # noqa: SLF001
+    assert "g row 0" in text
+    assert "g row 10 changed" in text
 
 
 # ----- commit-detail author avatar ---------------------------------------

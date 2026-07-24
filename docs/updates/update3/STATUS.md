@@ -58,3 +58,15 @@
 - `GraphViewModel.history_loading_changed(bool)` — эмитится вокруг перестройки графа в `load_more_commits` (только при реальной загрузке страницы, не при no-op).
 - `MainViewModel._on_history_loading_changed` пробрасывает в `_is_busy` + `busy_changed` → тот же `QProgressBar`-спиннер в статус-баре справа внизу, что и при переключении репозиториев (плюс штатный re-entrancy guard тулбара).
 - Тесты: `test_load_more_emits_history_loading_signal` (burst [True, False] на страницу, тишина при drained), `test_history_loading_drives_busy_spinner` (проброс + сброс `is_busy`). 1198 passed.
+
+## Follow-up D (2026-07-23): правая панель — инфа снизу блока, сплит 50/50
+- Баг: у коммита без тела сообщения (напр. merge-коммит `182d18bb` в kilocode) info-блок прижимался к верху — виноват trailing `addStretch()` в верхнем контейнере. У коммита с телом растянутый `_body_scroll` толкал инфу вниз, поэтому там было ок.
+- Фикс: филлер `addStretch(1)` между темой и `_body_scroll` (stretch=100, доминирует, когда виден) — info-блок всегда прибит к нижнему краю верхней панели. Trailing stretch удалён.
+- Сплиттер message+info / changed files: 60/40 → **50/50** (`setStretchFactor(1,1)` + одноразовый `_enforce_initial_split` на первом show/resize, дальше ручной drag пользователя не трогаем).
+- Тесты: `_info_bottom_gap` ≤ 6px для коммита без тела и с телом; дефолтный сплит 50/50 (±8px). 1201 passed.
+
+## Follow-up E (2026-07-23): Full document не отображался
+- Корень: `DiffViewWidget.view_mode_changed` не был ни к чему подключён — `request_full_document()` (ленивый вариант R3.2 P4) не вызывался никогда, ни для WIP-панели, ни для commit-detail. Full-document слот оставался пустым.
+- Фикс (MainWindow): трекинг источника диффа `self._diff_source` (WIP VM или commit-detail, по последнему `diff_pair_ready`), подключение `view_mode_changed` → `_on_diff_view_mode_changed`, `_maybe_request_full_document()` с re-entrancy флагом (запрос → повторный `diff_pair_ready` → тот же слот). Плюс автозапрос при клике на другой файл, когда viewer уже в FULL_DOCUMENT.
+- `DiffViewWidget`: публичные пробы `has_changes_only()` / `has_full_document()`.
+- Тесты: toggle для commit-файла и WIP-файла (ленивость сохранена: full пуст до переключения), автоподгрузка при смене файла в full-режиме. 1204 passed.

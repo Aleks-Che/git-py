@@ -180,6 +180,7 @@ class CommitDetailPanel(QWidget):
         self._main_vm = main_view_model
         self._selected_file: str | None = None
         self._current_sha: str | None = None
+        self._split_initialized = False
 
         self._build_ui()
         self._render_empty()
@@ -313,17 +314,22 @@ class CommitDetailPanel(QWidget):
         self._files.customContextMenuRequested.connect(self._on_file_context_menu)
         self._files.itemClicked.connect(self._on_files_item_clicked)
 
-        # --- splitter: 60% message+info / 40% files ---
+        # --- splitter: 50% message+info / 50% files ---
         top_container = QWidget()
         top_container.setObjectName("commit-detail-top")
         top_layout = QVBoxLayout(top_container)
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.setSpacing(4)
         top_layout.addWidget(self._message)
-        top_layout.addWidget(self._body_scroll, stretch=1)
+        # Filler between the subject and the body/info: pins the info
+        # block to the bottom edge of the top pane even when the commit
+        # has no body. The body scroll dominates the extra space when
+        # it is visible (stretch 100 vs 1), so the filler only takes
+        # over for body-less commits.
+        top_layout.addStretch(1)
+        top_layout.addWidget(self._body_scroll, stretch=100)
         top_layout.addSpacing(6)
         top_layout.addWidget(info_row)
-        top_layout.addStretch()
 
         files_container = QWidget()
         files_container.setObjectName("commit-detail-files")
@@ -336,8 +342,8 @@ class CommitDetailPanel(QWidget):
         self._splitter = QSplitter(Qt.Orientation.Vertical)
         self._splitter.addWidget(top_container)
         self._splitter.addWidget(files_container)
-        self._splitter.setStretchFactor(0, 3)
-        self._splitter.setStretchFactor(1, 2)
+        self._splitter.setStretchFactor(0, 1)
+        self._splitter.setStretchFactor(1, 1)
         self._splitter.setChildrenCollapsible(False)
 
         layout = QVBoxLayout(self)
@@ -345,12 +351,28 @@ class CommitDetailPanel(QWidget):
         layout.setSpacing(0)
         layout.addWidget(self._splitter, stretch=1)
 
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._enforce_initial_split()
+
     def resizeEvent(self, event) -> None:  # noqa: N802
-        """Enforce 60/40 split on first resize."""
         super().resizeEvent(event)
+        self._enforce_initial_split()
+
+    def _enforce_initial_split(self) -> None:
+        """Apply the default 50/50 split exactly once.
+
+        Runs on the first show/resize that reports a real splitter
+        height; after that the user's manual drags are left alone.
+        """
+        if self._split_initialized:
+            return
         h = self._splitter.height()
-        if h > 0 and self._splitter.sizes()[0] == 0:
-            self._splitter.setSizes([int(h * 0.6), int(h * 0.4)])
+        if h <= 0:
+            return
+        half = h // 2
+        self._splitter.setSizes([half, h - half])
+        self._split_initialized = True
 
     # ----- public API --------------------------------------------------
 
