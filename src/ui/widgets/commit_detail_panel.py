@@ -918,7 +918,8 @@ def _format_info(
         )
     if info.parents:
         parents = ", ".join(html.escape(p[:7]) for p in info.parents)
-        parts.append(f"<b>Parents:</b> {parents}")
+        label = "Parent:" if len(info.parents) == 1 else "Parents:"
+        parts.append(f"<b>{label}</b> {parents}")
     else:
         parts.append("<b>Parents:</b> (root commit)")
     if branch:

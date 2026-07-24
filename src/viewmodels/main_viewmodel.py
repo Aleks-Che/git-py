@@ -106,7 +106,7 @@ class MainViewModel(QObject):
         super().__init__(parent)
         self._repo_manager: RepositoryManager | None = None
         self._command_processor = CommandProcessor(self)
-        self._graph_view_model = GraphViewModel(None, self)
+        self._graph_view_model = GraphViewModel(None, self, async_enabled=async_enabled)
         self._commit_panel_view_model = CommitPanelViewModel(self)
         self._branch_panel_view_model = BranchPanelViewModel(self)
         # ``None`` means "no conflict in progress". When a dict is

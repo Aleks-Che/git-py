@@ -583,42 +583,45 @@ def build_graph(
                     break
         fork_merging_cells: list[CellInfo] | None = None
         fork_merging_lanes: list[tuple[int, int]] = []
+        fork_main_lane: int = 0
+        merging_lanes: list[tuple[int, int]] = []
+        connector_active_lanes: list[str | None] = []
         if len(fork_lanes) >= 2:
-            main_lane = min(fork_lanes)
-            merging_lanes: list[tuple[int, int]] = []
+            fork_main_lane = min(fork_lanes)
             for fl in fork_lanes:
-                if fl == main_lane:
+                if fl == fork_main_lane:
                     continue
                 color = lane_color_index.get(fl)
                 if color is None:
-                    color = oid_color_index.get(commit.sha, fl)
+                    # Lane-colour cache miss (the lane was released and
+                    # reused): fall back to the child-colour snapshot,
+                    # which resolves the colour from the child commit's
+                    # own oid entry.  The old fallback (the fork point's
+                    # own colour) flattened the whole corridor into one
+                    # colour whenever the cache was poisoned — e.g. by
+                    # a stash lane reuse (kilocode ``bdb9070a``).
+                    color = fork_lane_colors.get(fl, fl)
                 merging_lanes.append((fl, color))
 
             for ml, _ in merging_lanes:
                 if ml > max_lane:
                     max_lane = ml
-            if main_lane > max_lane:
-                max_lane = main_lane
-
-            main_color = lane_color_index.get(main_lane)
-            if main_color is None:
-                main_color = oid_color_index.get(commit.sha, main_lane)
-            fork_merging_cells = _build_fork_connector_cells(
-                main_lane,
-                main_color,
-                merging_lanes,
-                lanes,
-                oid_color_index,
-                lane_color_index,
-                max_lane,
-            )
-            fork_merging_lanes = list(merging_lanes)
+            if fork_main_lane > max_lane:
+                max_lane = fork_main_lane
 
             for ml, _ in merging_lanes:
                 if ml < len(lanes):
                     lanes[ml] = None
                     color_assigner.release_lane(ml)
                     lane_color_index.pop(ml, None)
+
+            # Snapshot the lane table for the fork-connector build,
+            # which is deferred until the commit's own colour is
+            # decided (the corridor takes the commit's final colour —
+            # see the call site below).  Parent processing in between
+            # rewrites ``lanes``, so the pre-parent state must be
+            # captured here.
+            connector_active_lanes = list(lanes)
 
         # --- determine colour index ---
         commit_branch_names = oid_to_branches.get(commit.sha, [])
@@ -654,7 +657,18 @@ def build_graph(
             lanes[lane] = None
 
         # --- process parents ---
-        valid_parents: list[str] = [p for p in commit.parents if p in oid_to_row]
+        # Parents that fall outside the loaded window (history is
+        # truncated at ``history_limit``) are kept: registering them
+        # on a lane lets the pipe continue to the bottom edge of the
+        # graph instead of ending in a half-cell stub right under the
+        # commit (GitKraken renders truncated lanes the same way).
+        # The SHA can never match a later row — if it were in the
+        # window it would be in ``oid_to_row`` — so the lane simply
+        # runs off the bottom.  When two in-window commits share the
+        # same off-window parent, the second one finds the lane
+        # already tracking it and the lines converge before leaving
+        # the window, mirroring the fork point below the boundary.
+        valid_parents: list[str] = list(commit.parents)
 
         fork_sibling_color: int | None = None
 
@@ -773,7 +787,23 @@ def build_graph(
         # visually unambiguous. The second parent therefore
         # stays on its natural lane; nothing is reshuffled here.
         # See ``_build_row_cells`` for the ``CROSS`` placement.
-        _ = fork_merging_cells  # intentional no-op; see comment above
+        if merging_lanes:
+            # Deferred connector build: the commit's own colour is
+            # decided only now, and the corridor's trunk pipe must
+            # match it (the old pre-build needed a fixup pass for the
+            # half-cell under the dot — kilocode ``22149292``).  The
+            # lane table is rewritten by parent processing in between,
+            # so the pre-parent snapshot captured above is used.
+            fork_merging_cells = _build_fork_connector_cells(
+                fork_main_lane,
+                final_color_index,
+                merging_lanes,
+                connector_active_lanes,
+                oid_color_index,
+                lane_color_index,
+                max_lane,
+            )
+            fork_merging_lanes = list(merging_lanes)
 
         if lane > max_lane:
             max_lane = lane
@@ -816,31 +846,6 @@ def build_graph(
         # TEE_UP / MERGE_LEFT at other fork lanes, and PIPE at
         # unrelated lanes) is merged in.
         if fork_merging_cells is not None:
-            # The fork connector was built BEFORE the commit's own
-            # colour was decided: its ``main_color`` came from the
-            # lane cache, i.e. the colour of the child that registered
-            # the main lane.  The vertical segment under the commit
-            # dot must match the pipe that continues to the first
-            # parent (``final_color_index``, which ``lane_color_index``
-            # carries into the rows below) — otherwise the half-cell
-            # under the commit is painted in a child branch's colour
-            # (e.g. kilocode ``22149292``).
-            main_fc_idx = lane * 2
-            if main_fc_idx < len(fork_merging_cells):
-                fc_main = fork_merging_cells[main_fc_idx]
-                if fc_main.cell_type == CellType.TEE_RIGHT:
-                    if fc_main.pipe_color_index != final_color_index:
-                        fork_merging_cells[main_fc_idx] = CellInfo(
-                            fc_main.cell_type,
-                            color_index=fc_main.color_index,
-                            pipe_color_index=final_color_index,
-                            direction=fc_main.direction,
-                        )
-                elif (
-                    fc_main.cell_type == CellType.PIPE
-                    and fc_main.color_index != final_color_index
-                ):
-                    fork_merging_cells[main_fc_idx] = CellInfo.pipe(final_color_index)
             # Priority rule (update2 B4): when the row carries CROSS
             # cells (a second parent landed on a fork lane) the MERGE
             # connector owns the horizontal track between the commit
@@ -1630,20 +1635,32 @@ def _build_fork_connector_cells(
     lane_color_index: dict[int, int],
     max_lane: int,
 ) -> list[CellInfo]:
+    """Build the corridor that joins a fork point's children into one track.
+
+    Corridor colouring (the "priority relay", matching GitKraken):
+
+    * the trunk (from the main lane to the first bend) carries the
+      FIRST merging child's colour;
+    * each segment between two bends carries the colour of the child
+      whose bend terminates the segment;
+    * each ``TEE_UP`` bend cell carries the NEXT child's colour in its
+      horizontal (``color_index``) — the continuation leaving the bend
+      to the right starts in the next branch's colour right at the
+      junction — while the vertical-up pipe keeps the OWN child's
+      colour (``pipe_color_index``), so the 90-degree bend (left arm +
+      up arm) reads as the own branch's colour;
+    * the rightmost ``MERGE_LEFT`` bend carries its child's colour.
+    """
     cells = [CellInfo.empty() for _ in range((max_lane + 1) * 2)]
 
     merging_lane_nums = sorted(ml for ml, _ in merging_lanes)
-
-    # Main lane: PIPE (single merge) or TEE_RIGHT with first-merge
-    # horizontal colour (multiple merges).
-    main_cell_idx = main_lane * 2
     first_merge_color = merging_lanes[0][1] if merging_lanes else main_color
+
+    # Main lane: PIPE (no merges) or TEE_RIGHT with the first child's
+    # corridor colour.
+    main_cell_idx = main_lane * 2
     if main_cell_idx < len(cells):
-        if len(merging_lanes) == 1:
-            cells[main_cell_idx] = CellInfo(
-                CellType.TEE_RIGHT, color_index=first_merge_color, pipe_color_index=main_color
-            )
-        elif len(merging_lanes) >= 2:
+        if merging_lanes:
             cells[main_cell_idx] = CellInfo(
                 CellType.TEE_RIGHT, color_index=first_merge_color, pipe_color_index=main_color
             )
@@ -1680,16 +1697,23 @@ def _build_fork_connector_cells(
                 if col < len(cells):
                     existing = cells[col]
                     if existing.cell_type == CellType.PIPE:
-                        cells[col] = CellInfo.horizontal_pipe(merge_color, existing.color_index)
+                        cells[col] = CellInfo.horizontal_pipe(
+                            merge_color, existing.color_index,
+                        )
                     elif existing.cell_type in (CellType.EMPTY, CellType.HORIZONTAL):
                         cells[col] = CellInfo.horizontal(merge_color)
 
         end_idx = merge_lane * 2
         if end_idx < len(cells):
             if not is_rightmost:
+                # Horizontal = NEXT child's colour (the continuation
+                # leaving the bend rightward); vertical pipe = OWN
+                # child's colour (the bend itself).
                 next_merge_color = merging_lanes[idx + 1][1]
                 cells[end_idx] = CellInfo(
-                    CellType.TEE_UP, color_index=next_merge_color, pipe_color_index=merge_color
+                    CellType.TEE_UP,
+                    color_index=next_merge_color,
+                    pipe_color_index=merge_color,
                 )
             else:
                 cells[end_idx] = CellInfo.merge_left(merge_color)

@@ -326,7 +326,8 @@ def test_commit_metadata_html_escape() -> None:
     # bold "Author:" / "SHA:" labels.
     assert "<b>Author:</b>" in html_out
     assert "<b>SHA:</b>" in html_out
-    assert "<b>Parents:</b>" in html_out
+    # Single-parent commit → singular label (``parents=["<bad>parent</bad>"]``).
+    assert "<b>Parent:</b>" in html_out
 
     # Round-trip through QLabel: the rendered text must not contain
     # the raw script tag — QLabel with Qt.RichText would render it.

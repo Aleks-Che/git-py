@@ -1688,28 +1688,18 @@ def test_build_branch_refs_map_filters_invalid_sha_keys() -> None:
         assert len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)
 
 
-def test_fork_connector_uses_merging_branch_colour() -> None:
-    """The fork connector at a fork-point commit must use the
-    merging branch's colour (the colour of the lane joining in),
-    not the root's own colour.
-
-    Regression guard: a previous attempt to keep bridge-pipe
-    colours consistent also rewrote :func:`_build_fork_connector_cells`
-    in :mod:`src.core.graph_v2` so that the horizontal connector
-    at the root row used ``main_color`` (the root's own colour)
-    instead of ``first_merge_color`` (the merging branch's
-    colour). That broke the visual link between the connector
-    and the merging lane — the connector is supposed to read as
-    the lane that's *entering* the fork point, not the lane
-    that's being joined into.
+def test_fork_connector_single_child_corridor_uses_child_colour() -> None:
+    """A fork point with a SINGLE merging child paints the whole
+    corridor in the child's colour: the track carries exactly one
+    edge, so the branch line stays uniform from its tip down to the
+    parent dot (kilocode ``9e1b54d`` → ``489601e5``).
 
     This test pins the cell-colour contract:
 
-    * ``TEE_RIGHT`` / ``HORIZONTAL`` / ``HORIZONTAL_PIPE`` at the
-      root row use the *first* merging branch's colour so the
-      connector reads as the merging lane.
-    * ``MERGE_LEFT`` at the merging lane uses the merging
-      branch's colour so the join point matches the lane.
+    * ``TEE_RIGHT`` / ``HORIZONTAL`` / ``HORIZONTAL_PIPE`` along the
+      corridor use the child's colour.
+    * ``MERGE_LEFT`` at the merging lane uses the same child colour —
+      the entire path is one colour.
     * ``pipe_color_index`` on the root's ``TEE_RIGHT`` keeps
       using ``main_color`` so the vertical line above/below the
       root still belongs to the root's own branch.
@@ -1731,15 +1721,13 @@ def test_fork_connector_uses_merging_branch_colour() -> None:
         max_lane=2,
     )
 
-    # main lane: TEE_RIGHT — colour_index must be the merging
-    # colour so the horizontal reads as the merging lane.
+    # main lane: TEE_RIGHT — the horizontal corridor starts in the
+    # child's colour.
     tee = cells[main_lane * 2]
     assert tee.cell_type == CellType.TEE_RIGHT
     assert tee.color_index == merge_color, (
-        f"TEE_RIGHT at root row must use merging colour "
-        f"{merge_color}, got {tee.color_index} (the fork connector "
-        f"must read as the merging lane's colour, not the root's "
-        f"own colour {main_color})"
+        f"TEE_RIGHT at root row must use the child's colour "
+        f"{merge_color}, got {tee.color_index}"
     )
     # vertical line of TEE_RIGHT stays in the root's colour
     assert tee.pipe_color_index == main_color, (
@@ -1747,13 +1735,8 @@ def test_fork_connector_uses_merging_branch_colour() -> None:
         f"{main_color}, got {tee.pipe_color_index}"
     )
 
-    # cells at intermediate active lanes carry the connector
-    # segments (HORIZONTAL_PIPE over an existing vertical PIPE).
-    # Only lane-centre columns (col = lane*2 + 1 between two
-    # active lanes) carry an explicit connector cell — the
-    # empty cells between them are just spacers.
-    # We probe the centre of each intermediate lane between
-    # main_lane+1 and merge_lane.
+    # Intermediate cells between main_lane+1 and merge_lane carry the
+    # corridor in the same child colour.
     for lane_idx in range(main_lane + 1, merge_lane):
         col = lane_idx * 2
         cell = cells[col]
@@ -1764,22 +1747,23 @@ def test_fork_connector_uses_merging_branch_colour() -> None:
         )
         assert cell.color_index == merge_color, (
             f"{cell.cell_type.name} at col {col} (lane {lane_idx}) "
-            f"must use merging colour {merge_color}, got "
+            f"must use the child's colour {merge_color}, got "
             f"{cell.color_index}"
         )
 
-    # MERGE_LEFT at the merging lane uses the merging colour.
+    # MERGE_LEFT at the merging lane uses the same child colour.
     merge_left = cells[merge_lane * 2]
     assert merge_left.cell_type == CellType.MERGE_LEFT
     assert merge_left.color_index == merge_color
 
 
-def test_fork_connector_multiple_merges_keeps_tee_in_first_merge_colour() -> None:
-    """When two branches merge into the fork point, the root's
-    ``TEE_RIGHT`` and the intermediate ``HORIZONTAL`` cells stay
-    in the *first* merge's colour, while the ``TEE_UP`` at the
-    intermediate merge lane carries the next merge's colour.
-    """
+def test_fork_connector_multiple_merges_priority_relay() -> None:
+    """With several branches merging into the fork point the corridor
+    is a priority relay: the trunk carries the FIRST child's colour,
+    each segment the colour of the child whose bend terminates it —
+    and each ``TEE_UP`` bend carries its OWN child's colour (not the
+    next child's), so the cell directly under a commit matches that
+    commit's branch (kilocode ``05dadaa``)."""
     from src.core.graph_v2 import _build_fork_connector_cells
 
     main_color = 1
@@ -1811,14 +1795,22 @@ def test_fork_connector_multiple_merges_keeps_tee_in_first_merge_colour() -> Non
     assert tee.color_index == first_merge_color
     assert tee.pipe_color_index == main_color
 
-    # intermediate merge lane gets TEE_UP in next_merge colour,
-    # pipe in own merge colour
+    # Intermediate merge lane: the TEE_UP bend splits at the junction
+    # — the vertical pipe and the segment arriving from the left keep
+    # the OWN child's colour, while the horizontal leaving the bend to
+    # the right already carries the NEXT child's colour.
     intermediate = cells[4]
     assert intermediate.cell_type == CellType.TEE_UP
     assert intermediate.color_index == second_merge_color
     assert intermediate.pipe_color_index == first_merge_color
 
-    # rightmost merge keeps MERGE_LEFT in its own colour
+    # The segment between the two bends carries the second child's
+    # colour (the child whose bend terminates the segment).
+    segment = cells[6]
+    assert segment.cell_type == CellType.HORIZONTAL
+    assert segment.color_index == second_merge_color
+
+    # Rightmost merge keeps MERGE_LEFT in its own colour.
     rightmost = cells[8]
     assert rightmost.cell_type == CellType.MERGE_LEFT
     assert rightmost.color_index == second_merge_color
@@ -2457,3 +2449,184 @@ def test_fork_commit_with_left_merge_keeps_connector() -> None:
     assert cells[3].color_index == main_color
     # The fork connector owns the commit cell (branch to the right).
     assert cells[4].cell_type == CellType.TEE_RIGHT
+
+
+def test_fork_corridor_trunk_uses_first_child_colour() -> None:
+    """The corridor trunk carries the FIRST child's colour (the
+    priority relay), not the fork-point commit's own colour —
+    kilocode ``bdb9070a``: "сначала идет цвет первой ветки в
+    приоритете, потом следующей"."""
+    f = "f0" + "0" * 38
+    commits = [
+        _c("c1" + "0" * 38, parents=[f], ts=4),
+        _c("c2" + "0" * 38, parents=[f], ts=3),
+        _c("c3" + "0" * 38, parents=[f], ts=2),
+        _c(f, parents=["r0" + "0" * 38], ts=1),
+        _c("r0" + "0" * 38, ts=0),
+    ]
+    # A branch ref on the fork point gives it a colour of its own —
+    # the corridor must NOT collapse to it.
+    branches = [_b("feature-x", f)]
+    layout = build_graph(commits, branches)
+    nodes = {n.commit.sha[:2]: n for n in layout.nodes}
+    f_node = nodes["f0"]
+    c1_node = nodes["c1"]
+    c2_node = nodes["c2"]
+    expected = _pick_branch_color("feature-x")
+    assert f_node.color_index == expected != c1_node.color_index
+
+    # The trunk (from the commit cell to the first bend) carries the
+    # first MERGING child's colour — the child on the main lane
+    # continues straight down and needs no bend.
+    trunk = f_node.cells[f_node.lane * 2]
+    assert trunk.cell_type == CellType.TEE_RIGHT
+    assert trunk.color_index == c2_node.color_index
+    assert trunk.pipe_color_index == expected
+
+
+def test_fork_corridor_bend_splits_own_and_next_colour() -> None:
+    """At a fork bend the 90-degree turn keeps the OWN child's colour
+    (vertical-up pipe + the segment arriving from the left), while the
+    continuation leaving the bend rightward already carries the NEXT
+    child's colour (user request: «заворот одним цветом вверх,
+    продолжение — цветом следующей ветки»)."""
+    f = "f0" + "0" * 38
+    commits = [
+        _c("c1" + "0" * 38, parents=[f], ts=4),
+        _c("c2" + "0" * 38, parents=[f], ts=3),
+        _c("c3" + "0" * 38, parents=[f], ts=2),
+        _c(f, parents=["r0" + "0" * 38], ts=1),
+        _c("r0" + "0" * 38, ts=0),
+    ]
+    layout = build_graph(commits, [])
+    nodes = {n.commit.sha[:2]: n for n in layout.nodes}
+    f_node = nodes["f0"]
+    c2_node = nodes["c2"]
+    c3_node = nodes["c3"]
+
+    # c2's bend (TEE_UP): up-pipe and the incoming left segment carry
+    # c2's colour; the outgoing horizontal carries c3's.
+    bend = f_node.cells[c2_node.lane * 2]
+    assert bend.cell_type == CellType.TEE_UP
+    assert bend.pipe_color_index == c2_node.color_index
+    assert bend.color_index == c3_node.color_index
+    incoming = f_node.cells[c2_node.lane * 2 - 1]
+    assert incoming.color_index == c2_node.color_index
+
+    # c3 is the rightmost child: its MERGE_LEFT bend keeps its own colour.
+    last = f_node.cells[c3_node.lane * 2]
+    assert last.cell_type == CellType.MERGE_LEFT
+    assert last.color_index == c3_node.color_index
+
+
+def test_fork_corridor_single_child_keeps_branch_colour_end_to_end() -> None:
+    """Single-child fork (kilocode ``9e1b54d`` → ``489601e5``): the
+    corridor, the bend and the child's vertical line all carry the
+    branch's colour — the outgoing line at branch creation must not
+    switch to the parent's colour."""
+    f = "f0" + "0" * 38
+    commits = [
+        _c("c1" + "0" * 38, parents=[f], ts=3),
+        _c("c2" + "0" * 38, parents=[f], ts=2),
+        _c(f, parents=["r0" + "0" * 38], ts=1),
+        _c("r0" + "0" * 38, ts=0),
+    ]
+    branches = [_b("main", "c1" + "0" * 38, is_head=True)]
+    layout = build_graph(commits, branches)
+    nodes = {n.commit.sha[:2]: n for n in layout.nodes}
+    f_node = nodes["f0"]
+    c2_node = nodes["c2"]
+    assert c2_node.lane != f_node.lane
+
+    bend = f_node.cells[c2_node.lane * 2]
+    assert bend.cell_type == CellType.MERGE_LEFT
+    assert bend.color_index == c2_node.color_index
+    for col in range(f_node.lane * 2, c2_node.lane * 2):
+        cell = f_node.cells[col]
+        if cell.cell_type in (
+            CellType.HORIZONTAL,
+            CellType.HORIZONTAL_PIPE,
+            CellType.TEE_RIGHT,
+        ):
+            assert cell.color_index == c2_node.color_index, (
+                f"col {col}: {cell.cell_type.name} colour {cell.color_index} "
+                f"!= branch colour {c2_node.color_index}"
+            )
+
+
+# ---- off-window (dangling) parents: lanes run to the bottom edge ------
+
+
+def test_off_window_parent_lane_continues_to_bottom() -> None:
+    """Truncation boundary: a commit whose parent lies outside the
+    loaded window must keep its lane alive — the pipe continues to the
+    bottom edge (GitKraken behaviour) instead of ending in a half-cell
+    stub right under the commit (kilocode ``4327386f`` with the default
+    500-commit window)."""
+    ext = "e" * 40  # parent of c1, NOT in the window
+    commits = [
+        _c("c3" + "0" * 38, parents=["c2" + "0" * 38], ts=4),
+        _c("c2" + "0" * 38, parents=["c1" + "0" * 38], ts=3),
+        _c("c1" + "0" * 38, parents=[ext], ts=2),
+        _c("z0" + "0" * 38, ts=1),  # independent root — a row BELOW c1
+    ]
+    layout = build_graph(commits, [])
+    nodes = {n.commit.sha[:2]: n for n in layout.nodes}
+    c1_node = nodes["c1"]
+    z_node = nodes["z0"]
+    assert z_node.lane != c1_node.lane
+    # The row below c1 still carries c1's lane as a vertical pipe in
+    # c1's own colour — the line visually runs off the bottom edge.
+    pipe_cell = z_node.cells[c1_node.lane * 2]
+    assert pipe_cell.cell_type == CellType.PIPE
+    assert pipe_cell.color_index == c1_node.color_index
+
+
+def test_merge_with_off_window_second_parent_branches_to_bottom() -> None:
+    """A merge whose second parent fell out of the window still opens
+    a side lane for it: BRANCH corner on the merge row + a pipe that
+    reaches the last visible row."""
+    ext = "e" * 40
+    m = "m0" + "0" * 38
+    a = "a0" + "0" * 38
+    commits = [
+        _c(m, parents=[a, ext], ts=2),
+        _c(a, ts=1),
+    ]
+    layout = build_graph(commits, [])
+    m_node, a_node = layout.nodes
+    assert len(a_node.cells) >= 4, "the dangling parent must keep a lane"
+    # Merge row: the second parent's lane starts with a branch corner.
+    bend_cells = [
+        (col, cell) for col, cell in enumerate(m_node.cells)
+        if cell.cell_type in (CellType.BRANCH_LEFT, CellType.BRANCH_RIGHT)
+    ]
+    assert bend_cells, "no BRANCH corner for the off-window second parent"
+    bend_col, bend_cell = bend_cells[0]
+    # The pipe survives into the last row in the bend's colour.
+    pipe_cell = a_node.cells[bend_col]
+    assert pipe_cell.cell_type == CellType.PIPE
+    assert pipe_cell.color_index == bend_cell.color_index
+
+
+def test_two_commits_sharing_off_window_parent_converge() -> None:
+    """Two in-window commits with the same off-window parent (a fork
+    point below the truncation boundary) join into one lane that runs
+    off the bottom — not two parallel stubs."""
+    ext = "e" * 40
+    c2, c1, y = "c2" + "0" * 38, "c1" + "0" * 38, "y0" + "0" * 38
+    commits = [
+        _c(c2, parents=[c1], ts=3),
+        _c(c1, parents=[ext], ts=2),
+        _c(y, parents=[ext], ts=1),
+    ]
+    layout = build_graph(commits, [])
+    nodes = {n.commit.sha[:2]: n for n in layout.nodes}
+    c1_node, y_node = nodes["c1"], nodes["y0"]
+    assert y_node.lane != c1_node.lane
+    # y connects into c1's lane (the shared dangling parent), and the
+    # lane is NOT closed afterwards — it continues to the bottom edge.
+    junction = y_node.cells[c1_node.lane * 2]
+    assert junction.cell_type in (CellType.TEE_RIGHT, CellType.MERGE_RIGHT)
+    commit_cell = y_node.cells[y_node.lane * 2]
+    assert commit_cell.cell_type in (CellType.TEE_LEFT, CellType.COMMIT)

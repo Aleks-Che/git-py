@@ -399,8 +399,9 @@ def test_async_load_updates_truncated_count_for_infinite_scroll(
     assert vm.graph_view_model().truncated_count == 15
     assert emitted and len(emitted[-1]) == 10
     # The async-loaded window respects the grown limit on reload too:
-    # load a page (sync refresh) and check the counter moves.
+    # load a page and check the counter moves when the worker lands.
     vm.graph_view_model().load_more_commits()
+    _drain_async_ops()
     assert vm.graph_view_model().truncated_count == 5
     assert len(emitted[-1]) == 20
 
@@ -423,5 +424,34 @@ def test_history_loading_drives_busy_spinner(tmp_git_repo: Path) -> None:
     vm.busy_changed.connect(states.append)
     vm.graph_view_model().load_more_commits()
 
+    assert states == [True, False]
+    assert not vm.is_busy()
+
+
+def test_load_more_commits_async_keeps_spinner_up_while_worker_runs(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """Production wiring (``async_enabled=True``): the busy spinner must
+    stay up for the whole background page load — the synchronous path
+    blocked the UI thread, so the spinner never rendered."""
+    _ensure_app()
+    mgr = _make_linear_repo(tmp_git_repo, 25)
+    vm = MainViewModel(async_enabled=True)
+    vm.graph_view_model().history_limit = 10
+    vm.set_repository(mgr)
+    assert vm.graph_view_model().truncated_count == 15
+
+    states: list[bool] = []
+    vm.busy_changed.connect(states.append)
+    vm.graph_view_model().load_more_commits()
+    # Async: the burst started but has not finished synchronously.
+    assert states == [True]
+    assert vm.is_busy()
+
+    gvm = vm.graph_view_model()
+    with qtbot.waitSignal(gvm.graph_updated, timeout=5000) as blocker:
+        pass
+    assert len(blocker.args[0]) == 20
+    assert gvm.truncated_count == 5
     assert states == [True, False]
     assert not vm.is_busy()

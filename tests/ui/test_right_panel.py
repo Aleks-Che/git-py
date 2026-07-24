@@ -2035,3 +2035,20 @@ def test_format_info_escapes_branch_name() -> None:
 
     text = _format_info(_detail_info(), BranchAttribution("we<branch>", False))
     assert "we&lt;branch&gt;" in text
+
+
+def test_format_info_single_parent_uses_singular_label() -> None:
+    from src.ui.widgets.commit_detail_panel import _format_info
+
+    text = _format_info(_detail_info())  # parents == ["b" * 40]
+    assert "<b>Parent:</b> bbbbbbb" in text
+    assert "<b>Parents:</b>" not in text
+
+
+def test_format_info_multiple_parents_uses_plural_label() -> None:
+    from src.ui.widgets.commit_detail_panel import _format_info
+
+    info = _detail_info()
+    info.parents.append("c" * 40)
+    text = _format_info(info)
+    assert "<b>Parents:</b> bbbbbbb, ccccccc" in text
