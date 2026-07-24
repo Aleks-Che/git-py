@@ -2554,6 +2554,95 @@ def test_fork_corridor_single_child_keeps_branch_colour_end_to_end() -> None:
             )
 
 
+# ---- merge connector owns the trunk left of the fork corridor ------
+
+
+def test_merge_connector_owns_trunk_left_of_fork_corridor() -> None:
+    """Merge commit that is ALSO a fork point (kilocode ``1a3c7191``):
+    the second parent's ``BRANCH_LEFT`` bend sits LEFT of the fork
+    bend, so the merge connector owns the track from the commit to its
+    bend — the second parent's colour runs all the way into the commit
+    node («заворачивает влево и идёт прямо в коммит») instead of
+    stopping at the bend's half-cell arm.  The bend itself splits
+    relay-style: the 90-degree turn (left arm + down pipe) keeps the
+    parent's colour, the corridor leaving the bend rightward carries
+    the fork child's colour."""
+    m = "m0" + "0" * 38
+    p2 = "p2" + "0" * 38
+    cf = "cf" + "0" * 38
+    commits = [
+        _c("cm" + "0" * 38, parents=[m], ts=11),
+        _c("t1" + "0" * 38, parents=["b0" + "0" * 38], ts=10),
+        _c("t2" + "0" * 38, parents=["b0" + "0" * 38], ts=9),
+        _c("t3" + "0" * 38, parents=["b0" + "0" * 38], ts=8),
+        _c("t4" + "0" * 38, parents=["b0" + "0" * 38], ts=7),
+        _c("t5" + "0" * 38, parents=["b0" + "0" * 38], ts=6),
+        _c(cf, parents=[m], ts=5),
+        _c("b0" + "0" * 38, parents=["r0" + "0" * 38], ts=4),
+        _c(m, parents=["p1" + "0" * 38, p2], ts=3),
+        _c("p1" + "0" * 38, parents=["r0" + "0" * 38], ts=2),
+        _c(p2, parents=["r0" + "0" * 38], ts=1),
+        _c("r0" + "0" * 38, ts=0),
+    ]
+    branches = [_b("main", "cm" + "0" * 38, is_head=True)]
+    layout = build_graph(commits, branches)
+    nodes = {n.commit.sha[:2]: n for n in layout.nodes}
+    m_node = nodes["m0"]
+    p2_node = nodes["p2"]
+    cf_node = nodes["cf"]
+
+    assert m_node.lane == 0
+    assert 0 < p2_node.lane < cf_node.lane
+
+    bend_col = p2_node.lane * 2
+    fork_bend_col = cf_node.lane * 2
+
+    # Trunk: the merge connector owns the track from the commit to the
+    # bend — the TEE_RIGHT at the commit and every horizontal between
+    # carry the second parent's colour.
+    tee = m_node.cells[0]
+    assert tee.cell_type == CellType.TEE_RIGHT
+    assert tee.color_index == p2_node.color_index
+    for col in range(1, bend_col - 1):
+        cell = m_node.cells[col]
+        if cell.cell_type in (CellType.HORIZONTAL, CellType.HORIZONTAL_PIPE):
+            assert cell.color_index == p2_node.color_index, (
+                f"col {col}: {cell.cell_type.name} colour {cell.color_index} "
+                f"!= second parent colour {p2_node.color_index}"
+            )
+    # The gap cell left of the bend stays EMPTY — the fork corridor
+    # colour must not leak half a cell into the parent's track.
+    assert m_node.cells[bend_col - 1].cell_type == CellType.EMPTY
+
+    # The bend splits relay-style: own (second parent) colour for the
+    # 90-degree turn, corridor (fork child) colour for the rightward
+    # continuation.
+    bend = m_node.cells[bend_col]
+    assert bend.cell_type == CellType.BRANCH_LEFT
+    assert bend.pipe_color_index == p2_node.color_index
+    assert bend.color_index == cf_node.color_index
+
+    # Right of the bend the corridor carries the fork child's colour
+    # up to its MERGE_LEFT bend.
+    for col in range(bend_col + 1, fork_bend_col):
+        cell = m_node.cells[col]
+        if cell.cell_type in (CellType.HORIZONTAL, CellType.HORIZONTAL_PIPE):
+            assert cell.color_index == cf_node.color_index, (
+                f"col {col}: {cell.cell_type.name} colour {cell.color_index} "
+                f"!= fork child colour {cf_node.color_index}"
+            )
+    fork_bend = m_node.cells[fork_bend_col]
+    assert fork_bend.cell_type == CellType.MERGE_LEFT
+    assert fork_bend.color_index == cf_node.color_index
+
+    # Serialisation: the split bend round-trips with both colours,
+    # while a plain bend keeps the single-colour form.
+    d = bend.to_dict()
+    assert d["c"] == cf_node.color_index
+    assert d["p"] == p2_node.color_index
+    assert "p" not in CellInfo.branch_left(5).to_dict()
+
+
 # ---- off-window (dangling) parents: lanes run to the bottom edge ------
 
 

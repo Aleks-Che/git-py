@@ -91,18 +91,19 @@ def main() -> None:
             if cell.cell_type == CellType.EMPTY:
                 continue
             desc = f"{col}:{cell.cell_type.name}(c={cell.color_index}"
-            if cell.cell_type in (
+            two_colour = cell.cell_type in (
                 CellType.HORIZONTAL_PIPE, CellType.TEE_RIGHT, CellType.TEE_LEFT,
                 CellType.TEE_UP, CellType.CROSS,
-            ):
+            ) or (
+                cell.cell_type == CellType.BRANCH_LEFT
+                and cell.pipe_color_index != cell.color_index
+            )
+            if two_colour:
                 desc += f",p={cell.pipe_color_index}"
             if cell.direction:
                 desc += f",d={cell.direction}"
             desc += f" {colour(cell.color_index)}"
-            if cell.cell_type in (
-                CellType.HORIZONTAL_PIPE, CellType.TEE_RIGHT, CellType.TEE_LEFT,
-                CellType.TEE_UP, CellType.CROSS,
-            ):
+            if two_colour:
                 desc += f"/{colour(cell.pipe_color_index)}"
             desc += ")"
             cells_desc.append(desc)

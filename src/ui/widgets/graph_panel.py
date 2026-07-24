@@ -1728,10 +1728,19 @@ class GraphTableWidget(QWidget):
                     for ci, pc in enumerate(prev_cells):
                         if ci // 2 == li and pc.get("t", _T_EMPTY) != _T_EMPTY:
                             pt = pc.get("t", _T_EMPTY)
-                            if pt in (_T_HORIZONTAL_PIPE, _T_TEE_RIGHT, _T_TEE_LEFT, _T_TEE_UP):
+                            if pt in (
+                                _T_HORIZONTAL_PIPE,
+                                _T_TEE_RIGHT,
+                                _T_TEE_LEFT,
+                                _T_TEE_UP,
+                                _T_BRANCH_LEFT,
+                            ):
                                 # ``"p"`` is now always written by ``CellInfo.to_dict``;
                                 # if it's missing the cell is malformed and we fall back
                                 # to the horizontal colour (``c``) for robustness.
+                                # For a relay-split ``BRANCH_LEFT`` ``"p"`` is present
+                                # only when the bend is two-coloured — and it is exactly
+                                # the DOWN-pipe colour the bridge must continue with.
                                 clr_idx = pc.get("p")
                                 if clr_idx is None:
                                     clr_idx = pc.get("c", 0)
@@ -1742,7 +1751,13 @@ class GraphTableWidget(QWidget):
                         for ci, cell in enumerate(cells):
                             if ci // 2 == li and cell.get("t", _T_EMPTY) != _T_EMPTY:
                                 t = cell.get("t", _T_EMPTY)
-                                if t in (_T_HORIZONTAL_PIPE, _T_TEE_RIGHT, _T_TEE_LEFT, _T_TEE_UP):
+                                if t in (
+                                    _T_HORIZONTAL_PIPE,
+                                    _T_TEE_RIGHT,
+                                    _T_TEE_LEFT,
+                                    _T_TEE_UP,
+                                    _T_BRANCH_LEFT,
+                                ):
                                     clr_idx = cell.get("p")
                                     if clr_idx is None:
                                         clr_idx = cell.get("c", 0)
@@ -2921,7 +2936,18 @@ def _draw_cell_row(
         elif t == _T_BRANCH_RIGHT:
             _draw_branch_right(painter, x, y_center, bot_half_h, edge_width, color, lane_w)
         elif t == _T_BRANCH_LEFT:
-            _draw_branch_left(painter, x, y_center, bot_half_h, edge_width, color, lane_w)
+            if has_pipe_color:
+                # Relay-split bend (merge connector owning the trunk
+                # left of a fork corridor): the corridor leaving the
+                # bend rightward carries the corridor colour, while the
+                # 90-degree bend itself (left arm + down pipe) keeps
+                # the second parent's colour (kilocode ``1a3c7191``).
+                _draw_horiz_line(painter, x, y_center, lane_w / 2, edge_width, color)
+                _draw_branch_left(
+                    painter, x, y_center, bot_half_h, edge_width, p_color, lane_w
+                )
+            else:
+                _draw_branch_left(painter, x, y_center, bot_half_h, edge_width, color, lane_w)
         elif t == _T_MERGE_RIGHT:
             _draw_merge_right(painter, x, y_center, half_h, edge_width, color, lane_w)
         elif t == _T_MERGE_LEFT:

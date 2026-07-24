@@ -105,3 +105,14 @@
 - `TEE_UP` снова несёт `color_index = следующий ребёнок` (горизонталь уходит вправо цветом следующей ветки прямо от развязки), `pipe_color_index = свой ребёнок` (вертикаль вверх). Левый рычаг bend'а приходит из предыдущей нечётной клетки в своём цвете — рендер менять не нужно, переход происходит ровно в центре развязки.
 - Тесты: `test_fork_connector_multiple_merges_priority_relay` (TEE_UP: color=next, pipe=own), `test_fork_corridor_bend_splits_own_and_next_colour` (up-pipe + входящий сегмент = свой, исходящая горизонталь = следующий; MERGE_LEFT = свой). Дамп: `bdb9070a` — TEE@6(c=4,p=3), TEE@8(c=30,p=4), TEE@16(c=31,p=30), TEE@20(c=30,p=31).
 - 1216 passed, ruff чистый.
+
+## Follow-up K (2026-07-25): merge-коннектор владеет trunk'ом левее fork-коридора
+- Баг (kilocode `1a3c7191`, merge PR + создание ветки из того же коммита): янтарная ветка второго родителя заворачивала влево на полклетки и обрывалась — fork-коннектор перекрашивал трассу [коммит..bend] в цвет своего коридора. Ожидание: merge-коннектор идёт прямо в коммит (эталон — `9f7c8e5`, где trunk уже принадлежит merge-цвету через CROSS-правило).
+- Фикс движка (`build_graph`): право-сторонний `BRANCH_LEFT` ЛЕВЕЕ всех fork-bend'ов защищает спан `[commit_col, bend_col)` от fork-оверлея целиком (включая gap-ячейку перед bend'ом — отдельный `right_bend_span`, т.к. для CROSS-спанов gap должен оставаться заполняемым); сам bend перекрашивается relay-сплитом: `color_index` = цвет коридора (первый fork-ребёнок), `pipe_color_index` = свой (второй родитель) — как TEE_UP из Follow-up J.
+- Сериализация: `CellInfo.to_dict` для `BRANCH_LEFT` пишет `p` только при `pipe != color`; фабрика `branch_left(color)` теперь ставит `pipe = color` (одноцветные bend'ы сериализуются без `p` — рендер не меняется).
+- Рендер (`graph_panel`): `BRANCH_LEFT` с `p` рисует продолжение `lane_w/2` вправо цветом коридора + заворот (левый рычаг + вертикаль вниз) своим цветом.
+- Дампер `tools/dump_graph_cells.py` печатает `p=` для split-`BRANCH_LEFT`.
+- Дамп `1a3c7191` (row 52): `0:TEE_RIGHT(c=3,p=19)` → c3 до `6:BRANCH_LEFT(c=6,p=3)` → коридор c6 до `12:MERGE_LEFT(c=6)`; эталонный `9f7c8e5` (row 164) не изменился.
+- Тест: `test_merge_connector_owns_trunk_left_of_fork_corridor` (топология: p2 на lane 2 через BRANCH_LEFT, fork-ребёнок на lane 6; trunk/gap/split/коридор/сериализация).
+- Follow-up K1: bridge-pipe между строками (`_draw_cells`, graph_panel) брал цвет из `"c"` клетки верхней строки — для split-`BRANCH_LEFT` это цвет коридора, и сегмент над родительским коммитом становился чужим. Добавлен `_T_BRANCH_LEFT` в оба lookup'а pipe-цвета (для одноцветных bend'ов `p` отсутствует → fallback на `c`, поведение не меняется).
+- 1217 passed, ruff чистый.

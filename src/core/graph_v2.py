@@ -185,6 +185,16 @@ class CellInfo:
             # back to ``color_index``" by checking whether the ``p`` key
             # is present at all.
             d["p"] = self.pipe_color_index
+        elif self.cell_type == CellType.BRANCH_LEFT:
+            d["c"] = self.color_index
+            # A relay-split bend (merge connector owning the trunk left
+            # of a fork corridor) carries the corridor colour in
+            # ``color_index`` and the bend's own colour in
+            # ``pipe_color_index``.  Plain bends keep both equal and
+            # serialise without ``p`` so the renderer falls back to the
+            # single-colour path.
+            if self.pipe_color_index != self.color_index:
+                d["p"] = self.pipe_color_index
         else:
             d["c"] = self.color_index
         if self.cell_type == CellType.CROSS and self.direction:
@@ -218,7 +228,11 @@ class CellInfo:
 
     @staticmethod
     def branch_left(color: int) -> CellInfo:
-        return CellInfo(CellType.BRANCH_LEFT, color_index=color)
+        # ``pipe_color_index`` mirrors ``color_index`` so a plain bend
+        # serialises without ``p`` (see ``to_dict``); a relay-split bend
+        # (corridor continuation in a different colour) sets the two
+        # indices explicitly.
+        return CellInfo(CellType.BRANCH_LEFT, color_index=color, pipe_color_index=color)
 
     @staticmethod
     def merge_right(color: int) -> CellInfo:
@@ -877,6 +891,33 @@ def build_graph(
                     left_merge_cols.update(range(pl * 2, lane * 2))
                     if left_merge_color is None:
                         left_merge_color = pcol
+            # Right-merge trunk protection (kilocode ``1a3c7191``): when
+            # the commit is BOTH a fork point AND a merge whose second
+            # parent bends down (``BRANCH_LEFT``) LEFT of every fork
+            # bend, the merge connector owns the track from the commit
+            # to that bend — the second parent's colour must run all
+            # the way into the commit node instead of stopping at the
+            # bend's half-cell arm.  Same ownership rule as
+            # ``merge_own_cols`` for CROSS fork-merge points.
+            right_bend_cols: list[int] = []
+            right_bend_span: set[int] = set()
+            first_fork_bend_col = (
+                min(ml * 2 for ml, _ in fork_merging_lanes)
+                if fork_merging_lanes
+                else None
+            )
+            for col_e, cell_e in enumerate(cells):
+                if (
+                    cell_e.cell_type == CellType.BRANCH_LEFT
+                    and col_e > lane * 2
+                    and (first_fork_bend_col is None or col_e < first_fork_bend_col)
+                ):
+                    right_bend_cols.append(col_e)
+                    # The merge connector owns these columns outright —
+                    # including the gap cell left of the bend, which the
+                    # fork connector would otherwise paint in the
+                    # corridor colour half a cell early.
+                    right_bend_span.update(range(lane * 2, col_e))
             while len(cells) < len(fork_merging_cells):
                 cells.append(CellInfo.empty())
             for fci, fc in enumerate(fork_merging_cells):
@@ -898,6 +939,8 @@ def build_graph(
                     CellType.HORIZONTAL_PIPE,
                 ):
                     continue
+                if fci in right_bend_span:
+                    continue
                 if (
                     fci in left_merge_cols
                     and fc.cell_type == CellType.PIPE
@@ -915,6 +958,23 @@ def build_graph(
                 and cells[lane * 2 - 1].cell_type == CellType.EMPTY
             ):
                 cells[lane * 2 - 1] = CellInfo.horizontal(left_merge_color)
+
+            # Split the protected right-side BRANCH_LEFT bends
+            # relay-style (same convention as the fork corridor's
+            # TEE_UP): the 90-degree bend (left arm + down pipe) keeps
+            # the second parent's colour, while the corridor leaving
+            # the bend rightward carries the first fork child's colour
+            # (kilocode ``1a3c7191``).
+            if right_bend_cols and fork_merging_lanes:
+                corridor_color = min(fork_merging_lanes)[1]
+                for bend_col in right_bend_cols:
+                    bend = cells[bend_col]
+                    if bend.cell_type == CellType.BRANCH_LEFT:
+                        cells[bend_col] = CellInfo(
+                            CellType.BRANCH_LEFT,
+                            color_index=corridor_color,
+                            pipe_color_index=bend.color_index,
+                        )
 
             # --- half-cell cleanup past fork-connector bends ---------
             # Even/odd column geometry makes every horizontal cell
