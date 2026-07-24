@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import functools
 
+import pygit2
 from PySide6.QtCore import QObject, QThreadPool, QTimer, Signal
 
 from src.core.diff_parser import ParsedDiffLine
@@ -145,6 +146,11 @@ class MainViewModel(QObject):
         self._graph_view_model.error_occurred.connect(self.error_occurred)
         self._commit_panel_view_model.error_occurred.connect(self.error_occurred)
         self._branch_panel_view_model.error_occurred.connect(self.error_occurred)
+        # Infinite-scroll page loads drive the same status-bar spinner
+        # as repository switches.
+        self._graph_view_model.history_loading_changed.connect(
+            self._on_history_loading_changed,
+        )
 
         # ``selected_commit_sha`` drives the right panel. ``None`` means
         # the panel is hidden; ``WIP_SHA`` means the WIP / commit-input
@@ -390,6 +396,13 @@ class MainViewModel(QObject):
         if repo_path is None:
             return
 
+        # Capture on the main thread: the worker must not touch the
+        # GraphViewModel, and the infinite-scroll window the user grew
+        # via ``load_more_commits`` must survive background reloads
+        # (otherwise every async refresh silently reverts the graph
+        # to the default 500-row page).
+        history_limit = self._graph_view_model.history_limit
+
         # Capture the generation token at dispatch time — if the user
         # swaps repositories while the worker runs, the result will be
         # stale and dropped in :meth:`_on_result` (R2.2 C7).
@@ -399,7 +412,10 @@ class MainViewModel(QObject):
         self._is_busy = True
         self.busy_changed.emit(True)
 
-        def _work(repo_path: str = repo_path) -> dict | None:
+        def _work(
+            repo_path: str = repo_path,
+            history_limit: int = history_limit,
+        ) -> dict | None:
             """Open a worker-owned RepositoryManager, read all data,
             and return a result dict.  The worker's pygit2.Repository is
             never accessed from the main thread, avoiding libgit2's
@@ -413,12 +429,26 @@ class MainViewModel(QObject):
             try:
                 debug_print("[worker::bg] _compute_graph...")
                 _t1 = _wt.monotonic()
-                rows, err = GraphViewModel._compute_graph(worker_repo)
+                rows, err = GraphViewModel._compute_graph(
+                    worker_repo, history_limit=history_limit,
+                )
                 _elapsed = _wt.monotonic() - _t1
                 _nrows = len(rows) if rows else 0
                 debug_print(f"[worker::bg] _compute_graph took {_elapsed:.2f}s, rows={_nrows}")
                 if err is not None:
                     return {"error": err}
+                # The infinite scroll and the "showing N of M" label
+                # read ``truncated_count``; the sync path computes it
+                # in ``refresh_graph`` but this worker bypasses that
+                # method, so do it here (a full-DAG walk is cheap next
+                # to ``_compute_graph`` and happens off the UI thread).
+                try:
+                    total = worker_repo.count_all_history()
+                    truncated_count = (
+                        total - history_limit if total > history_limit else 0
+                    )
+                except (GitError, pygit2.GitError, OSError):
+                    truncated_count = 0
                 debug_print("[worker::bg] _compute_status_data...")
                 _t2 = _wt.monotonic()
                 file_changes, staged, raw_status = (
@@ -447,6 +477,7 @@ class MainViewModel(QObject):
                 debug_print(f"[worker::bg] worker_repo closed, total: {_wt.monotonic() - _t0:.2f}s")
             return {
                 "rows": rows,
+                "truncated_count": truncated_count,
                 "file_changes": file_changes,
                 "staged": staged,
                 "raw_status": raw_status,
@@ -475,6 +506,7 @@ class MainViewModel(QObject):
             raw_status: dict = data["raw_status"]
             branch_data: dict = data["branch_data"]
 
+            self._graph_view_model._truncated_count = data.get("truncated_count", 0)
             self._graph_view_model.graph_updated.emit(rows)
             self._commit_panel_view_model._file_changes = file_changes
             self._commit_panel_view_model._staged_files = staged
@@ -505,6 +537,16 @@ class MainViewModel(QObject):
         debug_print("[worker] dispatched")
 
     # ----- verb commands ----------------------------------------------
+
+    def _on_history_loading_changed(self, busy: bool) -> None:
+        """Forward the graph's infinite-scroll loading bursts to the UI.
+
+        Drives the same status-bar spinner as repository switches so
+        the user gets visible feedback while the next history page is
+        being built.
+        """
+        self._is_busy = busy
+        self.busy_changed.emit(busy)
 
     @_guard_mutation
     def commit_changes(self, message: str) -> None:

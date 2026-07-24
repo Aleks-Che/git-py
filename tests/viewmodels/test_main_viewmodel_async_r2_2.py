@@ -355,3 +355,73 @@ def test_async_worker_failed_carries_exception(qtbot) -> None:
     assert isinstance(exc, _ExplodingError)
     assert not isinstance(exc, str)
     assert str(exc) == "kaboom"
+
+
+# ---------------------------------------------------------------------------
+# Infinite scroll: async load must publish truncated_count
+
+
+def _make_linear_repo(path: Path, count: int) -> RepositoryManager:
+    """A repo with ``count`` linear commits on ``main``."""
+    mgr = RepositoryManager(str(path))
+    sig = pygit2.Signature("u", "u@x", int(time.time()), 0)
+    parents: list = []
+    for i in range(count):
+        (path / "f.txt").write_text(f"{i}\n")
+        mgr.repo.index.add("f.txt")
+        mgr.repo.index.write()
+        tree = mgr.repo.index.write_tree()
+        oid = mgr.repo.create_commit("refs/heads/main", sig, sig, f"c{i}", tree, parents)
+        parents = [oid]
+    return mgr
+
+
+def test_async_load_updates_truncated_count_for_infinite_scroll(
+    tmp_git_repo: Path,
+) -> None:
+    """The background worker bypasses ``refresh_graph``, so it used to
+    leave ``truncated_count`` at 0 — the "showing N of M" label never
+    appeared and scrolling to the bottom never triggered
+    ``load_more_commits`` in the real app (the sync path covered by
+    earlier tests worked fine).
+    """
+    _ensure_app()
+    mgr = _make_linear_repo(tmp_git_repo, 25)
+    vm = MainViewModel(async_enabled=True)
+    emitted: list = []
+    vm.graph_view_model().graph_updated.connect(emitted.append)
+    vm.set_repository(mgr, refresh=False)
+    vm.graph_view_model().history_limit = 10
+
+    vm.load_repository_data()
+    _drain_async_ops()
+
+    assert vm.graph_view_model().truncated_count == 15
+    assert emitted and len(emitted[-1]) == 10
+    # The async-loaded window respects the grown limit on reload too:
+    # load a page (sync refresh) and check the counter moves.
+    vm.graph_view_model().load_more_commits()
+    assert vm.graph_view_model().truncated_count == 5
+    assert len(emitted[-1]) == 20
+
+
+def test_history_loading_drives_busy_spinner(tmp_git_repo: Path) -> None:
+    """``load_more_commits`` must toggle ``MainViewModel.busy_changed``
+    so the status-bar spinner (the one shown on repository switches)
+    covers infinite-scroll page loads too.
+    """
+    _ensure_app()
+    mgr = _make_linear_repo(tmp_git_repo, 25)
+    vm = MainViewModel()
+    # The limit setter syncs ``_page_size``, so the reset inside
+    # ``set_repository`` keeps this 10-commit window.
+    vm.graph_view_model().history_limit = 10
+    vm.set_repository(mgr)
+    assert vm.graph_view_model().truncated_count == 15
+
+    states: list[bool] = []
+    vm.busy_changed.connect(states.append)
+    vm.graph_view_model().load_more_commits()
+
+    assert states == [True, False]
+    assert not vm.is_busy()

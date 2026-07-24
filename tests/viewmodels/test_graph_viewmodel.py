@@ -380,3 +380,82 @@ def test_stash_with_uncommitted_keeps_wip_on_main_lane(
     )
     # The WIP node appears above the stash in the rendered output.
     assert rows.index(wip) < rows.index(stash)
+
+
+# ----- infinite scroll (load_more_commits) -------------------------------
+
+
+def _make_linear_repo(path: Path, count: int) -> RepositoryManager:
+    """A repo with ``count`` linear commits on ``main``."""
+    mgr = RepositoryManager(str(path))
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    parents: list = []
+    for i in range(count):
+        (path / "f.txt").write_text(f"{i}\n")
+        mgr.repo.index.add("f.txt")
+        mgr.repo.index.write()
+        tree = mgr.repo.index.write_tree()
+        oid = mgr.repo.create_commit("refs/heads/main", sig, sig, f"c{i}", tree, parents)
+        parents = [oid]
+    return mgr
+
+
+def test_load_more_commits_extends_history_one_page_at_a_time(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    _ensure_app()
+    mgr = _make_linear_repo(tmp_git_repo, 25)
+    vm = GraphViewModel(history_limit=10)
+    vm.set_repository(mgr)
+    assert vm.truncated_count == 15
+
+    vm.load_more_commits()
+    assert vm.history_limit == 20
+    assert vm.truncated_count == 5
+
+    vm.load_more_commits()
+    assert vm.history_limit == 30
+    assert vm.truncated_count == 0
+
+    # No-op once the full DAG is visible: the window must not grow.
+    vm.load_more_commits()
+    assert vm.history_limit == 30
+
+
+def test_load_more_commits_noop_without_repository(qtbot) -> None:
+    _ensure_app()
+    vm = GraphViewModel(history_limit=10)
+    vm.load_more_commits()  # must not raise
+    assert vm.history_limit == 10
+
+
+def test_set_repository_resets_history_window(qtbot, tmp_git_repo: Path) -> None:
+    _ensure_app()
+    mgr = _make_linear_repo(tmp_git_repo, 25)
+    vm = GraphViewModel(history_limit=10)
+    vm.set_repository(mgr)
+    vm.load_more_commits()
+    assert vm.history_limit == 20
+    # Re-binding starts a fresh one-page window — the new repo must
+    # not inherit the previous session's grown limit.
+    vm.set_repository(mgr)
+    assert vm.history_limit == 10
+
+
+def test_load_more_emits_history_loading_signal(qtbot, tmp_git_repo: Path) -> None:
+    _ensure_app()
+    mgr = _make_linear_repo(tmp_git_repo, 25)
+    vm = GraphViewModel(history_limit=10)
+    vm.set_repository(mgr)
+    states: list[bool] = []
+    vm.history_loading_changed.connect(states.append)
+
+    vm.load_more_commits()
+    assert states == [True, False]
+
+    vm.load_more_commits()
+    assert states == [True, False, True, False]
+
+    # History drained: no page to load, no loading burst.
+    vm.load_more_commits()
+    assert states == [True, False, True, False]

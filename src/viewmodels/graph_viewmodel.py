@@ -111,6 +111,12 @@ class GraphViewModel(QObject):
     commit_selected = Signal(str)
     error_occurred = Signal(str)
     search_results_changed = Signal(list)
+    history_loading_changed = Signal(bool)
+    """``True`` while :meth:`load_more_commits` rebuilds the graph for
+    the next history page, ``False`` when it finishes.  Forwarded by
+    :class:`MainViewModel` as ``busy_changed`` so the status-bar
+    spinner (the one shown on repository switches) also covers
+    infinite-scroll page loads."""
     scroll_to_commit_requested = Signal(str)
     """Emitted by :meth:`scroll_to_commit`; the view scrolls the commit
     (vertically and horizontally) so the user lands on it. Decoupled from
@@ -145,6 +151,13 @@ class GraphViewModel(QObject):
         self._history_limit: int = (
             history_limit if history_limit is not None else _load_graph_history_limit()
         )
+        # GitKraken-style infinite scroll: :meth:`load_more_commits`
+        # grows the visible history one page at a time when the user
+        # scrolls to the bottom.  ``_page_size`` is the increment —
+        # the limit the VM started with — and ``set_repository``
+        # resets the limit back to it so a new repo never inherits
+        # the previous session's grown window.
+        self._page_size: int = self._history_limit
         self._truncated_count: int = 0
         # R3.2 (P7): branch-priority cache, computed once per
         # ``refresh_graph`` instead of being recomputed for every chip
@@ -170,6 +183,10 @@ class GraphViewModel(QObject):
         Passing ``None`` clears the graph (emits an empty list).
         """
         self._repo = manager
+        # Reset the infinite-scroll window: a different repository
+        # starts at one page regardless of how far the user scrolled
+        # the previous one.
+        self._history_limit = self._page_size
         if refresh:
             self.refresh_graph()
 
@@ -192,6 +209,10 @@ class GraphViewModel(QObject):
         if value <= 0:
             return
         self._history_limit = int(value)
+        # Keep the infinite-scroll page in sync: a new configured
+        # window is also the page ``load_more_commits`` grows by and
+        # the size ``set_repository`` resets to.
+        self._page_size = int(value)
 
     @property
     def truncated_count(self) -> int:
@@ -233,6 +254,26 @@ class GraphViewModel(QObject):
         # thread for every chip.
         self._update_branch_priority_cache()
         self.graph_updated.emit(rows)
+
+    def load_more_commits(self) -> None:
+        """Grow the visible history by one page and re-emit the layout.
+
+        GitKraken-style infinite scroll: the widget calls this when
+        the user scrolls to the bottom of the loaded history (or
+        clicks the "Load more" link in the truncation label).  No-op
+        when no repository is bound or the full DAG is already
+        visible (``truncated_count == 0``).
+        """
+        if self._repo is None or not self._repo.is_open:
+            return
+        if self._truncated_count <= 0:
+            return
+        self._history_limit += self._page_size
+        self.history_loading_changed.emit(True)
+        try:
+            self.refresh_graph()
+        finally:
+            self.history_loading_changed.emit(False)
 
     def _update_branch_priority_cache(self) -> None:
         """Recompute :attr:`branch_priority_cache` from the current repo.
