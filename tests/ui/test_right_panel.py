@@ -112,6 +112,18 @@ def _click_file_row(detail, path: str) -> None:  # noqa: ANN001 - CommitDetailPa
     raise AssertionError(f"{path!r} not found in the changed-files list")
 
 
+def _wait_detail_populated(qtbot, detail) -> None:  # noqa: ANN001
+    """Wait for the async commit-detail load to fill the changed-files list.
+
+    Production ``MainWindow`` runs the VM with ``async_enabled=True``, so
+    ``show_commit`` returns before the worker delivers the payload — tests
+    must wait for the file list before clicking rows. The 15 s budget
+    covers the loaded full-suite case where each git subprocess spawn
+    behind the branch attribution slows to ~0.5 s.
+    """
+    qtbot.waitUntil(lambda: detail._files.count() > 0, timeout=15000)  # noqa: SLF001
+
+
 # ----- selection_changed signal contract ---------------------------------
 
 
@@ -460,15 +472,16 @@ def test_full_document_loads_on_mode_toggle_for_commit_file(
     window.set_repository(mgr)
     window._main_vm.select_commit(head_sha)  # noqa: SLF001
     detail = window._right_panel._commit_detail  # noqa: SLF001
+    _wait_detail_populated(qtbot, detail)
     _click_file_row(detail, "f.txt")
     # R3.2 P4 laziness: only the changes-only variant is loaded eagerly.
-    assert window._diff_view.has_changes_only()  # noqa: SLF001
+    qtbot.waitUntil(lambda: window._diff_view.has_changes_only(), timeout=15000)  # noqa: SLF001
     assert not window._diff_view.has_full_document()  # noqa: SLF001
     assert "line 0" not in window._diff_view.toPlainText()  # noqa: SLF001
 
     window._diff_view.set_view_mode(DiffViewMode.FULL_DOCUMENT)  # noqa: SLF001
 
-    assert window._diff_view.has_full_document()  # noqa: SLF001
+    qtbot.waitUntil(lambda: window._diff_view.has_full_document(), timeout=15000)  # noqa: SLF001
     text = window._diff_view.toPlainText()  # noqa: SLF001
     assert "line 0" in text
     assert "line 10 changed" in text
@@ -523,13 +536,18 @@ def test_full_document_follows_file_selection_while_in_full_mode(
     window.set_repository(mgr)
     window._main_vm.select_commit(head_sha)  # noqa: SLF001
     detail = window._right_panel._commit_detail  # noqa: SLF001
+    _wait_detail_populated(qtbot, detail)
     _click_file_row(detail, "f.txt")
+    qtbot.waitUntil(lambda: window._diff_view.has_changes_only(), timeout=15000)  # noqa: SLF001
     window._diff_view.set_view_mode(DiffViewMode.FULL_DOCUMENT)  # noqa: SLF001
-    assert window._diff_view.has_full_document()  # noqa: SLF001
+    qtbot.waitUntil(lambda: window._diff_view.has_full_document(), timeout=15000)  # noqa: SLF001
 
     _click_file_row(detail, "g.txt")
 
-    assert window._diff_view.has_full_document()  # noqa: SLF001
+    qtbot.waitUntil(
+        lambda: "g row 0" in window._diff_view.toPlainText(),  # noqa: SLF001
+        timeout=15000,
+    )
     text = window._diff_view.toPlainText()  # noqa: SLF001
     assert "g row 0" in text
     assert "g row 10 changed" in text
@@ -1000,11 +1018,12 @@ def test_clicking_file_in_commit_detail_shows_diff(
     window._main_vm.select_commit(head_sha)
 
     detail = window._right_panel._commit_detail
+    _wait_detail_populated(qtbot, detail)
     detail._on_files_item_clicked(detail._files.item(0))
 
     assert window._graph_stack.currentIndex() == 1
     assert window._diff_view.isVisible()
-    assert len(window._diff_view.toPlainText()) > 0
+    qtbot.waitUntil(lambda: len(window._diff_view.toPlainText()) > 0, timeout=15000)
     assert window._diff_view.line_action_mode() is None
 
 
@@ -1022,6 +1041,7 @@ def test_clicking_same_file_in_commit_detail_toggles_off(
     window._main_vm.select_commit(head_sha)
 
     detail = window._right_panel._commit_detail
+    _wait_detail_populated(qtbot, detail)
     item = detail._files.item(0)
 
     detail._on_files_item_clicked(item)
@@ -1046,6 +1066,7 @@ def test_switching_commits_clears_file_selection(
     window._main_vm.select_commit(head_sha)
 
     detail = window._right_panel._commit_detail
+    _wait_detail_populated(qtbot, detail)
     detail._on_files_item_clicked(detail._files.item(0))
     assert window._graph_stack.currentIndex() == 1
 
@@ -1069,6 +1090,7 @@ def test_commit_detail_panel_clears_selection_on_hide(
     window._main_vm.select_commit(head_sha)
 
     detail = window._right_panel._commit_detail
+    _wait_detail_populated(qtbot, detail)
     detail._on_files_item_clicked(detail._files.item(0))
     assert window._graph_stack.currentIndex() == 1
 
@@ -1220,6 +1242,7 @@ def test_clicking_file_in_commit_detail_hides_left_panel(
 
     assert window._left_panel.isVisible()
     detail = window._right_panel._commit_detail
+    _wait_detail_populated(qtbot, detail)
     detail._on_files_item_clicked(detail._files.item(0))
     assert not window._left_panel.isVisible()
 
@@ -1239,6 +1262,7 @@ def test_switching_commits_with_file_selected_restores_left_panel(
     window._main_vm.select_commit(head_sha)
 
     detail = window._right_panel._commit_detail
+    _wait_detail_populated(qtbot, detail)
     detail._on_files_item_clicked(detail._files.item(0))
     assert not window._left_panel.isVisible()
 

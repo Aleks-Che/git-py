@@ -166,7 +166,12 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._build_central()
         self._build_status_bar()
+        self._activity_active = False
         self._main_vm.busy_changed.connect(self._on_busy_changed)
+        # Lightweight background reads (commit detail, per-file diff)
+        # drive the same status-bar spinner but never touch the
+        # mutation guard / toolbar state.
+        self._main_vm.activity_changed.connect(self._on_activity_changed)
         # Refresh the repository from disk when the application
         # becomes active (window restored from minimised, switched
         # back from another app, etc.) so commits / branch changes
@@ -1449,7 +1454,7 @@ class MainWindow(QMainWindow):
         On busy=False, re-evaluate undo/redo from the command processor and
         re-enable close if a repo is open (R2.3 / R2.6 M13).
         """
-        self._busy_spinner.setVisible(busy)
+        self._busy_spinner.setVisible(busy or self._activity_active)
         if busy:
             self._status.showMessage("Working…")
         else:
@@ -1481,6 +1486,15 @@ class MainWindow(QMainWindow):
         if not busy:
             self._status.clearMessage()
             self._update_repo_actions()
+
+    def _on_activity_changed(self, active: bool) -> None:
+        """Toggle the status-bar spinner for lightweight background reads.
+
+        Unlike :meth:`_on_busy_changed` this touches nothing else — a
+        commit-detail or file-diff load must not disable the toolbar.
+        """
+        self._activity_active = active
+        self._busy_spinner.setVisible(active or self._main_vm.is_busy())
 
     def _on_error(self, message: str) -> None:
         """Show error in the status bar and as a toast popup."""

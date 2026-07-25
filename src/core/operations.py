@@ -1307,7 +1307,10 @@ def branch_of_commit(
                 continue
             # Cheap pre-filter: a trunk that does not contain the
             # commit at all can never name it (~20 ms vs ~150 ms for
-            # a name-rev that comes back "undefined").
+            # a name-rev that comes back "undefined"). Batching this
+            # via ``for-each-ref --contains`` was tried and reverted:
+            # the walk over ~1100 refs costs ~140 ms — slower than the
+            # two spawns the common case needs.
             contained = _run_git_in_workdir(
                 r,
                 ["merge-base", "--is-ancestor", sha, ref],
@@ -1336,6 +1339,51 @@ def branch_of_commit(
                 name = name[len("remotes/"):]
             return BranchAttribution(name, certain)
     return None
+
+
+def commit_file_diff_text(
+    repo: RepositoryManager | pygit2.Repository,
+    sha: str,
+    path: str,
+    context_lines: int = 3,
+) -> str:
+    """Return the unified diff for ``path`` in ``sha`` (vs its first parent).
+
+    For a root commit (no parents) the diff is against the empty tree,
+    so every file it introduces is reported as ``new file``.  Only the
+    patch for ``path`` is extracted from the commit-wide diff, so the
+    cost stays proportional to the commit, not the working tree.
+
+    ``context_lines`` controls how many unchanged lines surround each
+    change: ``3`` produces a compact review diff; a value large enough
+    to span the whole file powers the *Full document* viewer mode.
+
+    Runs happily on a worker thread as long as ``repo`` is a
+    worker-owned :class:`RepositoryManager` — libgit2 repositories are
+    not thread-safe.
+    """
+    with unwrap(repo) as r:
+        try:
+            obj = r.revparse_single(sha).peel(pygit2.Commit)
+        except (KeyError, pygit2.GitError, ValueError) as exc:
+            raise InvalidRefError(f"Unknown revision: {sha!r}") from exc
+        if obj.parent_ids:
+            try:
+                parent_tree = obj.parents[0].tree
+            except (KeyError, ValueError):
+                parent_tree = r.TreeBuilder().write()
+        else:
+            parent_tree = r.TreeBuilder().write()
+        try:
+            diff = r.diff(parent_tree, obj.tree, context_lines=context_lines)
+        except (pygit2.GitError, KeyError, ValueError) as exc:
+            raise GitError(f"Failed to diff {sha!r}: {exc}") from exc
+        pieces: list[str] = []
+        for patch in diff:
+            delta = patch.delta
+            if (delta.new_file.path == path) or (delta.old_file.path == path):
+                pieces.append(patch.text or "")
+        return "".join(pieces)
 
 
 def squash_commits(

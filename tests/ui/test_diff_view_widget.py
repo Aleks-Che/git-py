@@ -22,6 +22,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from src.core.diff_parser import DiffLineType
 from src.ui.widgets.diff_view_widget import (
+    _MAX_RENDERED_DIFF_LINES,
     _SCROLLBAR_WIDTH,
     ADDITION_BG,
     DELETION_BG,
@@ -1227,3 +1228,37 @@ def test_disabling_line_actions_shrinks_gutter(qtbot) -> None:
 
     assert action_width > plain_width
     assert view._editor.gutter_width() == plain_width
+
+
+# ----- huge diffs are truncated before rendering -------------------------
+
+
+def test_huge_diff_is_truncated_with_banner(qtbot) -> None:
+    """Diffs beyond ``_MAX_RENDERED_DIFF_LINES`` must not freeze the UI:
+    only the first lines are rendered, followed by a banner."""
+    _ensure_app()
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+    total = _MAX_RENDERED_DIFF_LINES + 5000
+    text = "\n".join(f"+line {i}" for i in range(total))
+
+    view.set_diff(text)
+
+    rendered = view.toPlainText()
+    assert "diff truncated" in rendered
+    assert str(_MAX_RENDERED_DIFF_LINES) in rendered
+    assert str(total) in rendered
+    # The tail of the original diff never reached the document.
+    assert f"+line {total - 1}" not in rendered
+    # …but the stored text is complete, so toggles / copies see it all.
+    assert view.has_changes_only()
+    assert view._changes_only_text.count("\n") == total - 1
+
+
+def test_small_diff_is_not_truncated(qtbot) -> None:
+    _ensure_app()
+    view = DiffViewWidget()
+    qtbot.addWidget(view)
+    view.set_diff(_SAMPLE_DIFF)
+    assert "diff truncated" not in view.toPlainText()
+
