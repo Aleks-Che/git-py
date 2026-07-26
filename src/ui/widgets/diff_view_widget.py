@@ -112,6 +112,15 @@ _GUTTER_RIGHT_PADDING_CHARS = 3
 # against both the widget edge above and the editor body below.
 _TOOLBAR_VERTICAL_MARGIN = 4
 
+# Render cap for very large diffs. Rendering cost in the plain-text
+# editor grows superlinearly with line count (document layout plus one
+# ExtraSelection per changed line): ~20k lines take ~0.25 s, ~50k
+# lines ~2 s, and a multi-MB generated file (e.g. a snapshot fixture
+# with 100k+ changed lines) froze the UI for tens of seconds. Beyond
+# this cap the view shows the first lines plus a truncation banner;
+# the full text is still kept for toggles and copy actions.
+_MAX_RENDERED_DIFF_LINES = 20_000
+
 # Default scrollbar width on Windows is ~16px. The custom scrollbar
 # needs to fit two halves + a divider. We use an *odd* width so the
 # centre column sits at an integer pixel — this gives us exact 10+1+10
@@ -966,6 +975,19 @@ class DiffViewWidget(QWidget):
         """Return the currently active :class:`DiffViewMode`."""
         return self._view_mode
 
+    def has_changes_only(self) -> bool:
+        """Whether a non-empty changes-only diff is loaded."""
+        return bool(self._changes_only_text)
+
+    def has_full_document(self) -> bool:
+        """Whether a non-empty full-document variant is loaded.
+
+        The full-document text is computed lazily (R3.2 P4); the
+        :class:`MainWindow` uses this probe to decide whether it must
+        ask the active diff source for ``request_full_document()``.
+        """
+        return bool(self._full_document_text)
+
     def set_view_mode(self, mode: DiffViewMode) -> None:
         """Switch the active mode and re-render.
 
@@ -1045,6 +1067,19 @@ class DiffViewWidget(QWidget):
             text = self._changes_only_text
         else:
             text = self._full_document_text
+        # Cap the rendered line count — see ``_MAX_RENDERED_DIFF_LINES``.
+        # The stored text stays complete; only the document shown in the
+        # editor is truncated. The banner line has no diff prefix, so it
+        # parses as neutral context and renders unhighlighted.
+        lines = text.split("\n")
+        if len(lines) > _MAX_RENDERED_DIFF_LINES:
+            total = len(lines)
+            lines = lines[:_MAX_RENDERED_DIFF_LINES]
+            lines.append(
+                f"… diff truncated — showing {_MAX_RENDERED_DIFF_LINES} "
+                f"of {total} lines (file too large)",
+            )
+            text = "\n".join(lines)
         parsed = parse_diff_lines(text)
         # Drop file-level headers — they're noise in a per-file view.
         # Hunk markers, additions, deletions, context, and the

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pygit2
 import pytest
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from src.core.repository import RepositoryManager
 from src.viewmodels.graph_viewmodel import GraphViewModel
@@ -380,3 +381,164 @@ def test_stash_with_uncommitted_keeps_wip_on_main_lane(
     )
     # The WIP node appears above the stash in the rendered output.
     assert rows.index(wip) < rows.index(stash)
+
+
+# ----- infinite scroll (load_more_commits) -------------------------------
+
+
+def _make_linear_repo(path: Path, count: int) -> RepositoryManager:
+    """A repo with ``count`` linear commits on ``main``."""
+    mgr = RepositoryManager(str(path))
+    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+    parents: list = []
+    for i in range(count):
+        (path / "f.txt").write_text(f"{i}\n")
+        mgr.repo.index.add("f.txt")
+        mgr.repo.index.write()
+        tree = mgr.repo.index.write_tree()
+        oid = mgr.repo.create_commit("refs/heads/main", sig, sig, f"c{i}", tree, parents)
+        parents = [oid]
+    return mgr
+
+
+def test_load_more_commits_extends_history_one_page_at_a_time(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    _ensure_app()
+    mgr = _make_linear_repo(tmp_git_repo, 25)
+    vm = GraphViewModel(history_limit=10)
+    vm.set_repository(mgr)
+    assert vm.truncated_count == 15
+
+    vm.load_more_commits()
+    assert vm.history_limit == 20
+    assert vm.truncated_count == 5
+
+    vm.load_more_commits()
+    assert vm.history_limit == 30
+    assert vm.truncated_count == 0
+
+    # No-op once the full DAG is visible: the window must not grow.
+    vm.load_more_commits()
+    assert vm.history_limit == 30
+
+
+def test_load_more_commits_noop_without_repository(qtbot) -> None:
+    _ensure_app()
+    vm = GraphViewModel(history_limit=10)
+    vm.load_more_commits()  # must not raise
+    assert vm.history_limit == 10
+
+
+def test_set_repository_resets_history_window(qtbot, tmp_git_repo: Path) -> None:
+    _ensure_app()
+    mgr = _make_linear_repo(tmp_git_repo, 25)
+    vm = GraphViewModel(history_limit=10)
+    vm.set_repository(mgr)
+    vm.load_more_commits()
+    assert vm.history_limit == 20
+    # Re-binding starts a fresh one-page window — the new repo must
+    # not inherit the previous session's grown limit.
+    vm.set_repository(mgr)
+    assert vm.history_limit == 10
+
+
+def test_load_more_emits_history_loading_signal(qtbot, tmp_git_repo: Path) -> None:
+    _ensure_app()
+    mgr = _make_linear_repo(tmp_git_repo, 25)
+    vm = GraphViewModel(history_limit=10)
+    vm.set_repository(mgr)
+    states: list[bool] = []
+    vm.history_loading_changed.connect(states.append)
+
+    vm.load_more_commits()
+    assert states == [True, False]
+
+    vm.load_more_commits()
+    assert states == [True, False, True, False]
+
+    # History drained: no page to load, no loading burst.
+    vm.load_more_commits()
+    assert states == [True, False, True, False]
+
+
+# ----- async infinite scroll (async_enabled=True) -----------------------
+
+
+def test_load_more_commits_async_loads_page_off_thread(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """With ``async_enabled`` the recompute runs on a worker: the method
+    returns immediately (UI thread stays free for the spinner), and the
+    new page arrives with the ``graph_updated`` emission."""
+    _ensure_app()
+    mgr = _make_linear_repo(tmp_git_repo, 25)
+    vm = GraphViewModel(history_limit=10, async_enabled=True)
+    vm.set_repository(mgr)
+    assert vm.truncated_count == 15
+
+    states: list[bool] = []
+    vm.history_loading_changed.connect(states.append)
+    vm.load_more_commits()
+    # The loading burst has started but nothing was delivered yet —
+    # a synchronous implementation would have completed by now.
+    assert states == [True]
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=5000) as blocker:
+        pass
+    assert len(blocker.args[0]) == 20
+    assert vm.history_limit == 20
+    assert vm.truncated_count == 5
+    assert states == [True, False]
+
+
+def test_load_more_commits_async_ignores_reentrant_calls(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """The scroll trigger re-fires on every scrollbar tick; while a
+    page load is in flight further calls must not grow the window."""
+    _ensure_app()
+    mgr = _make_linear_repo(tmp_git_repo, 60)
+    vm = GraphViewModel(history_limit=10, async_enabled=True)
+    vm.set_repository(mgr)
+
+    vm.load_more_commits()
+    assert vm.history_limit == 20
+    vm.load_more_commits()  # in flight — must be ignored
+    assert vm.history_limit == 20
+
+    with qtbot.waitSignal(vm.graph_updated, timeout=5000) as blocker:
+        pass
+    assert len(blocker.args[0]) == 20
+
+    # Once the page landed, the next request works again.
+    vm.load_more_commits()
+    assert vm.history_limit == 30
+    with qtbot.waitSignal(vm.graph_updated, timeout=5000) as blocker:
+        pass
+    assert len(blocker.args[0]) == 30
+
+
+def test_load_more_commits_async_drops_result_after_repo_rebind(
+    qtbot, tmp_git_repo: Path,
+) -> None:
+    """A page-load result computed for the previous binding must not
+    overwrite the freshly bound repository's state (mirrors R2.2 C7)."""
+    _ensure_app()
+    mgr = _make_linear_repo(tmp_git_repo, 25)
+    vm = GraphViewModel(history_limit=10, async_enabled=True)
+    vm.set_repository(mgr)
+    vm.load_more_commits()
+
+    other_path = tmp_git_repo / "other"
+    pygit2.init_repository(str(other_path), initial_head="main")
+    other = _make_linear_repo(other_path, 3)
+    emissions: list[list] = []
+    vm.graph_updated.connect(emissions.append)
+    vm.set_repository(other)  # rebind while the worker is in flight
+    assert vm.truncated_count == 0
+
+    QTest.qWait(300)  # give the stale worker time to deliver its result
+    assert [len(rows) for rows in emissions] == [3]
+    assert vm.truncated_count == 0
+    assert not vm._load_more_in_flight  # noqa: SLF001

@@ -46,20 +46,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QStatusBar,
     QTabWidget,
     QToolBar,
+    QWidget,
 )
 
 from src.core.exceptions import GitError, RepositoryNotFoundError
@@ -68,6 +71,7 @@ from src.ui.dialogs.clone_dialog import CloneDialog
 from src.ui.dialogs.open_or_clone_dialog import OpenOrCloneDialog
 from src.ui.dialogs.remote_manage_dialog import RemoteManageDialog
 from src.ui.dialogs.settings_dialog import SettingsDialog
+from src.ui.icons import toolbar_icon
 from src.ui.widgets.action_history_widget import ActionHistoryWidget
 from src.ui.widgets.diff_view_widget import (
     DiffLineActionMode,
@@ -166,7 +170,12 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._build_central()
         self._build_status_bar()
+        self._activity_active = False
         self._main_vm.busy_changed.connect(self._on_busy_changed)
+        # Lightweight background reads (commit detail, per-file diff)
+        # drive the same status-bar spinner but never touch the
+        # mutation guard / toolbar state.
+        self._main_vm.activity_changed.connect(self._on_activity_changed)
         # Refresh the repository from disk when the application
         # becomes active (window restored from minimised, switched
         # back from another app, etc.) so commits / branch changes
@@ -451,43 +460,71 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self._bottom_tabs.setTabVisible(idx, visible)
 
+    def _apply_toolbar_icon(self, action: QAction, icon_name: str) -> None:
+        """Give ``action`` a themed icon and a text + shortcut tooltip."""
+        action.setIcon(toolbar_icon(icon_name))
+        text = action.text().replace("&", "")
+        shortcut = action.shortcut().toString(QKeySequence.SequenceFormat.NativeText)
+        tip = f"{text} ({shortcut})" if shortcut else text
+        action.setToolTip(tip)
+        action.setStatusTip(tip)
+
     def _build_toolbar(self) -> None:
-        """Stage 8: Edit toolbar with Undo / Redo, then Remote / Stash / Search."""
-        edit_toolbar = QToolBar("Edit", self)
-        edit_toolbar.setObjectName("edit-toolbar")
-        edit_toolbar.setMovable(False)
-        edit_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        edit_toolbar.addAction(self._action_undo)
-        edit_toolbar.addAction(self._action_redo)
-        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, edit_toolbar)
+        """Icon toolbars (Undo/Redo, Remote, Stash) + right-aligned search."""
+        icon_size = QSize(18, 18)
+
+        def icon_toolbar(title: str, object_name: str) -> QToolBar:
+            tb = QToolBar(title, self)
+            tb.setObjectName(object_name)
+            tb.setMovable(False)
+            tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            tb.setIconSize(icon_size)
+            self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)
+            return tb
+
+        edit_toolbar = icon_toolbar("Edit", "edit-toolbar")
+        for action, name in ((self._action_undo, "undo"), (self._action_redo, "redo")):
+            self._apply_toolbar_icon(action, name)
+            edit_toolbar.addAction(action)
         self._edit_toolbar = edit_toolbar
 
-        toolbar = QToolBar("Remote", self)
-        toolbar.setObjectName("remote-toolbar")
-        toolbar.setMovable(False)
         # Use the same actions as the Remote menu so the enabled
         # state stays in sync (one source of truth).
-        toolbar.addAction(self._action_fetch)
-        toolbar.addAction(self._action_pull)
-        toolbar.addAction(self._action_push)
-        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
+        toolbar = icon_toolbar("Remote", "remote-toolbar")
+        for action, name in (
+            (self._action_fetch, "fetch"),
+            (self._action_pull, "pull"),
+            (self._action_push, "push"),
+        ):
+            self._apply_toolbar_icon(action, name)
+            toolbar.addAction(action)
         self._remote_toolbar = toolbar
 
         # Stage 7: Stash toolbar with Push / Pop shortcuts.
-        stash_toolbar = QToolBar("Stash", self)
-        stash_toolbar.setObjectName("stash-toolbar")
-        stash_toolbar.setMovable(False)
-        stash_toolbar.addAction(self._action_stash_push)
-        stash_toolbar.addAction(self._action_stash_pop)
-        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, stash_toolbar)
+        stash_toolbar = icon_toolbar("Stash", "stash-toolbar")
+        for action, name in (
+            (self._action_stash_push, "stash_push"),
+            (self._action_stash_pop, "stash_pop"),
+        ):
+            self._apply_toolbar_icon(action, name)
+            stash_toolbar.addAction(action)
         self._stash_toolbar = stash_toolbar
 
-        # Stage 7: commit search bar as a compact toolbar.
-        self._search_bar.setMaximumHeight(32)
-        self._search_bar.setMinimumWidth(260)
+        # Stage 7: commit search bar, pushed to the right edge of the
+        # row by an expanding spacer and kept at a fixed compact width
+        # instead of stretching across the whole window.
+        self._search_bar.setMaximumHeight(28)
+        self._search_bar.setFixedWidth(320)
+        self._search_bar.addAction(
+            toolbar_icon("search"),
+            QLineEdit.ActionPosition.LeadingPosition,
+        )
         search_toolbar = QToolBar("Search", self)
         search_toolbar.setObjectName("search-toolbar")
         search_toolbar.setMovable(False)
+        spacer = QWidget(search_toolbar)
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        search_toolbar.addWidget(spacer)
         search_toolbar.addWidget(self._search_bar)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, search_toolbar)
 
@@ -609,13 +646,23 @@ class MainWindow(QMainWindow):
         cp_vm = self._main_vm.commit_panel_view_model()
         cp_vm.selected_file_changed.connect(self._on_commit_file_selected)
         cp_vm.diff_ready.connect(self._on_diff_ready)
-        # The full-document variant is pre-computed in the same VM
-        # call as the changes-only diff so the diff view can toggle
-        # between its two display modes without a round-trip to Git.
-        cp_vm.diff_pair_ready.connect(self._on_diff_pair_ready)
+        # The full-document variant is computed lazily (R3.2 P4): the
+        # pair arrives with an empty full-document slot, and we ask
+        # the emitting source for the expensive variant when the user
+        # toggles the viewer into FULL_DOCUMENT mode. The source is
+        # tracked per-emission because both right-panel views feed
+        # this same slot.
+        self._diff_source = None
+        self._requesting_full_document = False
+        cp_vm.diff_pair_ready.connect(
+            lambda changes_only, full_document: self._on_diff_pair_ready(
+                changes_only, full_document, cp_vm,
+            ),
+        )
         self._diff_view.line_action_requested.connect(
             self._on_diff_line_action_requested,
         )
+        self._diff_view.view_mode_changed.connect(self._on_diff_view_mode_changed)
 
         # The commit-detail panel emits the same signal pair so a
         # file click in either right-panel view swaps the graph for
@@ -625,7 +672,9 @@ class MainWindow(QMainWindow):
         )
         self._right_panel._commit_detail.diff_ready.connect(self._on_diff_ready)
         self._right_panel._commit_detail.diff_pair_ready.connect(
-            self._on_diff_pair_ready,
+            lambda changes_only, full_document: self._on_diff_pair_ready(
+                changes_only, full_document, self._right_panel._commit_detail,
+            ),
         )
         # The commit-detail panel surfaces its own errors via a public
         # ``error_occurred`` signal; route both branches to the existing
@@ -805,11 +854,55 @@ class MainWindow(QMainWindow):
         self._diff_view.set_diff(text)
 
     def _on_diff_pair_ready(
-        self, changes_only: str, full_document: str,
+        self,
+        changes_only: str,
+        full_document: str,
+        source,  # noqa: ANN001 - CommitPanelViewModel | CommitDetailPanel
     ) -> None:
-        """Hand the pre-computed (changes-only, full-document) pair to
-        the diff widget so toggling its toolbar is instantaneous."""
+        """Hand the (changes-only, full-document) pair to the diff widget.
+
+        ``source`` is the object that emitted the pair (the WIP commit
+        panel VM or the commit-detail panel); it is remembered so the
+        lazily-computed full-document variant (R3.2 P4) can later be
+        requested from the same place.
+        """
+        self._diff_source = source
         self._diff_view.set_diff_pair(changes_only, full_document)
+        # Selecting another file while already in FULL_DOCUMENT mode
+        # arrives with an empty full-document slot — fetch it now so
+        # the view does not stay blank.
+        self._maybe_request_full_document()
+
+    def _on_diff_view_mode_changed(self, mode: DiffViewMode) -> None:
+        """Fetch the lazy full-document diff on first toggle (R3.2 P4)."""
+        if mode == DiffViewMode.FULL_DOCUMENT:
+            self._maybe_request_full_document()
+
+    def _maybe_request_full_document(self) -> None:
+        """Ask the active diff source for the full-document variant.
+
+        Only fires when the viewer is in FULL_DOCUMENT mode, a
+        changes-only diff is loaded, and the full variant is still
+        missing. The re-entrancy flag breaks the signal loop:
+        ``request_full_document`` re-emits ``diff_pair_ready``, which
+        lands back in :meth:`_on_diff_pair_ready`.
+        """
+        if self._requesting_full_document:
+            return
+        if self._diff_view.view_mode() != DiffViewMode.FULL_DOCUMENT:
+            return
+        if not self._diff_view.has_changes_only():
+            return
+        if self._diff_view.has_full_document():
+            return
+        source = self._diff_source
+        if source is None:
+            return
+        self._requesting_full_document = True
+        try:
+            source.request_full_document()
+        finally:
+            self._requesting_full_document = False
 
     def _on_copy_diff(self, sha: str) -> None:
         """Copy the full unified diff to the system clipboard."""
@@ -1393,7 +1486,7 @@ class MainWindow(QMainWindow):
         On busy=False, re-evaluate undo/redo from the command processor and
         re-enable close if a repo is open (R2.3 / R2.6 M13).
         """
-        self._busy_spinner.setVisible(busy)
+        self._busy_spinner.setVisible(busy or self._activity_active)
         if busy:
             self._status.showMessage("Working…")
         else:
@@ -1425,6 +1518,15 @@ class MainWindow(QMainWindow):
         if not busy:
             self._status.clearMessage()
             self._update_repo_actions()
+
+    def _on_activity_changed(self, active: bool) -> None:
+        """Toggle the status-bar spinner for lightweight background reads.
+
+        Unlike :meth:`_on_busy_changed` this touches nothing else — a
+        commit-detail or file-diff load must not disable the toolbar.
+        """
+        self._activity_active = active
+        self._busy_spinner.setVisible(active or self._main_vm.is_busy())
 
     def _on_error(self, message: str) -> None:
         """Show error in the status bar and as a toast popup."""

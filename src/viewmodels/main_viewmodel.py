@@ -33,7 +33,9 @@ error_occurred(str)
 from __future__ import annotations
 
 import functools
+from collections import OrderedDict
 
+import pygit2
 from PySide6.QtCore import QObject, QThreadPool, QTimer, Signal
 
 from src.core.diff_parser import ParsedDiffLine
@@ -43,7 +45,7 @@ from src.core.exceptions import (
     RebaseConflictError,
     RepositoryNotFoundError,
 )
-from src.core.models import RemoteInfo
+from src.core.models import BranchAttribution, RemoteInfo
 from src.core.repository import RepositoryManager
 from src.utils.async_worker import AsyncWorker
 from src.utils.config import default_config_path, load_author_signature, load_config
@@ -92,6 +94,21 @@ class MainViewModel(QObject):
     log_message = Signal(str)  # human-readable timestamped log line
     recently_created_changed = Signal(object)  # set[str] — branches newly created in this session
     selection_changed = Signal(object)  # str | None — currently selected SHA, or WIP_SHA, or None
+    # Commit-detail loading (right panel). The payload is the requested
+    # SHA, the ``CommitInfo`` (or ``None`` when unknown) and the list of
+    # ``FileChange``. Results may arrive synchronously (cache hit /
+    # ``async_enabled=False``) or from a worker — the consumer must
+    # re-check that the SHA is still the displayed one before applying.
+    commit_detail_ready = Signal(str, object, object)
+    # Per-file diff for the commit-detail panel:
+    # (sha, path, text, context_lines). ``context_lines`` distinguishes
+    # the changes-only variant from the full-document one.
+    commit_file_diff_ready = Signal(str, str, str, int)
+    # Lightweight background *reads* (commit detail, per-file diff).
+    # Unlike ``busy_changed`` this does NOT engage the mutation guard —
+    # it only drives the status-bar spinner so the user sees that a
+    # load is in flight while the UI stays responsive.
+    activity_changed = Signal(bool)
 
     def __init__(
         self,
@@ -105,7 +122,7 @@ class MainViewModel(QObject):
         super().__init__(parent)
         self._repo_manager: RepositoryManager | None = None
         self._command_processor = CommandProcessor(self)
-        self._graph_view_model = GraphViewModel(None, self)
+        self._graph_view_model = GraphViewModel(None, self, async_enabled=async_enabled)
         self._commit_panel_view_model = CommitPanelViewModel(self)
         self._branch_panel_view_model = BranchPanelViewModel(self)
         # ``None`` means "no conflict in progress". When a dict is
@@ -145,6 +162,11 @@ class MainViewModel(QObject):
         self._graph_view_model.error_occurred.connect(self.error_occurred)
         self._commit_panel_view_model.error_occurred.connect(self.error_occurred)
         self._branch_panel_view_model.error_occurred.connect(self.error_occurred)
+        # Infinite-scroll page loads drive the same status-bar spinner
+        # as repository switches.
+        self._graph_view_model.history_loading_changed.connect(
+            self._on_history_loading_changed,
+        )
 
         # ``selected_commit_sha`` drives the right panel. ``None`` means
         # the panel is hidden; ``WIP_SHA`` means the WIP / commit-input
@@ -158,6 +180,23 @@ class MainViewModel(QObject):
         # ``set_repository`` and refreshed via
         # :attr:`recently_created_changed` so widgets can re-pull it.
         self._recently_created_branches: set[str] = set()
+        # Memoized ``branch_of_commit`` answers — the git subprocesses
+        # behind one lookup add up to ~0.7 s on a large repo, so repeat
+        # clicks on the same commit must not re-run them.  Cleared on
+        # every repository change.
+        self._branch_of_commit_cache: dict[str, BranchAttribution | None] = {}
+        # LRU caches for the right panel's commit-detail loads. One
+        # uncached click on a large repo costs ~0.6 s of git subprocesses
+        # (branch attribution) plus up to seconds for a big tree diff,
+        # so repeat views of the same commit / file must be served from
+        # memory. Cleared on every repository change.
+        self._commit_detail_cache: OrderedDict[
+            str, tuple[object, list, BranchAttribution | None]
+        ] = OrderedDict()
+        self._commit_diff_cache: OrderedDict[tuple[str, str, int], str] = OrderedDict()
+        # Reference count of in-flight lightweight background reads;
+        # drives ``activity_changed`` (spinner only, no mutation guard).
+        self._activity_count: int = 0
 
     # ----- destructive-action confirmation ------------------------------
 
@@ -326,6 +365,12 @@ class MainViewModel(QObject):
         # logic doesn't carry stale state across repositories.
         self._recently_created_branches = set()
         self.recently_created_changed.emit(set(self._recently_created_branches))
+        self._branch_of_commit_cache.clear()
+        self._commit_detail_cache.clear()
+        self._commit_diff_cache.clear()
+        if self._activity_count:
+            self._activity_count = 0
+            self.activity_changed.emit(False)
         if self._selected_commit_sha is not None:
             self._selected_commit_sha = None
             self.selection_changed.emit(None)
@@ -384,6 +429,13 @@ class MainViewModel(QObject):
         if repo_path is None:
             return
 
+        # Capture on the main thread: the worker must not touch the
+        # GraphViewModel, and the infinite-scroll window the user grew
+        # via ``load_more_commits`` must survive background reloads
+        # (otherwise every async refresh silently reverts the graph
+        # to the default 500-row page).
+        history_limit = self._graph_view_model.history_limit
+
         # Capture the generation token at dispatch time — if the user
         # swaps repositories while the worker runs, the result will be
         # stale and dropped in :meth:`_on_result` (R2.2 C7).
@@ -393,7 +445,10 @@ class MainViewModel(QObject):
         self._is_busy = True
         self.busy_changed.emit(True)
 
-        def _work(repo_path: str = repo_path) -> dict | None:
+        def _work(
+            repo_path: str = repo_path,
+            history_limit: int = history_limit,
+        ) -> dict | None:
             """Open a worker-owned RepositoryManager, read all data,
             and return a result dict.  The worker's pygit2.Repository is
             never accessed from the main thread, avoiding libgit2's
@@ -407,12 +462,26 @@ class MainViewModel(QObject):
             try:
                 debug_print("[worker::bg] _compute_graph...")
                 _t1 = _wt.monotonic()
-                rows, err = GraphViewModel._compute_graph(worker_repo)
+                rows, err = GraphViewModel._compute_graph(
+                    worker_repo, history_limit=history_limit,
+                )
                 _elapsed = _wt.monotonic() - _t1
                 _nrows = len(rows) if rows else 0
                 debug_print(f"[worker::bg] _compute_graph took {_elapsed:.2f}s, rows={_nrows}")
                 if err is not None:
                     return {"error": err}
+                # The infinite scroll and the "showing N of M" label
+                # read ``truncated_count``; the sync path computes it
+                # in ``refresh_graph`` but this worker bypasses that
+                # method, so do it here (a full-DAG walk is cheap next
+                # to ``_compute_graph`` and happens off the UI thread).
+                try:
+                    total = worker_repo.count_all_history()
+                    truncated_count = (
+                        total - history_limit if total > history_limit else 0
+                    )
+                except (GitError, pygit2.GitError, OSError):
+                    truncated_count = 0
                 debug_print("[worker::bg] _compute_status_data...")
                 _t2 = _wt.monotonic()
                 file_changes, staged, raw_status = (
@@ -441,6 +510,7 @@ class MainViewModel(QObject):
                 debug_print(f"[worker::bg] worker_repo closed, total: {_wt.monotonic() - _t0:.2f}s")
             return {
                 "rows": rows,
+                "truncated_count": truncated_count,
                 "file_changes": file_changes,
                 "staged": staged,
                 "raw_status": raw_status,
@@ -469,6 +539,7 @@ class MainViewModel(QObject):
             raw_status: dict = data["raw_status"]
             branch_data: dict = data["branch_data"]
 
+            self._graph_view_model._truncated_count = data.get("truncated_count", 0)
             self._graph_view_model.graph_updated.emit(rows)
             self._commit_panel_view_model._file_changes = file_changes
             self._commit_panel_view_model._staged_files = staged
@@ -499,6 +570,16 @@ class MainViewModel(QObject):
         debug_print("[worker] dispatched")
 
     # ----- verb commands ----------------------------------------------
+
+    def _on_history_loading_changed(self, busy: bool) -> None:
+        """Forward the graph's infinite-scroll loading bursts to the UI.
+
+        Drives the same status-bar spinner as repository switches so
+        the user gets visible feedback while the next history page is
+        being built.
+        """
+        self._is_busy = busy
+        self.busy_changed.emit(busy)
 
     @_guard_mutation
     def commit_changes(self, message: str) -> None:
@@ -684,6 +765,15 @@ class MainViewModel(QObject):
         operation is in flight. In either case the current panel state is
         preserved; callers can retry after the operation completes.
 
+        When ``async_enabled`` is on (production) the refresh is routed
+        through :meth:`load_repository_data`, which does the heavy
+        graph / status / branch reads on a worker thread. The previous
+        synchronous refresh froze the UI for seconds on large repos
+        every time the application regained focus — any click (e.g. a
+        right-click on the repo tab) queued behind it felt broken.
+        Tests construct the VM with ``async_enabled=False`` and keep
+        the synchronous behaviour.
+
         Child ViewModels route expected :class:`GitError` instances through
         :attr:`error_occurred`; this method catches those errors and emits a
         user-facing refresh failure while leaving existing state intact.
@@ -693,6 +783,9 @@ class MainViewModel(QObject):
         if self._is_busy:
             return
         self._log("refresh", "Refreshing repository state from disk")
+        if self._async_enabled:
+            self.load_repository_data()
+            return
         try:
             self._refresh_all_views()
         except GitError as exc:
@@ -2104,21 +2197,243 @@ class MainViewModel(QObject):
         except GitError:
             return False
 
-    def branch_of_commit(self, sha: str) -> str | None:
-        """Return the name of the branch ``sha`` belongs to, or ``None``.
+    def branch_of_commit(self, sha: str) -> BranchAttribution | None:
+        """Return the branch attribution for ``sha``, or ``None``.
 
         Non-mutating query for the commit detail panel's "Branch:"
         line; ``None`` when no repository is open or the sha is
-        unknown (e.g. the synthetic WIP row).
+        unknown (e.g. the synthetic WIP row).  The ``certain`` flag
+        tells the UI whether the name is a structural fact
+        (first-parent chain) or a nearest-ref reconstruction.
         """
         if self._repo_manager is None or not self._repo_manager.is_open:
             return None
+        if sha in self._branch_of_commit_cache:
+            return self._branch_of_commit_cache[sha]
         from src.core.operations import branch_of_commit as _branch_of
 
         try:
-            return _branch_of(self._repo_manager, sha)
+            result = _branch_of(self._repo_manager, sha)
         except GitError:
-            return None
+            result = None
+        self._branch_of_commit_cache[sha] = result
+        return result
+
+    # ----- commit-detail loading (right panel, R4 perf) ----------------
+
+    _COMMIT_DETAIL_CACHE_SIZE = 32
+    _COMMIT_DIFF_CACHE_SIZE = 24
+
+    def _activity_begin(self) -> None:
+        """Mark the start of a lightweight background read (spinner only)."""
+        self._activity_count += 1
+        if self._activity_count == 1:
+            self.activity_changed.emit(True)
+
+    def _activity_end(self) -> None:
+        if self._activity_count > 0:
+            self._activity_count -= 1
+        if self._activity_count == 0:
+            self.activity_changed.emit(False)
+
+    @staticmethod
+    def _compute_commit_detail(
+        mgr: RepositoryManager, sha: str,
+    ) -> tuple[object, list, BranchAttribution | None]:
+        """Read ``(info, changes, attribution)`` for ``sha`` from *mgr*.
+
+        Pure read — safe to run on a worker with a worker-owned manager.
+        Errors degrade gracefully: an unknown SHA yields ``None`` info
+        (the panel renders its empty state), a failed tree diff yields
+        an empty file list, a failed attribution yields ``None``.
+        """
+        try:
+            info = mgr.get_commit(sha)
+        except GitError:
+            info = None
+        if info is None:
+            return None, [], None
+        try:
+            changes = mgr.get_commit_changes(sha)
+        except GitError:
+            changes = []
+        from src.core.operations import branch_of_commit as _branch_of
+
+        try:
+            attr = _branch_of(mgr, sha)
+        except GitError:
+            attr = None
+        return info, changes, attr
+
+    def _store_commit_detail(
+        self,
+        sha: str,
+        info: object,
+        changes: list,
+        attr: BranchAttribution | None,
+    ) -> None:
+        self._commit_detail_cache[sha] = (info, changes, attr)
+        self._commit_detail_cache.move_to_end(sha)
+        while len(self._commit_detail_cache) > self._COMMIT_DETAIL_CACHE_SIZE:
+            self._commit_detail_cache.popitem(last=False)
+        # Warm the attribution cache so the panel's ``branch_of_commit``
+        # call during ``_populate`` never re-runs the git subprocesses.
+        self._branch_of_commit_cache[sha] = attr
+
+    def request_commit_detail(self, sha: str) -> None:
+        """Load the right-panel data for ``sha`` and emit ``commit_detail_ready``.
+
+        Serving order: LRU cache (instant) → inline compute when
+        ``async_enabled`` is False (tests keep the old synchronous
+        contract) → worker thread with a worker-owned
+        :class:`RepositoryManager` (production). The worker path keeps
+        the ~0.6 s of git subprocesses plus the tree diff off the UI
+        thread; ``activity_changed`` drives the status-bar spinner
+        while it runs.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.commit_detail_ready.emit(sha, None, [])
+            return
+        cached = self._commit_detail_cache.get(sha)
+        if cached is not None:
+            self._commit_detail_cache.move_to_end(sha)
+            info, changes, _attr = cached
+            self.commit_detail_ready.emit(sha, info, changes)
+            return
+        if not self._async_enabled:
+            info, changes, attr = self._compute_commit_detail(self._repo_manager, sha)
+            self._store_commit_detail(sha, info, changes, attr)
+            self.commit_detail_ready.emit(sha, info, changes)
+            return
+
+        repo_path = self._repo_manager.path
+        generation = self._async_generation
+        self._activity_begin()
+
+        def _work(
+            repo_path: str = repo_path,
+            sha: str = sha,
+        ) -> tuple[object, list, BranchAttribution | None]:
+            worker_repo = RepositoryManager()
+            worker_repo.open(repo_path)
+            try:
+                return MainViewModel._compute_commit_detail(worker_repo, sha)
+            finally:
+                worker_repo.close()
+
+        def _on_result(result: object) -> None:
+            self._activity_end()
+            if generation != self._async_generation:
+                return
+            info, changes, attr = result  # type: ignore[misc]
+            self._store_commit_detail(sha, info, changes, attr)
+            self.commit_detail_ready.emit(sha, info, changes)
+
+        def _on_failure(exc: object) -> None:
+            self._activity_end()
+            if generation != self._async_generation:
+                return
+            self.error_occurred.emit(str(exc))
+
+        worker = AsyncWorker(_work)
+        worker.signals.finished.connect(_on_result)
+        worker.signals.failed.connect(_on_failure)
+        self._active_workers.add(worker)
+        worker.signals.lifespan_finished.connect(
+            lambda w=worker: self._on_async_finished(w),
+        )
+        QThreadPool.globalInstance().start(worker)
+
+    def request_commit_file_diff(
+        self, sha: str, path: str, context_lines: int = 3,
+    ) -> None:
+        """Load the unified diff for ``path`` in ``sha`` and emit
+        ``commit_file_diff_ready``.
+
+        Same serving order as :meth:`request_commit_detail`. A failure
+        surfaces via :attr:`error_occurred` and an empty diff text —
+        matching the panel's previous behaviour of rendering an empty
+        diff on :class:`GitError`.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.commit_file_diff_ready.emit(sha, path, "", context_lines)
+            return
+        key = (sha, path, context_lines)
+        cached = self._commit_diff_cache.get(key)
+        if cached is not None:
+            self._commit_diff_cache.move_to_end(key)
+            self.commit_file_diff_ready.emit(sha, path, cached, context_lines)
+            return
+        if not self._async_enabled:
+            try:
+                text = self._compute_file_diff(
+                    self._repo_manager, sha, path, context_lines,
+                )
+            except GitError as exc:
+                self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
+                text = ""
+            self._store_file_diff(key, text)
+            self.commit_file_diff_ready.emit(sha, path, text, context_lines)
+            return
+
+        repo_path = self._repo_manager.path
+        generation = self._async_generation
+        self._activity_begin()
+
+        def _work(
+            repo_path: str = repo_path,
+            sha: str = sha,
+            path: str = path,
+            context_lines: int = context_lines,
+        ) -> str:
+            worker_repo = RepositoryManager()
+            worker_repo.open(repo_path)
+            try:
+                return MainViewModel._compute_file_diff(
+                    worker_repo, sha, path, context_lines,
+                )
+            finally:
+                worker_repo.close()
+
+        def _on_result(result: object) -> None:
+            self._activity_end()
+            if generation != self._async_generation:
+                return
+            text: str = result  # type: ignore[assignment]
+            self._store_file_diff(key, text)
+            self.commit_file_diff_ready.emit(sha, path, text, context_lines)
+
+        def _on_failure(exc: object) -> None:
+            self._activity_end()
+            if generation != self._async_generation:
+                return
+            self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
+            # The panel still needs a (empty) result so it can leave
+            # the loading state — mirror the old synchronous behaviour.
+            self.commit_file_diff_ready.emit(sha, path, "", context_lines)
+
+        worker = AsyncWorker(_work)
+        worker.signals.finished.connect(_on_result)
+        worker.signals.failed.connect(_on_failure)
+        self._active_workers.add(worker)
+        worker.signals.lifespan_finished.connect(
+            lambda w=worker: self._on_async_finished(w),
+        )
+        QThreadPool.globalInstance().start(worker)
+
+    @staticmethod
+    def _compute_file_diff(
+        mgr: RepositoryManager, sha: str, path: str, context_lines: int,
+    ) -> str:
+        from src.core.operations import commit_file_diff_text
+
+        return commit_file_diff_text(mgr, sha, path, context_lines=context_lines)
+
+    def _store_file_diff(self, key: tuple[str, str, int], text: str) -> None:
+        self._commit_diff_cache[key] = text
+        self._commit_diff_cache.move_to_end(key)
+        while len(self._commit_diff_cache) > self._COMMIT_DIFF_CACHE_SIZE:
+            self._commit_diff_cache.popitem(last=False)
 
     @_guard_mutation
     def squash_commits(self, shas: list[str], message: str) -> None:

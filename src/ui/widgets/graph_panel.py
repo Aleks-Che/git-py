@@ -384,6 +384,11 @@ class GraphTableWidget(QWidget):
         self._scrollbar = QScrollBar(Qt.Orientation.Vertical, self)
         self._scrollbar.valueChanged.connect(self._on_scroll)
         self._scrollbar.setRange(0, 0)
+        # Re-entrancy guard for the infinite scroll: loading the next
+        # history page rebuilds the graph and re-ranges the scrollbar,
+        # which fires ``valueChanged`` again — the flag prevents a
+        # recursive page request while one is already in flight.
+        self._loading_more = False
 
         # R3.1 (P2): a small overlay label that surfaces the
         # "showing N of M (Load more)" indicator when the visible
@@ -400,6 +405,13 @@ class GraphTableWidget(QWidget):
         self._truncation_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
         )
+        # The "(Load more)" part is a real hyperlink — clicking it
+        # loads the next history page, same as scrolling to the
+        # bottom (GitKraken-style infinite scroll).
+        self._truncation_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction,
+        )
+        self._truncation_label.linkActivated.connect(self._on_load_more_link)
         self._truncation_label.hide()
 
         self._h_scrollbars: list[QScrollBar] = [
@@ -594,10 +606,9 @@ class GraphTableWidget(QWidget):
 
         Reads :attr:`GraphViewModel.truncated_count`; renders a
         ``"showing N of M (Load more)"`` string when the count is
-        positive, hides the label otherwise.  The (out-of-scope
-        for R3.1) "Load more" button is presented as plain text
-        so the visual contract is already correct — wiring the
-        button is a follow-up.
+        positive, hides the label otherwise.  "Load more" is a
+        hyperlink wired to :meth:`GraphViewModel.load_more_commits`
+        — the same infinite-scroll entry point the scrollbar uses.
         """
         vm = self._view_model
         truncated = 0
@@ -616,7 +627,9 @@ class GraphTableWidget(QWidget):
             return
         total = visible + truncated
         self._truncation_label.setText(
-            f"showing {visible} of {total} (Load more)",
+            f'showing {visible} of {total} '
+            f'(<a href="load-more" style="color: #569CD6; text-decoration: underline;">'
+            f"Load more</a>)",
         )
         self._truncation_label.adjustSize()
         # Re-anchor in the rightmost header column so the label
@@ -654,6 +667,43 @@ class GraphTableWidget(QWidget):
     def _on_scroll(self, value: int) -> None:
         self._scroll_offset = value
         self.update()
+        self._maybe_request_more_history(value)
+
+    def _maybe_request_more_history(self, value: int) -> None:
+        """Ask the ViewModel for the next history page near the bottom.
+
+        GitKraken-style infinite scroll: when the scrollbar comes
+        within two rows of the bottom and the ViewModel reports
+        truncated history, the next page is loaded so the history
+        appears to grow seamlessly.  Rows are appended at the bottom
+        (newest-first order), so the scroll position survives the
+        page load.
+        """
+        if self._loading_more or not self._rows:
+            return
+        bar = self._scrollbar
+        if bar.maximum() <= 0:
+            return
+        if value < bar.maximum() - self._cfg.row_height * 2:
+            return
+        if getattr(self._view_model, "truncated_count", 0) <= 0:
+            return
+        self._request_more_history()
+
+    def _on_load_more_link(self, _href: str) -> None:
+        self._request_more_history()
+
+    def _request_more_history(self) -> None:
+        if self._loading_more:
+            return
+        load_more = getattr(self._view_model, "load_more_commits", None)
+        if load_more is None:
+            return
+        self._loading_more = True
+        try:
+            load_more()
+        finally:
+            self._loading_more = False
 
     def _on_h_scroll(self, col: int, value: int) -> None:
         self._h_scrolls[col] = value
@@ -770,26 +820,41 @@ class GraphTableWidget(QWidget):
         return [max(0, branch_overflow), max(0, graph_overflow), max(0, text_overflow)]
 
     def _measure_branch_row(self, branch_refs: list, fm) -> int:
+        """Width of the branch column content *as rendered*.
+
+        Multi-branch rows collapse to a single priority chip with a
+        collapse indicator (:meth:`_draw_branch_chips`), so the
+        overflow must be measured against that one chip.  Summing
+        every ref's full name produced a phantom scrollbar wider
+        than anything on screen for rows whose extra branches live
+        only in the hover popup (kilocode ``232d7f2c`` — 3 long
+        remote names).
+        """
         icon_size = self._cfg.branch_icon_size
         pad = 5
         gap = 3
         avatar_size = icon_size + 4
-        cursor = 6
-        for branch in branch_refs:
-            display = branch["name"]
-            if branch.get("is_remote"):
-                parts = display.split("/", 1)
-                if len(parts) == 2:
-                    display = parts[1]
-            reserved = (
-                pad * 2
-                + (icon_size + gap if branch.get("is_head") else 0)
-                + (gap + icon_size if not branch.get("is_remote") else 0)
-                + gap
-                + avatar_size
-            )
-            cursor += fm.horizontalAdvance(display) + reserved
-        return cursor
+
+        local_display_names = {
+            _branch_display_name(b) for b in branch_refs if not b.get("is_remote")
+        }
+        visible = _suppress_dup_remotes(branch_refs, local_display_names)
+        if not visible:
+            return 0
+        primary = sorted(visible, key=self._branch_priority_key)[0]
+        hidden_count = len(visible) - 1
+
+        content_w = pad
+        if primary.get("is_head"):
+            content_w += icon_size + gap
+        content_w += fm.horizontalAdvance(_branch_display_name(primary))
+        if not primary.get("is_remote"):
+            content_w += gap + icon_size
+        content_w += gap + avatar_size + pad
+        if hidden_count > 0:
+            # The collapse indicator slot mirrors the draw code.
+            content_w += 18 + (8 if hidden_count > 1 else 0)
+        return 6 + content_w
 
     def _col_ranges(self) -> list[tuple[int, int]]:
         ranges: list[tuple[int, int]] = []
@@ -1663,10 +1728,19 @@ class GraphTableWidget(QWidget):
                     for ci, pc in enumerate(prev_cells):
                         if ci // 2 == li and pc.get("t", _T_EMPTY) != _T_EMPTY:
                             pt = pc.get("t", _T_EMPTY)
-                            if pt in (_T_HORIZONTAL_PIPE, _T_TEE_RIGHT, _T_TEE_LEFT, _T_TEE_UP):
+                            if pt in (
+                                _T_HORIZONTAL_PIPE,
+                                _T_TEE_RIGHT,
+                                _T_TEE_LEFT,
+                                _T_TEE_UP,
+                                _T_BRANCH_LEFT,
+                            ):
                                 # ``"p"`` is now always written by ``CellInfo.to_dict``;
                                 # if it's missing the cell is malformed and we fall back
                                 # to the horizontal colour (``c``) for robustness.
+                                # For a relay-split ``BRANCH_LEFT`` ``"p"`` is present
+                                # only when the bend is two-coloured — and it is exactly
+                                # the DOWN-pipe colour the bridge must continue with.
                                 clr_idx = pc.get("p")
                                 if clr_idx is None:
                                     clr_idx = pc.get("c", 0)
@@ -1677,7 +1751,13 @@ class GraphTableWidget(QWidget):
                         for ci, cell in enumerate(cells):
                             if ci // 2 == li and cell.get("t", _T_EMPTY) != _T_EMPTY:
                                 t = cell.get("t", _T_EMPTY)
-                                if t in (_T_HORIZONTAL_PIPE, _T_TEE_RIGHT, _T_TEE_LEFT, _T_TEE_UP):
+                                if t in (
+                                    _T_HORIZONTAL_PIPE,
+                                    _T_TEE_RIGHT,
+                                    _T_TEE_LEFT,
+                                    _T_TEE_UP,
+                                    _T_BRANCH_LEFT,
+                                ):
                                     clr_idx = cell.get("p")
                                     if clr_idx is None:
                                         clr_idx = cell.get("c", 0)
@@ -2856,7 +2936,18 @@ def _draw_cell_row(
         elif t == _T_BRANCH_RIGHT:
             _draw_branch_right(painter, x, y_center, bot_half_h, edge_width, color, lane_w)
         elif t == _T_BRANCH_LEFT:
-            _draw_branch_left(painter, x, y_center, bot_half_h, edge_width, color, lane_w)
+            if has_pipe_color:
+                # Relay-split bend (merge connector owning the trunk
+                # left of a fork corridor): the corridor leaving the
+                # bend rightward carries the corridor colour, while the
+                # 90-degree bend itself (left arm + down pipe) keeps
+                # the second parent's colour (kilocode ``1a3c7191``).
+                _draw_horiz_line(painter, x, y_center, lane_w / 2, edge_width, color)
+                _draw_branch_left(
+                    painter, x, y_center, bot_half_h, edge_width, p_color, lane_w
+                )
+            else:
+                _draw_branch_left(painter, x, y_center, bot_half_h, edge_width, color, lane_w)
         elif t == _T_MERGE_RIGHT:
             _draw_merge_right(painter, x, y_center, half_h, edge_width, color, lane_w)
         elif t == _T_MERGE_LEFT:

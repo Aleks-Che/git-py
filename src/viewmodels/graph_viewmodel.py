@@ -16,7 +16,7 @@ import time
 from collections.abc import Callable
 
 import pygit2
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QThreadPool, Signal
 
 from src.core.exceptions import GitError
 from src.core.graph_v2 import (
@@ -28,6 +28,7 @@ from src.core.graph_v2 import (
 )
 from src.core.models import CommitInfo, StashInfo
 from src.core.repository import RepositoryManager
+from src.utils.async_worker import AsyncWorker
 from src.utils.config import default_config_path, get_int, load_config
 from src.utils.debug_mode import dump_graph, is_debug_mode
 
@@ -111,6 +112,14 @@ class GraphViewModel(QObject):
     commit_selected = Signal(str)
     error_occurred = Signal(str)
     search_results_changed = Signal(list)
+    history_loading_changed = Signal(bool)
+    """``True`` while :meth:`load_more_commits` rebuilds the graph for
+    the next history page, ``False`` when it finishes.  Forwarded by
+    :class:`MainViewModel` as ``busy_changed`` so the status-bar
+    spinner (the one shown on repository switches) also covers
+    infinite-scroll page loads.  With ``async_enabled`` the recompute
+    runs on a background thread, so the burst stays visible (and the
+    spinner animated) instead of freezing the UI for the duration."""
     scroll_to_commit_requested = Signal(str)
     """Emitted by :meth:`scroll_to_commit`; the view scrolls the commit
     (vertically and horizontally) so the user lands on it. Decoupled from
@@ -131,6 +140,7 @@ class GraphViewModel(QObject):
         parent=None,
         *,
         history_limit: int | None = None,
+        async_enabled: bool = False,
     ) -> None:
         super().__init__(parent)
         self._repo: RepositoryManager | None = repo_manager
@@ -145,6 +155,13 @@ class GraphViewModel(QObject):
         self._history_limit: int = (
             history_limit if history_limit is not None else _load_graph_history_limit()
         )
+        # GitKraken-style infinite scroll: :meth:`load_more_commits`
+        # grows the visible history one page at a time when the user
+        # scrolls to the bottom.  ``_page_size`` is the increment —
+        # the limit the VM started with — and ``set_repository``
+        # resets the limit back to it so a new repo never inherits
+        # the previous session's grown window.
+        self._page_size: int = self._history_limit
         self._truncated_count: int = 0
         # R3.2 (P7): branch-priority cache, computed once per
         # ``refresh_graph`` instead of being recomputed for every chip
@@ -154,6 +171,19 @@ class GraphViewModel(QObject):
         # :meth:`branch_priority_for` instead of calling pygit2 on
         # the UI thread.
         self._branch_priority_cache: dict[str, tuple[int, str]] = {}
+        # ``async_enabled`` moves the ``load_more_commits`` recompute
+        # to a background thread (production passes ``True`` via
+        # :class:`MainViewModel`; tests default to the synchronous
+        # path).  ``_load_more_worker`` keeps a strong reference to
+        # the in-flight :class:`AsyncWorker` so it is not garbage
+        # collected mid-run; ``_load_more_in_flight`` rejects
+        # re-entrant page requests; ``_load_more_generation`` is
+        # bumped by :meth:`set_repository` so a result computed for
+        # the previous binding is dropped (mirrors R2.2 C7).
+        self._async_enabled: bool = async_enabled
+        self._load_more_worker: AsyncWorker | None = None
+        self._load_more_in_flight: bool = False
+        self._load_more_generation: int = 0
 
     # ------------------------------------------------------------------
     # repository binding
@@ -170,6 +200,13 @@ class GraphViewModel(QObject):
         Passing ``None`` clears the graph (emits an empty list).
         """
         self._repo = manager
+        # Reset the infinite-scroll window: a different repository
+        # starts at one page regardless of how far the user scrolled
+        # the previous one.  The generation bump also invalidates any
+        # async page-load result still in flight — it belongs to the
+        # previous binding.
+        self._load_more_generation += 1
+        self._history_limit = self._page_size
         if refresh:
             self.refresh_graph()
 
@@ -192,6 +229,10 @@ class GraphViewModel(QObject):
         if value <= 0:
             return
         self._history_limit = int(value)
+        # Keep the infinite-scroll page in sync: a new configured
+        # window is also the page ``load_more_commits`` grows by and
+        # the size ``set_repository`` resets to.
+        self._page_size = int(value)
 
     @property
     def truncated_count(self) -> int:
@@ -233,6 +274,110 @@ class GraphViewModel(QObject):
         # thread for every chip.
         self._update_branch_priority_cache()
         self.graph_updated.emit(rows)
+
+    def load_more_commits(self) -> None:
+        """Grow the visible history by one page and re-emit the layout.
+
+        GitKraken-style infinite scroll: the widget calls this when
+        the user scrolls to the bottom of the loaded history (or
+        clicks the "Load more" link in the truncation label).  No-op
+        when no repository is bound or the full DAG is already
+        visible (``truncated_count == 0``).
+
+        With ``async_enabled`` the recompute runs on a background
+        thread (:meth:`_load_more_async`) so the UI — and the
+        status-bar spinner driven by :attr:`history_loading_changed` —
+        stays responsive; :attr:`graph_updated` fires when the worker
+        finishes.  Otherwise the graph is rebuilt synchronously before
+        the method returns.
+        """
+        if self._repo is None or not self._repo.is_open:
+            return
+        if self._truncated_count <= 0:
+            return
+        if self._load_more_in_flight:
+            # An async page load is already running — the scroll
+            # trigger re-fires on every scrollbar tick, so without
+            # this guard the window would grow unboundedly.
+            return
+        self._history_limit += self._page_size
+        if self._async_enabled:
+            self._load_more_async()
+            return
+        self.history_loading_changed.emit(True)
+        try:
+            self.refresh_graph()
+        finally:
+            self.history_loading_changed.emit(False)
+
+    def _load_more_async(self) -> None:
+        """Run the page-load recompute on a background thread.
+
+        Mirrors :meth:`MainViewModel.load_repository_data`: the worker
+        opens its own :class:`RepositoryManager` on the same path
+        (libgit2 repositories are not thread-safe) and the result is
+        applied on the UI thread via queued signal delivery.
+        """
+        repo = self._repo
+        repo_path = repo.path
+        limit = self._history_limit
+        generation = self._load_more_generation
+        self._load_more_in_flight = True
+        self.history_loading_changed.emit(True)
+
+        def _work() -> dict:
+            worker_repo = RepositoryManager()
+            worker_repo.open(repo_path)
+            try:
+                rows, err = GraphViewModel._compute_graph(
+                    worker_repo, history_limit=limit,
+                )
+                if err is not None:
+                    return {"error": err}
+                try:
+                    total = worker_repo.count_all_history()
+                    truncated = total - limit if total > limit else 0
+                except (GitError, pygit2.GitError, OSError):
+                    truncated = 0
+            finally:
+                worker_repo.close()
+            return {"rows": rows, "truncated_count": truncated}
+
+        def _on_result(result: object) -> None:
+            self._load_more_in_flight = False
+            try:
+                if generation != self._load_more_generation or self._repo is not repo:
+                    # Stale — the repository was re-bound while the
+                    # worker ran; the fresh binding owns the state now.
+                    return
+                data: dict = result  # type: ignore[assignment]
+                err = data.get("error")
+                if err is not None:
+                    self.error_occurred.emit(str(err))
+                    return
+                self._truncated_count = data["truncated_count"]
+                self.graph_updated.emit(data["rows"])
+            finally:
+                self.history_loading_changed.emit(False)
+
+        def _on_failure(exc: object) -> None:
+            self._load_more_in_flight = False
+            try:
+                if generation == self._load_more_generation and self._repo is repo:
+                    self.error_occurred.emit(str(exc))
+            finally:
+                self.history_loading_changed.emit(False)
+
+        worker = AsyncWorker(_work)
+        worker.signals.finished.connect(_on_result)
+        worker.signals.failed.connect(_on_failure)
+        self._load_more_worker = worker
+        worker.signals.lifespan_finished.connect(self._clear_load_more_worker)
+        QThreadPool.globalInstance().start(worker)
+
+    def _clear_load_more_worker(self) -> None:
+        """Drop the strong reference to the finished page-load worker."""
+        self._load_more_worker = None
 
     def _update_branch_priority_cache(self) -> None:
         """Recompute :attr:`branch_priority_cache` from the current repo.

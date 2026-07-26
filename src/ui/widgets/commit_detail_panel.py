@@ -19,15 +19,16 @@ for the right-click context menu (*Apply N stashed files* /
 selection set is what gets acted on, while the last plain-clicked
 file keeps driving the centre-column diff.
 
-The widget is bound to :class:`MainViewModel` for the commit's
-``CommitInfo`` and to :class:`RepositoryManager` (through the VM) for
-the list of changed files and the per-file diff.
+The widget is bound to :class:`MainViewModel`: commit details and
+per-file diffs are requested via :meth:`MainViewModel.request_commit_detail`
+/ :meth:`MainViewModel.request_commit_file_diff`, which serve results
+asynchronously from a worker (or inline for a synchronous VM) so a
+click on a commit never freezes the UI on a large repository.
 """
 from __future__ import annotations
 
 import html
 
-import pygit2
 from PySide6.QtCore import QRect, QSize, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter
 from PySide6.QtWidgets import (
@@ -48,8 +49,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.core.exceptions import GitError
-from src.core.models import CommitInfo, FileChange
+from src.core.models import BranchAttribution, CommitInfo, FileChange
 from src.ui.widgets.file_list_model import (
     DEFAULT_PATH_TEXT_COLOR,
     PATH_TEXT_COLOR,
@@ -180,6 +180,18 @@ class CommitDetailPanel(QWidget):
         self._main_vm = main_view_model
         self._selected_file: str | None = None
         self._current_sha: str | None = None
+        self._split_initialized = False
+        # Inputs cached so ``request_full_document`` can re-request the
+        # full-document variant lazily (R3.2 P4).
+        self._current_diff_sha: str | None = None
+        self._current_diff_path: str | None = None
+        self._current_diff_changes_only: str = ""
+
+        # The VM serves commit details / file diffs asynchronously;
+        # results arrive here and are applied only when they still
+        # match the commit / file the user is looking at.
+        self._main_vm.commit_detail_ready.connect(self._on_commit_detail_ready)
+        self._main_vm.commit_file_diff_ready.connect(self._on_commit_file_diff_ready)
 
         self._build_ui()
         self._render_empty()
@@ -313,17 +325,22 @@ class CommitDetailPanel(QWidget):
         self._files.customContextMenuRequested.connect(self._on_file_context_menu)
         self._files.itemClicked.connect(self._on_files_item_clicked)
 
-        # --- splitter: 60% message+info / 40% files ---
+        # --- splitter: 50% message+info / 50% files ---
         top_container = QWidget()
         top_container.setObjectName("commit-detail-top")
         top_layout = QVBoxLayout(top_container)
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.setSpacing(4)
         top_layout.addWidget(self._message)
-        top_layout.addWidget(self._body_scroll, stretch=1)
+        # Filler between the subject and the body/info: pins the info
+        # block to the bottom edge of the top pane even when the commit
+        # has no body. The body scroll dominates the extra space when
+        # it is visible (stretch 100 vs 1), so the filler only takes
+        # over for body-less commits.
+        top_layout.addStretch(1)
+        top_layout.addWidget(self._body_scroll, stretch=100)
         top_layout.addSpacing(6)
         top_layout.addWidget(info_row)
-        top_layout.addStretch()
 
         files_container = QWidget()
         files_container.setObjectName("commit-detail-files")
@@ -336,8 +353,8 @@ class CommitDetailPanel(QWidget):
         self._splitter = QSplitter(Qt.Orientation.Vertical)
         self._splitter.addWidget(top_container)
         self._splitter.addWidget(files_container)
-        self._splitter.setStretchFactor(0, 3)
-        self._splitter.setStretchFactor(1, 2)
+        self._splitter.setStretchFactor(0, 1)
+        self._splitter.setStretchFactor(1, 1)
         self._splitter.setChildrenCollapsible(False)
 
         layout = QVBoxLayout(self)
@@ -345,12 +362,28 @@ class CommitDetailPanel(QWidget):
         layout.setSpacing(0)
         layout.addWidget(self._splitter, stretch=1)
 
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._enforce_initial_split()
+
     def resizeEvent(self, event) -> None:  # noqa: N802
-        """Enforce 60/40 split on first resize."""
         super().resizeEvent(event)
+        self._enforce_initial_split()
+
+    def _enforce_initial_split(self) -> None:
+        """Apply the default 50/50 split exactly once.
+
+        Runs on the first show/resize that reports a real splitter
+        height; after that the user's manual drags are left alone.
+        """
+        if self._split_initialized:
+            return
         h = self._splitter.height()
-        if h > 0 and self._splitter.sizes()[0] == 0:
-            self._splitter.setSizes([int(h * 0.6), int(h * 0.4)])
+        if h <= 0:
+            return
+        half = h // 2
+        self._splitter.setSizes([half, h - half])
+        self._split_initialized = True
 
     # ----- public API --------------------------------------------------
 
@@ -374,7 +407,9 @@ class CommitDetailPanel(QWidget):
             self.diff_ready.emit("")
             self.diff_pair_ready.emit("", "")
             return
-        self._compute_and_emit_diff(self._current_sha, path)
+        self._main_vm.request_commit_file_diff(
+            self._current_sha, path, context_lines=3,
+        )
 
     def show_commit(self, sha: str) -> None:
         """Populate the panel for the commit at ``sha``.
@@ -394,18 +429,19 @@ class CommitDetailPanel(QWidget):
         if repo is None or not repo.is_open:
             self._render_empty()
             return
-        try:
-            info = repo.get_commit(sha)
-        except GitError:
-            self._render_empty()
+        # The heavy reads (tree diff + branch attribution git calls)
+        # run on a worker in production; ``_on_commit_detail_ready``
+        # applies the result. With a synchronous VM (tests) the result
+        # is delivered inline before this call returns.
+        self._main_vm.request_commit_detail(sha)
+
+    def _on_commit_detail_ready(self, sha: str, info: object, changes: list) -> None:
+        """Apply the VM's commit-detail payload if it is still current."""
+        if sha != self._current_sha:
             return
         if info is None:
             self._render_empty()
             return
-        try:
-            changes = repo.get_commit_changes(sha)
-        except GitError:
-            changes = []
         self._populate(info, changes)
 
     def clear(self) -> None:
@@ -703,111 +739,48 @@ class CommitDetailPanel(QWidget):
 
     # ----- diff computation -------------------------------------------
 
-    def _compute_and_emit_diff(self, sha: str, path: str) -> None:
-        """Compute the commit-vs-parent diff for ``path`` and emit the
-        diff signals.
+    def _on_commit_file_diff_ready(
+        self, sha: str, path: str, text: str, context_lines: int,
+    ) -> None:
+        """Apply the VM's per-file diff payload if it is still current.
 
-        Emits :attr:`diff_ready` with the changes-only text eagerly;
-        the full-document variant is computed lazily on
-        :meth:`request_full_document` because rendering 2^31 context
-        lines is expensive on large commits (R3.2 P4).
+        The changes-only variant (``context_lines=3``) is cached and
+        re-emitted eagerly; the full-document variant completes the
+        ``diff_pair_ready`` pair (R3.2 P4). Stale results — the user
+        clicked another file or commit while the worker was running —
+        are dropped.
         """
-        repo = self._main_vm.repository_manager()
-        if repo is None or not repo.is_open:
-            self.diff_ready.emit("")
-            self.diff_pair_ready.emit("", "")
+        if context_lines == _FULL_DOCUMENT_CONTEXT_LINES:
+            if sha != self._current_diff_sha or path != self._current_diff_path:
+                return
+            self.diff_pair_ready.emit(self._current_diff_changes_only, text)
             return
-        try:
-            changes_only = self._build_commit_diff_text(
-                repo, sha, path, context_lines=3,
-            )
-        except GitError as exc:
-            self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
-            self.diff_ready.emit("")
-            self.diff_pair_ready.emit("", "")
+        if sha != self._current_sha or path != self._selected_file:
             return
-        # Cache the inputs so ``request_full_document`` can recompute
-        # the full variant lazily (R3.2 P4).
         self._current_diff_sha = sha
         self._current_diff_path = path
-        self._current_diff_changes_only = changes_only
-        self.diff_ready.emit(changes_only)
+        self._current_diff_changes_only = text
+        self.diff_ready.emit(text)
         # ``full_document`` is intentionally empty here — the toolbar
         # viewer will call ``request_full_document()`` when the user
         # toggles into full-document mode.
-        self.diff_pair_ready.emit(changes_only, "")
+        self.diff_pair_ready.emit(text, "")
 
     def request_full_document(self) -> None:
-        """Recompute the full-document diff and re-emit ``diff_pair_ready``.
+        """Request the full-document diff and re-emit ``diff_pair_ready``.
 
-        R3.2 (P4): ``_compute_and_emit_diff`` used to build both
-        changes-only and full-document eagerly.  We now defer
-        ``full_document`` to this explicit request so file clicks are
-        not blocked on the expensive 2^31-context-line variant.
+        R3.2 (P4): the expensive 2^31-context-line variant is deferred
+        to this explicit request so file clicks are not blocked on it.
+        The compute runs on the VM's worker in production; the result
+        arrives in :meth:`_on_commit_file_diff_ready`.
         """
-        sha = getattr(self, "_current_diff_sha", None)
-        path = getattr(self, "_current_diff_path", None)
-        changes_only = getattr(self, "_current_diff_changes_only", "")
-        if sha is None or path is None or changes_only == "":
+        sha = self._current_diff_sha
+        path = self._current_diff_path
+        if sha is None or path is None or not self._current_diff_changes_only:
             return
-        repo = self._main_vm.repository_manager()
-        if repo is None or not repo.is_open:
-            return
-        try:
-            full_document = self._build_commit_diff_text(
-                repo, sha, path, context_lines=_FULL_DOCUMENT_CONTEXT_LINES,
-            )
-        except GitError as exc:
-            self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
-            return
-        self.diff_pair_ready.emit(changes_only, full_document)
-
-    def _build_commit_diff_text(
-        self,
-        repo,  # noqa: ANN001 - RepositoryManager
-        sha: str,
-        path: str,
-        context_lines: int = 3,
-    ) -> str:
-        """Return the unified diff for ``path`` (commit tree vs its
-        first parent's tree).
-
-        For a root commit (no parents) the diff is against the empty
-        tree, so every file it introduces is reported as
-        ``new file``. We pick the patch for ``path`` out of a
-        multi-file diff via :meth:`_extract_patch_for`.
-
-        ``context_lines`` controls how many unchanged lines surround
-        each change: ``3`` (the default) produces a compact diff for
-        review; the *Full document* viewer mode passes a value large
-        enough to cover the whole file.
-        """
-        try:
-            obj = repo.repo.revparse_single(sha).peel(pygit2.Commit)
-        except (KeyError, pygit2.GitError, ValueError) as exc:
-            raise GitError(f"Unknown revision: {sha!r}") from exc
-        if obj.parent_ids:
-            try:
-                parent_tree = obj.parents[0].tree
-            except (KeyError, ValueError):
-                parent_tree = repo.repo.TreeBuilder().write()
-        else:
-            parent_tree = repo.repo.TreeBuilder().write()
-        try:
-            diff = repo.repo.diff(parent_tree, obj.tree, context_lines=context_lines)
-        except (pygit2.GitError, KeyError, ValueError) as exc:
-            raise GitError(f"Failed to diff {sha!r}: {exc}") from exc
-        return self._extract_patch_for(diff, path)
-
-    @staticmethod
-    def _extract_patch_for(diff, path: str) -> str:  # noqa: ANN001 - pygit2.Diff
-        """Return the patch text for ``path`` from a multi-file ``pygit2.Diff``."""
-        pieces: list[str] = []
-        for patch in diff:
-            delta = patch.delta
-            if (delta.new_file.path == path) or (delta.old_file.path == path):
-                pieces.append(patch.text or "")
-        return "".join(pieces)
+        self._main_vm.request_commit_file_diff(
+            sha, path, context_lines=_FULL_DOCUMENT_CONTEXT_LINES,
+        )
 
 __all__ = ["CommitDetailPanel"]
 
@@ -840,13 +813,15 @@ def _split_message(message: str) -> tuple[str, str]:
 
 def _format_info(
     info: CommitInfo,
-    branch: str | None = None,
+    branch: BranchAttribution | None = None,
 ) -> str:
     """Format the info block (author, committer, time, SHA, parents, branch).
 
-    ``branch`` is the name of the branch the commit belongs to
-    (``git name-rev`` semantics), supplied by the ViewModel; ``None``
-    omits the line.
+    ``branch`` is the commit's branch attribution, supplied by the
+    ViewModel; ``None`` omits the line.  A ``certain`` attribution
+    (the commit lies on the branch's first-parent chain) renders as
+    ``Branch:``; a heuristic nearest-ref reconstruction renders as
+    ``Reconstructed branch:`` so the user can tell fact from guess.
 
     Times are rendered as ``YYYY-MM-DD HH:MM:SS`` from the unix
     timestamp — we don't pull the system locale in here because the
@@ -894,11 +869,13 @@ def _format_info(
         )
     if info.parents:
         parents = ", ".join(html.escape(p[:7]) for p in info.parents)
-        parts.append(f"<b>Parents:</b> {parents}")
+        label = "Parent:" if len(info.parents) == 1 else "Parents:"
+        parts.append(f"<b>{label}</b> {parents}")
     else:
         parts.append("<b>Parents:</b> (root commit)")
     if branch:
-        parts.append(f"<b>Branch:</b> {html.escape(branch)}")
+        label = "Branch:" if branch.certain else "Reconstructed branch:"
+        parts.append(f"<b>{label}</b> {html.escape(branch.name)}")
     return "<br/>".join(parts)
 
 def _format_time(unix_ts: int) -> str:
