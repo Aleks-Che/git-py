@@ -127,3 +127,12 @@
 - Попытка ускорить `branch_of_commit` батчингом через `for-each-ref --contains` откачена после замера: обход ~1100 refs стоит ~140мс — медленнее двух spawn'ов общего случая (merge-base 20мс + name-rev 170мс).
 - Тесты: новый `tests/viewmodels/test_commit_detail_async.py` (9 шт: sync inline, кэши, async worker + activity, вложенность, async refresh_state); 2 теста капа в `test_diff_view_widget.py`; 8 UI-тестов правой панели переведены на ожидание async-загрузки (`_wait_detail_populated`, waitUntil по diff-состоянию, таймауты 15с под нагрузкой сьюта).
 - 1228 passed, ruff чистый.
+
+## Follow-up M (2026-07-25): иконочный тулбар + компактный поиск справа
+- **M1. Векторные иконки без ассетов**: новый `src/ui/icons.py` — глифы рисуются `QPainter`'ом на сетке 16×16 (pixmap 2× DPR, антиалиасинг, round caps/joins). Набор: `undo`/`redo` (стрелки-«уголки»), `fetch` (стрелка вниз на базовую линию), `pull` (стрелка вниз в лоток), `push` (стрелка вверх из лотка), `stash_push`/`stash_pop` (закрытый бокс со стрелкой вниз/вверх), `search` (лупа). У каждой иконки три pixmap'а по QIcon.Mode: Normal `#D4D4D4`, Disabled `#6A6A6A` (Qt сам показывает на задизейбленной кнопке), Active `#1F8AD2` (подсветка при hover стилем по умолчанию).
+- **M2. Тулбары на иконках**: Edit/Remote/Stash — `ToolButtonIconOnly`, `iconSize` 18; текст кнопок ушёл в тултип вместе с шорткатом (`_apply_toolbar_icon`: `action.text()` без `&` + ` (Ctrl+Z)` NativeText, тот же текст в `statusTip`). В меню те же QAction'ы — тексты и иконки видны и там.
+- **M3. Поиск справа и компактный**: в `search-toolbar` добавлен expanding-спейсер перед полем; `SearchBar` — фиксированная ширина 320 (вместо растягивания на весь экран), высота 28, лупа в `LeadingPosition`.
+- Атрибуты `_edit_toolbar`/`_remote_toolbar`/`_stash_toolbar` и objectName'ы сохранены — старые тесты не тронуты.
+- Тесты: новый `tests/ui/test_toolbar_icons.py` (6 шт: иконки не пустые, тултипы содержат текст+шорткат без `&`, IconOnly-стиль, distinct disabled-pixmap, спейсер+порядок виджетов, фикс. ширина ≤400).
+- Замечен флейк (pre-existing, из Follow-up L): `test_window_persistence` ловит «Signal source has been deleted», если async-воркер `load_repository_data` финиширует после удаления окна; поодиночке проходит.
+- 1234 passed, ruff чистый.

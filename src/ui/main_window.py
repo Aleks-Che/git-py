@@ -46,20 +46,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QStatusBar,
     QTabWidget,
     QToolBar,
+    QWidget,
 )
 
 from src.core.exceptions import GitError, RepositoryNotFoundError
@@ -68,6 +71,7 @@ from src.ui.dialogs.clone_dialog import CloneDialog
 from src.ui.dialogs.open_or_clone_dialog import OpenOrCloneDialog
 from src.ui.dialogs.remote_manage_dialog import RemoteManageDialog
 from src.ui.dialogs.settings_dialog import SettingsDialog
+from src.ui.icons import toolbar_icon
 from src.ui.widgets.action_history_widget import ActionHistoryWidget
 from src.ui.widgets.diff_view_widget import (
     DiffLineActionMode,
@@ -456,43 +460,71 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self._bottom_tabs.setTabVisible(idx, visible)
 
+    def _apply_toolbar_icon(self, action: QAction, icon_name: str) -> None:
+        """Give ``action`` a themed icon and a text + shortcut tooltip."""
+        action.setIcon(toolbar_icon(icon_name))
+        text = action.text().replace("&", "")
+        shortcut = action.shortcut().toString(QKeySequence.SequenceFormat.NativeText)
+        tip = f"{text} ({shortcut})" if shortcut else text
+        action.setToolTip(tip)
+        action.setStatusTip(tip)
+
     def _build_toolbar(self) -> None:
-        """Stage 8: Edit toolbar with Undo / Redo, then Remote / Stash / Search."""
-        edit_toolbar = QToolBar("Edit", self)
-        edit_toolbar.setObjectName("edit-toolbar")
-        edit_toolbar.setMovable(False)
-        edit_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        edit_toolbar.addAction(self._action_undo)
-        edit_toolbar.addAction(self._action_redo)
-        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, edit_toolbar)
+        """Icon toolbars (Undo/Redo, Remote, Stash) + right-aligned search."""
+        icon_size = QSize(18, 18)
+
+        def icon_toolbar(title: str, object_name: str) -> QToolBar:
+            tb = QToolBar(title, self)
+            tb.setObjectName(object_name)
+            tb.setMovable(False)
+            tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            tb.setIconSize(icon_size)
+            self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)
+            return tb
+
+        edit_toolbar = icon_toolbar("Edit", "edit-toolbar")
+        for action, name in ((self._action_undo, "undo"), (self._action_redo, "redo")):
+            self._apply_toolbar_icon(action, name)
+            edit_toolbar.addAction(action)
         self._edit_toolbar = edit_toolbar
 
-        toolbar = QToolBar("Remote", self)
-        toolbar.setObjectName("remote-toolbar")
-        toolbar.setMovable(False)
         # Use the same actions as the Remote menu so the enabled
         # state stays in sync (one source of truth).
-        toolbar.addAction(self._action_fetch)
-        toolbar.addAction(self._action_pull)
-        toolbar.addAction(self._action_push)
-        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
+        toolbar = icon_toolbar("Remote", "remote-toolbar")
+        for action, name in (
+            (self._action_fetch, "fetch"),
+            (self._action_pull, "pull"),
+            (self._action_push, "push"),
+        ):
+            self._apply_toolbar_icon(action, name)
+            toolbar.addAction(action)
         self._remote_toolbar = toolbar
 
         # Stage 7: Stash toolbar with Push / Pop shortcuts.
-        stash_toolbar = QToolBar("Stash", self)
-        stash_toolbar.setObjectName("stash-toolbar")
-        stash_toolbar.setMovable(False)
-        stash_toolbar.addAction(self._action_stash_push)
-        stash_toolbar.addAction(self._action_stash_pop)
-        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, stash_toolbar)
+        stash_toolbar = icon_toolbar("Stash", "stash-toolbar")
+        for action, name in (
+            (self._action_stash_push, "stash_push"),
+            (self._action_stash_pop, "stash_pop"),
+        ):
+            self._apply_toolbar_icon(action, name)
+            stash_toolbar.addAction(action)
         self._stash_toolbar = stash_toolbar
 
-        # Stage 7: commit search bar as a compact toolbar.
-        self._search_bar.setMaximumHeight(32)
-        self._search_bar.setMinimumWidth(260)
+        # Stage 7: commit search bar, pushed to the right edge of the
+        # row by an expanding spacer and kept at a fixed compact width
+        # instead of stretching across the whole window.
+        self._search_bar.setMaximumHeight(28)
+        self._search_bar.setFixedWidth(320)
+        self._search_bar.addAction(
+            toolbar_icon("search"),
+            QLineEdit.ActionPosition.LeadingPosition,
+        )
         search_toolbar = QToolBar("Search", self)
         search_toolbar.setObjectName("search-toolbar")
         search_toolbar.setMovable(False)
+        spacer = QWidget(search_toolbar)
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        search_toolbar.addWidget(spacer)
         search_toolbar.addWidget(self._search_bar)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, search_toolbar)
 
