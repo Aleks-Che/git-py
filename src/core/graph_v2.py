@@ -120,6 +120,19 @@ def _pick_branch_color(name: str) -> int:
 MAIN_COLOR_INDEX: int = 1  # "main"/"master" → blue via overrides
 
 
+def _sha_color_seed(sha: str) -> int:
+    """Deterministic palette seed derived from a commit SHA.
+
+    Used as the fallback starting point for nameless second parents so
+    the colour belongs to the *branch* (via its tip SHA) rather than to
+    whatever lane the parent happened to land on — two unrelated
+    branches reusing one lane at different heights must not collapse
+    onto the same lane-number colour (kilocode ``e2be875b``: three
+    distinct branches on one lane all painted light-red).
+    """
+    return crc32(sha.encode("utf-8")) % len(BRANCH_PALETTE)
+
+
 class CellType(IntEnum):
     """Atomic rendering element for one cell of a graph row.
 
@@ -385,18 +398,29 @@ class ColorAssigner:
         self._set_lane_color(lane, color)
         return color
 
-    def assign_color(self, lane: int, branch_name: str | None = None) -> int:
-        """Allocate a colour for *lane* derived from *branch_name*."""
+    def assign_color(
+        self, lane: int, branch_name: str | None = None, *, seed: int | None = None
+    ) -> int:
+        """Allocate a colour for *lane* derived from *branch_name*.
+
+        *seed* replaces the lane number as the fallback starting point —
+        a nameless parent seeded by its own SHA keeps one colour for the
+        whole branch instead of inheriting whatever the lane number
+        yields (two unrelated branches reusing one lane would otherwise
+        paint in the same fallback colour — kilocode ``e2be875b``).
+        """
         if branch_name:
             color = _pick_branch_color(branch_name)
         else:
-            color = self._pick_fallback(lane)
+            color = self._pick_fallback(lane, seed)
         self._set_lane_color(lane, color)
         return color
 
-    def assign_fork_sibling_color(self, lane: int, branch_name: str | None = None) -> int:
+    def assign_fork_sibling_color(
+        self, lane: int, branch_name: str | None = None, *, seed: int | None = None
+    ) -> int:
         """Allocate a colour for a fork-sibling lane."""
-        return self.assign_color(lane, branch_name)
+        return self.assign_color(lane, branch_name, seed=seed)
 
     def begin_fork(self) -> None:
         """Legacy hook retained for compatibility with old callers."""
@@ -413,14 +437,20 @@ class ColorAssigner:
 
     # -- internals ---------------------------------------------------------
 
-    def _pick_fallback(self, lane: int) -> int:
-        """Sequential fallback when no branch name is available."""
+    def _pick_fallback(self, lane: int, seed: int | None = None) -> int:
+        """Sequential fallback when no branch name is available.
+
+        *seed* (typically derived from the parent SHA) shifts the
+        starting candidate so different nameless branches landing on
+        the same lane do not all collapse onto the lane's own colour.
+        """
+        start = seed if seed is not None else lane
         for offset in range(len(BRANCH_PALETTE)):
-            candidate = (lane + offset) % len(BRANCH_PALETTE)
+            candidate = (start + offset) % len(BRANCH_PALETTE)
             if candidate not in self._used_colors:
                 self._used_colors.add(candidate)
                 return candidate
-        return lane % len(BRANCH_PALETTE)
+        return start % len(BRANCH_PALETTE)
 
     def _set_lane_color(self, lane: int, color: int) -> None:
         self._lane_colors[lane] = color
@@ -514,6 +544,17 @@ def build_graph(
     color_assigner = ColorAssigner()
     oid_color_index: dict[str, int] = {}
     lane_color_index: dict[int, int] = {}
+    # Lane -> colour of a pending merge connector: set when a second
+    # (non-first) parent is placed on a fresh lane.  Unlike
+    # ``lane_color_index`` this is written even for the branch-name
+    # fallback colour (the anti-poisoning rule at the placement site
+    # deliberately skips ``lane_color_index`` there) — and it is
+    # consulted ONLY by the fork-connector colour picks, so it cannot
+    # poison ``continue_lane`` or pipe colouring.  Without it the
+    # arrival bend of a merge connector falls back to the lane NUMBER
+    # while the trunk pipe uses the oid fallback, painting one
+    # connector in two colours (kilocode ``df9e1fb1``).
+    connector_lane_color: dict[int, int] = {}
 
     for commit in commits:
         color_assigner.advance_row()
@@ -538,6 +579,17 @@ def build_graph(
 
         # --- fork point handling: multiple lanes track the same commit ---
         fork_lanes: list[int] = [i for i, lo in enumerate(lanes) if lo == commit.sha]
+
+        def _fork_lane_color(ln: int) -> int:
+            """Lane colour for fork-connector picks: live cache first,
+            then the pending merge-connector colour (a fallback-coloured
+            second parent deliberately never entered ``lane_color_index``),
+            then the lane number as a last resort."""
+            c = lane_color_index.get(ln)
+            if c is None:
+                c = connector_lane_color.get(ln, ln)
+            return c
+
         # Snapshot the colour of every fork lane NOW, before the
         # fork-connector handling releases those lanes. The CROSS
         # cell placed at a fork-merge point needs the lane's
@@ -546,7 +598,7 @@ def build_graph(
         # below the colour is gone and the CROSS cell would fall
         # back to the second parent's colour, blending the two
         # connections visually.
-        fork_lane_colors: dict[int, int] = {ml: lane_color_index.get(ml, ml) for ml in fork_lanes}
+        fork_lane_colors: dict[int, int] = {ml: _fork_lane_color(ml) for ml in fork_lanes}
         # Track the fork lanes (children lanes) so that, when this
         # commit is also a merge, a second parent landing on one of
         # these lanes can be drawn with a CROSS cell at the
@@ -628,6 +680,7 @@ def build_graph(
                     lanes[ml] = None
                     color_assigner.release_lane(ml)
                     lane_color_index.pop(ml, None)
+                    connector_lane_color.pop(ml, None)
 
             # Snapshot the lane table for the fork-connector build,
             # which is deferred until the commit's own colour is
@@ -764,7 +817,9 @@ def build_graph(
                 lanes[new_lane] = parent_sha
                 parent_branch_names = oid_to_branches.get(parent_sha, [])
                 parent_branch = parent_branch_names[0] if parent_branch_names else None
-                new_color = color_assigner.assign_fork_sibling_color(new_lane, parent_branch)
+                new_color = color_assigner.assign_fork_sibling_color(
+                    new_lane, parent_branch, seed=_sha_color_seed(parent_sha)
+                )
                 oid_color_index[parent_sha] = new_color
                 # Deliberately do NOT overwrite ``lane_color_index[new_lane]``
                 # with ``new_color`` when ``new_color`` is a fallback
@@ -780,6 +835,12 @@ def build_graph(
                 # writes the correct lane colour anyway.
                 if parent_branch is not None:
                     lane_color_index[new_lane] = new_color
+                # The pending connector's colour is tracked separately so
+                # the arrival bend (fork-connector build at the parent's
+                # row) uses the SAME colour the departure corridor and
+                # the trunk pipe already use — see the declaration of
+                # ``connector_lane_color`` above.
+                connector_lane_color[new_lane] = new_color
                 parent_lane = new_lane
                 was_existing = False
                 parent_color = new_color
@@ -1108,6 +1169,7 @@ def build_graph(
                     lanes[ending_l] = None
                     color_assigner.release_lane(ending_l)
                     lane_color_index.pop(ending_l, None)
+                    connector_lane_color.pop(ending_l, None)
 
     # --- Rebalance stashes above HEAD onto offset lanes -------------------
     # Without this step, a stash whose first parent is HEAD inherits

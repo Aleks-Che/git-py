@@ -13,7 +13,9 @@ from src.core.graph_v2 import (
     UNCOMMITTED_COLOR_INDEX,
     CellInfo,
     CellType,
+    ColorAssigner,
     _pick_branch_color,
+    _sha_color_seed,
     build_graph,
     graph_to_dicts,
 )
@@ -2719,3 +2721,183 @@ def test_two_commits_sharing_off_window_parent_converge() -> None:
     assert junction.cell_type in (CellType.TEE_RIGHT, CellType.MERGE_RIGHT)
     commit_cell = y_node.cells[y_node.lane * 2]
     assert commit_cell.cell_type in (CellType.TEE_LEFT, CellType.COMMIT)
+
+# ---- connector colour consistency (kilocode regressions) -------------------
+
+
+def test_merge_connector_single_colour_end_to_end() -> None:
+    """A merge connector to a second parent that carries NO branch name
+    must be painted in ONE colour along its whole path: the departure
+    corridor at the merge's row, the trunk pipe, and the arrival bend
+    at the second parent's row.
+
+    Regression (kilocode ``df9e1fb1``): the parent was placed on a fresh
+    lane with a fallback colour that deliberately never entered
+    ``lane_color_index`` (anti-poisoning rule), so the trunk used the
+    oid fallback while the arrival bend fell back to the lane NUMBER —
+    the connector turned from one colour into another right at the bend.
+    """
+    cc, mm, bb, aa, xx = (
+        "cc" + "0" * 38,
+        "mm" + "0" * 38,
+        "bb" + "0" * 38,
+        "aa" + "0" * 38,
+        "xx" + "0" * 38,
+    )
+    commits = [
+        _c(cc, parents=[bb, mm], ts=5),   # merge pulling mm onto a side lane
+        _c(mm, parents=[xx, aa], ts=4),   # the merge; aa = second parent
+        _c(bb, parents=[aa], ts=3),       # main-line child of aa
+        _c(aa, parents=[], ts=2),         # second parent (no branch name)
+        _c(xx, parents=[], ts=1),
+    ]
+    layout = build_graph(commits, [_b("main", cc, is_head=True)])
+    m_node, b_node, a_node = layout.nodes[1], layout.nodes[2], layout.nodes[3]
+    assert m_node.commit.sha == mm
+    assert b_node.commit.sha == bb
+    assert a_node.commit.sha == aa
+
+    # Departure: the bend leaving the merge's row toward aa below.
+    dep_bends = [
+        (ci, c) for ci, c in enumerate(m_node.cells)
+        if c.cell_type == CellType.BRANCH_LEFT
+    ]
+    assert len(dep_bends) == 1
+    dep_col, dep_bend = dep_bends[0]
+
+    # Trunk: the pipe at the connector's lane in the row between.
+    trunk = b_node.cells[dep_col]
+    assert trunk.cell_type == CellType.PIPE
+    assert trunk.color_index == dep_bend.color_index
+
+    # Arrival: the bend at aa's row plus its corridor share the colour.
+    arr = a_node.cells[dep_col]
+    assert arr.cell_type == CellType.MERGE_LEFT
+    assert arr.color_index == dep_bend.color_index, (
+        f"arrival bend colour {arr.color_index} != departure/trunk colour "
+        f"{dep_bend.color_index} — one connector painted in two colours"
+    )
+    for c in a_node.cells[:dep_col]:
+        if c.cell_type in (CellType.HORIZONTAL, CellType.TEE_RIGHT):
+            assert c.color_index == dep_bend.color_index
+        elif c.cell_type == CellType.HORIZONTAL_PIPE:
+            assert c.color_index == dep_bend.color_index
+
+
+def test_fork_merge_cross_keeps_both_colours() -> None:
+    """Fork-merge point (a merge whose second parent lands on the lane of
+    the merge's own forked child): the CROSS cell must keep BOTH colours
+    — the merge connector (second parent's colour) going down, and the
+    forked child's branch colour going up (kilocode ``1246d989`` /
+    ``e2be875b``: green fork from the merge commit above a light-red
+    merge connector, each staying its own colour).
+    """
+    b0, gg, mg, ss, ff = (
+        "b0" + "0" * 38,
+        "gg" + "0" * 38,
+        "mg" + "0" * 38,
+        "ss" + "0" * 38,
+        "ff" + "0" * 38,
+    )
+    commits = [
+        _c(b0, parents=[mg], ts=5),
+        _c(gg, parents=[mg], ts=4),       # branch forked FROM the merge
+        _c(mg, parents=[ff, ss], ts=3),   # the merge; ss = second parent
+        _c(ss, parents=[ff], ts=2),
+        _c(ff, parents=[], ts=1),
+    ]
+    branches = [
+        _b("main", b0, is_head=True),
+        _b("feat/green", gg),
+    ]
+    layout = build_graph(commits, branches)
+    g_node, mg_node, s_node = layout.nodes[1], layout.nodes[2], layout.nodes[3]
+    assert g_node.commit.sha == gg
+    assert mg_node.commit.sha == mg
+    assert s_node.commit.sha == ss
+    green = _pick_branch_color("feat/green")
+    assert g_node.color_index == green
+
+    crosses = [
+        (ci, c) for ci, c in enumerate(mg_node.cells)
+        if c.cell_type == CellType.CROSS
+    ]
+    assert len(crosses) == 1
+    cross_col, cross = crosses[0]
+    # Down to the second parent: the merge connector's colour, matching
+    # both the corridor leaving the merge commit and ss's own lane.
+    assert cross.color_index == s_node.color_index
+    tee = mg_node.cells[mg_node.lane * 2]
+    assert tee.cell_type == CellType.TEE_RIGHT
+    assert tee.color_index == cross.color_index
+    # Up to the forked child: the child's branch colour, not the
+    # connector's — the two connections must not blend into one colour.
+    assert cross.pipe_color_index == green
+    assert cross.pipe_color_index != cross.color_index
+
+
+def test_nameless_second_parent_colour_seeded_by_sha() -> None:
+    """The fallback colour of a second parent with NO branch name is
+    derived from the parent's SHA, not from the lane it lands on — so a
+    branch keeps its own colour wherever it is placed, and two
+    unrelated nameless branches reusing one lane do not collapse onto
+    the same lane-number colour (kilocode ``e2be875b``: three distinct
+    branches on lane 14 all painted light-red).
+    """
+    assigner = ColorAssigner()
+    lane_a = assigner.assign_fork_sibling_color(5, None, seed=_sha_color_seed("a" * 40))
+    assert lane_a == _sha_color_seed("a" * 40)
+    # Same seed on another lane: the seeded colour is taken, so the
+    # allocator moves to the next free index (skip rule preserved).
+    lane_b = assigner.assign_fork_sibling_color(6, None, seed=_sha_color_seed("a" * 40))
+    assert lane_b == (_sha_color_seed("a" * 40) + 1) % len(BRANCH_PALETTE)
+    # A different seed gets its own colour even on the same lane number.
+    lane_c = assigner.assign_fork_sibling_color(5, None, seed=_sha_color_seed("b" * 40))
+    assert lane_c == _sha_color_seed("b" * 40)
+
+
+def test_nameless_branches_reusing_one_lane_get_distinct_colours() -> None:
+    """Two nameless branches placed on the SAME lane at different
+    heights must be painted in two different colours (each derived
+    from its own tip SHA).  With the old lane-number fallback both
+    received whatever the lane's sequential fallback yielded at
+    placement time — unrelated branches appearing in one colour.
+    """
+    b0, g1, m1, s1, b1, g2, m2, s2, ff = (
+        "b0" + "0" * 38, "g1" + "0" * 38, "m1" + "0" * 38, "s1" + "0" * 38,
+        "b1" + "0" * 38, "g2" + "0" * 38, "m2" + "0" * 38, "s2" + "0" * 38,
+        "ff" + "0" * 38,
+    )
+    commits = [
+        _c(b0, parents=[m1], ts=8),
+        _c(g1, parents=[m1], ts=7),
+        _c(m1, parents=[b1, s1], ts=6),   # fork-merge: s1 lands on g1's lane
+        _c(s1, parents=[], ts=5),
+        _c(b1, parents=[m2], ts=4),
+        _c(g2, parents=[m2], ts=3),
+        _c(m2, parents=[ff, s2], ts=2),   # fork-merge: s2 lands on g2's lane
+        _c(s2, parents=[], ts=1),
+        _c(ff, parents=[], ts=0),
+    ]
+    branches = [
+        _b("main", b0, is_head=True),
+        _b("feat/g1", g1),
+        _b("feat/g2", g2),
+    ]
+    layout = build_graph(commits, branches)
+    s1_node, s2_node = layout.nodes[3], layout.nodes[7]
+    assert s1_node.commit.sha == s1
+    assert s2_node.commit.sha == s2
+    # Both nameless branches occupy lane 1 (each released before the
+    # other arrives) yet must NOT share a colour.
+    assert s1_node.lane == s2_node.lane
+    assert s1_node.color_index == _sha_color_seed(s1)
+    assert s2_node.color_index == _sha_color_seed(s2)
+    assert s1_node.color_index != s2_node.color_index
+    # The merge connectors into each of them carry the same colour as
+    # the branch itself (single-colour connector invariant).
+    m1_node, m2_node = layout.nodes[2], layout.nodes[6]
+    m1_cross = [c for c in m1_node.cells if c.cell_type == CellType.CROSS]
+    m2_cross = [c for c in m2_node.cells if c.cell_type == CellType.CROSS]
+    assert m1_cross and m1_cross[0].color_index == s1_node.color_index
+    assert m2_cross and m2_cross[0].color_index == s2_node.color_index

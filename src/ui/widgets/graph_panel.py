@@ -1724,7 +1724,13 @@ class GraphTableWidget(QWidget):
                 prev_cells = self._rows[row_idx - 1].get("cells", [])
                 for li in common:
                     x = self._lane_x(li, lane_w)
-                    clr_idx = 0
+                    # ``None`` is the "not found" sentinel — index ``0``
+                    # (GREEN) is a legitimate palette colour, so using it
+                    # as the sentinel would recolour every bridge below a
+                    # green cell with the CURRENT row's cell colour
+                    # (kilocode ``1246d989``: the bridge above the
+                    # fork-merge CROSS painted red instead of green).
+                    clr_idx: int | None = None
                     for ci, pc in enumerate(prev_cells):
                         if ci // 2 == li and pc.get("t", _T_EMPTY) != _T_EMPTY:
                             pt = pc.get("t", _T_EMPTY)
@@ -1747,7 +1753,7 @@ class GraphTableWidget(QWidget):
                             else:
                                 clr_idx = pc.get("c", 0)
                             break
-                    if clr_idx == 0:
+                    if clr_idx is None:
                         for ci, cell in enumerate(cells):
                             if ci // 2 == li and cell.get("t", _T_EMPTY) != _T_EMPTY:
                                 t = cell.get("t", _T_EMPTY)
@@ -1764,8 +1770,10 @@ class GraphTableWidget(QWidget):
                                 else:
                                     clr_idx = cell.get("c", 0)
                                 break
-                    if clr_idx == 0 and li == lane:
+                    if clr_idx is None and li == lane:
                         clr_idx = row_data.get("color_index", 0)
+                    if clr_idx is None:
+                        clr_idx = 0
                     clr = _cell_color(clr_idx)
                     pen = QPen(clr, ew, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
                     painter.setPen(pen)
@@ -3113,10 +3121,20 @@ def _tee_horiz_len(cells: list, idx: int, direction: int, lane_w: float) -> floa
 def _horiz_span(cells: list, idx: int, cell: dict, lane_w: float) -> float:
     """Horizontal span for HORIZONTAL / HORIZONTAL_PIPE cells.
 
-    The explicit ``d`` trim wins; otherwise an untrimmed rightward
-    arm is shortened to half a lane when the next lane over holds a
-    corner bend facing this cell (same rule as :func:`_tee_horiz_len`).
+    Odd-index cells sit *between* lanes; when the lane immediately to
+    their right is a corner bend, the bend's curve already covers the
+    half lane from this cell's centre up to the corner's vertical
+    pipe, so nothing may be drawn here (this also overrides the
+    core's ``d == -1`` trim, which stops at the pipe — flush under
+    the curve).  Even-index cells follow the same rule as
+    :func:`_tee_horiz_len`; the explicit ``d`` trim wins otherwise.
     """
+    if (
+        idx % 2 == 1
+        and idx + 1 < len(cells)
+        and cells[idx + 1].get("t", _T_EMPTY) in _CORNERS_FACING_LEFT
+    ):
+        return 0.0
     span = _trimmed_horiz_len(cell, lane_w)
     if span == lane_w:
         span = _tee_horiz_len(cells, idx, 1, lane_w)
@@ -3171,6 +3189,8 @@ def _draw_horiz_line(
 ) -> None:
     pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap)
     painter.setPen(pen)
+    if lane_w == 0:
+        return
     sign = 1 if lane_w > 0 else -1
     abs_w = abs(lane_w)
     painter.drawLine(int(x), int(y_center), int(x + sign * abs_w), int(y_center))
