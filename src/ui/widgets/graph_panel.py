@@ -2955,7 +2955,7 @@ def _draw_cell_row(
         elif t == _T_HORIZONTAL:
             _draw_horiz_line(
                 painter, x, y_center,
-                _trimmed_horiz_len(cell, lane_w), edge_width, color,
+                _horiz_span(cells, idx, cell, lane_w), edge_width, color,
             )
         elif t == _T_HORIZONTAL_PIPE:
             _draw_vert_line(
@@ -2970,7 +2970,7 @@ def _draw_cell_row(
             )
             _draw_horiz_line(
                 painter, x, y_center,
-                _trimmed_horiz_len(cell, lane_w), edge_width, color,
+                _horiz_span(cells, idx, cell, lane_w), edge_width, color,
             )
         elif t == _T_TEE_RIGHT:
             vert_color = p_color if has_pipe_color else color
@@ -2984,7 +2984,10 @@ def _draw_cell_row(
                 top_half_h=node_radius,
                 bottom_half_h=bot_half_h,
             )
-            _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
+            _draw_horiz_line(
+                painter, x, y_center,
+                _tee_horiz_len(cells, idx, 1, lane_w), edge_width, color,
+            )
         elif t == _T_TEE_LEFT:
             vert_color = p_color if has_pipe_color else color
             _draw_vert_line(
@@ -2997,10 +3000,16 @@ def _draw_cell_row(
                 top_half_h=node_radius,
                 bottom_half_h=bot_half_h,
             )
-            _draw_horiz_line(painter, x, y_center, -lane_w, edge_width, color)
+            _draw_horiz_line(
+                painter, x, y_center,
+                _tee_horiz_len(cells, idx, -1, lane_w), edge_width, color,
+            )
         elif t == _T_TEE_UP:
             vert_color = p_color if has_pipe_color else color
-            _draw_horiz_line(painter, x, y_center, lane_w, edge_width, color)
+            _draw_horiz_line(
+                painter, x, y_center,
+                _tee_horiz_len(cells, idx, 1, lane_w), edge_width, color,
+            )
             _draw_vert_line(
                 painter,
                 x,
@@ -3072,6 +3081,46 @@ def _trimmed_horiz_len(cell: dict, lane_w: float) -> float:
     if d == 1:
         return -lane_w / 2
     return lane_w
+
+
+# Corner cell types whose curve endpoint sits half a lane to their
+# left (╮/╯) or right (╭/╰).  When such a corner occupies the lane
+# immediately next to a tee, the tee's horizontal arm must stop at
+# the curve endpoint instead of running flush into the corner's
+# vertical pipe — otherwise the straight segment doubles the stroke
+# over the bend and the corner reads as a filled rectangle.
+_CORNERS_FACING_LEFT = (_T_BRANCH_LEFT, _T_MERGE_LEFT)
+_CORNERS_FACING_RIGHT = (_T_BRANCH_RIGHT, _T_MERGE_RIGHT)
+
+
+def _tee_horiz_len(cells: list, idx: int, direction: int, lane_w: float) -> float:
+    """Horizontal span for a TEE cell's connector arm.
+
+    Full ``lane_w`` normally; half that when the next lane over holds
+    a corner bend facing this cell — the bend's curve already covers
+    the remaining half lane.
+    """
+    corner_idx = idx + 2 * direction
+    facing = _CORNERS_FACING_LEFT if direction > 0 else _CORNERS_FACING_RIGHT
+    if (
+        0 <= corner_idx < len(cells)
+        and cells[corner_idx].get("t", _T_EMPTY) in facing
+    ):
+        return direction * lane_w / 2
+    return direction * lane_w
+
+
+def _horiz_span(cells: list, idx: int, cell: dict, lane_w: float) -> float:
+    """Horizontal span for HORIZONTAL / HORIZONTAL_PIPE cells.
+
+    The explicit ``d`` trim wins; otherwise an untrimmed rightward
+    arm is shortened to half a lane when the next lane over holds a
+    corner bend facing this cell (same rule as :func:`_tee_horiz_len`).
+    """
+    span = _trimmed_horiz_len(cell, lane_w)
+    if span == lane_w:
+        span = _tee_horiz_len(cells, idx, 1, lane_w)
+    return span
 
 
 def _draw_vert_line(
