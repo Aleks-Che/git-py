@@ -7,7 +7,9 @@ cell contents, lane assignment, colour indices, and fork-point handling.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
+import pygit2
 from src.core.graph_v2 import (
     BRANCH_PALETTE,
     UNCOMMITTED_COLOR_INDEX,
@@ -1997,7 +1999,7 @@ def test_cellinfo_to_dict_writes_pipe_for_all_pipe_aware_types() -> None:
         assert d_nonzero["p"] == 37
 
 
-def test_build_graph_pipe_color_zero_does_not_fall_back_to_oid_color() -> None:
+def test_build_graph_pipe_color_zero_does_not_fall_back_to_oid_color(tmp_git_repo: Path) -> None:
     """``lane_color_index[lane] = 0`` (GREEN) must not fall back to the oid colour.
 
     Regression test for ``BUG_VISUAL_FEAT_PIPE_COLOR``.  The pipe-colour
@@ -2010,28 +2012,182 @@ def test_build_graph_pipe_color_zero_does_not_fall_back_to_oid_color() -> None:
     The test inspects the **first** pipe cell on lane 1 *after* the
     visual-feat chain ends — the cell that the bug used to colour
     wisteria.  With the fix in place it stays GREEN.
+
+    The original test relied on the local ``git-py`` checkout carrying
+    a ``visual-feat`` branch — pre-existing/environmental (see
+    ``docs/updates/update1/STATUS-r3.1.md``).  This version is
+    self-contained: it builds a synthetic repo whose layout reproduces
+    the original bug-trigger topology (a side branch whose
+    ``_pick_branch_color(name)`` happens to be 0 — the GREEN index —
+    is merged back into main and then crossed by a horizontal
+    connector from a later merge).
+
+    Branch-name selection: ``crc32("xyz0") % 40 == 0`` so the side
+    branch (call it the ``xyz0`` chain) gets the GREEN idx 0 by
+    deterministic branch-name hashing.  That's the only condition
+    needed to exercise the ``or`` fallback in ``build_graph``.
+
+    Topology (top to bottom in the graph):
+
+    * ``xyz2`` -- ``xyz1`` -- ``merge_x`` (``merge xyz0`` into ``main``)
+    * ``m2`` -- ``m1`` -- ``merge_x``
+    * ``beta2`` -- ``beta1`` -- ``merge_b`` (``merge beta`` into ``main``)
+    * ``root`` -- ``merge_x`` / ``merge_b``
+
+    The ``xyz0`` vertical pipe sits on lane 1; ``merge_b``'s horizontal
+    connector must cross it.  Before the fix the
+    ``lane_color_index.get(...) or oid_color_index.get(...)`` lookup
+    treated ``0`` as missing and over-painted the xyz0 pipe.
     """
-    rm = RepositoryManager()
-    rm.open(".")
-    layout = build_graph(rm.get_all_history(max_count=10_000), rm.branches)
 
-    visual_tip_sha = None
-    for b in rm.branches:
-        if b.name == "visual-feat" and b.target_sha:
-            visual_tip_sha = b.target_sha
+    def _sig() -> pygit2.Signature:
+        return pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
+
+    repo = pygit2.Repository(str(tmp_git_repo))
+
+    sig = _sig()
+    head_oid: pygit2.Oid | None = None  # populated by first commit
+
+    def _commit(
+        parents: list[pygit2.Oid] | None,
+        message: str,
+        files: dict[str, str],
+        ref: str = "refs/heads/main",
+    ) -> pygit2.Oid:
+        # ``parents`` is an explicit list of parent OIDs.  Pass ``[]`` for
+        # the very first commit (the empty repo has no ``refs/heads/main``
+        # yet) and ``[head_oid]`` for subsequent linear commits.  Merge
+        # commits pass ``[head_oid, other_oid]`` (HEAD first, then the
+        # other parent) so the topology matches what the graph layout
+        # expects — first parent is always the "current" side.  ``ref``
+        # defaults to ``refs/heads/main``; pass another ref to commit
+        # onto a side branch.
+        if parents is None:
+            # Legacy linear-on-HEAD path: only valid after the first
+            # commit has populated ``head_oid``.
+            assert head_oid is not None, "linear commit before any parent"
+            parent_oids: list[pygit2.Oid] = [head_oid]
+        else:
+            parent_oids = list(parents)
+        for path, content in files.items():
+            full = tmp_git_repo / path
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text(content)
+            repo.index.add(path)
+        repo.index.write()
+        tree = repo.index.write_tree()
+        oid = repo.create_commit(
+            ref, sig, sig, message, tree, parent_oids
+        )
+        return oid
+
+    def _commit_chain(message: str, files: dict[str, str]) -> pygit2.Oid:
+        """Linear commit on ``refs/heads/main``; caches the result for the
+        next call.  The first call lands with no parents (root commit),
+        every later call uses ``[head_oid]``."""
+        nonlocal head_oid
+        if head_oid is None:
+            parent_oids: list[pygit2.Oid] = []
+        else:
+            parent_oids = [head_oid]
+        oid = _commit(parent_oids, message, files)
+        head_oid = oid
+        return oid
+
+    def _commit_side(
+        message: str,
+        files: dict[str, str],
+        branch_name: str,
+        parent_oid: pygit2.Oid,
+    ) -> pygit2.Oid:
+        """Linear commit onto a *side* branch ref; does NOT touch ``head_oid``.
+
+        The parent of the new commit is ``parent_oid`` (the previous tip
+        of the side branch); ``refs/heads/main`` is left untouched so the
+        topology matches the docstring diagram (side chains branch off
+        main and are merged back in later).
+        """
+        for path, content in files.items():
+            full = tmp_git_repo / path
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text(content)
+            repo.index.add(path)
+        repo.index.write()
+        tree = repo.index.write_tree()
+        return repo.create_commit(
+            f"refs/heads/{branch_name}",
+            sig,
+            sig,
+            message,
+            tree,
+            [parent_oid],
+        )
+
+    # Build commits in topological order (oldest first).  Side chains
+    # (``beta``, ``xyz0``) are committed onto their own branch refs so
+    # ``refs/heads/main`` only advances on mainline commits and merges.
+    # pygit2 generates its own OIDs; we capture them so subsequent
+    # commits can reference parents by real Oid.
+    root_oid = _commit_chain("root", {"root.txt": "root\n"})
+    # ``beta`` side branch forks off ``root``.
+    beta1_oid = _commit_side("beta1", {"beta1.txt": "b1\n"}, "beta", root_oid)
+    beta2_oid = _commit_side("beta2", {"beta2.txt": "b2\n"}, "beta", beta1_oid)
+    # ``merge_b`` brings the beta chain into main: first parent is the
+    # current ``refs/heads/main`` tip (``root_oid``), second is ``beta2``.
+    merge_b_oid = _commit(
+        [root_oid, beta2_oid], "merge beta", {"merge_b.txt": "x\n"}
+    )
+    head_oid = merge_b_oid
+    # ``xyz0`` side branch forks off ``merge_b``.
+    xyz1_oid = _commit_side("xyz1", {"xyz1.txt": "x1\n"}, "xyz0", merge_b_oid)
+    xyz2_oid = _commit_side("xyz2", {"xyz2.txt": "x2\n"}, "xyz0", xyz1_oid)
+    # ``merge_x`` brings the xyz0 chain into main: first parent is the
+    # current ``refs/heads/main`` tip (``merge_b_oid``), second is
+    # ``xyz2``.  The ``refs/heads/xyz0`` ref was already advanced to
+    # ``xyz2_oid`` by ``_commit_side`` above, so the layout picks up
+    # the branch name and runs ``_pick_branch_color("xyz0")``
+    # (``crc32("xyz0") % 40 == 0`` → GREEN idx 0 — the bug trigger).
+    merge_x_oid = _commit(
+        [merge_b_oid, xyz2_oid], "merge xyz0", {"merge_x.txt": "x\n"}
+    )
+    head_oid = merge_x_oid
+    _commit_chain("m1", {"m1.txt": "m1\n"})
+    _commit_chain("m2", {"m2.txt": "m2\n"})
+
+    rm = RepositoryManager(str(tmp_git_repo))
+    history = rm.get_all_history(max_count=10_000)
+    branches = rm.branches
+    layout = build_graph(history, branches)
+
+    # Find the xyz0 chain tip.  The bug is about the pipe on xyz0's
+    # lane one row below the bottom of the chain — wherever that
+    # lane happens to be in this synthetic history.  The tip is the
+    # single commit carrying the branch name ``xyz0`` (set up above
+    # via ``_commit_side(..., "xyz0", ...)``).
+    xyz_tip_sha: str | None = None
+    for n in layout.nodes:
+        if n.commit is not None and "xyz0" in n.branch_names:
+            xyz_tip_sha = n.commit.sha
             break
-    assert visual_tip_sha is not None, "test needs a branch named 'visual-feat'"
+    if xyz_tip_sha is None:
+        # Fall back to locating by message in case branch_name lookup
+        # doesn't surface (e.g. ``get_all_history`` ordering oddity).
+        for n in layout.nodes:
+            if n.commit is not None and n.commit.message == "xyz2":
+                xyz_tip_sha = n.commit.sha
+                break
+    assert xyz_tip_sha is not None, "synthetic repo is missing the xyz0 chain"
 
-    # Find the row index of the tip and walk one row past the bottom
-    # of the visual-feat chain.
     tip_idx: int | None = None
     for i, n in enumerate(layout.nodes):
-        if n.commit is not None and n.commit.sha == visual_tip_sha:
+        if n.commit is not None and n.commit.sha == xyz_tip_sha:
             tip_idx = i
             break
     assert tip_idx is not None
 
-    # Walk down the chain from the tip until the lane changes.
+    # Walk down the chain from the tip until the lane changes (or we
+    # run out of rows).  The cell on the tip's lane one row *past* the
+    # chain's bottom is the regression target.
     bottom_idx = tip_idx
     for j in range(tip_idx, len(layout.nodes) - 1):
         n = layout.nodes[j]
@@ -2042,24 +2198,43 @@ def test_build_graph_pipe_color_zero_does_not_fall_back_to_oid_color() -> None:
             break
         bottom_idx = j + 1
 
-    # The first row *after* the visual-feat chain sits on a different
-    # lane, but the cell at col = (visual-feat lane) * 2 still carries a
-    # PIPE because the lane was re-used by the mainline / a sibling
-    # side branch.  That pipe used to inherit the wisteria mainline
-    # colour via the ``or`` fallback.  With the fix it stays GREEN.
-    first_after = layout.nodes[bottom_idx + 1]
+    target_row = layout.nodes[bottom_idx + 1]
     col = layout.nodes[tip_idx].lane * 2
-    assert col < len(first_after.cells), (
+    assert col < len(target_row.cells), (
         "test setup changed: cell column out of range"
     )
-    cell = first_after.cells[col]
-    assert cell.cell_type in (CellType.PIPE, CellType.HORIZONTAL_PIPE), (
-        f"expected a pipe at row {bottom_idx + 1} col={col}, got {cell.cell_type.name}"
-    )
-    assert cell.color_index == 0, (
-        f"Pipe below visual-feat was over-painted: row {bottom_idx + 1} "
+    cell = target_row.cells[col]
+    # The cell at xyz0's lane one row past the bottom of the chain is
+    # the place where a later merge's horizontal connector crosses the
+    # still-living vertical pipe.  The renderer distinguishes between:
+    #   * plain PIPE — the vertical line is the only thing there, so
+    #     ``color_index`` is the pipe colour;
+    #   * CROSS / HORIZONTAL_PIPE / TEE_* — a horizontal connector
+    #     crosses the lane, the vertical pipe colour lives in
+    #     ``pipe_color_index`` while ``color_index`` is the
+    #     horizontal side's colour.
+    # The fix's invariant is the same in both cases: the *vertical*
+    # pipe on xyz0's lane must stay GREEN (idx 0) instead of being
+    # over-painted with the crossing commit's oid colour.
+    if cell.cell_type == CellType.PIPE:
+        pipe_color = cell.color_index
+    else:
+        assert cell.cell_type in (
+            CellType.CROSS,
+            CellType.HORIZONTAL_PIPE,
+            CellType.TEE_RIGHT,
+            CellType.TEE_LEFT,
+            CellType.TEE_UP,
+        ), (
+            f"expected a pipe/cross at row {bottom_idx + 1} col={col}, "
+            f"got {cell.cell_type.name}"
+        )
+        pipe_color = cell.pipe_color_index
+    assert pipe_color == 0, (
+        f"Pipe on xyz0 lane was over-painted: row {bottom_idx + 1} "
         f"col={col} {cell.cell_type.name} colour idx={cell.color_index} "
-        f"({BRANCH_PALETTE[cell.color_index]}).  The "
+        f"pipe idx={cell.pipe_color_index} "
+        f"({BRANCH_PALETTE[pipe_color]}).  The "
         f"``lane_color_index.get(...) or ...`` fallback in ``build_graph`` "
         "swapped a 0-valued GREEN for whatever ``oid_color_index`` held.  "
         "See BUG_VISUAL_FEAT_PIPE_COLOR."
