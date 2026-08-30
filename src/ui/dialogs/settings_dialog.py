@@ -8,7 +8,10 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -18,12 +21,16 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
+    QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
 
 from src.ui.dialogs.clone_dialog import SshKeyDialog, _find_ssh_keygen
+from src.ui.icons import toolbar_icon
 from src.utils.config import load_config, save_config
 
 
@@ -44,10 +51,15 @@ class SettingsDialog(QDialog):
     def __init__(self, config_path: str | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(540, 320)
+        self.resize(640, 480)
 
         self._config_path = config_path
         self._config = load_config(config_path) if config_path else {}
+
+        self._refresh_pubkey_timer = QTimer(self)
+        self._refresh_pubkey_timer.setSingleShot(True)
+        self._refresh_pubkey_timer.setInterval(150)
+        self._refresh_pubkey_timer.timeout.connect(self._refresh_public_key_view)
 
         self._build_ui()
         self._load_from_config()
@@ -101,6 +113,39 @@ class SettingsDialog(QDialog):
         gen_btn.clicked.connect(self._on_generate_ssh)
         form.addRow(gen_btn)
 
+        # -- Public key preview + copy --
+        self._ssh_pub_view = QPlainTextEdit()
+        self._ssh_pub_view.setReadOnly(True)
+        self._ssh_pub_view.setMinimumHeight(70)
+        self._ssh_pub_view.setMaximumHeight(110)
+        # Mono-space font for SSH key content (long base64 strings).
+        mono = QFont("Monospace")
+        mono.setStyleHint(QFont.StyleHint.TypeWriter)
+        self._ssh_pub_view.setFont(mono)
+        self._ssh_pub_view.setPlaceholderText(
+            "No public key file found at the configured path."
+        )
+
+        self._copy_btn = QToolButton()
+        self._copy_btn.setIcon(toolbar_icon("copy"))
+        self._copy_btn.setToolTip("Copy public key to clipboard")
+        self._copy_btn.setText("Copy")
+        self._copy_btn.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        self._copy_btn.clicked.connect(self._on_copy_public_key)
+
+        pub_view_row = QHBoxLayout()
+        pub_view_row.addWidget(self._ssh_pub_view, stretch=1)
+        pub_view_row.addWidget(self._copy_btn)
+        pub_view_widget = QWidget()
+        pub_view_widget.setLayout(pub_view_row)
+        form.addRow("Public Key:", pub_view_widget)
+
+        # React to path changes → debounced refresh.
+        self._ssh_priv_edit.textChanged.connect(self._on_path_changed)
+        self._ssh_pub_edit.textChanged.connect(self._on_path_changed)
+
         layout.addLayout(form)
         layout.addStretch(1)
 
@@ -123,6 +168,9 @@ class SettingsDialog(QDialog):
         )
         self._ssh_priv_edit.setText(c.get("ssh_private_key", ""))
         self._ssh_pub_edit.setText(c.get("ssh_public_key", ""))
+        # Load public key content synchronously at startup so the user
+        # sees it immediately when they open Settings.
+        self._refresh_public_key_view()
 
     def _on_accept(self) -> None:
         c = self._config
@@ -160,6 +208,56 @@ class SettingsDialog(QDialog):
     def _on_ssh_key_generated(self, priv: str, pub: str, _contents: str) -> None:
         self._ssh_priv_edit.setText(priv)
         self._ssh_pub_edit.setText(pub)
+
+    # ----- public-key view & copy -----------------------------------------
+
+    def _on_path_changed(self, _text: str) -> None:
+        """Debounced refresh of the public key preview when paths change."""
+        self._refresh_pubkey_timer.start()
+
+    def _refresh_public_key_view(self) -> None:
+        """Read the configured public key file and show it in the preview.
+
+        Priority: explicit public-key path if set, else derive from the
+        private-key path (``priv`` → ``priv + ".pub"``).
+        """
+        pub_path_text = self._ssh_pub_edit.text().strip()
+        if pub_path_text:
+            candidate = Path(pub_path_text)
+        else:
+            priv_text = self._ssh_priv_edit.text().strip()
+            if not priv_text:
+                self._ssh_pub_view.clear()
+                return
+            candidate = Path(priv_text + ".pub")
+        try:
+            content = candidate.read_text(encoding="utf-8").strip()
+        except OSError:
+            # File missing / unreadable — clear and show placeholder.
+            self._ssh_pub_view.clear()
+            return
+        self._ssh_pub_view.setPlainText(content)
+
+    def _on_copy_public_key(self) -> None:
+        """Copy the currently displayed public key to the clipboard."""
+        text = self._ssh_pub_view.toPlainText().strip()
+        if not text:
+            QMessageBox.information(
+                self,
+                "Copy Public Key",
+                "No public key to copy. Generate one or set a valid path first.",
+            )
+            return
+        clipboard = QApplication.clipboard()
+        clipboard.setText(text)
+        # Brief tooltip near the button as feedback (2s).
+        QToolTip.showText(
+            self._copy_btn.mapToGlobal(self._copy_btn.rect().bottomLeft()),
+            "Copied!",
+            self._copy_btn,
+            self._copy_btn.rect(),
+            2000,
+        )
 
     def _do_generate_ssh(self) -> None:
         priv_default = self._ssh_priv_edit.text().strip() or str(

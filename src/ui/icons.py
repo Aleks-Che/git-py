@@ -115,6 +115,20 @@ def _draw_search(p: QPainter) -> None:
     p.drawLine(QPointF(9.2, 9.2), QPointF(13.5, 13.5))
 
 
+def _draw_copy(p: QPainter) -> None:
+    """Two overlapping rectangles — classic clipboard / "copy" glyph.
+
+    The back rectangle is the source page (top-left), the front rectangle
+    is the destination page (bottom-right). Both are open-top so the
+    inner stroke reads as a page edge.
+    """
+    # Back rectangle (source page).
+    p.drawRect(QRectF(2.5, 3.5, 8.0, 9.0))
+    # Front rectangle (destination page) — drawn last so it visually
+    # overlaps the back rectangle.
+    p.drawRect(QRectF(5.5, 6.0, 8.0, 7.5))
+
+
 _DRAWERS: dict[str, DrawFn] = {
     "undo": _draw_undo,
     "redo": _draw_redo,
@@ -124,6 +138,7 @@ _DRAWERS: dict[str, DrawFn] = {
     "stash_push": _draw_stash_push,
     "stash_pop": _draw_stash_pop,
     "search": _draw_search,
+    "copy": _draw_copy,
 }
 
 _CACHE: dict[str, QIcon] = {}
