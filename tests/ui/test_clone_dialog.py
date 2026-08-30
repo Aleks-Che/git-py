@@ -486,7 +486,12 @@ def test_ssh_dialog_detects_file_with_ssh_name(
 def test_ssh_dialog_offers_alternative_path_on_file_conflict(
     qtbot, tmp_path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """User clicks 'Yes' on the question dialog -> path moves to sibling."""
+    """User clicks 'Yes' on the question dialog -> path moves to ~/.ssh-py/.
+
+    The key must NOT be dropped directly into the home directory (which
+    would litter ~/ with key files); it must go into a dedicated
+    ``.ssh-py/`` subfolder under home.
+    """
     from src.ui.dialogs import clone_dialog
 
     monkeypatch.setattr(clone_dialog, "_find_ssh_keygen", lambda: "ssh-keygen")
@@ -494,6 +499,9 @@ def test_ssh_dialog_offers_alternative_path_on_file_conflict(
     fake_ssh_file = tmp_path / ".ssh"
     fake_ssh_file.write_text("not a directory\n")
     requested = fake_ssh_file / "git-py-ed25519"
+
+    # Redirect Path.home() to tmp_path so the test is self-contained.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
     # Choose 'Yes' for the question dialog.
     monkeypatch.setattr(
@@ -508,7 +516,6 @@ def test_ssh_dialog_offers_alternative_path_on_file_conflict(
 
     def fake_run(args, **kwargs):  # noqa: ANN001
         captured_args.append(list(args))
-        # ssh-keygen creates files at the resolved path.
         priv = Path(args[args.index("-f") + 1])
         priv.parent.mkdir(parents=True, exist_ok=True)
         priv.write_text("PRIV\n")
@@ -522,12 +529,124 @@ def test_ssh_dialog_offers_alternative_path_on_file_conflict(
     dialog._path_edit.setText(str(requested))  # noqa: SLF001
     dialog._on_generate()  # noqa: SLF001
 
-    # Sibling path was used: tmp_path/git-py-ed25519 (parent is tmp_path, a real dir).
     assert captured_args, "ssh-keygen was not called"
     resolved_path = Path(captured_args[0][captured_args[0].index("-f") + 1])
-    assert resolved_path == tmp_path / "git-py-ed25519"
-    assert (tmp_path / "git-py-ed25519").exists()
-    assert (tmp_path / "git-py-ed25519.pub").exists()
+    # Path must be ~/.ssh-py/git-py-ed25519, NOT directly in ~/
+    expected = tmp_path / ".ssh-py" / "git-py-ed25519"
+    assert resolved_path == expected, (
+        f"key path must be inside ~/.ssh-py/, not directly in home. "
+        f"Got: {resolved_path}, expected: {expected}"
+    )
+    assert expected.exists()
+    assert (tmp_path / ".ssh-py" / "git-py-ed25519.pub").exists()
+    # Home directory must NOT have key files directly in it.
+    assert not (tmp_path / "git-py-ed25519").exists(), (
+        "key file leaked into home directory (would be 'мусор')"
+    )
+
+
+def test_ssh_dialog_yes_creates_ssh_py_folder_automatically(
+    qtbot, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``~/.ssh-py/`` folder must be auto-created if it doesn't exist."""
+    from src.ui.dialogs import clone_dialog
+
+    monkeypatch.setattr(clone_dialog, "_find_ssh_keygen", lambda: "ssh-keygen")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+
+    fake_ssh_file = tmp_path / ".ssh"
+    fake_ssh_file.write_text("not a directory\n")
+    requested = fake_ssh_file / "git-py-ed25519"
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes),
+    )
+
+    # Pre-condition: ~/.ssh-py does not exist
+    assert not (tmp_path / ".ssh-py").exists()
+
+    def fake_run(args, **kwargs):  # noqa: ANN001
+        priv = Path(args[args.index("-f") + 1])
+        priv.parent.mkdir(parents=True, exist_ok=True)
+        priv.write_text("PRIV\n")
+        priv.with_suffix(priv.suffix + ".pub").write_text("PUB\n")
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    dialog = SshKeyDialog()
+    qtbot.addWidget(dialog)
+    dialog._path_edit.setText(str(requested))  # noqa: SLF001
+    dialog._on_generate()  # noqa: SLF001
+
+    assert (tmp_path / ".ssh-py").is_dir(), ".ssh-py should have been auto-created"
+
+
+def test_ssh_dialog_yes_falls_back_to_tempdir_if_ssh_py_also_blocked(
+    qtbot, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``~/.ssh-py/`` is also blocked, recurse to case 3 (tempdir)."""
+    import tempfile
+
+    from src.ui.dialogs import clone_dialog
+
+    monkeypatch.setattr(clone_dialog, "_find_ssh_keygen", lambda: "ssh-keygen")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+
+    fake_ssh_file = tmp_path / ".ssh"
+    fake_ssh_file.write_text("not a directory\n")
+    # Also pre-create .ssh-py as a FILE (rare, but possible)
+    (tmp_path / ".ssh-py").write_text("block\n")
+
+    requested = fake_ssh_file / "git-py-ed25519"
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes),
+    )
+    # Silence the fallback info dialog.
+    info_messages: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        staticmethod(
+            lambda *a, **k: (
+                info_messages.append(a[2] if len(a) > 2 else k.get("text", "")),
+                0,
+            )[1],
+        ),
+    )
+
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+
+    captured_args: list[list[str]] = []
+
+    def fake_run(args, **kwargs):  # noqa: ANN001
+        captured_args.append(list(args))
+        priv = Path(args[args.index("-f") + 1])
+        priv.parent.mkdir(parents=True, exist_ok=True)
+        priv.write_text("PRIV\n")
+        priv.with_suffix(priv.suffix + ".pub").write_text("PUB\n")
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    dialog = SshKeyDialog()
+    qtbot.addWidget(dialog)
+    dialog._path_edit.setText(str(requested))  # noqa: SLF001
+    dialog._on_generate()  # noqa: SLF001
+
+    # ssh-keygen should still be called, but with a tempdir path
+    assert captured_args, "ssh-keygen should be invoked via tempdir fallback"
+    resolved_path = Path(captured_args[0][captured_args[0].index("-f") + 1])
+    assert str(resolved_path).startswith(str(tmp_path / "tmp")), (
+        f"expected tempdir fallback, got: {resolved_path}"
+    )
+    # The fallback info dialog should have been shown.
+    assert info_messages, "fallback info dialog should fire"
 
 
 def test_ssh_dialog_fallback_message_mentions_pub_file(

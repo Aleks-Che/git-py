@@ -197,28 +197,49 @@ class SshKeyDialog(QDialog):
     ) -> tuple[Path | None, bool]:
         """Parent exists but is a regular file, not a directory.
 
-        Offer the user a sibling path (same directory as the conflicting
-        file, but without the .ssh/ segment) or a tempdir fallback.
+        Offer the user a dedicated subfolder under their home directory
+        (``~/.ssh-py/``) so we don't litter the home directory with key
+        files when ``~/.ssh`` is occupied by a stray file. If ``~/.ssh-py``
+        is also unavailable (already exists as a file, etc.), fall back
+        to tempdir without a second prompt.
         """
-        # Suggest a sibling path: e.g. C:\Users\User\git-py-ed25519 instead
-        # of C:\Users\User\.ssh\git-py-ed25519.
-        sibling = parent.parent / path.name
+        ssh_py_dir = Path.home() / ".ssh-py"
+        new_path = ssh_py_dir / path.name
+
+        # If the proposed new directory is ALSO a file, we cannot recurse
+        # safely (would loop forever on the same conflict). Fall back
+        # directly to tempdir.
+        if ssh_py_dir.exists() and not ssh_py_dir.is_dir():
+            return self._fallback_to_tempdir(
+                path,
+                OSError(
+                    f"{parent} exists but is a file, "
+                    f"and {ssh_py_dir} is also a file",
+                ),
+            )
+
         choice = QMessageBox.question(
             self,
             "Generate SSH Key",
             f"Cannot use {parent} as a directory: "
             f"a file with that name already exists.\n\n"
-            f"Would you like to save the key to {sibling} instead?\n"
-            f"(Click 'No' to use a temporary folder instead.)",
+            f"Would you like to save the key to {new_path} instead?\n"
+            f"(.ssh-py is a dedicated subfolder for git-py SSH keys.)\n\n"
+            f"Click 'No' to use a temporary folder instead.",
             QMessageBox.StandardButton.Yes
             | QMessageBox.StandardButton.No
             | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Yes,
         )
         if choice == QMessageBox.StandardButton.Yes:
-            # Recurse: the sibling's parent is the grandparent, which is
-            # presumably a real directory.
-            return self._ensure_parent_dir(sibling)
+            # Create ~/.ssh-py directly (avoid recursion through
+            # _ensure_parent_dir which would re-trigger the file
+            # conflict detection and could loop).
+            try:
+                ssh_py_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                return self._fallback_to_tempdir(path, exc)
+            return new_path, False
         if choice == QMessageBox.StandardButton.No:
             return self._fallback_to_tempdir(
                 path, OSError(f"{parent} exists but is a file, not a directory"),
