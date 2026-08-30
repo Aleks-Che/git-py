@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import Signal
@@ -159,6 +160,41 @@ class SshKeyDialog(QDialog):
         if email:
             self._comment_edit.setText(email)
 
+    def _ensure_parent_dir(
+        self, path: Path,
+    ) -> tuple[Path | None, bool]:
+        """Create ``path.parent`` if missing; fall back to tempdir if not writable.
+
+        Returns ``(resolved_path, fell_back)``. ``resolved_path`` is None on
+        unrecoverable failure (warning shown to the user).
+        """
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            return path, False
+        except OSError as primary_exc:
+            # Primary location is not creatable (e.g. ~/.ssh missing AND
+            # home directory not writable on Windows). Try tempdir.
+            fallback_dir = Path(tempfile.gettempdir()) / "git-py-ssh"
+            try:
+                fallback_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as secondary_exc:
+                QMessageBox.warning(
+                    self,
+                    "Generate SSH Key",
+                    f"Cannot create directory for SSH key:\n"
+                    f"Primary: {path.parent} ({primary_exc})\n"
+                    f"Fallback: {fallback_dir} ({secondary_exc})",
+                )
+                return None, False
+            new_path = fallback_dir / path.name
+            QMessageBox.information(
+                self,
+                "Generate SSH Key",
+                f"Could not use {path.parent} ({primary_exc}). "
+                f"Falling back to: {fallback_dir}",
+            )
+            return new_path, True
+
     def _on_generate(self) -> None:
         path_text = self._path_edit.text().strip()
         if not path_text:
@@ -179,6 +215,12 @@ class SshKeyDialog(QDialog):
                 "Generate SSH Key",
                 "`ssh-keygen` was not found on PATH. Install OpenSSH and retry.",
             )
+            return
+        # Ensure the parent directory exists. On Windows ~/.ssh is often
+        # missing; without this ssh-keygen fails with
+        # "Saving key '<path>' failed: No such file or directory".
+        path, fell_back = self._ensure_parent_dir(path)
+        if path is None:
             return
         try:
             completed = subprocess.run(  # noqa: S603 - intentional subprocess
