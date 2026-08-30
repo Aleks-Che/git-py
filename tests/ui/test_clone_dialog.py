@@ -103,9 +103,11 @@ def test_accept_with_both_fields_emits(qtbot) -> None:
     captured: list[tuple[str, str]] = []
     dialog.accepted.connect(lambda u, p: captured.append((u, p)))
     dialog.set_url("https://example.com/repo.git")
-    dialog.set_local_path("/tmp/clone-target")
+    # Use a path that already ends with the repo name so update11's
+    # auto-append logic doesn't change it.
+    dialog.set_local_path("/tmp/clone-target/repo")
     dialog._on_accept()  # noqa: SLF001
-    assert captured == [("https://example.com/repo.git", "/tmp/clone-target")]
+    assert captured == [("https://example.com/repo.git", "/tmp/clone-target/repo")]
 
 
 # ----- SSH key dialog (no real subprocess) --------------------------------
@@ -719,3 +721,53 @@ def test_generate_ssh_button_opens_subdialog(
     )
     dialog._on_generate_ssh()  # noqa: SLF001
     assert calls
+
+
+# ----- update11: clone target path resolution --------------------------------
+
+
+def test_clone_dialog_appends_repo_name_when_path_does_not_exist(
+    qtbot, tmp_path,
+) -> None:
+    """Non-existent destination path → treated as parent, repo name appended."""
+    dialog = CloneDialog()
+    qtbot.addWidget(dialog)
+    parent = tmp_path / "work" / "git"  # does not exist
+    assert not parent.exists()
+
+    resolved = dialog._resolve_clone_target(  # noqa: SLF001
+        "git@github.com:Aleks-Che/git-py.git", str(parent),
+    )
+    assert resolved == str(parent / "git-py")
+
+
+def test_clone_dialog_does_not_touch_existing_path(
+    qtbot, tmp_path,
+) -> None:
+    """Existing destination path → use verbatim (user knows the dir is ready)."""
+    dialog = CloneDialog()
+    qtbot.addWidget(dialog)
+    existing = tmp_path / "my-repos"
+    existing.mkdir()  # user already created this empty dir
+
+    resolved = dialog._resolve_clone_target(  # noqa: SLF001
+        "git@github.com:Aleks-Che/git-py.git", str(existing),
+    )
+    assert resolved == str(existing)
+
+
+def test_clone_dialog_does_not_duplicate_when_path_already_has_name(
+    qtbot, tmp_path,
+) -> None:
+    """Path ending with repo name → no duplication."""
+    dialog = CloneDialog()
+    qtbot.addWidget(dialog)
+    target = tmp_path / "work" / "git-py"  # already ends with repo name
+    assert not target.exists()
+
+    resolved = dialog._resolve_clone_target(  # noqa: SLF001
+        "git@github.com:Aleks-Che/git-py.git", str(target),
+    )
+    assert resolved == str(target), (
+        f"should not append repo name again, got: {resolved}"
+    )

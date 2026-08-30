@@ -163,6 +163,7 @@ class RepositoryManager:
         path: str,
         bare: bool = False,
         callbacks: pygit2.RemoteCallbacks | None = None,
+        ssh_key_path: str | None = None,
     ) -> None:
         """Clone ``url`` to ``path``.
 
@@ -179,6 +180,10 @@ class RepositoryManager:
         HTTPS / ``file://`` / ``git://`` URLs go through ``pygit2`` and
         benefit from its in-process transport.
 
+        ``ssh_key_path`` is only meaningful for SSH URLs — when provided
+        it is passed to the underlying ``ssh`` invocation so the user's
+        key (which may live outside ``~/.ssh/``) is actually used.
+
         On failure the previously open repository, if any, is dropped so
         callers do not see a stale handle.
         """
@@ -190,7 +195,7 @@ class RepositoryManager:
             # Run the CLI clone. After it succeeds, the on-disk repo
             # exists; open it via pygit2 (works because that access is
             # local-filesystem only, no SSH transport needed).
-            _clone_via_cli(url, path, bare=bare)
+            _clone_via_cli(url, path, bare=bare, ssh_key_path=ssh_key_path)
             try:
                 self._repo = pygit2.Repository(path)
             except pygit2.GitError as exc:

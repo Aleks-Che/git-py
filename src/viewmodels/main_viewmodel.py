@@ -2042,13 +2042,28 @@ class MainViewModel(QObject):
     def _execute_clone_sync(self, url: str, path: str) -> None:
         try:
             manager = RepositoryManager()
-            manager.clone(url, path)
+            ssh_key = self._ssh_key_path_for_clone()
+            manager.clone(url, path, ssh_key_path=ssh_key)
         except GitError as exc:
             self.error_occurred.emit(str(exc))
             self._log("clone", f"Clone failed: {exc}", level="error")
             return
         self.set_repository(manager)
         self._log("clone", f"Clone finished: {url} → {path}")
+
+    def _ssh_key_path_for_clone(self) -> str | None:
+        """Return the configured private SSH key path, if any.
+
+        Used by ``clone_repository`` to forward the key to ``git``
+        via ``GIT_SSH_COMMAND``. Returns ``None`` if no key is
+        configured (git CLI will fall back to ``~/.ssh/id_*``).
+        """
+        try:
+            config = load_config(default_config_path())
+        except OSError:
+            return None
+        key = str(config.get("ssh_private_key", "") or "").strip()
+        return key or None
 
     def _current_branch_shorthand(self) -> str:
         """Return the current branch shorthand, or ``""`` if unborn / no repo."""
@@ -2945,7 +2960,8 @@ class MainViewModel(QObject):
 
         def _work() -> None:
             manager = RepositoryManager()
-            manager.clone(url, path)
+            ssh_key = self._ssh_key_path_for_clone()
+            manager.clone(url, path, ssh_key_path=ssh_key)
 
         def _on_success(_: object) -> None:
             if generation != self._async_generation:

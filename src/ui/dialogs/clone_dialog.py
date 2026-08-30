@@ -482,8 +482,43 @@ class CloneDialog(QDialog):
         if not path:
             QMessageBox.warning(self, "Clone Repository", "Please choose a local path.")
             return
+        # If the destination directory does not exist yet, treat it as
+        # the **parent** directory and append the repository name. This
+        # matches what most Git GUI clients do: pick the folder where
+        # the new repo should live, and the repo is created as a child.
+        path = self._resolve_clone_target(url, path)
         self.accepted.emit(url, path)
         self.accept()
+
+    def _resolve_clone_target(self, url: str, path: str) -> str:
+        """Append the repo name to ``path`` unless it already ends there.
+
+        Rules:
+        - If ``path`` does not exist on disk → treat as parent, append
+          the repo name derived from ``url``.
+        - If ``path`` exists → use it verbatim (user knows the dir is
+          already empty / ready for clone).
+        - If the last segment of ``path`` already equals the repo name
+          → leave as is (avoid duplicating the name).
+        - If we cannot parse a repo name from ``url`` → leave path alone.
+        """
+        try:
+            from src.core.operations import _extract_repo_name
+            repo_name = _extract_repo_name(url)
+        except ImportError:
+            return path
+        if not repo_name:
+            return path
+        target = Path(path)
+        # If user already pointed at a path that ends with the repo
+        # name, do not duplicate.
+        if target.name == repo_name:
+            return path
+        # If the path already exists on disk, assume the user wants the
+        # exact directory they picked (e.g. an empty directory).
+        if target.exists():
+            return path
+        return str(target / repo_name)
 
 
 __all__ = ["CloneDialog", "SshKeyDialog"]
