@@ -165,35 +165,96 @@ class SshKeyDialog(QDialog):
     ) -> tuple[Path | None, bool]:
         """Create ``path.parent`` if missing; fall back to tempdir if not writable.
 
+        Handles three cases on the primary location:
+
+        1. **Parent missing**: create it via ``mkdir(parents=True, exist_ok=True)``.
+        2. **Parent exists but is a file** (e.g. ``~/.ssh`` is a leftover file
+           rather than a directory, common on Windows after Cygwin installs):
+           offer the user an alternative path (sibling of the conflicting file)
+           or tempdir fallback, via a Yes/No dialog.
+        3. **Parent not creatable** (permission denied, read-only home):
+           fall back to ``tempfile.gettempdir()/git-py-ssh``.
+
         Returns ``(resolved_path, fell_back)``. ``resolved_path`` is None on
         unrecoverable failure (warning shown to the user).
         """
+        parent = path.parent
+
+        # Case 2: parent exists but is a file. Cannot mkdir into it.
+        if parent.exists() and not parent.is_dir():
+            return self._handle_parent_is_file(path, parent)
+
+        # Case 1: parent missing or already a directory.
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            parent.mkdir(parents=True, exist_ok=True)
             return path, False
         except OSError as primary_exc:
-            # Primary location is not creatable (e.g. ~/.ssh missing AND
-            # home directory not writable on Windows). Try tempdir.
-            fallback_dir = Path(tempfile.gettempdir()) / "git-py-ssh"
-            try:
-                fallback_dir.mkdir(parents=True, exist_ok=True)
-            except OSError as secondary_exc:
-                QMessageBox.warning(
-                    self,
-                    "Generate SSH Key",
-                    f"Cannot create directory for SSH key:\n"
-                    f"Primary: {path.parent} ({primary_exc})\n"
-                    f"Fallback: {fallback_dir} ({secondary_exc})",
-                )
-                return None, False
-            new_path = fallback_dir / path.name
-            QMessageBox.information(
+            # Case 3: parent not creatable (permission denied, etc.).
+            return self._fallback_to_tempdir(path, primary_exc)
+
+    def _handle_parent_is_file(
+        self, path: Path, parent: Path,
+    ) -> tuple[Path | None, bool]:
+        """Parent exists but is a regular file, not a directory.
+
+        Offer the user a sibling path (same directory as the conflicting
+        file, but without the .ssh/ segment) or a tempdir fallback.
+        """
+        # Suggest a sibling path: e.g. C:\Users\User\git-py-ed25519 instead
+        # of C:\Users\User\.ssh\git-py-ed25519.
+        sibling = parent.parent / path.name
+        choice = QMessageBox.question(
+            self,
+            "Generate SSH Key",
+            f"Cannot use {parent} as a directory: "
+            f"a file with that name already exists.\n\n"
+            f"Would you like to save the key to {sibling} instead?\n"
+            f"(Click 'No' to use a temporary folder instead.)",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        if choice == QMessageBox.StandardButton.Yes:
+            # Recurse: the sibling's parent is the grandparent, which is
+            # presumably a real directory.
+            return self._ensure_parent_dir(sibling)
+        if choice == QMessageBox.StandardButton.No:
+            return self._fallback_to_tempdir(
+                path, OSError(f"{parent} exists but is a file, not a directory"),
+            )
+        # Cancel
+        return None, False
+
+    def _fallback_to_tempdir(
+        self, path: Path, primary_exc: OSError,
+    ) -> tuple[Path | None, bool]:
+        """Fall back to ``tempfile.gettempdir()/git-py-ssh`` and notify user."""
+        fallback_dir = Path(tempfile.gettempdir()) / "git-py-ssh"
+        try:
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as secondary_exc:
+            QMessageBox.warning(
                 self,
                 "Generate SSH Key",
-                f"Could not use {path.parent} ({primary_exc}). "
-                f"Falling back to: {fallback_dir}",
+                f"Cannot create directory for SSH key:\n"
+                f"Primary: {path.parent} ({primary_exc})\n"
+                f"Fallback: {fallback_dir} ({secondary_exc})",
             )
-            return new_path, True
+            return None, False
+        new_path = fallback_dir / path.name
+        QMessageBox.information(
+            self,
+            "Generate SSH Key",
+            f"Could not use {path.parent}.\n\n"
+            f"Reason: {primary_exc}\n\n"
+            f"Your key pair was created at:\n"
+            f"  Private: {new_path}\n"
+            f"  Public:  {new_path}.pub\n\n"
+            f"Add the .pub contents to your Git host (GitHub/GitLab/etc.) "
+            f"from this location.",
+        )
+        return new_path, True
 
     def _on_generate(self) -> None:
         path_text = self._path_edit.text().strip()
