@@ -741,10 +741,15 @@ def test_clone_dialog_appends_repo_name_when_path_does_not_exist(
     assert resolved == str(parent / "git-py")
 
 
-def test_clone_dialog_does_not_touch_existing_path(
+def test_clone_dialog_appends_repo_name_to_existing_path(
     qtbot, tmp_path,
 ) -> None:
-    """Existing destination path → use verbatim (user knows the dir is ready)."""
+    """Even an already-existing destination path gets the repo name appended.
+
+    Matches the behaviour of GitHub Desktop / Sourcetree / GitKraken:
+    the user picks a **parent** folder and the repo is created inside it
+    as a child. Whether or not the parent exists already is irrelevant.
+    """
     dialog = CloneDialog()
     qtbot.addWidget(dialog)
     existing = tmp_path / "my-repos"
@@ -753,7 +758,10 @@ def test_clone_dialog_does_not_touch_existing_path(
     resolved = dialog._resolve_clone_target(  # noqa: SLF001
         "git@github.com:Aleks-Che/git-py.git", str(existing),
     )
-    assert resolved == str(existing)
+    assert resolved == str(existing / "git-py"), (
+        f"expected repo name to be appended even when path exists, "
+        f"got: {resolved}"
+    )
 
 
 def test_clone_dialog_does_not_duplicate_when_path_already_has_name(

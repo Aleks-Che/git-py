@@ -493,14 +493,18 @@ class CloneDialog(QDialog):
     def _resolve_clone_target(self, url: str, path: str) -> str:
         """Append the repo name to ``path`` unless it already ends there.
 
+        The path the user picks is treated as the **parent directory**
+        for the new clone, matching the behaviour of GitHub Desktop,
+        Sourcetree, GitKraken and other Git GUI clients. Whether or
+        not the path already exists on disk is irrelevant — append the
+        repo name derived from ``url`` and let ``git clone`` create the
+        directory as needed.
+
         Rules:
-        - If ``path`` does not exist on disk → treat as parent, append
-          the repo name derived from ``url``.
-        - If ``path`` exists → use it verbatim (user knows the dir is
-          already empty / ready for clone).
+        - If we cannot parse a repo name from ``url`` → leave path alone.
         - If the last segment of ``path`` already equals the repo name
           → leave as is (avoid duplicating the name).
-        - If we cannot parse a repo name from ``url`` → leave path alone.
+        - Otherwise → append the repo name.
         """
         try:
             from src.core.operations import _extract_repo_name
@@ -514,10 +518,8 @@ class CloneDialog(QDialog):
         # name, do not duplicate.
         if target.name == repo_name:
             return path
-        # If the path already exists on disk, assume the user wants the
-        # exact directory they picked (e.g. an empty directory).
-        if target.exists():
-            return path
+        # Otherwise always append — the user's chosen path is treated
+        # as the parent directory.
         return str(target / repo_name)
 
 
