@@ -441,6 +441,149 @@ def test_ssh_dialog_aborts_when_no_directory_is_creatable(
     assert subprocess_calls == [], "ssh-keygen must not be invoked when no dir is creatable"
 
 
+# ----- update7: handle parent-is-a-file conflict (e.g. .ssh is a file) -----
+
+
+def test_ssh_dialog_detects_file_with_ssh_name(
+    qtbot, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``~/.ssh`` exists as a *file* (not dir), user gets a question dialog."""
+    from src.ui.dialogs import clone_dialog
+
+    monkeypatch.setattr(clone_dialog, "_find_ssh_keygen", lambda: "ssh-keygen")
+
+    # Simulate the situation: parent of chosen path is a FILE, not a directory.
+    fake_ssh_file = tmp_path / ".ssh"
+    fake_ssh_file.write_text("not a directory\n")
+
+    requested = fake_ssh_file / "git-py-ed25519"
+
+    # Mock QMessageBox.question to capture the question text and choose Cancel
+    # (so we don't recurse into _ensure_parent_dir).
+    questions: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        staticmethod(
+            lambda *a, **k: (
+                questions.append(a[2] if len(a) > 2 else k.get("text", "")),
+                QMessageBox.StandardButton.Cancel,
+            )[1],
+        ),
+    )
+
+    dialog = SshKeyDialog()
+    qtbot.addWidget(dialog)
+    dialog._path_edit.setText(str(requested))  # noqa: SLF001
+    dialog._on_generate()  # noqa: SLF001
+
+    assert questions, "expected a question dialog for file-vs-dir conflict"
+    question_text = questions[0]
+    assert ".ssh" in question_text or str(fake_ssh_file) in question_text
+    assert "already exists" in question_text or "file" in question_text.lower()
+
+
+def test_ssh_dialog_offers_alternative_path_on_file_conflict(
+    qtbot, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """User clicks 'Yes' on the question dialog -> path moves to sibling."""
+    from src.ui.dialogs import clone_dialog
+
+    monkeypatch.setattr(clone_dialog, "_find_ssh_keygen", lambda: "ssh-keygen")
+
+    fake_ssh_file = tmp_path / ".ssh"
+    fake_ssh_file.write_text("not a directory\n")
+    requested = fake_ssh_file / "git-py-ed25519"
+
+    # Choose 'Yes' for the question dialog.
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        staticmethod(
+            lambda *a, **k: QMessageBox.StandardButton.Yes,
+        ),
+    )
+
+    captured_args: list[list[str]] = []
+
+    def fake_run(args, **kwargs):  # noqa: ANN001
+        captured_args.append(list(args))
+        # ssh-keygen creates files at the resolved path.
+        priv = Path(args[args.index("-f") + 1])
+        priv.parent.mkdir(parents=True, exist_ok=True)
+        priv.write_text("PRIV\n")
+        priv.with_suffix(priv.suffix + ".pub").write_text("PUB\n")
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    dialog = SshKeyDialog()
+    qtbot.addWidget(dialog)
+    dialog._path_edit.setText(str(requested))  # noqa: SLF001
+    dialog._on_generate()  # noqa: SLF001
+
+    # Sibling path was used: tmp_path/git-py-ed25519 (parent is tmp_path, a real dir).
+    assert captured_args, "ssh-keygen was not called"
+    resolved_path = Path(captured_args[0][captured_args[0].index("-f") + 1])
+    assert resolved_path == tmp_path / "git-py-ed25519"
+    assert (tmp_path / "git-py-ed25519").exists()
+    assert (tmp_path / "git-py-ed25519.pub").exists()
+
+
+def test_ssh_dialog_fallback_message_mentions_pub_file(
+    qtbot, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fallback 'information' dialog must mention the .pub file location."""
+    import tempfile
+
+    from src.ui.dialogs import clone_dialog
+
+    monkeypatch.setattr(clone_dialog, "_find_ssh_keygen", lambda: "ssh-keygen")
+
+    # Force mkdir to fail globally via instance-method patch (avoids Qt/ctypes crash).
+    dialog = SshKeyDialog()
+    qtbot.addWidget(dialog)
+
+    def fake_ensure(path):  # noqa: ANN001
+        return dialog._fallback_to_tempdir(
+            path, OSError("simulated permission denied"),
+        )
+
+    monkeypatch.setattr(dialog, "_ensure_parent_dir", fake_ensure)
+
+    info_messages: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        staticmethod(
+            lambda *a, **k: (
+                info_messages.append(a[2] if len(a) > 2 else k.get("text", "")),
+                0,
+            )[1],
+        ),
+    )
+
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+
+    def fake_run(args, **kwargs):  # noqa: ANN001
+        priv = Path(args[args.index("-f") + 1])
+        priv.parent.mkdir(parents=True, exist_ok=True)
+        priv.write_text("PRIV\n")
+        priv.with_suffix(priv.suffix + ".pub").write_text("PUB\n")
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    dialog._path_edit.setText(str(tmp_path / "no-dir" / "key"))  # noqa: SLF001
+    dialog._on_generate()  # noqa: SLF001
+
+    assert info_messages, "expected an information dialog"
+    msg = info_messages[0]
+    assert ".pub" in msg, f"message should mention .pub file location, got: {msg!r}"
+    assert "Private" in msg or "private" in msg
+    assert "Public" in msg or "public" in msg
+
+
 # ----- generate-ssh-key button on CloneDialog opens sub-dialog ------------
 
 
