@@ -172,9 +172,37 @@ class RepositoryManager:
         :class:`src.core.exceptions.AuthError` is raised on the first
         credential prompt.
 
+        For SSH URLs (``git@host:path`` / ``ssh://...``) we delegate to
+        the system ``git`` CLI via :func:`src.core.operations._clone_via_cli`
+        because the prebuilt ``pygit2`` wheel on Windows is built without
+        ``libssh2`` and surfaces these as ``unsupported URL protocol``.
+        HTTPS / ``file://`` / ``git://`` URLs go through ``pygit2`` and
+        benefit from its in-process transport.
+
         On failure the previously open repository, if any, is dropped so
         callers do not see a stale handle.
         """
+        # Import locally to avoid a circular import: repository.py is
+        # imported by operations.py for unwrap().
+        from src.core.operations import _clone_via_cli, _url_needs_cli_fallback
+
+        if _url_needs_cli_fallback(url):
+            # Run the CLI clone. After it succeeds, the on-disk repo
+            # exists; open it via pygit2 (works because that access is
+            # local-filesystem only, no SSH transport needed).
+            _clone_via_cli(url, path, bare=bare)
+            try:
+                self._repo = pygit2.Repository(path)
+            except pygit2.GitError as exc:
+                self._repo = None
+                self._path = None
+                raise GitError(
+                    f"Cloned {url} to {path}, but failed to open the "
+                    f"resulting repository: {exc}",
+                ) from exc
+            self._path = str(Path(path))
+            return
+
         try:
             repo = pygit2.clone_repository(url, path, bare=bare, callbacks=callbacks)
         except pygit2.GitError as exc:
