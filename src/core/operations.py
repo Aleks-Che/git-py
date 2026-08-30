@@ -2368,6 +2368,69 @@ def _fetch_via_cli(
         raise GitError(f"git fetch {url} failed: {stderr}") from None
 
 
+def _clone_via_cli(url: str, path: str, bare: bool = False) -> None:
+    """Run ``git clone <url> <path>`` (or ``--bare``) outside any repo.
+
+    Used as a fallback for SSH URLs that pygit2 cannot handle because
+    the prebuilt Windows wheels ship without libssh2. The system ``git``
+    CLI uses the user's own SSH client (OpenSSH on PATH, ``~/.ssh/config``,
+    ``SSH_AUTH_SOCK``) which works out of the box.
+
+    On success, the cloned repository lives on disk at ``path``; the
+    caller is expected to open it with :class:`pygit2.Repository` (which
+    works fine because it is a local-filesystem access).
+    """
+    git = shutil.which("git")
+    if git is None:
+        raise GitNotInstalledError("`git` CLI is not in PATH.")
+    args: list[str] = ["clone", url, path]
+    if bare:
+        args.insert(2, "--bare")
+    try:
+        completed = subprocess.run(
+            [git, *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=300.0,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(
+            f"git clone {url} -> {path} timed out: {exc}",
+        ) from exc
+    except OSError as exc:
+        raise GitError(
+            f"git clone {url} -> {path} failed to start: {exc}",
+        ) from exc
+    if completed.returncode != 0:
+        stderr = (completed.stderr or completed.stdout or "").strip()
+        low = stderr.lower()
+        # ``git clone`` reports auth failures as "Permission denied
+        # (publickey)" / "Repository not found" and network problems
+        # similarly to ``git fetch``.
+        if "permission denied" in low or "publickey" in low or "authentication" in low:
+            raise AuthError(
+                f"Authentication failed for {url}: {stderr}",
+            ) from None
+        if (
+            "could not resolve" in low
+            or "connection refused" in low
+            or "connection timed out" in low
+            or "network" in low
+            or "no route" in low
+        ):
+            raise NetworkError(
+                f"Network error contacting {url}: {stderr}",
+            ) from None
+        # "Repository not found" → GitError (the URL is well-formed but
+        # the remote doesn't exist; that's neither auth nor network).
+        raise GitError(
+            f"git clone {url} -> {path} failed: {stderr}",
+        ) from None
+
+
 def add_remote(
     repo: RepositoryManager | pygit2.Repository,
     name: str,

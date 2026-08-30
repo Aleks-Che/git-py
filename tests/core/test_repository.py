@@ -534,3 +534,151 @@ def test_get_commit_file_diff_text_handles_unknown_sha(
 ) -> None:
     with pytest.raises(InvalidRefError):
         committed_repo.get_commit_file_diff_text("deadbeef" * 5, "hello.txt")
+
+
+# ----- clone: SSH fallback (update10) ---------------------------------------
+
+
+def test_clone_routes_ssh_url_through_git_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """SSH URL (``git@host:path``) → ``git clone`` subprocess, not pygit2."""
+    captured: list[list[str]] = []
+
+    def fake_run(args, **kwargs):  # noqa: ANN001
+        captured.append(list(args))
+        # Pretend the CLI successfully cloned into the target dir by
+        # creating a .git directory. pygit2.Repository(path) will then
+        # fail in the assertion block below — that's fine, we just want
+        # to verify the call shape.
+        target = Path(args[-1])
+        (target / ".git").mkdir(parents=True, exist_ok=True)
+        return type(
+            "P",
+            (),
+            {"returncode": 0, "stdout": "", "stderr": ""},
+        )()
+
+    monkeypatch.setattr("src.core.operations.subprocess.run", fake_run)
+    # pygit2.Repository would fail on an empty .git — patch it to return
+    # a sentinel that won't be inspected further.
+    monkeypatch.setattr(
+        "src.core.repository.pygit2.Repository",
+        lambda _path: object(),
+    )
+
+    mgr = RepositoryManager()
+    ssh_url = "git@github.com:Aleks-Che/git-py.git"
+    target = tmp_path / "myrepo"
+    try:
+        mgr.clone(ssh_url, str(target))
+    except Exception:  # noqa: BLE001 - we just check the call shape
+        pass
+
+    assert captured, "git CLI was not invoked for SSH clone"
+    cmd = captured[0]
+    assert cmd[0].endswith("git") or cmd[0] == "git"
+    assert "clone" in cmd
+    assert ssh_url in cmd
+    assert str(target) in cmd
+
+
+def test_clone_uses_pygit2_for_https_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """HTTPS URL → ``pygit2.clone_repository`` directly (no subprocess)."""
+    pygit2_calls: list[tuple[str, str]] = []
+
+    class _FakeRepo:
+        pass
+
+    def fake_clone_repository(url, path, bare=False, callbacks=None):  # noqa: ANN001
+        pygit2_calls.append((url, path))
+        # Make the path "look like" a repo so the manager keeps the
+        # handle without raising.
+        (Path(path) / ".git").mkdir(parents=True, exist_ok=True)
+        return _FakeRepo()
+
+    monkeypatch.setattr(
+        "src.core.repository.pygit2.clone_repository", fake_clone_repository,
+    )
+
+    subprocess_calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):  # noqa: ANN001
+        subprocess_calls.append(list(args))
+        return type(
+            "P",
+            (),
+            {"returncode": 0, "stdout": "", "stderr": ""},
+        )()
+
+    monkeypatch.setattr("src.core.operations.subprocess.run", fake_run)
+
+    mgr = RepositoryManager()
+    https_url = "https://github.com/Aleks-Che/git-py.git"
+    target = tmp_path / "myrepo"
+    mgr.clone(https_url, str(target))
+
+    assert pygit2_calls, "pygit2.clone_repository was not called"
+    assert subprocess_calls == [], (
+        "subprocess.run must NOT be invoked for HTTPS URL — pygit2 handles it"
+    )
+
+
+def test_clone_via_cli_propagates_auth_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``git clone`` failure with 'Permission denied' → :class:`AuthError`."""
+    from src.core.exceptions import AuthError
+    from src.core.operations import _clone_via_cli
+
+    def fake_run(args, **kwargs):  # noqa: ANN001
+        return type(
+            "P",
+            (),
+            {
+                "returncode": 128,
+                "stdout": "",
+                "stderr": "git@github.com: Permission denied (publickey).\n",
+            },
+        )()
+
+    monkeypatch.setattr("src.core.operations.subprocess.run", fake_run)
+    monkeypatch.setattr("src.core.operations.shutil.which", lambda _: "/usr/bin/git")
+
+    target = tmp_path / "myrepo"
+    with pytest.raises(AuthError) as exc_info:
+        _clone_via_cli("git@github.com:foo/bar.git", str(target))
+
+    assert "git@github.com:foo/bar.git" in str(exc_info.value)
+    assert "Permission denied" in str(exc_info.value)
+
+
+def test_clone_via_cli_propagates_network_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``git clone`` failure with 'Could not resolve hostname' → :class:`NetworkError`."""
+    from src.core.exceptions import NetworkError
+    from src.core.operations import _clone_via_cli
+
+    def fake_run(args, **kwargs):  # noqa: ANN001
+        return type(
+            "P",
+            (),
+            {
+                "returncode": 128,
+                "stdout": "",
+                "stderr": "fatal: Could not resolve hostname example.com\n",
+            },
+        )()
+
+    monkeypatch.setattr("src.core.operations.subprocess.run", fake_run)
+    monkeypatch.setattr("src.core.operations.shutil.which", lambda _: "/usr/bin/git")
+
+    target = tmp_path / "myrepo"
+    with pytest.raises(NetworkError) as exc_info:
+        _clone_via_cli("git@github.com:foo/bar.git", str(target))
+
+    assert "git@github.com:foo/bar.git" in str(exc_info.value)
+    assert "Could not resolve" in str(exc_info.value)
