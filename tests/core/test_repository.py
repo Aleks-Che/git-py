@@ -682,3 +682,85 @@ def test_clone_via_cli_propagates_network_error(
 
     assert "git@github.com:foo/bar.git" in str(exc_info.value)
     assert "Could not resolve" in str(exc_info.value)
+
+
+# ----- update11: clone uses Settings key + auto repo name ---------------------
+
+
+def test_extract_repo_name_from_scp_url() -> None:
+    """SCP-style SSH URL → repo name with .git stripped."""
+    from src.core.operations import _extract_repo_name
+    assert _extract_repo_name("git@github.com:Aleks-Che/git-py.git") == "git-py"
+
+
+def test_extract_repo_name_from_https_url() -> None:
+    """HTTPS URL → repo name with .git stripped."""
+    from src.core.operations import _extract_repo_name
+    assert _extract_repo_name("https://github.com/Aleks-Che/git-py.git") == "git-py"
+
+
+def test_extract_repo_name_strips_dot_git() -> None:
+    """HTTPS without .git → still returns repo name."""
+    from src.core.operations import _extract_repo_name
+    assert _extract_repo_name("https://gitlab.com/user/my-project") == "my-project"
+
+
+def test_clone_via_cli_sets_git_ssh_command_when_key_provided(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """When ssh_key_path is given, GIT_SSH_COMMAND env var carries the key path."""
+    from src.core.operations import _clone_via_cli
+
+    captured: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):  # noqa: ANN001
+        captured["args"] = list(args)
+        captured["env"] = kwargs.get("env")
+        return type(
+            "P",
+            (),
+            {"returncode": 0, "stdout": "", "stderr": ""},
+        )()
+
+    monkeypatch.setattr("src.core.operations.subprocess.run", fake_run)
+    monkeypatch.setattr("src.core.operations.shutil.which", lambda _: "/usr/bin/git")
+
+    key_path = "/home/user/.ssh-py/git-py-ed25519"
+    _clone_via_cli(
+        "git@github.com:foo/bar.git",
+        str(tmp_path / "bar"),
+        ssh_key_path=key_path,
+    )
+
+    env = captured["env"]
+    assert env is not None, "env should have been passed to subprocess"
+    cmd = env["GIT_SSH_COMMAND"]
+    assert key_path in cmd
+    assert "StrictHostKeyChecking=accept-new" in cmd
+    assert "-i" in cmd
+
+
+def test_clone_via_cli_no_ssh_command_when_no_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Without ssh_key_path, env is not overridden (git uses its own defaults)."""
+    from src.core.operations import _clone_via_cli
+
+    captured: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):  # noqa: ANN001
+        captured["env"] = kwargs.get("env")
+        return type(
+            "P",
+            (),
+            {"returncode": 0, "stdout": "", "stderr": ""},
+        )()
+
+    monkeypatch.setattr("src.core.operations.subprocess.run", fake_run)
+    monkeypatch.setattr("src.core.operations.shutil.which", lambda _: "/usr/bin/git")
+
+    _clone_via_cli("git@github.com:foo/bar.git", str(tmp_path / "bar"))
+
+    assert captured["env"] is None, (
+        "env should be None when no ssh_key_path is provided"
+    )

@@ -2304,6 +2304,47 @@ _SCP_URL_RE = re.compile(r"^[\w.-]+@[\w.-]+:")
 _SSH_SCHEME_RE = re.compile(r"^(ssh|git\+ssh)://", re.IGNORECASE)
 
 
+def _extract_repo_name(url: str) -> str | None:
+    """Extract the repository directory name from a Git URL.
+
+    Supports:
+    - SCP-style: ``git@host:path/repo.git`` → ``repo``
+    - SSH URL: ``ssh://git@host/path/repo.git`` → ``repo``
+    - HTTPS URL: ``https://host/path/repo.git`` → ``repo``
+    - Without ``.git`` suffix: ``https://host/path/repo`` → ``repo``
+
+    Returns ``None`` if the URL cannot be parsed.
+    """
+    if not url:
+        return None
+    # SCP-style: everything after the first colon is the path.
+    m = _SCP_URL_RE.match(url)
+    if m:
+        path_part = url[m.end():]
+    else:
+        # URL-style: take everything after the host.
+        # urlsplit handles ssh://, https://, git://, file://.
+        from urllib.parse import urlsplit
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            return None
+        if not parts.scheme:
+            return None
+        path_part = parts.path
+    if not path_part:
+        return None
+    # Strip leading slashes and split.
+    segments = [s for s in path_part.split("/") if s]
+    if not segments:
+        return None
+    last = segments[-1]
+    # Remove ``.git`` suffix if present.
+    if last.endswith(".git"):
+        last = last[:-4]
+    return last or None
+
+
 def _url_needs_cli_fallback(url: str) -> bool:
     """Return ``True`` if ``url`` is an SSH URL pygit2 may not handle.
 
@@ -2368,13 +2409,25 @@ def _fetch_via_cli(
         raise GitError(f"git fetch {url} failed: {stderr}") from None
 
 
-def _clone_via_cli(url: str, path: str, bare: bool = False) -> None:
+def _clone_via_cli(
+    url: str,
+    path: str,
+    bare: bool = False,
+    ssh_key_path: str | None = None,
+) -> None:
     """Run ``git clone <url> <path>`` (or ``--bare``) outside any repo.
 
     Used as a fallback for SSH URLs that pygit2 cannot handle because
     the prebuilt Windows wheels ship without libssh2. The system ``git``
     CLI uses the user's own SSH client (OpenSSH on PATH, ``~/.ssh/config``,
     ``SSH_AUTH_SOCK``) which works out of the box.
+
+    If ``ssh_key_path`` is provided, it is passed to the underlying
+    ``ssh`` invocation via the ``GIT_SSH_COMMAND`` environment variable
+    (e.g. ``ssh -i /path/to/key -o StrictHostKeyChecking=accept-new``).
+    This is needed when the user's SSH key is not in the default
+    ``~/.ssh/`` location — for example, after update8 the key may live
+    in ``~/.ssh-py/``.
 
     On success, the cloned repository lives on disk at ``path``; the
     caller is expected to open it with :class:`pygit2.Repository` (which
@@ -2386,6 +2439,20 @@ def _clone_via_cli(url: str, path: str, bare: bool = False) -> None:
     args: list[str] = ["clone", url, path]
     if bare:
         args.insert(2, "--bare")
+    env: dict[str, str] | None = None
+    if ssh_key_path:
+        # Quote the path so spaces / special characters in Windows
+        # paths are handled correctly. StrictHostKeyChecking=accept-new
+        # auto-trusts host keys on first connect without prompting
+        # (avoids the "Are you sure you want to continue connecting?"
+        # interactive prompt that would otherwise hang a non-interactive
+        # subprocess).
+        env = {
+            "GIT_SSH_COMMAND": (
+                f'ssh -i "{ssh_key_path}" '
+                f'-o StrictHostKeyChecking=accept-new'
+            ),
+        }
     try:
         completed = subprocess.run(
             [git, *args],
@@ -2395,6 +2462,7 @@ def _clone_via_cli(url: str, path: str, bare: bool = False) -> None:
             errors="replace",
             check=False,
             timeout=300.0,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         raise GitError(
