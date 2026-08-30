@@ -184,8 +184,137 @@ __all__ = [
     "test_settings_dialog_signal_fills_ssh_fields",
     "test_settings_dialog_save_persists_generated_ssh_paths",
     "test_settings_dialog_builds",
+    "test_settings_dialog_shows_public_key_content",
+    "test_settings_dialog_copy_button_copies_to_clipboard",
+    "test_settings_dialog_reads_public_key_on_path_change",
+    "test_settings_dialog_shows_placeholder_when_pub_missing",
 ]
 
 
 # Avoid an unused-import lint warning for the SshKeyDialog type used implicitly.
 _ = SshKeyDialog
+
+
+# ----- update9: public key preview + copy button -----------------------------
+
+
+def test_settings_dialog_shows_public_key_content(
+    qtbot, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SettingsDialog shows the contents of the configured .pub file on load."""
+
+    priv_key = tmp_path / "id_test"
+    priv_key.write_text("PRIVATE\n")
+    pub_key = tmp_path / "id_test.pub"
+    pub_key.write_text("ssh-ed25519 AAAAC3Nz... user@host\n")
+
+    config = tmp_path / "settings.json"
+    # Pre-populate the config so _load_from_config sees the paths.
+    import json
+    config.write_text(json.dumps({
+        "ssh_private_key": str(priv_key),
+        "ssh_public_key": str(pub_key),
+    }))
+
+    dialog = SettingsDialog(config_path=str(config))
+    qtbot.addWidget(dialog)
+
+    content = dialog._ssh_pub_view.toPlainText()  # noqa: SLF001
+    assert "ssh-ed25519" in content
+    assert "user@host" in content
+
+
+def test_settings_dialog_copy_button_copies_to_clipboard(
+    qtbot, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clicking the Copy button copies the public key to the system clipboard."""
+    from PySide6.QtWidgets import QApplication, QToolTip
+
+    priv_key = tmp_path / "id_test"
+    priv_key.write_text("PRIVATE\n")
+    pub_key = tmp_path / "id_test.pub"
+    pub_content = "ssh-ed25519 AAAAC3Nz... user@host\n"
+    pub_key.write_text(pub_content)
+
+    config = tmp_path / "settings.json"
+    import json
+    config.write_text(json.dumps({
+        "ssh_private_key": str(priv_key),
+        "ssh_public_key": str(pub_key),
+    }))
+
+    # Patch QToolTip.showText so it doesn't try to position itself on a
+    # hidden button (we never show the dialog in this test).
+    monkeypatch.setattr(QToolTip, "showText", staticmethod(lambda *a, **k: None))
+
+    dialog = SettingsDialog(config_path=str(config))
+    qtbot.addWidget(dialog)
+
+    clipboard = QApplication.clipboard()
+    # Clear clipboard so we can detect the change.
+    clipboard.clear()
+    assert clipboard.text() == ""
+
+    dialog._copy_btn.click()  # noqa: SLF001
+
+    assert clipboard.text().strip() == pub_content.strip()
+
+
+def test_settings_dialog_reads_public_key_on_path_change(
+    qtbot, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Editing the public-key path triggers a (debounced) reload of the view."""
+
+    # Start with one key pair.
+    priv_key = tmp_path / "id_test"
+    priv_key.write_text("PRIVATE\n")
+    pub_key = tmp_path / "id_test.pub"
+    pub_key.write_text("ssh-ed25519 AAAAFIRST... first@host\n")
+
+    config = tmp_path / "settings.json"
+    import json
+    config.write_text(json.dumps({
+        "ssh_private_key": str(priv_key),
+        "ssh_public_key": str(pub_key),
+    }))
+
+    dialog = SettingsDialog(config_path=str(config))
+    qtbot.addWidget(dialog)
+
+    assert "FIRST" in dialog._ssh_pub_view.toPlainText()  # noqa: SLF001
+
+    # Now point the dialog at a different key pair.
+    new_priv = tmp_path / "id_second"
+    new_priv.write_text("PRIVATE2\n")
+    new_pub = tmp_path / "id_second.pub"
+    new_pub_content = "ssh-ed25519 AAAASECOND... second@host\n"
+    new_pub.write_text(new_pub_content)
+
+    dialog._ssh_pub_edit.setText(str(new_pub))  # noqa: SLF001
+
+    # textChanged triggers debounce; wait for the timer to fire.
+    qtbot.waitUntil(lambda: "SECOND" in dialog._ssh_pub_view.toPlainText(),  # noqa: SLF001
+                    timeout=2000)
+
+    content = dialog._ssh_pub_view.toPlainText()  # noqa: SLF001
+    assert "SECOND" in content
+    assert "second@host" in content
+
+
+def test_settings_dialog_shows_placeholder_when_pub_missing(
+    qtbot, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the configured public-key file doesn't exist, view is empty + placeholder."""
+    config = tmp_path / "settings.json"
+    import json
+    config.write_text(json.dumps({
+        "ssh_private_key": str(tmp_path / "does-not-exist"),
+        "ssh_public_key": str(tmp_path / "does-not-exist.pub"),
+    }))
+
+    dialog = SettingsDialog(config_path=str(config))
+    qtbot.addWidget(dialog)
+
+    # View is empty (placeholder is shown when the widget is empty).
+    assert dialog._ssh_pub_view.toPlainText() == ""  # noqa: SLF001
+    assert dialog._ssh_pub_view.placeholderText() != ""  # noqa: SLF001
