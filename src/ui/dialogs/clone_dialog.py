@@ -82,13 +82,18 @@ class SshKeyDialog(QDialog):
 
     Signals
     -------
-    key_generated(str)
-        Emitted on success with the public key contents.
+    key_generated(str, str, str)
+        Emitted on success with ``(private_key_path, public_key_path,
+        public_key_contents)``.
     """
 
-    key_generated = Signal(str)
+    key_generated = Signal(str, str, str)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        default_path: str | Path | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Generate SSH Key")
         self.resize(640, 360)
@@ -97,7 +102,14 @@ class SshKeyDialog(QDialog):
 
         form = QFormLayout()
         self._path_edit = QLineEdit()
-        self._path_edit.setPlaceholderText("C:/Users/you/.ssh/git-py-ed25519")
+        resolved_default = (
+            Path(default_path) if default_path
+            else Path.home() / ".ssh" / "git-py-ed25519"
+        )
+        self._path_edit.setText(str(resolved_default))
+        self._path_edit.setPlaceholderText(
+            str(Path.home() / ".ssh" / "git-py-ed25519"),
+        )
         form.addRow("Key file:", self._path_edit)
 
         self._comment_edit = QLineEdit()
@@ -120,6 +132,32 @@ class SshKeyDialog(QDialog):
         )
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def showEvent(self, event: QWidget.showEvent) -> None:  # noqa: N802 - Qt naming
+        """Prefill the comment field from ``git config user.email`` on show.
+
+        Done in ``showEvent`` (not ``__init__``) so tests that build the
+        dialog without showing it never trigger the subprocess call.
+        """
+        super().showEvent(event)
+        if not self._comment_edit.text():
+            self._prefill_comment_from_git_config()
+
+    def _prefill_comment_from_git_config(self) -> None:
+        try:
+            email_proc = subprocess.run(  # noqa: S603 - intentional subprocess
+                ["git", "config", "user.email"],  # noqa: S607
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return
+        if email_proc.returncode != 0:
+            return
+        email = email_proc.stdout.strip()
+        if email:
+            self._comment_edit.setText(email)
 
     def _on_generate(self) -> None:
         path_text = self._path_edit.text().strip()
@@ -172,14 +210,15 @@ class SshKeyDialog(QDialog):
             )
             return
         try:
-            pub = path.with_suffix(path.suffix + ".pub").read_text(encoding="utf-8")
+            pub_path = path.with_suffix(path.suffix + ".pub")
+            pub = pub_path.read_text(encoding="utf-8")
         except OSError as exc:
             QMessageBox.warning(
                 self, "Generate SSH Key", f"Generated, but failed to read public key: {exc}",
             )
             return
         self._output.setText(pub)
-        self.key_generated.emit(pub)
+        self.key_generated.emit(str(path), str(pub_path), pub)
 
 
 def _find_ssh_keygen() -> str | None:
@@ -304,7 +343,10 @@ class CloneDialog(QDialog):
             self._path_edit.setText(directory)
 
     def _on_generate_ssh(self) -> None:
-        dialog = SshKeyDialog(self)
+        dialog = SshKeyDialog(
+            self,
+            default_path=str(Path.home() / ".ssh" / "git-py-ed25519"),
+        )
         dialog.exec()
 
     def _on_accept(self) -> None:
