@@ -150,8 +150,16 @@ class SettingsDialog(QDialog):
 
     def _on_generate_ssh(self) -> None:
         """Open a small dialog to generate an ed25519 key pair."""
-        dialog = SshKeyDialog(self)
+        default = self._ssh_priv_edit.text().strip() or str(
+            Path.home() / ".ssh" / "git-py-ed25519",
+        )
+        dialog = SshKeyDialog(self, default_path=default)
+        dialog.key_generated.connect(self._on_ssh_key_generated)
         dialog.exec()
+
+    def _on_ssh_key_generated(self, priv: str, pub: str, _contents: str) -> None:
+        self._ssh_priv_edit.setText(priv)
+        self._ssh_pub_edit.setText(pub)
 
     def _do_generate_ssh(self) -> None:
         priv_default = self._ssh_priv_edit.text().strip() or str(
