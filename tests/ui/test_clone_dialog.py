@@ -7,6 +7,8 @@ rather than entering keystrokes into the line edits.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from PySide6.QtWidgets import QMessageBox
 from src.ui.dialogs.clone_dialog import CloneDialog, SshKeyDialog
@@ -294,6 +296,149 @@ def test_ssh_dialog_show_event_does_not_block_tests(
     dialog.show()
     qtbot.waitExposed(dialog)
     assert any("user.email" in a for a in calls), calls
+
+
+# ----- auto-create ~/.ssh directory before ssh-keygen (update6) ----------
+
+
+def test_ssh_dialog_creates_missing_parent_directory(
+    qtbot, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing parent dir is created automatically before ssh-keygen runs.
+
+    Reproduces the Windows bug: user has no ``~/.ssh`` folder; prefill
+    selects ``~/.ssh/git-py-ed25519``; without mkdir, ssh-keygen fails
+    with ``Saving key "..." failed: No such file or directory``.
+    """
+    from src.ui.dialogs import clone_dialog
+
+    monkeypatch.setattr(clone_dialog, "_find_ssh_keygen", lambda: "ssh-keygen")
+
+    nested = tmp_path / "no" / "sub" / "id_test"
+    pub_path = tmp_path / "no" / "sub" / "id_test.pub"
+    assert not nested.parent.exists()  # precondition
+
+    def fake_run(args, **kwargs):  # noqa: ANN001
+        # Verify parent now exists before ssh-keygen would be called.
+        assert nested.parent.exists(), "parent dir was not created before ssh-keygen"
+        nested.write_text("PRIVATE\n")
+        pub_path.write_text("ssh-ed25519 AAAA comment\n")
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    dialog = SshKeyDialog()
+    qtbot.addWidget(dialog)
+    dialog._path_edit.setText(str(nested))  # noqa: SLF001
+    dialog._comment_edit.setText("")  # noqa: SLF001
+    dialog._on_generate()  # noqa: SLF001
+
+    assert nested.exists()
+    assert pub_path.exists()
+
+
+def test_ssh_dialog_falls_back_to_tempdir_when_home_unwritable(
+    qtbot, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``Path.home()/.ssh`` cannot be created, fall back to ``tempdir/git-py-ssh``.
+
+    We patch ``_ensure_parent_dir`` directly instead of ``Path.mkdir`` to
+    avoid Qt/ctypes crashes when monkeypatching built-in types globally.
+    """
+    import tempfile
+
+    from src.ui.dialogs import clone_dialog
+
+    monkeypatch.setattr(clone_dialog, "_find_ssh_keygen", lambda: "ssh-keygen")
+
+    fallback_root = tmp_path / "tempdir"
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fallback_root))
+
+    # Patch QMessageBox.information so it doesn't block on modal.
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        staticmethod(lambda *a, **k: 0),
+    )
+
+    pub_target = fallback_root / "git-py-ssh" / "id_test.pub"
+
+    def fake_run(args, **kwargs):  # noqa: ANN001
+        # Verify the resolved -f path now lives under fallback_root/git-py-ssh
+        assert str(fallback_root / "git-py-ssh") in args[args.index("-f") + 1]
+        # Simulate ssh-keygen creating the files.
+        priv = Path(args[args.index("-f") + 1])
+        priv.parent.mkdir(parents=True, exist_ok=True)
+        priv.write_text("PRIVATE\n")
+        priv.with_suffix(priv.suffix + ".pub").write_text("ssh-ed25519 AAAA\n")
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    dialog = SshKeyDialog()
+    qtbot.addWidget(dialog)
+
+    # Patch the instance method so primary path always "fails". This is
+    # safer than monkeypatching the global Path class.
+    def fake_ensure(path):  # noqa: ANN001
+        new = fallback_root / "git-py-ssh" / path.name
+        new.parent.mkdir(parents=True, exist_ok=True)
+        return new, True
+
+    monkeypatch.setattr(dialog, "_ensure_parent_dir", fake_ensure)
+    dialog._path_edit.setText(str(tmp_path / "id_test"))  # noqa: SLF001
+    dialog._on_generate()  # noqa: SLF001
+
+    assert pub_target.exists()
+
+
+def test_ssh_dialog_aborts_when_no_directory_is_creatable(
+    qtbot, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If both primary AND tempdir are uncreatable, show warning and return None.
+
+    Patch the instance method directly (not Path.mkdir globally) to avoid
+    Qt/ctypes crashes on monkeypatching built-in types.
+    """
+    from src.ui.dialogs import clone_dialog
+
+    monkeypatch.setattr(clone_dialog, "_find_ssh_keygen", lambda: "ssh-keygen")
+
+    subprocess_calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):  # noqa: ANN001
+        subprocess_calls.append(list(args))
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    dialog = SshKeyDialog()
+    qtbot.addWidget(dialog)
+
+    # Simulate _ensure_parent_dir fully failing AND showing the warning
+    # the real implementation would show.
+    warned: list[bool] = []
+
+    def fake_warning(*a, **k):  # noqa: ANN001
+        warned.append(True)
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(fake_warning))
+
+    def fake_ensure(path):  # noqa: ANN001
+        QMessageBox.warning(
+            None,
+            "Generate SSH Key",
+            "Cannot create directory for SSH key",
+        )
+        return None, False
+
+    monkeypatch.setattr(dialog, "_ensure_parent_dir", fake_ensure)
+    dialog._path_edit.setText(str(tmp_path / "id_test"))  # noqa: SLF001
+    dialog._on_generate()  # noqa: SLF001
+
+    assert warned, "expected warning dialog"
+    assert subprocess_calls == [], "ssh-keygen must not be invoked when no dir is creatable"
 
 
 # ----- generate-ssh-key button on CloneDialog opens sub-dialog ------------
