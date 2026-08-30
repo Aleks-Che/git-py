@@ -230,16 +230,70 @@ def test_ssh_dialog_success(qtbot, tmp_path, monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr("subprocess.run", _fake_run)
 
-    emitted: list[str] = []
+    emitted: list[tuple[str, str, str]] = []
     dialog = SshKeyDialog()
     qtbot.addWidget(dialog)
-    dialog.key_generated.connect(emitted.append)
+    # Signal is now 3-arg (priv, pub, contents); lambda absorbs them as one tuple.
+    dialog.key_generated.connect(lambda *args: emitted.append(args))
     dialog._path_edit.setText(str(key_path))  # noqa: SLF001
     dialog._comment_edit.setText("tester@example.com")  # noqa: SLF001
     dialog._on_generate()  # noqa: SLF001
 
     assert "ssh-ed25519" in dialog._output.text()  # noqa: SLF001
-    assert emitted and "ssh-ed25519" in emitted[0]
+    assert emitted, "key_generated signal was not emitted"
+    priv, pub, contents = emitted[0]
+    assert priv == str(key_path)
+    assert pub == str(pub_path)
+    assert "ssh-ed25519" in contents
+
+
+# ----- prefill + default_path for SshKeyDialog -----------------------------
+
+
+def test_ssh_dialog_prefills_default_path(qtbot) -> None:
+    """Opening ``SshKeyDialog()`` without args prefills ``~/.ssh/git-py-ed25519``."""
+    dialog = SshKeyDialog()
+    qtbot.addWidget(dialog)
+    text = dialog._path_edit.text()  # noqa: SLF001
+    assert text != ""
+    assert text.endswith("/.ssh/git-py-ed25519") or text.endswith(r"\.ssh\git-py-ed25519")
+    assert dialog._path_edit.placeholderText() == text  # noqa: SLF001
+
+
+def test_ssh_dialog_respects_explicit_default_path(qtbot, tmp_path) -> None:
+    """``default_path`` constructor arg overrides the built-in default."""
+    custom = tmp_path / "my-key"
+    dialog = SshKeyDialog(default_path=str(custom))
+    qtbot.addWidget(dialog)
+    assert dialog._path_edit.text() == str(custom)  # noqa: SLF001
+
+
+def test_ssh_dialog_show_event_does_not_block_tests(
+    qtbot, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``showEvent`` calls git config user.email only when dialog is shown.
+
+    Without a show, the constructor must NOT invoke subprocess, so test
+    runners using monkeypatch on subprocess.run never deadlock.
+    """
+    from src.ui.dialogs import clone_dialog
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):  # noqa: ANN001
+        calls.append(list(args))
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(clone_dialog, "subprocess", type("M", (), {"run": staticmethod(fake_run)}))
+
+    # Constructor only — must not call subprocess.run
+    dialog = SshKeyDialog()
+    qtbot.addWidget(dialog)
+    assert calls == [], "subprocess.run was called during __init__, would deadlock tests"
+    # After show(), it must be called once for 'git config user.email'
+    dialog.show()
+    qtbot.waitExposed(dialog)
+    assert any("user.email" in a for a in calls), calls
 
 
 # ----- generate-ssh-key button on CloneDialog opens sub-dialog ------------
