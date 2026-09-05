@@ -1054,6 +1054,7 @@ def test_push_auth_error_uses_domain_exception(
 
     class _FakeRemote:
         url = "https://example.com/repo.git"
+        push_url = None
 
         def push(self, *args: object, **kwargs: object) -> None:
             msg = "authentication failed for 'https://x@example.com/repo.git'"

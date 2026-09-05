@@ -22,10 +22,12 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
 from collections import Counter
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -450,6 +452,48 @@ def checkout_commit(
     return None
 
 
+def checkout_fetched_branch(
+    repo: RepositoryManager | pygit2.Repository,
+    remote_branch: str,
+    *,
+    force: bool = False,
+) -> bool:
+    """Check out a fetched local tracking branch; return whether it diverged.
+
+    A forced reset updates the requested local ref, even when a different
+    branch is currently checked out. Ordinary checkout preserves local work.
+    """
+    if "/" not in remote_branch:
+        raise InvalidRefError(f"Not a remote branch: {remote_branch!r}")
+    local_name = remote_branch.split("/", 1)[1]
+    with unwrap(repo) as r:
+        try:
+            remote = r.lookup_branch(remote_branch, pygit2.GIT_BRANCH_REMOTE)
+            if remote is None:
+                raise InvalidRefError(f"Unknown remote branch: {remote_branch!r}")
+            local = r.lookup_branch(local_name)
+            diverged = bool(
+                local is not None and local.target != remote.target
+                and not r.descendant_of(remote.target, local.target)
+            )
+            destination = local.target if diverged and not force else remote.target
+            destructive = force and local is not None
+            if not destructive:
+                ensure_safe_tree_update(r, str(destination), f"check out {remote_branch}")
+            # Update the worktree before moving either ref. On checkout failure,
+            # the original branch tips and HEAD still describe the old state.
+            r.checkout_tree(r[destination], strategy=pygit2.GIT_CHECKOUT_FORCE)
+            if local is None:
+                local = r.create_branch(local_name, r[destination])
+            elif local.target != destination:
+                local.set_target(destination, f"update from {remote_branch}")
+            local.upstream = remote
+            r.set_head(local.name)
+            return diverged and not force
+        except (KeyError, ValueError, pygit2.GitError) as exc:
+            raise GitError(f"Cannot check out {remote_branch!r}: {exc}") from exc
+
+
 def rename_branch(
     repo: RepositoryManager | pygit2.Repository,
     old_name: str,
@@ -625,11 +669,22 @@ def merge_branch(
                 raise GitError(f"Merge failed: {exc}") from exc
             conflicts = _collect_conflicts(r)
             if conflicts:
-                if previous_head_name is not None:
-                    r.set_head(previous_head_name)
+                # Keep HEAD on the *target* branch (the checkout above
+                # already moved it there when the merge was requested for
+                # a non-current branch).  MERGE_HEAD, the conflicted
+                # index and the worktree conflict markers all belong to
+                # the target, so resolve -> complete_merge and
+                # ``git merge --abort`` must also run with HEAD on the
+                # target.  This mirrors the clean-merge outcome, which
+                # likewise ends with HEAD on the target branch, and
+                # prevents the merge commit from being created on the
+                # unrelated branch the user started from.
                 raise MergeConflictError(
                     f"Merge of {source!r} produced conflicts in {len(conflicts)} file(s).",
                     conflicting_paths=conflicts,
+                    source_oid=str(source_oid),
+                    target_branch=target_name,
+                    target_oid=str(head_oid),
                 )
             try:
                 tree_oid = r.index.write_tree()
@@ -656,6 +711,11 @@ def merge_branch(
             )
         except pygit2.GitError as exc:
             raise GitError(f"Failed to create merge commit: {exc}") from exc
+        # ``r.merge()`` leaves MERGE_HEAD/MERGE_MSG/MERGE_MODE behind;
+        # the merge is fully committed now, so clear the in-progress
+        # state.  Otherwise ``is_merge_in_progress()`` keeps returning
+        # True and every later operation sees a phantom merge.
+        _clear_merge_state(r)
     return True
 
 
@@ -677,6 +737,100 @@ def _collect_conflicts(repo: pygit2.Repository) -> list[str]:
                 conflicts.append(side.path)
                 break
     return conflicts
+
+
+def conflicting_paths(repo: RepositoryManager | pygit2.Repository) -> list[str]:
+    """Public wrapper around the index conflict scan.
+
+    Used by the ViewModel layer to populate the conflict state with the
+    real conflicting paths (after a merge, rebase step, cherry-pick or
+    stash apply stopped with conflicts).
+    """
+    with unwrap(repo) as r:
+        try:
+            r.index.read(force=True)
+            return _collect_conflicts(r)
+        except (OSError, pygit2.GitError) as exc:
+            raise GitError(f"Cannot read index conflicts: {exc}") from exc
+
+
+def ensure_safe_tree_update(
+    repo: RepositoryManager | pygit2.Repository,
+    target: str,
+    action: str,
+) -> None:
+    """Refuse a forced checkout/reset that would destroy local files.
+
+    Untracked and ignored files are allowed unless a path in the destination
+    tree would overwrite them (including file/directory collisions).
+    """
+    try:
+        _ensure_safe_tree_update(repo, target, action)
+    except (KeyError, ValueError, OSError, pygit2.GitError) as exc:
+        raise GitError(f"Cannot verify worktree safety before {action}: {exc}") from exc
+
+
+def _ensure_safe_tree_update(
+    repo: RepositoryManager | pygit2.Repository, target: str, action: str,
+) -> None:
+    with unwrap(repo) as r:
+        r.index.read(force=True)
+        dirty = _dirty_paths(r)
+        tree = r.revparse_single(target).peel(pygit2.Commit).tree
+        destinations: set[str] = set()
+
+        def collect(node: pygit2.Tree, prefix: str = "") -> None:
+            for entry in node:
+                path = prefix + entry.name
+                if entry.type == pygit2.GIT_OBJECT_TREE:
+                    collect(r[entry.id], path + "/")
+                else:
+                    destinations.add(os.path.normcase(path).replace("\\", "/"))
+
+        collect(tree)
+        directories = {
+            path[:i]
+            for path in destinations
+            for i, char in enumerate(path)
+            if char == "/"
+        }
+        for path, flags in r.status(untracked_files="all", ignored=True).items():
+            if flags & (pygit2.GIT_STATUS_CONFLICTED | pygit2.GIT_STATUS_WT_UNREADABLE):
+                dirty.append(path)
+            if not flags & (pygit2.GIT_STATUS_WT_NEW | pygit2.GIT_STATUS_IGNORED):
+                continue
+            normalized = os.path.normcase(path).replace("\\", "/").rstrip("/")
+            ancestors = {
+                normalized[:i] for i, char in enumerate(normalized) if char == "/"
+            }
+            if (normalized in destinations or normalized in directories
+                    or ancestors & destinations):
+                dirty.append(path)
+        if dirty:
+            raise DirtyWorkTreeError(
+                f"Cannot {action}: uncommitted changes or untracked/ignored files "
+                f"would be lost. Commit, stash or move them first: {', '.join(sorted(set(dirty)))}",
+            )
+
+
+def _clear_merge_state(repo: pygit2.Repository) -> None:
+    """Remove the in-progress merge state files from the git dir.
+
+    Clears ``MERGE_HEAD``, ``MERGE_MSG``, ``MERGE_MODE`` and
+    ``MERGE_AUTO`` so :func:`is_merge_in_progress` returns ``False``
+    and subsequent operations (both in this app and via the Git CLI)
+    see a consistent, non-merging repository.
+    """
+    gd = _git_dir(repo)
+    for state_file in ("MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "MERGE_AUTO"):
+        path = gd / state_file
+        if path.is_file():
+            try:
+                path.unlink()
+            except OSError as exc:
+                raise GitError(
+                    f"Failed to clear {state_file}: {exc}",
+                ) from exc
 
 
 def rebase_branch(
@@ -744,6 +898,26 @@ def is_merge_in_progress(repo: RepositoryManager | pygit2.Repository) -> bool:
     with unwrap(repo) as r:
         merge_head = _git_dir(r) / "MERGE_HEAD"
     return merge_head.is_file()
+
+
+def merge_head_oid(repo: RepositoryManager | pygit2.Repository) -> str | None:
+    """Return the OID recorded in ``.git/MERGE_HEAD``, or ``None``.
+
+    This is the *source* commit of the in-progress merge — the second
+    parent of the future merge commit.  Reading it back lets callers
+    recover the merge context after an app restart (or after an
+    exception that lost the original operation context) without
+    relying on ref names that a fetch could have moved since.
+    """
+    with unwrap(repo) as r:
+        path = _git_dir(r) / "MERGE_HEAD"
+    if not path.is_file():
+        return None
+    try:
+        first_line = path.read_text(encoding="utf-8").splitlines()[0].strip()
+    except (OSError, IndexError):
+        return None
+    return first_line or None
 
 
 def is_rebase_in_progress(repo: RepositoryManager | pygit2.Repository) -> bool:
@@ -902,28 +1076,35 @@ def complete_merge(
             raise GitError(f"Failed to create merge commit: {exc}") from exc
         # Clear in-progress state so is_merge_in_progress() returns False
         # and the worktree / status refreshes to "clean".
-        for state_file in ("MERGE_HEAD", "MERGE_MSG"):
-            path = _git_dir(r) / state_file
-            if path.is_file():
-                try:
-                    path.unlink()
-                except OSError as exc:
-                    raise GitError(
-                        f"Failed to clear {state_file}: {exc}",
-                    ) from exc
+        _clear_merge_state(r)
     return str(merge_oid)
 
 
-def complete_rebase_continue(repo: RepositoryManager | pygit2.Repository) -> bool:
+class RebaseContinueResult(Enum):
+    """Outcome of :func:`complete_rebase_continue`.
+
+    Replaces the previous ambiguous ``bool`` return (``True`` meant
+    "rebase finished" but the ViewModel read it as "more conflicts",
+    leaving a finished rebase in the conflicted UI state).
+    """
+
+    COMPLETED = "completed"
+    CONFLICTS_REMAIN = "conflicts_remain"
+
+
+def complete_rebase_continue(
+    repo: RepositoryManager | pygit2.Repository,
+) -> RebaseContinueResult:
     """Continue an in-progress rebase after the user resolved conflicts.
 
     Runs ``git rebase --continue`` with ``GIT_EDITOR=true`` so the
     command does not block waiting for input — the original commit
     message is reused (``--continue`` does not change it).
 
-    Returns ``True`` if the rebase is fully done, ``False`` if more
-    commits still have to be applied (and the next step produced new
-    conflicts).
+    Returns :attr:`RebaseContinueResult.COMPLETED` when the rebase is
+    fully done and :attr:`RebaseContinueResult.CONFLICTS_REMAIN` when
+    the next step stopped with new conflicts (the caller should read
+    :func:`conflicting_paths` and prompt for resolution again).
     """
     with unwrap(repo) as r:
         if not is_rebase_in_progress(r):
@@ -940,15 +1121,16 @@ def complete_rebase_continue(repo: RepositoryManager | pygit2.Repository) -> boo
     if completed.returncode != 0:
         if "conflict" in (completed.stderr + completed.stdout).lower():
             # Not an error per se: there are more commits to apply and
-            # the next one conflicted. Return False so the caller can
-            # prompt for resolution again.
-            return False
+            # the next one conflicted.
+            return RebaseContinueResult.CONFLICTS_REMAIN
         raise GitError(
             f"git rebase --continue failed: "
             f"{completed.stderr.strip() or completed.stdout.strip()}",
         )
     with unwrap(repo) as r:
-        return not is_rebase_in_progress(r)
+        if is_rebase_in_progress(r):
+            return RebaseContinueResult.CONFLICTS_REMAIN
+    return RebaseContinueResult.COMPLETED
 
 
 def cherry_pick(
@@ -1031,6 +1213,10 @@ def drop_commit(
     """Remove ``sha`` from the current branch's history.
 
     * ``sha`` is the branch tip → ``reset --hard`` to its parent.
+      Requires a clean index/worktree: uncommitted changes would be
+      destroyed by the hard reset, so :class:`DirtyWorkTreeError` is
+      raised instead (dropping a commit and discarding local changes
+      are separate, explicitly chosen actions).
     * Otherwise → ``git rebase --onto <sha>^ <sha>`` via the CLI (the
       plain rebase flattens merge commits between ``sha`` and HEAD —
       merge commits in between are not preserved).
@@ -1059,6 +1245,12 @@ def drop_commit(
         if not commit.parent_ids:
             raise GitError("Cannot drop the root commit.")
         if r.head.target == commit.id:
+            # ``reset --hard`` discards index *and* worktree changes
+            # that are not part of the dropped commit.  Refuse while
+            # the user has uncommitted work instead of silently
+            # deleting it — dropping the tip and discarding local
+            # changes are separate, explicitly chosen actions.
+            ensure_safe_tree_update(r, str(commit.parent_ids[0]), f"drop {sha[:7]}")
             reset(r, str(commit.parent_ids[0]), mode="hard")
             return
         if not r.descendant_of(r.head.target, commit.id):
@@ -1095,9 +1287,9 @@ def edit_commit_message(
     * ``sha`` is the branch tip → pure-pygit2 amend: a new commit with
       the same tree/parents/authorship replaces the tip (the index and
       worktree are *not* touched, unlike ``git commit --amend``).
-    * Otherwise → interactive rebase (``reword``) via generated
-      sequence/message editor scripts. Trees are replayed unchanged,
-      so conflicts are impossible.
+    * Otherwise → recreate the target and its descendants with mapped
+      parent OIDs, preserving every tree and merge edge. Only the current
+      branch ref moves; the index and worktree remain untouched.
 
     Detached HEAD is rejected up front.
     """
@@ -1135,77 +1327,41 @@ def edit_commit_message(
                 f"Commit {sha[:7]} is not an ancestor of HEAD; "
                 "only commits on the current branch can be reworded.",
             )
-        new_info = _reword_via_interactive_rebase(r, commit, message)
+        new_info = _reword_history(r, commit, message)
     return new_info
 
 
-def _reword_via_interactive_rebase(
+def _reword_history(
     r: pygit2.Repository,
     commit: pygit2.Commit,
     message: str,
 ) -> CommitInfo:
-    """Reword ``commit`` via ``git rebase -i`` with scripted editors.
+    """Rewrite a commit and its descendants, preserving the original DAG.
 
-    ``GIT_SEQUENCE_EDITOR`` rewrites the todo list (``pick`` →
-    ``reword`` for the target line); ``GIT_EDITOR`` replaces the
-    commit message file with the new text. Both helper scripts and
-    the message payload live in a temp dir so no shell quoting is
-    involved.
+    The parent-before-child walk creates an explicit old/new OID map. Other
+    branches and all trees stay unchanged, including manual merge resolutions.
+    Ref movement happens only after every replacement commit has been written.
     """
-    import sys
-    import tempfile
-
-    full_sha = str(commit.id)
-    tmp = Path(tempfile.mkdtemp(prefix="git_py_reword_"))
+    head = r.head
+    original_head = head.target
+    replacements: dict[pygit2.Oid, pygit2.Oid] = {}
     try:
-        seq_script = tmp / "seq_editor.py"
-        seq_script.write_text(
-            "import sys\n"
-            f"target = {full_sha[:7]!r}\n"
-            "path = sys.argv[1]\n"
-            "with open(path, encoding='utf-8') as fh:\n"
-            "    lines = fh.readlines()\n"
-            "with open(path, 'w', encoding='utf-8') as fh:\n"
-            "    for line in lines:\n"
-            "        parts = line.split()\n"
-            "        if (\n"
-            "            len(parts) >= 2\n"
-            "            and parts[0] == 'pick'\n"
-            "            and target.startswith(parts[1])\n"
-            "        ):\n"
-            "            line = line.replace('pick', 'reword', 1)\n"
-            "        fh.write(line)\n",
-            encoding="utf-8",
-        )
-        msg_file = tmp / "message.txt"
-        msg_file.write_text(message, encoding="utf-8")
-        msg_script = tmp / "msg_editor.py"
-        msg_script.write_text(
-            "import shutil\n"
-            "import sys\n"
-            f"shutil.copyfile({str(msg_file)!r}, sys.argv[1])\n",
-            encoding="utf-8",
-        )
-        python = sys.executable or "python"
-        env = {
-            **os.environ,
-            "GIT_SEQUENCE_EDITOR": f'"{python}" "{seq_script}"',
-            "GIT_EDITOR": f'"{python}" "{msg_script}"',
-        }
-        if not commit.parent_ids:
-            base_args = ["rebase", "-i", "--root"]
-        else:
-            base_args = ["rebase", "-i", f"{full_sha}^"]
-        completed = _run_git_in_workdir(r, base_args, timeout=300.0, env=env)
-        if completed.returncode != 0:
-            raise GitError(
-                f"Edit commit message failed: "
-                f"{completed.stderr.strip() or completed.stdout.strip()}",
+        walk = r.walk(original_head, pygit2.GIT_SORT_TOPOLOGICAL | pygit2.GIT_SORT_REVERSE)
+        for current in walk:
+            parents = [replacements.get(parent, parent) for parent in current.parent_ids]
+            if current.id != commit.id and parents == current.parent_ids:
+                continue
+            replacements[current.id] = r.create_commit(
+                None, current.author, current.committer,
+                message if current.id == commit.id else current.message,
+                current.tree_id, parents,
             )
-        rewritten = r.revparse_single(full_sha)
-        return _to_commit_info(rewritten.peel(pygit2.Commit))
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        if r.head.name != head.name or r.head.target != original_head:
+            raise GitError("HEAD changed while rewriting history; the branch was not updated.")
+        head.set_target(replacements[original_head], "reword: rewrite commit message")
+        return _to_commit_info(r[replacements[commit.id]])
+    except (KeyError, ValueError, pygit2.GitError) as exc:
+        raise GitError(f"Cannot rewrite commit message: {exc}") from exc
 
 
 def is_commit_pushed(
@@ -1398,8 +1554,11 @@ def squash_commits(
     Merge commits inside the range are rejected, and the oldest entry
     must have a parent (the squash base).
 
-    * Range top == branch tip → ``reset --soft`` to the base + one
-      commit (cannot conflict).
+    * Range top == branch tip → a new commit is created directly from
+      the *top commit's tree* with the range base as parent, and the
+      branch ref is moved — the index and worktree are **not** touched,
+      so unrelated staged/dirty changes the user had stay exactly as
+      they were (and cannot leak into the squashed commit).
     * Otherwise → interactive rebase (``squash`` lines) via scripted
       editors; a conflicting replay raises
       :class:`RebaseConflictError`.
@@ -1448,8 +1607,25 @@ def squash_commits(
             )
         base_sha = str(oldest.parent_ids[0])
         if r.head.target == commits[0].id:
-            reset(r, base_sha, mode="soft")
-            return commit_changes(r, message, stage_all=False)
+            # Build the squashed commit from the *top commit's tree*
+            # and move the branch ref only.  The previous
+            # ``reset --soft`` + commit-from-index approach silently
+            # included unrelated staged changes the user happened to
+            # have in the index — changes that belong to none of the
+            # selected commits.  Creating the commit unattached keeps
+            # the user's index and worktree byte-identical: their
+            # staged files stay staged, their dirty files stay dirty.
+            top = commits[0]
+            new_oid = r.create_commit(
+                None,
+                oldest.author,
+                _now_signature(),
+                message,
+                top.tree_id,
+                [oldest.parent_ids[0]],
+            )
+            r.head.set_target(new_oid, "squash: collapse tip range")
+            return _to_commit_info(r[new_oid])
         new_oid = _squash_via_interactive_rebase(
             r,
             [str(c.id) for c in reversed(commits)],
@@ -1483,8 +1659,8 @@ def _squash_via_interactive_rebase(
         seq_script = tmp / "seq_editor.py"
         seq_script.write_text(
             "import sys\n"
-            f"oldest = {range_shas_oldest_first[0][:7]!r}\n"
-            f"range_shas = {[s[:7] for s in range_shas_oldest_first]!r}\n"
+            f"oldest = {range_shas_oldest_first[0]!r}\n"
+            f"range_shas = {range_shas_oldest_first!r}\n"
             "path = sys.argv[1]\n"
             "with open(path, encoding='utf-8') as fh:\n"
             "    lines = fh.readlines()\n"
@@ -1492,8 +1668,8 @@ def _squash_via_interactive_rebase(
             "    for line in lines:\n"
             "        parts = line.split()\n"
             "        if len(parts) >= 2 and parts[0] == 'pick':\n"
-            "            for short in range_shas:\n"
-            "                if short.startswith(parts[1]) and short != oldest:\n"
+            "            for full in range_shas:\n"
+            "                if full.startswith(parts[1]) and full != oldest:\n"
             "                    line = line.replace('pick', 'squash', 1)\n"
             "                    break\n"
             "        fh.write(line)\n",
@@ -2361,10 +2537,29 @@ def _url_needs_cli_fallback(url: str) -> bool:
     return bool(_SCP_URL_RE.match(url) or _SSH_SCHEME_RE.match(url))
 
 
+def _ssh_environment(ssh_key_path: str | None) -> dict[str, str] | None:
+    """Use the selected identity while retaining the system Git/SSH environment."""
+    if not ssh_key_path:
+        return None
+    key = Path(ssh_key_path).expanduser().absolute()
+    if not key.is_file():
+        raise AuthError(f"SSH private key not found: {key}. Select a key in Settings.")
+    # Git evaluates GIT_SSH_COMMAND through a shell, including on Windows.
+    # Forward slashes and shell quoting preserve spaces and literal metacharacters.
+    env = os.environ.copy()
+    env["GIT_SSH_COMMAND"] = (
+        f"ssh -i {shlex.quote(key.as_posix())} "
+        "-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+    )
+    env["GIT_SSH_VARIANT"] = "ssh"
+    return env
+
+
 def _fetch_via_cli(
     repo: pygit2.Repository,
     remote_name: str,
     refspec: Sequence[str] | None,
+    ssh_key_path: str | None = None,
 ) -> None:
     """Run ``git fetch <remote> [refspec...]`` in ``repo``'s workdir.
 
@@ -2380,7 +2575,7 @@ def _fetch_via_cli(
         else:
             args.extend(refspec)
     try:
-        completed = _run_git_in_workdir(repo, args)
+        completed = _run_git_in_workdir(repo, args, env=_ssh_environment(ssh_key_path))
     except GitNotInstalledError:
         raise
     if completed.returncode != 0:
@@ -2425,9 +2620,8 @@ def _clone_via_cli(
     If ``ssh_key_path`` is provided, it is passed to the underlying
     ``ssh`` invocation via the ``GIT_SSH_COMMAND`` environment variable
     (e.g. ``ssh -i /path/to/key -o StrictHostKeyChecking=accept-new``).
-    This is needed when the user's SSH key is not in the default
-    ``~/.ssh/`` location — for example, after update8 the key may live
-    in ``~/.ssh-py/``.
+    This also selects app-generated keys with nonstandard filenames
+    inside ``~/.ssh/``. The parent process environment is preserved.
 
     On success, the cloned repository lives on disk at ``path``; the
     caller is expected to open it with :class:`pygit2.Repository` (which
@@ -2439,20 +2633,7 @@ def _clone_via_cli(
     args: list[str] = ["clone", url, path]
     if bare:
         args.insert(2, "--bare")
-    env: dict[str, str] | None = None
-    if ssh_key_path:
-        # Quote the path so spaces / special characters in Windows
-        # paths are handled correctly. StrictHostKeyChecking=accept-new
-        # auto-trusts host keys on first connect without prompting
-        # (avoids the "Are you sure you want to continue connecting?"
-        # interactive prompt that would otherwise hang a non-interactive
-        # subprocess).
-        env = {
-            "GIT_SSH_COMMAND": (
-                f'ssh -i "{ssh_key_path}" '
-                f'-o StrictHostKeyChecking=accept-new'
-            ),
-        }
+    env = _ssh_environment(ssh_key_path)
     try:
         completed = subprocess.run(
             [git, *args],
@@ -2583,6 +2764,7 @@ def push(
     remote_name: str = "origin",
     refspec: str | None = None,
     callbacks: pygit2.RemoteCallbacks | None = None,
+    ssh_key_path: str | None = None,
 ) -> None:
     """Push ``refspec`` to ``remote_name`` (default: push ``HEAD``).
 
@@ -2597,9 +2779,9 @@ def push(
             remote = r.remotes[remote_name]
         except KeyError as exc:
             raise InvalidRefError(f"Unknown remote: {remote_name!r}") from exc
-        url = remote.url or ""
+        url = remote.push_url or remote.url or ""
         if _url_needs_cli_fallback(url):
-            _push_via_cli(r, remote_name, refspec)
+            _push_via_cli(r, remote_name, refspec, ssh_key_path=ssh_key_path)
             return
         try:
             remote.push([spec], callbacks=callbacks)
@@ -2612,6 +2794,7 @@ def fetch(
     remote_name: str = "origin",
     refspec: Sequence[str] | None = None,
     callbacks: pygit2.RemoteCallbacks | None = None,
+    ssh_key_path: str | None = None,
 ) -> None:
     """Fetch ``refspec`` from ``remote_name`` (default: fetch all configured refspecs).
 
@@ -2627,7 +2810,7 @@ def fetch(
             raise InvalidRefError(f"Unknown remote: {remote_name!r}") from exc
         url = remote.url or ""
         if _url_needs_cli_fallback(url):
-            _fetch_via_cli(r, remote_name, refspec)
+            _fetch_via_cli(r, remote_name, refspec, ssh_key_path=ssh_key_path)
             return
         try:
             remote.fetch(refspec, callbacks=callbacks)
@@ -2639,6 +2822,7 @@ def _push_via_cli(
     repo: pygit2.Repository,
     remote_name: str,
     refspec: str | None,
+    ssh_key_path: str | None = None,
 ) -> None:
     """Run ``git push <remote> [refspec]`` in ``repo``'s workdir.
 
@@ -2648,7 +2832,7 @@ def _push_via_cli(
     spec = refspec or "HEAD"
     args: list[str] = ["push", remote_name, spec]
     try:
-        completed = _run_git_in_workdir(repo, args)
+        completed = _run_git_in_workdir(repo, args, env=_ssh_environment(ssh_key_path))
     except GitNotInstalledError:
         raise
     if completed.returncode != 0:
@@ -2679,6 +2863,7 @@ def pull(
     remote_name: str = "origin",
     refspec: str | None = None,
     callbacks: pygit2.RemoteCallbacks | None = None,
+    ssh_key_path: str | None = None,
 ) -> bool:
     """Fetch + merge ``remote_name``/``refspec`` into the current branch.
 
@@ -2696,7 +2881,10 @@ def pull(
                 f"No upstream branch configured for {branch_name}. Set upstream with git branch "
                 "--set-upstream-to or configure remote tracking."
             )
-    fetch(repo, remote_name, [refspec] if refspec else None, callbacks=callbacks)
+    fetch(
+        repo, remote_name, [refspec] if refspec else None,
+        callbacks=callbacks, ssh_key_path=ssh_key_path,
+    )
     with unwrap(repo) as r:
         upstream_ref = r.lookup_reference(upstream_ref.name)
     return merge_branch(repo, str(upstream_ref.target))
@@ -2889,6 +3077,7 @@ def apply_file_from_stash(
 
 
 __all__ = [
+    "RebaseContinueResult",
     "abort_merge",
     "branch_of_commit",
     "abort_rebase",
@@ -2901,6 +3090,7 @@ __all__ = [
     "commit_changes",
     "complete_merge",
     "complete_rebase_continue",
+    "conflicting_paths",
     "create_branch",
     "delete_branch",
     "delete_file_from_disk",
@@ -2911,6 +3101,7 @@ __all__ = [
     "is_rebase_in_progress",
     "list_remotes",
     "merge_branch",
+    "merge_head_oid",
     "pull",
     "push",
     "rebase_branch",

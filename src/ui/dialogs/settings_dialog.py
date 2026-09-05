@@ -2,6 +2,7 @@
 
 Opened from ``File > Settings…``. Reads current values from the app
 config JSON, lets the user edit them, and saves back on accept.
+Generating a key activates its paths immediately; other edits still require OK.
 """
 from __future__ import annotations
 
@@ -31,7 +32,7 @@ from PySide6.QtWidgets import (
 
 from src.ui.dialogs.clone_dialog import SshKeyDialog, _find_ssh_keygen
 from src.ui.icons import toolbar_icon
-from src.utils.config import load_config, save_config
+from src.utils.config import default_ssh_key_path, load_config, save_config, save_ssh_key_paths
 
 
 class SettingsDialog(QDialog):
@@ -45,7 +46,7 @@ class SettingsDialog(QDialog):
       author info from ``git config`` instead of the fields above.
     * **SSH Private Key / SSH Public Key** — file paths for SSH auth.
     * **Generate SSH Key…** — opens ``ssh-keygen`` to create a new
-      ed25519 key pair and pre-fills the path fields.
+      ed25519 key pair, pre-fills the path fields and saves those paths immediately.
     """
 
     def __init__(self, config_path: str | None = None, parent: QWidget | None = None) -> None:
@@ -173,7 +174,7 @@ class SettingsDialog(QDialog):
         self._refresh_public_key_view()
 
     def _on_accept(self) -> None:
-        c = self._config
+        c = load_config(self._config_path) if self._config_path else self._config
         c["author_name"] = self._author_name_edit.text().strip()
         c["author_email"] = self._author_email_edit.text().strip()
         c["use_default_git_credentials"] = self._use_default_cred_cb.isChecked()
@@ -198,9 +199,7 @@ class SettingsDialog(QDialog):
 
     def _on_generate_ssh(self) -> None:
         """Open a small dialog to generate an ed25519 key pair."""
-        default = self._ssh_priv_edit.text().strip() or str(
-            Path.home() / ".ssh" / "git-py-ed25519",
-        )
+        default = self._ssh_priv_edit.text().strip() or str(default_ssh_key_path())
         dialog = SshKeyDialog(self, default_path=default)
         dialog.key_generated.connect(self._on_ssh_key_generated)
         dialog.exec()
@@ -208,6 +207,14 @@ class SettingsDialog(QDialog):
     def _on_ssh_key_generated(self, priv: str, pub: str, _contents: str) -> None:
         self._ssh_priv_edit.setText(priv)
         self._ssh_pub_edit.setText(pub)
+        self._refresh_public_key_view()
+        # Generating a key activates it immediately, even if Settings is
+        # subsequently closed with Cancel. Other edits still require OK.
+        if self._config_path:
+            try:
+                save_ssh_key_paths(self._config_path, priv, pub)
+            except OSError as exc:
+                QMessageBox.warning(self, "SSH Settings", f"Could not save SSH key paths: {exc}")
 
     # ----- public-key view & copy -----------------------------------------
 

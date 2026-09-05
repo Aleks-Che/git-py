@@ -258,12 +258,41 @@ class RepositoryManager:
                 continue
             if branch.target is None:
                 continue
+            # Tracking state: upstream ref name/tip + ahead/behind
+            # counts.  ``branch.upstream`` raises ``ValueError`` when
+            # no upstream is configured — that is the common case, not
+            # an error.
+            upstream_name: str | None = None
+            upstream_sha: str | None = None
+            ahead: int | None = None
+            behind: int | None = None
+            try:
+                up = branch.upstream
+            except (ValueError, pygit2.GitError):
+                up = None
+            if up is not None:
+                try:
+                    upstream_name = up.shorthand
+                    resolved_up = up.resolve()
+                    if resolved_up.target is not None:
+                        upstream_sha = str(resolved_up.target)
+                        ahead, behind = self.repo.ahead_behind(
+                            branch.target, resolved_up.target,
+                        )
+                except (ValueError, pygit2.GitError):
+                    # A dangling upstream (deleted remote branch):
+                    # keep the name but no counts.
+                    pass
             result.append(
                 BranchInfo(
                     name=name,
                     is_head=(name == head_name),
                     is_remote=False,
+                    upstream=upstream_name,
                     target_sha=str(branch.target),
+                    upstream_sha=upstream_sha,
+                    ahead=ahead,
+                    behind=behind,
                 ),
             )
         for name in self.repo.branches.remote:

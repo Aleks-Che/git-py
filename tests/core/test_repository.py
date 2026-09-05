@@ -577,7 +577,7 @@ def test_clone_routes_ssh_url_through_git_cli(
 
     assert captured, "git CLI was not invoked for SSH clone"
     cmd = captured[0]
-    assert cmd[0].endswith("git") or cmd[0] == "git"
+    assert Path(cmd[0]).name.lower() in {"git", "git.exe"}
     assert "clone" in cmd
     assert ssh_url in cmd
     assert str(target) in cmd
@@ -725,7 +725,10 @@ def test_clone_via_cli_sets_git_ssh_command_when_key_provided(
     monkeypatch.setattr("src.core.operations.subprocess.run", fake_run)
     monkeypatch.setattr("src.core.operations.shutil.which", lambda _: "/usr/bin/git")
 
-    key_path = "/home/user/.ssh-py/git-py-ed25519"
+    key = tmp_path / ".ssh-py" / "git-py-ed25519"
+    key.parent.mkdir()
+    key.write_text("test private key", encoding="utf-8")
+    key_path = key.as_posix()
     _clone_via_cli(
         "git@github.com:foo/bar.git",
         str(tmp_path / "bar"),

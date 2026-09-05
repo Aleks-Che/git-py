@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import functools
 from collections import OrderedDict
+from collections.abc import Callable
+from pathlib import Path
 
 import pygit2
 from PySide6.QtCore import QObject, QThreadPool, QTimer, Signal
@@ -48,7 +50,12 @@ from src.core.exceptions import (
 from src.core.models import BranchAttribution, RemoteInfo
 from src.core.repository import RepositoryManager
 from src.utils.async_worker import AsyncWorker
-from src.utils.config import default_config_path, load_author_signature, load_config
+from src.utils.config import (
+    default_config_path,
+    load_author_signature,
+    load_config,
+    save_ssh_key_paths,
+)
 from src.utils.debug_mode import debug_print
 from src.viewmodels.branch_panel_viewmodel import BranchPanelViewModel
 from src.viewmodels.commands import CommandProcessor
@@ -118,10 +125,17 @@ class MainViewModel(QObject):
         merge_async_threshold: int = 50,
         auto_fetch_enabled: bool = False,
         auto_fetch_interval_ms: int = 60_000,
+        config_path: Path | str | None = None,
     ) -> None:
         super().__init__(parent)
+        self._config_path = Path(config_path) if config_path is not None else None
         self._repo_manager: RepositoryManager | None = None
         self._command_processor = CommandProcessor(self)
+        # Forward command failures (undo/redo/execute-after-failure
+        # retries) to the user-visible error channel.  Without this the
+        # processor's ``error_occurred`` went nowhere and a failed undo
+        # looked successful in the log (review finding 12).
+        self._command_processor.error_occurred.connect(self._on_command_processor_error)
         self._graph_view_model = GraphViewModel(None, self, async_enabled=async_enabled)
         self._commit_panel_view_model = CommitPanelViewModel(self)
         self._branch_panel_view_model = BranchPanelViewModel(self)
@@ -133,6 +147,14 @@ class MainViewModel(QObject):
         # they are not garbage collected while the worker thread is running.
         # Removed in :meth:`_on_async_finished`.
         self._active_workers: set[object] = set()
+        # Sequential mutation queue (review finding 10): every
+        # *mutating* background operation (push / pull / fetch / merge /
+        # rebase / clone / async redo) is started on this pool, which
+        # runs at most one worker at a time.  Read-only workers
+        # (repository data load, commit details, file diffs) keep using
+        # the global pool so reads never queue behind a slow push.
+        self._mutation_pool = QThreadPool(self)
+        self._mutation_pool.setMaxThreadCount(1)
         # Generation token — bumped on every :meth:`set_repository` so
         # async workers started under the previous repo deliver their
         # result into a VM that no longer holds the right state (R2.2
@@ -392,6 +414,49 @@ class MainViewModel(QObject):
             self._branch_panel_view_model.set_repository(manager, refresh=False)
 
         self.repository_changed.emit(manager.path)
+        self._restore_in_progress_operation()
+
+    def _restore_in_progress_operation(self) -> None:
+        """Re-enter the conflict state when Git reports an unfinished op.
+
+        Covers an app restart (or an external ``git merge`` /
+        ``git rebase``) while an operation was unresolved: the conflict
+        UI comes back with the real conflicting paths and the merge
+        context recovered from ``MERGE_HEAD`` / the current branch, so
+        the user can finish or abort the operation they started.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            return
+        from src.core.operations import (
+            conflicting_paths,
+            is_merge_in_progress,
+            is_rebase_in_progress,
+            merge_head_oid,
+        )
+
+        try:
+            if is_merge_in_progress(self._repo_manager):
+                self._set_conflict_state(
+                    "merge",
+                    conflicting_paths=conflicting_paths(self._repo_manager),
+                    source=merge_head_oid(self._repo_manager),
+                    target=self._current_branch_shorthand(),
+                )
+                self._log("merge", "Recovered an in-progress merge")
+                return
+            if is_rebase_in_progress(self._repo_manager):
+                self._set_conflict_state(
+                    "rebase",
+                    conflicting_paths=conflicting_paths(self._repo_manager),
+                    upstream=None,
+                )
+                self._log("rebase", "Recovered an in-progress rebase")
+                return
+            self._clear_conflict_state()
+        except GitError:
+            # Best-effort recovery — a corrupt state file must not
+            # block opening the repository.
+            pass
 
     def load_repository_data(self) -> None:
         """Run heavy graph / status / branch enumeration on a background thread.
@@ -605,7 +670,7 @@ class MainViewModel(QObject):
         from src.viewmodels.commands import CommitCommand  # local import: avoids cycle
 
         self._log("commit", f"Committing staged changes — message: {message[:80]}")
-        config = load_config(default_config_path())
+        config = load_config(self._config_path or default_config_path())
         author = load_author_signature(config)
         command = CommitCommand(self._repo_manager, message, author=author)
         try:
@@ -810,14 +875,31 @@ class MainViewModel(QObject):
         """
         if not self._command_processor.can_undo:
             return
+        command = self._command_processor.peek_undo_command()
+        if self._async_enabled and self._is_async_redo_candidate(command):
+            self._run_async(
+                command, self._after_history_change, history_action="undo", log_tag="undo",
+            )
+            return
         try:
-            self._command_processor.undo()
+            ok = self._command_processor.undo()
         except GitError as exc:
             self.error_occurred.emit(f"Undo failed: {exc}")
             self._log("undo", f"Undo failed: {exc}", level="error")
             return
+        if not ok:
+            # The processor already surfaced the concrete error through
+            # its ``error_occurred`` signal (forwarded above); do not
+            # log a success line for a failed undo.
+            self._log("undo", "Undo failed", level="error")
+            # A failed undo can still leave an unfinished operation
+            # behind (e.g. a merge the abort could not roll back) —
+            # resurface it in the conflict UI instead of hiding it.
+            self._restore_in_progress_operation()
+            return
         self._refresh_all_views()
         self._commit_panel_view_model.refresh_selected_diff()
+        self._restore_in_progress_operation()
         self._log("undo", "Undo succeeded")
 
     @_guard_mutation
@@ -844,14 +926,32 @@ class MainViewModel(QObject):
                 "Resolve conflicts before redoing merge."
             )
             return
+        # Network / long-running commands are redone on the sequential
+        # mutation queue (review finding 10): re-running a pull or a
+        # rebase must not block the UI thread.
+        if (
+            cmd is not None
+            and self._async_enabled
+            and self._is_async_redo_candidate(cmd)
+        ):
+            self._run_async_redo(cmd)
+            return
         try:
-            self._command_processor.redo()
+            ok = self._command_processor.redo()
         except GitError as exc:
             self.error_occurred.emit(f"Redo failed: {exc}")
             self._log("redo", f"Redo failed: {exc}", level="error")
             return
+        if not ok:
+            self._log("redo", "Redo failed", level="error")
+            # A failed redo typically means the re-attempted merge /
+            # pull conflicted again — put the conflict back on screen
+            # so the user can resolve or abort it.
+            self._restore_in_progress_operation()
+            return
         self._refresh_all_views()
         self._commit_panel_view_model.refresh_selected_diff()
+        self._restore_in_progress_operation()
         self._log("redo", "Redo succeeded")
 
     # ----- commit checkout (detached HEAD) ----------------------------
@@ -1344,177 +1444,30 @@ class MainViewModel(QObject):
 
         return self.checkout_branch(local_name)
 
-    def fetch_and_checkout_remote_branch(self, remote_branch_name: str) -> None:
-        """Fetch ``remote_branch_name`` from its remote, then switch to a local tracking branch.
+    def fetch_and_checkout_remote_branch(
+        self, remote_branch_name: str, *, on_success: Callable[[], None] | None = None,
+    ) -> None:
+        """Fetch, update and check out a tracking branch on the mutation worker.
 
-        This is the "double-click on a remote-tracking branch" verb:
-        download the latest state of the remote first, then create a
-        local branch (if one does not already exist) and switch HEAD to
-        it.
-
-        The fetch runs **synchronously** on the UI thread. The other
-        network ops in this VM (``push_changes`` / ``fetch_changes`` /
-        ``pull_changes``) route through :class:`AsyncWorker`, but for
-        this specific verb the async path is unsafe: ``pygit2``'s
-        :class:`Repository` is not thread-safe when shared with the
-        main thread, and a fetch kicked off from a worker has been
-        observed to silently hang / never propagate its result to the
-        UI (the ``result`` signal is queued back, but the underlying
-        network call may have died). For a one-shot user action where
-        the user is already waiting on the result, the safest thing
-        is to block the UI for the duration of the fetch and surface
-        the outcome immediately.
-
-        The busy flag is set so the re-entrancy guard and the
-        status-bar spinner still work. On error the issue is surfaced
-        via :attr:`error_occurred` and no checkout is attempted.
-
-        If a local branch with the same name already exists but is
-        behind the remote tracking tip, the local branch is
-        fast-forwarded so the user lands on the freshly downloaded
-        commit. If the local branch has diverged from the remote, it
-        is left alone and a warning is logged — the user must merge,
-        rebase, or reset manually.
-
-        ``remote_branch_name`` is in the form ``origin/feature``.
+        ``on_success`` runs on the GUI thread after checkout finishes. Remote
+        drag/drop uses this continuation to start a merge/rebase only on success.
         """
-        if self._repo_manager is None or not self._repo_manager.is_open:
-            self.error_occurred.emit("No repository open.")
-            self._log(
-                "checkout",
-                f"Fetch+checkout {remote_branch_name!r} failed: no repo",
-                level="error",
-            )
-            return
-        if self._is_busy:
-            self.error_occurred.emit("Another operation is already in progress.")
-            return
-        if "/" not in remote_branch_name:
-            self.error_occurred.emit(f"Not a remote branch: {remote_branch_name!r}")
-            return
-
-        remote_name, branch_name = remote_branch_name.split("/", 1)
-        self._log(
-            "checkout",
-            f"Fetch {remote_name}/{branch_name} before checkout of "
-            f"{remote_branch_name!r}",
-        )
-
-        from src.viewmodels.commands import FetchCommand
-
-        command = FetchCommand(self._repo_manager, remote_name, branch_name)
-        self._is_busy = True
-        self.busy_changed.emit(True)
-        try:
-            self._command_processor.execute(command)  # type: ignore[arg-type]
-        except GitError as exc:
-            self.error_occurred.emit(str(exc))
-            self._log("fetch", f"Fetch failed: {exc}", level="error")
-            return
-        finally:
-            self._is_busy = False
-            self.busy_changed.emit(False)
-
-        self._log("fetch", "Fetch succeeded")
-        # M9 — no ``_refresh_all_views()`` here.  The final
-        # ``self.checkout_branch(local_name)`` below is the
-        # authoritative refresh for this verb; refreshing earlier
-        # races with the follow-up lookup / fast-forward logic and
-        # is unnecessary work.  The previous extra refresh has
-        # been removed (R2.3 M9).
-
-        # Look up the (now-updated) remote tracking ref.
-        remote_info = next(
-            (b for b in self._repo_manager.branches
-             if b.name == remote_branch_name and b.is_remote),
-            None,
-        )
-        if remote_info is None:
-            self.error_occurred.emit(f"Unknown remote branch: {remote_branch_name!r}")
-            self._log(
-                "checkout",
-                f"Cannot find {remote_branch_name!r} after fetch",
-                level="error",
-            )
-            return
-
-        target_sha = remote_info.target_sha
-        local_name = branch_name
-        local_info = next(
-            (b for b in self._repo_manager.branches
-             if b.name == local_name and not b.is_remote),
-            None,
-        )
-
-        if local_info is None:
-            self._log(
-                "checkout",
-                f"Creating local branch {local_name!r} at {target_sha[:7]}",
-            )
-            if not self._create_branch_internal(local_name, target_sha):
-                return
-        elif local_info.target_sha != target_sha:
-            if self._is_fast_forward(local_info.target_sha, target_sha):
-                self._log(
-                    "checkout",
-                    f"Fast-forwarding {local_name!r} from "
-                    f"{local_info.target_sha[:7]} to {target_sha[:7]}",
-                )
-                if not self._move_branch_ref(local_name, target_sha):
-                    return
-            else:
-                self._log(
-                    "checkout",
-                    f"Local {local_name!r} has diverged from "
-                    f"{remote_branch_name!r}; leaving local ref as-is",
-                    level="warn",
-                )
-        else:
-            self._log(
-                "checkout",
-                f"Local {local_name!r} is already at {target_sha[:7]}",
-            )
-
-        self.checkout_branch(local_name)
+        self._run_remote_checkout(remote_branch_name, force=False, on_success=on_success)
 
     def reset_local_branch_to_remote(self, remote_branch_name: str) -> None:
-        """Hard-reset the local tracking branch to ``remote_branch_name`` and check it out.
+        """Fetch and reset the requested local branch after the UI confirmation.
 
-        This is the destructive counterpart to
-        :meth:`fetch_and_checkout_remote_branch`: the user explicitly
-        asked to abandon any unpushed local work on the tracking
-        branch (e.g. to roll back an unmerged merge commit) and
-        switch HEAD to whatever the remote currently points at. The
-        method is **not** undoable through the normal
-        ``CommandProcessor`` — the lost commits are gone from the
-        reflog path too once ``reset --hard`` is run, so the UI
-        gates this on a confirmation dialog.
-
-        ``remote_branch_name`` is in the form ``origin/feature``;
-        the local tracking branch is the part after the ``/``.
-        Behaviour:
-
-        * Fetches the remote first so the remote tracking ref is
-          up-to-date (otherwise we'd reset to a stale tip).
-        * If the local branch does not exist, this is equivalent to
-          a normal fetch+create+checkout — no confirmation is
-          needed because there is no local work to lose.
-        * If the local branch exists, hard-resets it to the remote's
-          tip and checks it out. Uncommitted working-tree changes
-          would also be lost; the caller is expected to have
-          already verified the user is OK with that (the left-panel
-          double-click is the only caller today).
-
-        On error the issue is surfaced via :attr:`error_occurred`
-        and the repository state is left untouched.
+        The command records the old branch tips for Undo. Uncommitted changes
+        discarded by an explicitly requested hard reset cannot be restored.
         """
+        self._run_remote_checkout(remote_branch_name, force=True)
+
+    def _run_remote_checkout(
+        self, remote_branch_name: str, *, force: bool,
+        on_success: Callable[[], None] | None = None,
+    ) -> None:
         if self._repo_manager is None or not self._repo_manager.is_open:
             self.error_occurred.emit("No repository open.")
-            self._log(
-                "reset",
-                f"Reset to {remote_branch_name!r} failed: no repo",
-                level="error",
-            )
             return
         if self._is_busy:
             self.error_occurred.emit("Another operation is already in progress.")
@@ -1522,140 +1475,37 @@ class MainViewModel(QObject):
         if "/" not in remote_branch_name:
             self.error_occurred.emit(f"Not a remote branch: {remote_branch_name!r}")
             return
+        from src.viewmodels.commands import FetchAndCheckoutCommand
 
-        remote_name, branch_name = remote_branch_name.split("/", 1)
-        self._log(
-            "reset",
-            f"Fetch {remote_name}/{branch_name} and reset local "
-            f"{branch_name!r} to {remote_branch_name!r}",
+        command = FetchAndCheckoutCommand(
+            self._repo_manager, remote_branch_name, force=force,
+            ssh_key_path=self._ssh_key_path(),
         )
+        tag = "reset" if force else "checkout"
 
-        # Step 1: fetch the remote so the local tracking ref is
-        # current.  We deliberately share the sync-fetch strategy
-        # with ``fetch_and_checkout_remote_branch`` — the
-        # network round-trip is short and a hung async fetch on
-        # Windows is a worse user experience than a brief UI
-        # freeze for a one-shot user action.
-        from src.viewmodels.commands import FetchCommand
+        def finished() -> None:
+            self._refresh_all_views()
+            if command.diverged:
+                self._log(tag, f"Local branch diverged from {remote_branch_name}; kept its tip",
+                          level="warn")
+            if on_success is not None:
+                on_success()
 
+        if self._async_enabled:
+            self._run_async(command, finished, log_tag=tag)
+            return
         self._is_busy = True
         self.busy_changed.emit(True)
         try:
-            self._command_processor.execute(
-                FetchCommand(self._repo_manager, remote_name, branch_name),
-            )
+            self._command_processor.execute(command)
         except GitError as exc:
             self.error_occurred.emit(str(exc))
-            self._log("fetch", f"Fetch failed: {exc}", level="error")
+            self._log(tag, f"Operation failed: {exc}", level="error")
             return
         finally:
             self._is_busy = False
             self.busy_changed.emit(False)
-
-        # Step 2: look up the (now-updated) remote tracking ref. If
-        # the fetch did not produce one, bail out — the remote
-        # either does not have the branch or the fetch silently
-        # failed and we do not want to reset to a stale tip.
-        remote_info = next(
-            (b for b in self._repo_manager.branches
-             if b.name == remote_branch_name and b.is_remote),
-            None,
-        )
-        if remote_info is None:
-            self.error_occurred.emit(
-                f"Unknown remote branch: {remote_branch_name!r}",
-            )
-            self._log(
-                "reset",
-                f"Cannot find {remote_branch_name!r} after fetch",
-                level="error",
-            )
-            return
-        target_sha = remote_info.target_sha
-
-        # Step 3: detect whether the local branch already tracks
-        # this remote.  ``origin/feature`` and ``feature`` are
-        # matched by the ``upstream_name`` on the local branch —
-        # if upstream points at a different branch (e.g. another
-        # fork's ``upstream/feature``) we still want the user's
-        # ``feature`` ref to land on the tip the user double-
-        # clicked, so we fall back to the bare name when the
-        # upstream is missing or different.
-        local_branch = next(
-            (b for b in self._repo_manager.branches
-             if b.name == branch_name and not b.is_remote),
-            None,
-        )
-        if local_branch is None:
-            # No local work to lose — just create the local
-            # tracking branch at the freshly fetched tip and check
-            # it out.  This path is the non-destructive equivalent
-            # of the existing ``fetch_and_checkout_remote_branch``
-            # and is the correct behaviour when the user has not
-            # set up a local branch yet.
-            self._log(
-                "reset",
-                f"Creating local branch {branch_name!r} at {target_sha[:7]}",
-            )
-            from src.viewmodels.commands import CreateBranchCommand
-
-            try:
-                self._command_processor.execute(
-                    CreateBranchCommand(self._repo_manager, branch_name, target_sha),
-                )
-            except GitError as exc:
-                self.error_occurred.emit(str(exc))
-                self._log("reset", f"Create branch failed: {exc}", level="error")
-                return
-            self._refresh_all_views()
-            self.checkout_branch(branch_name)
-            return
-
-        # Step 4: hard-reset the local branch to the remote's tip
-        # and check it out.  Hard reset is the right mode here: the
-        # user asked to abandon unpushed commits (and any index /
-        # worktree drift) so the local matches the remote
-        # exactly.  A soft or mixed reset would leave the lost
-        # commits in the index / worktree, which is the opposite
-        # of what the user is trying to do.
-        local_before = local_branch.target_sha
-        self._log(
-            "reset",
-            f"Hard-reset local {branch_name!r} from {local_before[:7]} "
-            f"to {target_sha[:7]} (remote {remote_name})",
-        )
-        from src.core.operations import reset as core_reset
-        try:
-            core_reset(self._repo_manager, target_sha, mode="hard")
-        except GitError as exc:
-            self.error_occurred.emit(str(exc))
-            self._log("reset", f"Reset failed: {exc}", level="error")
-            return
-
-        # Step 5: the local branch ref now points at the remote's
-        # tip. Check it out so the working tree follows.  We use
-        # ``GIT_CHECKOUT_FORCE`` because the hard reset has already
-        # brought the index and worktree in line with the target —
-        # the post-checkout dirty check inside ``checkout_branch``
-        # would otherwise re-flag the files we just rewrote.
-        from pygit2 import GIT_CHECKOUT_FORCE  # noqa: PLC0415
-
-        from src.core.operations import checkout_branch as core_checkout
-        try:
-            core_checkout(
-                self._repo_manager, branch_name, strategy=GIT_CHECKOUT_FORCE,
-            )
-        except GitError as exc:
-            self.error_occurred.emit(str(exc))
-            self._log("checkout", f"Checkout failed: {exc}", level="error")
-            return
-
-        self._refresh_all_views()
-        self._log(
-            "reset",
-            f"Local {branch_name!r} is now at {target_sha[:7]} "
-            f"(reset to {remote_branch_name})",
-        )
+        finished()
 
     def _is_fast_forward(self, old_sha: str, new_sha: str) -> bool:
         """Return ``True`` if ``new_sha`` is a descendant of ``old_sha``.
@@ -1956,7 +1806,9 @@ class MainViewModel(QObject):
                 "merge",
                 conflicting_paths=exc.conflicting_paths,
                 source=source,
-                target=target,
+                target=exc.target_branch or target,
+                source_oid=exc.source_oid,
+                target_oid=exc.target_oid,
             )
             return
         except GitError as exc:
@@ -1975,9 +1827,11 @@ class MainViewModel(QObject):
             self._command_processor.execute(command)  # type: ignore[arg-type]
         except RebaseConflictError as exc:
             self._log("rebase", f"Rebase onto {upstream!r} produced conflicts", level="warn")
+            from src.core.operations import conflicting_paths
+
             self._set_conflict_state(
                 "rebase",
-                conflicting_paths=[],
+                conflicting_paths=conflicting_paths(self._repo_manager),
                 upstream=upstream,
             )
             self.error_occurred.emit(str(exc))
@@ -2017,7 +1871,9 @@ class MainViewModel(QObject):
                     if refspec
                     else f"{remote_name}/{self._current_branch_shorthand()}"
                 ),
-                target=None,
+                target=exc.target_branch,
+                source_oid=exc.source_oid,
+                target_oid=exc.target_oid,
             )
             return
         except GitError as exc:
@@ -2042,7 +1898,7 @@ class MainViewModel(QObject):
     def _execute_clone_sync(self, url: str, path: str) -> None:
         try:
             manager = RepositoryManager()
-            ssh_key = self._ssh_key_path_for_clone()
+            ssh_key = self._ssh_key_path()
             manager.clone(url, path, ssh_key_path=ssh_key)
         except GitError as exc:
             self.error_occurred.emit(str(exc))
@@ -2051,15 +1907,24 @@ class MainViewModel(QObject):
         self.set_repository(manager)
         self._log("clone", f"Clone finished: {url} → {path}")
 
-    def _ssh_key_path_for_clone(self) -> str | None:
+    def configure_ssh_key(self, private_key: str, public_key: str) -> None:
+        """Persist a generated key so the next network operation uses it."""
+        try:
+            save_ssh_key_paths(
+                self._config_path or default_config_path(), private_key, public_key,
+            )
+        except OSError as exc:
+            self.error_occurred.emit(f"Could not save SSH key settings: {exc}")
+
+    def _ssh_key_path(self) -> str | None:
         """Return the configured private SSH key path, if any.
 
-        Used by ``clone_repository`` to forward the key to ``git``
+        Reloaded for each network operation to forward the key to ``git``
         via ``GIT_SSH_COMMAND``. Returns ``None`` if no key is
         configured (git CLI will fall back to ``~/.ssh/id_*``).
         """
         try:
-            config = load_config(default_config_path())
+            config = load_config(self._config_path or default_config_path())
         except OSError:
             return None
         key = str(config.get("ssh_private_key", "") or "").strip()
@@ -2158,13 +2023,18 @@ class MainViewModel(QObject):
 
         self._log("drop", f"Drop commit {sha[:7].rstrip()}")
         command = DropCommitCommand(self._repo_manager, sha)
+        if self._async_enabled:
+            self._run_async(command, self._refresh_all_views, log_tag="drop")
+            return
         try:
             self._command_processor.execute(command)
         except RebaseConflictError as exc:
+            from src.core.operations import conflicting_paths
+
             self._log("drop", f"Drop {sha[:7]!r} produced conflicts", level="warn")
             self._set_conflict_state(
                 "rebase",
-                conflicting_paths=[],
+                conflicting_paths=conflicting_paths(self._repo_manager),
                 op="drop",
                 sha=sha,
             )
@@ -2188,8 +2058,14 @@ class MainViewModel(QObject):
 
         self._log("reword", f"Edit message of {sha[:7].rstrip()}")
         command = EditCommitMessageCommand(self._repo_manager, sha, message)
+        if self._async_enabled:
+            self._run_async(command, self._refresh_all_views, log_tag="reword")
+            return
         try:
             self._command_processor.execute(command)
+        except RebaseConflictError as exc:
+            self._on_async_failed(command, exc, log_tag="reword")
+            return
         except GitError as exc:
             self.error_occurred.emit(str(exc))
             self._log("reword", f"Edit message {sha[:7]!r} failed: {exc}", level="error")
@@ -2465,13 +2341,18 @@ class MainViewModel(QObject):
 
         self._log("squash", f"Squash {len(shas)} commits")
         command = SquashCommitsCommand(self._repo_manager, shas, message)
+        if self._async_enabled:
+            self._run_async(command, self._refresh_all_views, log_tag="squash")
+            return
         try:
             self._command_processor.execute(command)
         except RebaseConflictError as exc:
+            from src.core.operations import conflicting_paths
+
             self._log("squash", "Squash produced conflicts", level="warn")
             self._set_conflict_state(
                 "rebase",
-                conflicting_paths=[],
+                conflicting_paths=conflicting_paths(self._repo_manager),
                 op="squash",
             )
             self.error_occurred.emit(str(exc))
@@ -2801,7 +2682,9 @@ class MainViewModel(QObject):
 
         spec = refspec or "HEAD"
         self._log("push", f"Push {remote_name}/{spec}")
-        command = PushCommand(self._repo_manager, remote_name, refspec)
+        command = PushCommand(
+            self._repo_manager, remote_name, refspec, ssh_key_path=self._ssh_key_path(),
+        )
         if self._async_enabled:
             self._run_async(
                 command,
@@ -2834,7 +2717,9 @@ class MainViewModel(QObject):
 
         spec = refspec or "HEAD"
         self._log("pull", f"Pull {remote_name}/{spec}")
-        command = PullCommand(self._repo_manager, remote_name, refspec)
+        command = PullCommand(
+            self._repo_manager, remote_name, refspec, ssh_key_path=self._ssh_key_path(),
+        )
         if self._async_enabled:
             self._run_async(
                 command,
@@ -2871,7 +2756,9 @@ class MainViewModel(QObject):
         spec = refspec or "all"
         if not silent:
             self._log("fetch", f"Fetch {remote_name}/{spec}")
-        command = FetchCommand(self._repo_manager, remote_name, refspec)
+        command = FetchCommand(
+            self._repo_manager, remote_name, refspec, ssh_key_path=self._ssh_key_path(),
+        )
         if self._async_enabled:
             self._run_async(
                 command,
@@ -2960,7 +2847,7 @@ class MainViewModel(QObject):
 
         def _work() -> None:
             manager = RepositoryManager()
-            ssh_key = self._ssh_key_path_for_clone()
+            ssh_key = self._ssh_key_path()
             manager.clone(url, path, ssh_key_path=ssh_key)
 
         def _on_success(_: object) -> None:
@@ -2997,7 +2884,7 @@ class MainViewModel(QObject):
         worker.signals.lifespan_finished.connect(
             lambda w=worker: self._on_async_finished(w),
         )
-        QThreadPool.globalInstance().start(worker)
+        self._mutation_pool.start(worker)
 
     # ----- auto-fetch timer --------------------------------------------
 
@@ -3081,29 +2968,66 @@ class MainViewModel(QObject):
             return
         from pathlib import Path
 
-        from src.core.operations import (
-            complete_merge,
-            complete_rebase_continue,
-            is_rebase_in_progress,
-        )
-
         self._log("conflict", f"Resolving conflict in {path!r}")
 
         try:
             full_path = Path(self._repo_manager.path) / path
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(resolution, encoding="utf-8")
+            self._repo_manager.repo.index.read(force=True)
             self._repo_manager.repo.index.add(path)
             self._repo_manager.repo.index.write()
-        except OSError as exc:
+        except (OSError, ValueError, pygit2.GitError) as exc:
             self.error_occurred.emit(f"Failed to resolve {path!r}: {exc}")
             self._log("conflict", f"Failed to write resolution for {path!r}: {exc}", level="error")
             return
 
-        # Drop the resolved path from the conflict list.
-        paths = list(self._conflict_state.get("conflicting_paths", []))
-        if path in paths:
-            paths.remove(path)
+        self._finalize_resolved_path(path)
+
+    @_guard_mutation
+    def resolve_conflict_bytes(self, path: str, resolution: bytes) -> None:
+        """Binary twin of :meth:`resolve_conflict`.
+
+        Writes raw bytes (e.g. the chosen side of a binary conflict
+        from the resolution dialog) instead of UTF-8 text — encoding
+        a binary payload as text would corrupt it.
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        if self._conflict_state is None:
+            self.error_occurred.emit("No conflict in progress.")
+            return
+        if self._repo_manager.path is None:
+            self.error_occurred.emit("Repository has no working directory.")
+            return
+        from pathlib import Path
+
+        self._log("conflict", f"Resolving binary conflict in {path!r}")
+
+        try:
+            full_path = Path(self._repo_manager.path) / path
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            full_path.write_bytes(resolution)
+            self._repo_manager.repo.index.read(force=True)
+            self._repo_manager.repo.index.add(path)
+            self._repo_manager.repo.index.write()
+        except (OSError, ValueError, pygit2.GitError) as exc:
+            self.error_occurred.emit(f"Failed to resolve {path!r}: {exc}")
+            self._log("conflict", f"Failed to write resolution for {path!r}: {exc}", level="error")
+            return
+
+        self._finalize_resolved_path(path)
+
+    def _finalize_resolved_path(self, path: str) -> None:
+        """Drop ``path`` from the conflict list; finish the op when done."""
+        from src.core.operations import conflicting_paths
+
+        try:
+            paths = conflicting_paths(self._repo_manager)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            return
         if paths:
             self._conflict_state["conflicting_paths"] = paths
             self.conflict_state_changed.emit(dict(self._conflict_state))
@@ -3112,40 +3036,52 @@ class MainViewModel(QObject):
 
         operation = self._conflict_state.get("operation")
         if operation == "merge":
-            try:
-                complete_merge(
-                    self._repo_manager,
-                    source=self._conflict_state.get("source") or "",
-                    target=self._conflict_state.get("target"),
+            # Prefer the recorded source *OID* — a ref name could have
+            # been moved by a fetch while the merge sat unresolved.
+            source = self._conflict_state.get("source_oid") or self._conflict_state.get(
+                "source",
+            )
+            if not source:
+                self.error_occurred.emit(
+                    "Merge context is missing; cannot complete the merge. "
+                    "Abort the merge and retry the operation.",
                 )
-            except (GitError, MergeConflictError) as exc:
-                self.error_occurred.emit(str(exc))
-                self._log("merge", f"Complete merge failed: {exc}", level="error")
+                self._log("merge", "Complete merge failed: no source in conflict state",
+                          level="error")
                 return
-            self._clear_conflict_state()
-            self._refresh_all_views()
-            self._log("merge", "Merge completed after conflict resolution")
+            # Route the completion through the CommandProcessor so the
+            # finished merge is undoable as its own command (review
+            # finding: a merge completed after conflict resolution used
+            # to be invisible to Undo).
+            parent_oid = self._conflict_state.get("target_oid") or str(
+                self._repo_manager.repo.head.target,
+            )
+            self.complete_merge_after_conflict(
+                source,
+                parent_oid=parent_oid,
+                target=self._conflict_state.get("target"),
+            )
             return
         if operation == "rebase":
-            try:
-                more = complete_rebase_continue(self._repo_manager)
-            except GitError as exc:
-                self.error_occurred.emit(str(exc))
-                self._log("rebase", f"Rebase continue failed: {exc}", level="error")
-                return
-            if more or is_rebase_in_progress(self._repo_manager):
-                from src.core.operations import _collect_conflicts
-                from src.core.repository import unwrap
+            from src.viewmodels.commands import ContinueRebaseCommand
 
-                with unwrap(self._repo_manager) as r:
-                    paths = _collect_conflicts(r)
-                self._conflict_state["conflicting_paths"] = paths
-                self.conflict_state_changed.emit(dict(self._conflict_state))
-                self._log("rebase", "More conflicts — continuing rebase")
+            command = ContinueRebaseCommand(self._repo_manager)
+
+            def continued() -> None:
+                self._restore_in_progress_operation()
+                self._refresh_all_views()
+                message = "Rebase continued" if self._conflict_state else "Rebase completed"
+                self._log("rebase", message)
+
+            if self._async_enabled:
+                self._run_async(command, continued, log_tag="rebase")
                 return
-            self._clear_conflict_state()
-            self._refresh_all_views()
-            self._log("rebase", "Rebase completed after conflict resolution")
+            try:
+                self._command_processor.execute(command)
+            except GitError as exc:
+                self._on_async_failed(command, exc, log_tag="rebase")
+                return
+            continued()
             return
         if operation in ("cherry-pick", "revert"):
             self._clear_conflict_state()
@@ -3156,7 +3092,50 @@ class MainViewModel(QObject):
         self._refresh_all_views()
 
     @_guard_mutation
-    def complete_merge_after_conflict(self, source: str, parent_oid: str | None = None) -> None:
+    def continue_operation(self) -> None:
+        """Finish the in-progress conflicted operation (Continue button).
+
+        Re-reads the index first: when the user resolved files with an
+        external editor instead of the in-app dialog, the VM's
+        ``conflicting_paths`` list is stale.  Any real conflicts left
+        in the index replace the list so the panel shows what still
+        needs attention; with a clean index the operation is completed
+        (merge → merge commit, rebase → ``git rebase --continue``).
+        """
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        if self._conflict_state is None:
+            self.error_occurred.emit("No conflict in progress.")
+            return
+        from src.core.operations import conflicting_paths
+
+        try:
+            remaining = conflicting_paths(self._repo_manager)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            return
+        if remaining:
+            self._conflict_state["conflicting_paths"] = remaining
+            self.conflict_state_changed.emit(dict(self._conflict_state))
+            self.error_occurred.emit(
+                f"Cannot continue: {len(remaining)} conflicting file(s) "
+                "still need resolution.",
+            )
+            return
+        # The index is clean — every conflict was resolved (possibly
+        # externally).  Pretend the last in-app resolution just landed:
+        # the shared tail completes / continues the operation.
+        self._conflict_state["conflicting_paths"] = []
+        self._finalize_resolved_path(path="")
+
+    @_guard_mutation
+    def complete_merge_after_conflict(
+        self,
+        source: str,
+        parent_oid: str | None = None,
+        target: str | None = None,
+    ) -> None:
         """Finalise a resolved merge via :class:`CompleteMergeCommand`.
 
         Constructs and executes :class:`CompleteMergeCommand`, which
@@ -3186,10 +3165,11 @@ class MainViewModel(QObject):
             self._repo_manager,
             source=source,
             parent_oid=parent_oid,
+            target=target,
         )
         try:
             self._command_processor.execute(command)
-        except GitError as exc:
+        except (GitError, MergeConflictError) as exc:
             self.error_occurred.emit(str(exc))
             self._log("merge", f"Complete merge failed: {exc}", level="error")
             return
@@ -3215,6 +3195,11 @@ class MainViewModel(QObject):
         level_tag = {"info": "INFO ", "warn": "WARN ", "error": "ERROR"}.get(level, "INFO ")
         prefix = f"[{category}]" if category else ""
         self.log_message.emit(f"{ts} {level_tag}{prefix} {message}")
+
+    def _on_command_processor_error(self, message: str) -> None:
+        """Forward a :class:`CommandProcessor` failure to the user channel."""
+        self.error_occurred.emit(message)
+        self._log("command", f"Command failed: {message}", level="error")
 
     def _refresh_all_views(self) -> None:
         """Refresh graph, commit panel, and branch panel after a state change."""
@@ -3253,77 +3238,111 @@ class MainViewModel(QObject):
         *,
         silent_on_failure: bool = False,
         log_tag: str = "",
+        history_action: str = "execute",
     ) -> None:
-        """Run ``command.execute()`` on a worker thread.
+        """Execute a command with its own repository handle on the mutation pool.
 
-        The work is wrapped in an :class:`AsyncWorker`; the ``finished``
-        signal triggers ``on_success`` on the UI thread, the ``failed``
-        signal routes the exception (passed as the actual exception
-        **object**, not a string) through the normal VM error /
-        conflict paths, and the ``lifespan_finished`` signal clears
-        the busy flag and drops the strong :class:`AsyncWorker`
-        reference.
-
-        ``silent_on_failure=True`` suppresses the ``error_occurred``
-        signal for generic :class:`GitError` failures. Conflict state
-        is still surfaced because the user must resolve it. The
-        auto-fetch timer uses silent mode so a dropped connection
-        does not flash a status-bar error every minute.
-
-        ``log_tag`` is used to emit success/failure log entries
-        (e.g. ``"fetch"``, ``"push"``).
-
-        R2.2 notes
-        ----------
-        * The current dispatch passes the UI-thread command
-          directly to the worker.  ``command._repo`` is therefore the
-          UI-thread :class:`RepositoryManager`; a true C6 fix would
-          require reconstructing the command with a worker-owned
-          manager (out of scope for this stage).  The busy-guard on
-          :meth:`set_repository` (and the long-standing busy-guard
-          on ``refresh_state`` and the verb verbs) are the
-          operational mitigation that prevents the UI thread from
-          entering the same ``pygit2.Repository`` while the worker
-          is in flight.
-        * The captured ``generation`` token drops stale results
-          when ``set_repository`` runs between worker dispatch and
-          completion (R2.2 C7).
+        Only command state and errors cross the thread boundary. History and
+        Qt signals are updated on the GUI thread after execution completes.
         """
+        import copy
+
         if self._is_busy:
             return
         self._is_busy = True
         self.busy_changed.emit(True)
-        # Capture the generation token at dispatch time (R2.2 C7).
         generation = self._async_generation
+        worker_command = copy.copy(command)
+        manager = getattr(command, "_repo", None)
+        repo_path = manager.path if manager is not None else None
 
-        def _work() -> None:
-            self._command_processor.execute(command)  # type: ignore[arg-type]
+        def _work() -> tuple[dict, Exception | None]:
+            worker_manager = RepositoryManager(repo_path) if repo_path is not None else None
+            if worker_manager is not None:
+                worker_command._repo = worker_manager
+            failure = None
+            try:
+                if history_action == "undo":
+                    worker_command.undo()
+                else:
+                    worker_command.execute()
+            except Exception as exc:
+                failure = exc.with_traceback(None)
+            finally:
+                if worker_manager is not None:
+                    worker_manager.close()
+            state = {key: value for key, value in vars(worker_command).items() if key != "_repo"}
+            return state, failure
 
-        def _on_result(_: object) -> None:
+        def _on_result(result: object) -> None:
             if generation != self._async_generation:
-                # Stale — the user opened a different repo while the
-                # worker was in flight.  Drop silently (R2.2 C7/M8).
+                self._on_async_finished(worker)
+                return
+            state, exc = result
+            vars(command).update(state)
+            if exc is not None:
+                if history_action == "execute":
+                    self._command_processor.record_failure(command, exc)
+                self._on_async_finished(worker)
+                self._on_async_failed(command, exc, silent_on_failure, log_tag=log_tag)
+                return
+            self._command_processor.record_success(command, history_action)
+            self._on_async_finished(worker)
+            # Record a completed operation even if the subsequent view refresh fails.
+            try:
+                if manager is not None:
+                    manager.repo.index.read(force=True)
+            except (OSError, pygit2.GitError) as read_error:
+                self._on_async_failed(command, read_error, silent_on_failure, log_tag=log_tag)
                 return
             if log_tag:
                 self._log(log_tag, "Operation succeeded")
-            on_success()  # type: ignore[operator]
+            on_success()
 
         def _on_failure(exc: object) -> None:
-            if generation != self._async_generation:
-                # Stale — drop silently.
-                return
-            self._on_async_failed(
-                command, exc, silent_on_failure, log_tag=log_tag,
-            )
+            self._on_async_finished(worker)
+            if generation == self._async_generation:
+                self._on_async_failed(command, exc, silent_on_failure, log_tag=log_tag)
 
         worker = AsyncWorker(_work)
         worker.signals.finished.connect(_on_result)
         worker.signals.failed.connect(_on_failure)
         self._active_workers.add(worker)
-        worker.signals.lifespan_finished.connect(
-            lambda w=worker: self._on_async_finished(w),
+        worker.signals.lifespan_finished.connect(lambda: self._on_async_finished(worker))
+        self._mutation_pool.start(worker)
+
+    @staticmethod
+    def _is_async_redo_candidate(command: object) -> bool:
+        """Return whether executing or undoing a command can block on Git."""
+        from src.viewmodels.commands import (
+            ContinueRebaseCommand,
+            DropCommitCommand,
+            EditCommitMessageCommand,
+            FetchAndCheckoutCommand,
+            FetchCommand,
+            MergeCommand,
+            PullCommand,
+            PushCommand,
+            RebaseCommand,
+            SquashCommitsCommand,
         )
-        QThreadPool.globalInstance().start(worker)
+
+        return isinstance(command, (
+            ContinueRebaseCommand, DropCommitCommand, EditCommitMessageCommand,
+            FetchAndCheckoutCommand, FetchCommand, MergeCommand, PullCommand,
+            PushCommand, RebaseCommand, SquashCommitsCommand,
+        ))
+
+    def _run_async_redo(self, command: object) -> None:
+        """Redo through the same worker dispatch without duplicating history."""
+        self._run_async(
+            command, self._after_history_change, history_action="redo", log_tag="redo",
+        )
+
+    def _after_history_change(self) -> None:
+        self._restore_in_progress_operation()
+        self._refresh_all_views()
+        self._commit_panel_view_model.refresh_selected_diff()
 
     def _on_async_failed(
         self,
@@ -3350,11 +3369,17 @@ class MainViewModel(QObject):
             if log_tag:
                 self._log(log_tag, f"Operation failed (conflicts): {message}", level="warn")
             if self._repo_manager is not None:
+                # Carry the typed operation context (source OID, target
+                # branch/OID) from the exception — never ``None`` —
+                # so ``resolve_conflict`` can finish the merge even
+                # though it runs long after the worker failed.
                 self._set_conflict_state(
                     "merge",
                     conflicting_paths=exc.conflicting_paths,
-                    source=None,
-                    target=None,
+                    source=exc.source_oid,
+                    target=exc.target_branch,
+                    source_oid=exc.source_oid,
+                    target_oid=exc.target_oid,
                 )
             elif not silent:
                 self.error_occurred.emit(message)
@@ -3363,7 +3388,13 @@ class MainViewModel(QObject):
             if log_tag:
                 self._log(log_tag, f"Operation failed (rebase conflicts): {message}", level="warn")
             if self._repo_manager is not None:
-                self._set_conflict_state("rebase", conflicting_paths=[], upstream=None)
+                from src.core.operations import conflicting_paths
+
+                self._set_conflict_state(
+                    "rebase",
+                    conflicting_paths=conflicting_paths(self._repo_manager),
+                    upstream=None,
+                )
             if not silent:
                 self.error_occurred.emit(message)
             return
@@ -3382,15 +3413,29 @@ class MainViewModel(QObject):
         from src.core.operations import is_merge_in_progress, is_rebase_in_progress
 
         if is_merge_in_progress(self._repo_manager):
-            from src.core.operations import _collect_conflicts
+            from src.core.operations import _collect_conflicts, merge_head_oid
             from src.core.repository import unwrap
 
             with unwrap(self._repo_manager) as r:
                 paths = _collect_conflicts(r)
-            self._set_conflict_state("merge", conflicting_paths=paths, source=None, target=None)
+            # Recover the operation context from the Git state files:
+            # MERGE_HEAD stores the source OID, and HEAD sits on the
+            # target branch while the merge is unresolved.
+            self._set_conflict_state(
+                "merge",
+                conflicting_paths=paths,
+                source=merge_head_oid(self._repo_manager),
+                target=self._current_branch_shorthand(),
+            )
             return
         if is_rebase_in_progress(self._repo_manager):
-            self._set_conflict_state("rebase", conflicting_paths=[], upstream=None)
+            from src.core.operations import conflicting_paths
+
+            self._set_conflict_state(
+                "rebase",
+                conflicting_paths=conflicting_paths(self._repo_manager),
+                upstream=None,
+            )
             if not silent:
                 self.error_occurred.emit(message)
             return
@@ -3417,9 +3462,11 @@ class MainViewModel(QObject):
         self._log("repo", f"Repository data load failed: {message}", level="error")
 
     def _on_async_finished(self, worker: object) -> None:
+        if worker not in self._active_workers:
+            return
         self._active_workers.discard(worker)
-        self._is_busy = False
-        self.busy_changed.emit(False)
+        self._is_busy = bool(self._active_workers)
+        self.busy_changed.emit(self._is_busy)
 
     def _set_conflict_state(
         self,

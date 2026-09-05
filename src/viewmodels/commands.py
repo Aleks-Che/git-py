@@ -40,6 +40,7 @@ from src.core.operations import (
     discard_file,
     drop_commit,
     edit_commit_message,
+    ensure_safe_tree_update,
     fetch,
     find_stash_index_by_oid,
     is_merge_in_progress,
@@ -172,27 +173,54 @@ class CommandProcessor(QObject):
         """Run ``command.execute()`` and push it onto the undo stack."""
         try:
             command.execute()
-        except MergeConflictError:
-            # A merge/pull conflict changes the index and leaves an
-            # in-progress operation behind. Keep the command in history so
-            # Undo can abort and clean up that partial operation, while the
-            # exception still reaches the ViewModel's conflict UI.
-            if getattr(command, "_had_conflict_in_execute", False):
-                command._timestamp = time.time()
-                command.is_noop = False
-                self._undo_stack.append(command)
-                self.stack_changed.emit()
+        except MergeConflictError as exc:
+            self.record_failure(command, exc)
             raise
+        self.record_success(command)
+
+    def record_failure(self, command: GitCommand, exc: Exception) -> None:
+        """Record a partially executed merge on the processor's owning thread."""
+        if (isinstance(exc, MergeConflictError)
+                and getattr(command, "_had_conflict_in_execute", False)):
+            command._timestamp = time.time()
+            command.is_noop = False
+            self._undo_stack.append(command)
+            self._redo_stack.clear()
+            self.stack_changed.emit()
+
+    def record_success(self, command: GitCommand, action: str = "execute") -> None:
+        """Apply history bookkeeping after a worker finishes, on the GUI thread."""
+        if action == "undo":
+            if self.peek_undo_command() is not command:
+                raise GitError("Undo history changed while the command was running.")
+            self._undo_stack.pop()
+            self._redo_stack.append(command)
+            self.stack_changed.emit()
+            return
+        if action == "redo":
+            if self.peek_redo_command() is not command:
+                raise GitError("Redo history changed while the command was running.")
+            self._redo_stack.pop()
         command._timestamp = time.time()
         if not command.is_noop:
             self._undo_stack.append(command)
-        self._redo_stack.clear()
+        if action == "execute":
+            self._redo_stack.clear()
         self.stack_changed.emit()
 
-    def undo(self) -> None:
-        """Pop the most recent command and undo it. No-op if stack is empty."""
+    def undo(self) -> bool:
+        """Pop the most recent command and undo it.
+
+        Returns ``True`` when the command was undone (and moved to the
+        redo stack), ``False`` when the stack was empty or the undo
+        failed.  On failure the command stays on the undo stack and the
+        error is reported through :attr:`error_occurred` — callers must
+        check the return value instead of assuming success (review
+        finding: a failed undo used to be logged as "Undo succeeded"
+        because the failure never left the processor).
+        """
         if not self._undo_stack:
-            return
+            return False
         command = self._undo_stack.pop()
         try:
             command.undo()
@@ -202,14 +230,20 @@ class CommandProcessor(QObject):
             self._undo_stack.append(command)
             self.error_occurred.emit(str(exc))
             self.stack_changed.emit()
-            return
+            return False
         self._redo_stack.append(command)
         self.stack_changed.emit()
+        return True
 
-    def redo(self) -> None:
-        """Re-apply the most recently undone command. No-op if stack is empty."""
+    def redo(self) -> bool:
+        """Re-apply the most recently undone command.
+
+        Same result contract as :meth:`undo`: ``True`` on success,
+        ``False`` on empty stack or failure (the command stays
+        redo-able and :attr:`error_occurred` carries the message).
+        """
         if not self._redo_stack:
-            return
+            return False
         command = self._redo_stack.pop()
         try:
             command.execute()
@@ -219,11 +253,12 @@ class CommandProcessor(QObject):
             self._redo_stack.append(command)
             self.error_occurred.emit(str(exc))
             self.stack_changed.emit()
-            return
+            return False
         command._timestamp = time.time()
         if not command.is_noop:
             self._undo_stack.append(command)
         self.stack_changed.emit()
+        return True
 
     @property
     def can_undo(self) -> bool:
@@ -259,6 +294,98 @@ class CommandProcessor(QObject):
         self._undo_stack.clear()
         self._redo_stack.clear()
         self.stack_changed.emit()
+
+
+# ----- undo safety guards ----------------------------------------------------
+#
+# History-rewriting commands capture the HEAD (and target-ref) OID they
+# produced in ``execute``.  Before an undo that destructively rewinds refs
+# (hard reset / forced checkout) the guards below verify:
+#
+# 1. HEAD is still exactly where the command left it — otherwise undo
+#    would rewind commits made afterwards (via this app, the CLI, or an
+#    IDE) that the command knows nothing about.
+# 2. The index/worktree carry no uncommitted changes — a hard reset
+#    would otherwise silently delete the user's uncommitted work.
+#
+# A failed guard raises :class:`GitError`; the processor keeps the command
+# in the undo stack, so the user can reconcile manually and retry.
+
+
+def _current_head_oid(repo: RepositoryManager) -> str | None:
+    """Return the resolved HEAD OID hex, or ``None`` when HEAD is unborn."""
+    r = repo.repo
+    if r.head_is_unborn:
+        return None
+    return str(r.head.target)
+
+
+def _ensure_head_at(
+    repo: RepositoryManager,
+    expected: str | None,
+    action: str,
+    expected_ref: str | None = None,
+) -> None:
+    """Refuse ``action`` when HEAD moved since the operation ran.
+
+    ``expected`` is the OID the command captured right after
+    ``execute``; ``None`` disables the check (nothing captured).
+    """
+    if expected is None:
+        return
+    if expected_ref is not None and repo.repo.head.name != expected_ref:
+        raise GitError(
+            f"Cannot {action}: HEAD is on a different branch "
+            f"(expected {expected_ref}, now {repo.repo.head.name}).",
+        )
+    current = _current_head_oid(repo)
+    if current == expected:
+        return
+    cur = current[:7] if current else "unborn"
+    raise GitError(
+        f"Cannot {action}: HEAD has moved since the operation ran "
+        f"(expected {expected[:7]}, now {cur}). "
+        "Reconcile manually (e.g. via the Git CLI) first.",
+    )
+
+
+# Status flags an undo hard reset / forced checkout would silently destroy.
+# Colliding untracked/ignored paths are checked against the destination tree.
+_UNSAFE_UNDO_STATUS_FLAGS = (
+    pygit2.GIT_STATUS_INDEX_NEW
+    | pygit2.GIT_STATUS_INDEX_MODIFIED
+    | pygit2.GIT_STATUS_INDEX_DELETED
+    | pygit2.GIT_STATUS_INDEX_RENAMED
+    | pygit2.GIT_STATUS_INDEX_TYPECHANGE
+    | pygit2.GIT_STATUS_WT_MODIFIED
+    | pygit2.GIT_STATUS_WT_DELETED
+    | pygit2.GIT_STATUS_WT_RENAMED
+    | pygit2.GIT_STATUS_WT_TYPECHANGE
+)
+
+
+def _ensure_no_uncommitted_changes(
+    repo: RepositoryManager, action: str, target: str | None = None,
+) -> None:
+    """Refuse a destructive ``action`` while the index/worktree is dirty."""
+    if target is not None:
+        ensure_safe_tree_update(repo, target, action)
+        return
+    repo.repo.index.read()
+    dirty = [
+        path
+        for path, flags in repo.repo.status().items()
+        if flags & _UNSAFE_UNDO_STATUS_FLAGS
+    ]
+    if not dirty:
+        return
+    n = len(dirty)
+    preview = ", ".join(sorted(dirty)[:10])
+    suffix = f" and {n - 10} more" if n > 10 else ""
+    raise GitError(
+        f"Cannot {action}: uncommitted changes in {n} file(s) would be "
+        f"lost. Commit, stash or discard them first: {preview}{suffix}",
+    )
 
 
 class CommitCommand(GitCommand):
@@ -629,9 +756,13 @@ class MergeCommand(GitCommand):
       created; undo is ``reset(_previous_head_sha, hard)``.
 
     A conflict (``MergeConflictError`` from the core layer) propagates
-    out of :meth:`execute`; the processor therefore does *not* push
-    the command onto the undo stack on failure, and the ViewModel
-    picks up the conflict state from the exception.
+    out of :meth:`execute`; the processor pushes the command onto the
+    undo stack (marked via ``_had_conflict_in_execute``) so Undo can
+    abort the in-progress merge, and the ViewModel picks up the
+    conflict state from the exception.  The core keeps HEAD on the
+    *target* branch while the conflict is unresolved — the merge state
+    belongs to that branch — and undo additionally returns HEAD to the
+    branch the user started from after the abort.
     """
 
     def __init__(
@@ -660,6 +791,8 @@ class MergeCommand(GitCommand):
         self._head_ref_name_before: str | None = None
         self._head_sha_before: str | None = None
         self._merge_oid: str | None = None
+        self._expected_head_after: str | None = None
+        self._expected_head_ref_after: str | None = None
         self._head_moved = False
         self._had_conflict_in_execute = False
 
@@ -699,6 +832,8 @@ class MergeCommand(GitCommand):
         except MergeConflictError:
             self._had_conflict_in_execute = True
             self._merge_oid = None
+            self._expected_head_after = _current_head_oid(self._repo)
+            self._expected_head_ref_after = repo.head.name
             self._head_moved = False
             self.is_noop = False
             raise
@@ -706,6 +841,8 @@ class MergeCommand(GitCommand):
         ref_after = repo.lookup_reference(self._target_ref_name)
         after_sha = str(ref_after.target)
         self._merge_oid = after_sha if after_sha != self._target_sha_before else None
+        self._expected_head_after = _current_head_oid(self._repo)
+        self._expected_head_ref_after = repo.head.name
         self._head_moved = (
             self._head_ref_name_before != (None if repo.head_is_detached else repo.head.name)
             or (
@@ -720,8 +857,15 @@ class MergeCommand(GitCommand):
         # A failed merge leaves MERGE_HEAD and conflict entries behind.
         # Abort that operation instead of treating it like a clean merge.
         if self._had_conflict_in_execute:
+            _ensure_head_at(
+                self._repo, self._target_sha_before, "undo the conflicted merge",
+                self._target_ref_name,
+            )
             if is_merge_in_progress(self._repo):
                 abort_merge(self._repo)
+            # The conflicting merge kept HEAD on the target branch;
+            # return the user to the branch they started from.
+            self._restore_previous_head()
             self._had_conflict_in_execute = False
             return
         # Up-to-date merges on the current branch do not move anything.  A
@@ -734,6 +878,30 @@ class MergeCommand(GitCommand):
         if self._merge_oid is None and not self._head_moved:
             return
 
+        # Refuse to clobber external changes: the target ref must still
+        # point at the merge result and HEAD must still be where this
+        # command left it (review: verify *all* refs an undo touches,
+        # not just HEAD).
+        if self._merge_oid is not None:
+            current_target = str(target_ref.target)
+            if current_target != self._merge_oid:
+                raise GitError(
+                    f"Cannot undo the merge: branch "
+                    f"{self._target_ref_name.removeprefix('refs/heads/')!r} "
+                    f"has moved since the merge (expected "
+                    f"{self._merge_oid[:7]}, now {current_target[:7]}). "
+                    "Reconcile manually (e.g. via the Git CLI) first.",
+                )
+        _ensure_head_at(
+            self._repo, self._expected_head_after, "undo the merge",
+            self._expected_head_ref_after,
+        )
+        destination = self._head_sha_before or self._target_sha_before
+        if self._head_ref_name_before != self._target_ref_name:
+            if self._head_ref_name_before is not None:
+                destination = str(repo.lookup_reference(self._head_ref_name_before).target)
+        _ensure_no_uncommitted_changes(self._repo, "undo the merge", destination)
+
         try:
             target_ref.set_target(self._target_sha_before)
             if self._head_ref_name_before is not None:
@@ -743,9 +911,22 @@ class MergeCommand(GitCommand):
                 repo.create_reference_direct("HEAD", self._head_sha_before, force=True)
                 repo.checkout_head(strategy=pygit2.GIT_CHECKOUT_FORCE)
         except (KeyError, ValueError, pygit2.GitError) as exc:
-            from src.core.exceptions import GitError
-
             raise GitError(f"Failed to undo merge: {exc}") from exc
+
+    def _restore_previous_head(self) -> None:
+        """Restore the original branch after abort, protecting local files."""
+        repo = self._repo.repo
+        if self._head_ref_name_before is None:
+            return
+        try:
+            current = None if repo.head_is_detached else repo.head.name
+            if current != self._head_ref_name_before:
+                destination = str(repo.lookup_reference(self._head_ref_name_before).target)
+                ensure_safe_tree_update(self._repo, destination, "restore the original branch")
+                repo.set_head(self._head_ref_name_before)
+                repo.checkout_head(strategy=pygit2.GIT_CHECKOUT_FORCE)
+        except (KeyError, ValueError, pygit2.GitError) as exc:
+            raise GitError(f"Cannot restore the original branch: {exc}") from exc
 
     @property
     def name(self) -> str:
@@ -784,6 +965,8 @@ class RebaseCommand(GitCommand):
         # future refactors a clear hook if the underlying behaviour ever
         # changes (R1.3 / finding C3).
         self._previous_head_was_detached: bool = False
+        self._new_head: str | None = None
+        self._new_head_ref: str | None = None
 
     def execute(self) -> None:
         pygit2_repo = self._repo.repo
@@ -791,6 +974,8 @@ class RebaseCommand(GitCommand):
             self._previous_head = str(pygit2_repo.head.target)
             self._previous_head_was_detached = pygit2_repo.head_is_detached
         rebase_branch(self._repo, self._upstream)
+        self._new_head = _current_head_oid(self._repo)
+        self._new_head_ref = self._repo.repo.head.name
 
     def undo(self) -> None:
         if is_rebase_in_progress(self._repo):
@@ -801,6 +986,8 @@ class RebaseCommand(GitCommand):
             return
         if self._previous_head is None:
             return
+        _ensure_head_at(self._repo, self._new_head, "undo the rebase", self._new_head_ref)
+        _ensure_no_uncommitted_changes(self._repo, "undo the rebase", self._previous_head)
         # ``reset(OID)`` keeps HEAD detached if it was detached before,
         # and re-attaches to the symbolic ref otherwise, so undoing
         # from either starting state lands on the right HEAD shape.
@@ -868,19 +1055,25 @@ class DropCommitCommand(GitCommand):
     """Drop ``sha`` from the current branch; undo by resetting.
 
     Mirrors :class:`RebaseCommand`: pre-drop HEAD is captured, undo
-    aborts an in-flight rebase (conflict) or hard-resets back.
+    aborts an in-flight rebase (conflict) or hard-resets back.  The
+    hard reset is guarded: it refuses while HEAD moved externally or
+    uncommitted changes would be destroyed.
     """
 
     def __init__(self, repo: RepositoryManager, sha: str) -> None:
         self._repo = repo
         self._sha = sha
         self._previous_head: str | None = None
+        self._new_head: str | None = None
+        self._new_head_ref: str | None = None
 
     def execute(self) -> None:
         pygit2_repo = self._repo.repo
         if not pygit2_repo.head_is_unborn:
             self._previous_head = str(pygit2_repo.head.target)
         drop_commit(self._repo, self._sha)
+        self._new_head = _current_head_oid(self._repo)
+        self._new_head_ref = self._repo.repo.head.name
 
     def undo(self) -> None:
         if is_rebase_in_progress(self._repo):
@@ -888,6 +1081,8 @@ class DropCommitCommand(GitCommand):
             return
         if self._previous_head is None:
             return
+        _ensure_head_at(self._repo, self._new_head, "undo the drop", self._new_head_ref)
+        _ensure_no_uncommitted_changes(self._repo, "undo the drop", self._previous_head)
         reset(self._repo, self._previous_head, mode="hard")
 
     @property
@@ -897,40 +1092,41 @@ class DropCommitCommand(GitCommand):
 
 
 class EditCommitMessageCommand(GitCommand):
-    """Rewrite ``sha``'s message; undo by resetting to the captured HEAD."""
+    """Rewrite a message and undo by restoring only the original branch ref."""
 
     def __init__(self, repo: RepositoryManager, sha: str, message: str) -> None:
         self._repo = repo
         self._sha = sha
         self._message = message
         self._previous_head: str | None = None
+        self._new_head: str | None = None
+        self._new_head_ref: str | None = None
 
     def execute(self) -> None:
-        pygit2_repo = self._repo.repo
-        if not pygit2_repo.head_is_unborn:
-            self._previous_head = str(pygit2_repo.head.target)
+        self._previous_head = _current_head_oid(self._repo)
         edit_commit_message(self._repo, self._sha, self._message)
+        self._new_head = _current_head_oid(self._repo)
+        self._new_head_ref = self._repo.repo.head.name
 
     def undo(self) -> None:
-        if is_rebase_in_progress(self._repo):
-            abort_rebase(self._repo)
-            return
         if self._previous_head is None:
             return
-        reset(self._repo, self._previous_head, mode="hard")
+        _ensure_head_at(self._repo, self._new_head, "undo the message edit", self._new_head_ref)
+        self._repo.repo.head.set_target(self._previous_head, "undo: restore pre-reword tip")
 
     @property
     def name(self) -> str:
-        short = self._sha[:7] if len(self._sha) >= 7 else self._sha
-        return f"edit message {short}"
+        return f"edit message {self._sha[:7]}"
 
 
 class SquashCommitsCommand(GitCommand):
     """Squash a contiguous chain of commits; undo by resetting.
 
     Pre-squash HEAD is captured; undo aborts an in-flight rebase
-    (conflict) or hard-resets back — the template proven by
-    :class:`RebaseCommand` / :class:`DropCommitCommand`.
+    (conflict), moves the ref back only for a tip-range squash (whose
+    execute touched nothing but the ref), or hard-resets back — with
+    the same external-change / dirty-tree guards as the other
+    history-rewriting commands.
     """
 
     def __init__(self, repo: RepositoryManager, shas: list[str], message: str) -> None:
@@ -938,12 +1134,23 @@ class SquashCommitsCommand(GitCommand):
         self._shas = list(shas)
         self._message = message
         self._previous_head: str | None = None
+        self._new_head: str | None = None
+        self._new_head_ref: str | None = None
+        self._was_tip = False
 
     def execute(self) -> None:
         pygit2_repo = self._repo.repo
+        self._was_tip = False
         if not pygit2_repo.head_is_unborn:
             self._previous_head = str(pygit2_repo.head.target)
+            try:
+                top = pygit2_repo.revparse_single(self._shas[0]).peel(pygit2.Commit)
+                self._was_tip = top.id == pygit2_repo.head.target
+            except (KeyError, ValueError, pygit2.GitError, IndexError):
+                self._was_tip = False
         squash_commits(self._repo, self._shas, self._message)
+        self._new_head = _current_head_oid(self._repo)
+        self._new_head_ref = self._repo.repo.head.name
 
     def undo(self) -> None:
         if is_rebase_in_progress(self._repo):
@@ -951,6 +1158,17 @@ class SquashCommitsCommand(GitCommand):
             return
         if self._previous_head is None:
             return
+        _ensure_head_at(self._repo, self._new_head, "undo the squash", self._new_head_ref)
+        if self._was_tip:
+            # Tip-range squash only moved the branch ref in execute;
+            # undo is the exact inverse — the index and worktree keep
+            # whatever the user had there (staged or dirty).
+            self._repo.repo.head.set_target(
+                self._previous_head,
+                "undo: restore pre-squash tip",
+            )
+            return
+        _ensure_no_uncommitted_changes(self._repo, "undo the squash", self._previous_head)
         reset(self._repo, self._previous_head, mode="hard")
 
     @property
@@ -1041,14 +1259,19 @@ class PushCommand(GitCommand):
         remote_name: str = "origin",
         refspec: str | None = None,
         callbacks: pygit2.RemoteCallbacks | None = None,
+        ssh_key_path: str | None = None,
     ) -> None:
         self._repo = repo
         self._remote_name = remote_name
         self._refspec = refspec
         self._callbacks = callbacks
+        self._ssh_key_path = ssh_key_path
 
     def execute(self) -> None:
-        push(self._repo, self._remote_name, self._refspec, callbacks=self._callbacks)
+        push(
+            self._repo, self._remote_name, self._refspec,
+            callbacks=self._callbacks, ssh_key_path=self._ssh_key_path,
+        )
 
     def undo(self) -> None:
         return  # no-op: see docstring
@@ -1077,12 +1300,16 @@ class PullCommand(GitCommand):
         remote_name: str = "origin",
         refspec: str | None = None,
         callbacks: pygit2.RemoteCallbacks | None = None,
+        ssh_key_path: str | None = None,
     ) -> None:
         self._repo = repo
         self._remote_name = remote_name
         self._refspec = refspec
         self._callbacks = callbacks
+        self._ssh_key_path = ssh_key_path
         self._previous_head: str | None = None
+        self._new_head: str | None = None
+        self._new_head_ref: str | None = None
         self._head_moved = False
         self._had_conflict_in_execute = False
 
@@ -1093,12 +1320,17 @@ class PullCommand(GitCommand):
         else:
             self._previous_head = None
         try:
-            pull(self._repo, self._remote_name, self._refspec, callbacks=self._callbacks)
+            pull(
+                self._repo, self._remote_name, self._refspec,
+                callbacks=self._callbacks, ssh_key_path=self._ssh_key_path,
+            )
         except MergeConflictError:
             self._had_conflict_in_execute = True
             self._head_moved = False
             self.is_noop = False
             raise
+        self._new_head = _current_head_oid(self._repo)
+        self._new_head_ref = self._repo.repo.head.name
         if self._previous_head is None:
             self._head_moved = False
         else:
@@ -1115,6 +1347,8 @@ class PullCommand(GitCommand):
             return
         if self._previous_head is None or not self._head_moved:
             return
+        _ensure_head_at(self._repo, self._new_head, "undo the pull", self._new_head_ref)
+        _ensure_no_uncommitted_changes(self._repo, "undo the pull", self._previous_head)
         reset(self._repo, self._previous_head, mode="hard")
 
     @property
@@ -1145,11 +1379,13 @@ class FetchCommand(GitCommand):
         remote_name: str = "origin",
         refspec: str | None = None,
         callbacks: pygit2.RemoteCallbacks | None = None,
+        ssh_key_path: str | None = None,
     ) -> None:
         self._repo = repo
         self._remote_name = remote_name
         self._refspec = refspec
         self._callbacks = callbacks
+        self._ssh_key_path = ssh_key_path
 
     def execute(self) -> None:
         fetch(
@@ -1157,6 +1393,7 @@ class FetchCommand(GitCommand):
             self._remote_name,
             [self._refspec] if self._refspec else None,
             callbacks=self._callbacks,
+            ssh_key_path=self._ssh_key_path,
         )
 
     def undo(self) -> None:
@@ -1716,13 +1953,136 @@ class CreateTagCommand(GitCommand):
         return f"create tag {self._name}{suffix}"
 
 
+class FetchAndCheckoutCommand(GitCommand):
+    """Fetch and update one tracking branch without touching other local refs."""
+
+    def __init__(
+        self, repo: RepositoryManager, remote_branch: str, *,
+        force: bool = False, ssh_key_path: str | None = None,
+    ):
+        self._repo = repo
+        self._remote_branch = remote_branch
+        self._force = force
+        self._ssh_key_path = ssh_key_path
+        self._previous_ref: str | None = None
+        self._previous_oid: str | None = None
+        self._local_oid: str | None = None
+        self._local_upstream: str | None = None
+        self._new_head: str | None = None
+        self.diverged = False
+
+    @property
+    def name(self) -> str:
+        verb = "reset to" if self._force else "fetch and checkout"
+        return f"{verb} {self._remote_branch}"
+
+    def execute(self) -> None:
+        from src.core.operations import checkout_fetched_branch
+
+        remote, local_name = self._remote_branch.split("/", 1)
+        fetch(
+            self._repo, remote,
+            [f"+refs/heads/{local_name}:refs/remotes/{remote}/{local_name}"],
+            ssh_key_path=self._ssh_key_path,
+        )
+        r = self._repo.repo
+        self._previous_ref = r.head.name if not r.head_is_unborn else None
+        self._previous_oid = _current_head_oid(self._repo)
+        local = r.lookup_branch(local_name)
+        self._local_oid = str(local.target) if local is not None else None
+        self._local_upstream = (
+            local.upstream.shorthand if local is not None and local.upstream is not None else None
+        )
+        self.diverged = checkout_fetched_branch(
+            self._repo, self._remote_branch, force=self._force,
+        )
+        self._new_head = _current_head_oid(self._repo)
+
+    def undo(self) -> None:
+        if self._previous_oid is None:
+            raise GitError("Cannot restore an unborn branch after remote checkout.")
+        r = self._repo.repo
+        local_name = self._remote_branch.split("/", 1)[1]
+        local_ref = f"refs/heads/{local_name}"
+        _ensure_head_at(self._repo, self._new_head, "undo remote checkout", local_ref)
+        destination = self._previous_oid
+        if self._previous_ref not in (local_ref, "HEAD", None):
+            destination = str(r.lookup_reference(self._previous_ref).target)
+        ensure_safe_tree_update(self._repo, destination, "undo remote checkout")
+        try:
+            r.checkout_tree(r[pygit2.Oid(hex=destination)], strategy=pygit2.GIT_CHECKOUT_FORCE)
+            local = r.lookup_branch(local_name)
+            if self._local_oid is not None:
+                local.set_target(self._local_oid)
+                local.upstream = (
+                    r.lookup_branch(self._local_upstream, pygit2.GIT_BRANCH_REMOTE)
+                    if self._local_upstream is not None else None
+                )
+            r.set_head(
+                pygit2.Oid(hex=destination) if self._previous_ref == "HEAD" else self._previous_ref,
+            )
+            if self._local_oid is None:
+                local.delete()
+        except (KeyError, ValueError, pygit2.GitError) as exc:
+            raise GitError(f"Cannot undo remote checkout: {exc}") from exc
+
+
+class ContinueRebaseCommand(GitCommand):
+    """Continue a resolved rebase and make its completed result undoable."""
+
+    def __init__(self, repo: RepositoryManager):
+        self._repo = repo
+        self._previous_oid: str | None = None
+        self._head_ref: str | None = None
+        self._new_head: str | None = None
+        self.result = None
+
+    @property
+    def name(self) -> str:
+        return "continue rebase"
+
+    def execute(self) -> None:
+        from src.core.operations import RebaseContinueResult, complete_rebase_continue
+
+        if self._new_head is not None:
+            _ensure_head_at(self._repo, self._previous_oid, "redo rebase", self._head_ref)
+            ensure_safe_tree_update(self._repo, self._new_head, "redo rebase")
+            reset(self._repo, self._new_head, mode="hard")
+            return
+        r = self._repo.repo
+        for dirname in ("rebase-merge", "rebase-apply"):
+            directory = Path(r.path) / dirname
+            if directory.is_dir():
+                try:
+                    self._previous_oid = (directory / "orig-head").read_text().strip()
+                    self._head_ref = (directory / "head-name").read_text().strip()
+                except OSError as exc:
+                    raise GitError(f"Cannot read rebase state: {exc}") from exc
+                break
+        self.result = complete_rebase_continue(self._repo)
+        self.is_noop = self.result is RebaseContinueResult.CONFLICTS_REMAIN
+        if not self.is_noop:
+            self._new_head = _current_head_oid(self._repo)
+            self._head_ref = r.head.name
+
+    def undo(self) -> None:
+        _ensure_head_at(self._repo, self._new_head, "undo rebase", self._head_ref)
+        if self._previous_oid is None:
+            raise GitError("Original rebase HEAD is missing; cannot undo.")
+        ensure_safe_tree_update(self._repo, self._previous_oid, "undo rebase")
+        reset(self._repo, self._previous_oid, mode="hard")
+
+
 class CompleteMergeCommand(GitCommand):
     """Finalize a conflict-resolved merge by creating the merge commit.
 
-    Undo: hard-reset HEAD back to the pre-merge parent OID captured
-    before the merge commit was created. The worktree is also reset
-    by the hard-reset — caller is expected to have a worktree they
-    can re-populate from the resolved tree if needed.
+    This is the CommandProcessor-routed finish of a conflicted
+    :class:`MergeCommand`: after the user resolves the last conflicting
+    file, the ViewModel executes this command so the merge completion
+    is itself undoable.  Undo rewinds the target branch to
+    ``parent_oid`` (the pre-merge tip) via a hard reset — guarded
+    against external HEAD moves and uncommitted changes like every
+    other destructive undo.
     """
 
     def __init__(
@@ -1730,13 +2090,16 @@ class CompleteMergeCommand(GitCommand):
         repo_manager,
         source: str,
         parent_oid: str,
+        target: str | None = None,
         message: str | None = None,
     ) -> None:
         self._repo = repo_manager
         self._source = source  # ref / branch / SHA being merged in
         self._parent_oid = parent_oid  # pre-merge HEAD SHA — undo target
+        self._target = target
         self._message = message
         self._merge_oid: str | None = None
+        self._head_ref: str | None = None
 
     @property
     def name(self) -> str:
@@ -1745,11 +2108,30 @@ class CompleteMergeCommand(GitCommand):
     def execute(self) -> None:
         from src.core.operations import complete_merge
 
+        if self._merge_oid is not None:
+            _ensure_head_at(
+                self._repo, self._parent_oid, "redo the merge completion", self._head_ref,
+            )
+            ensure_safe_tree_update(self._repo, self._merge_oid, "redo the merge completion")
+            reset(self._repo, self._merge_oid, mode="hard")
+            return
+        self._head_ref = self._repo.repo.head.name
         self._merge_oid = complete_merge(
-            self._repo, source=self._source, message=self._message
+            self._repo,
+            source=self._source,
+            target=self._target,
+            message=self._message,
         )
+
     def undo(self) -> None:
         from src.core.operations import reset as core_reset
+
+        _ensure_head_at(
+            self._repo, self._merge_oid, "undo the merge completion", self._head_ref,
+        )
+        _ensure_no_uncommitted_changes(
+            self._repo, "undo the merge completion", self._parent_oid,
+        )
         # Hard reset to pre-merge HEAD. Worktree is also reset —
         # caller should re-populate from the resolved tree if needed.
         core_reset(self._repo, target=self._parent_oid, mode="hard")

@@ -33,13 +33,37 @@ class DirtyWorkTreeError(GitError):
 class MergeConflictError(GitError):
     """A merge produced index conflicts that must be resolved before continuing.
 
-    The ``conflicting_paths`` attribute (when set) lists the files that
-    need attention.
+    Attributes
+    ----------
+    conflicting_paths : list[str]
+        Files that need attention.
+    source_oid : str | None
+        Full hex OID of the commit being merged in (second parent of
+        the future merge commit). Stored as an OID rather than a ref
+        name so a later fetch cannot change the parents of the
+        in-progress merge.
+    target_branch : str | None
+        Short name of the branch being merged into (the ref that
+        :func:`src.core.operations.complete_merge` must advance).
+    target_oid : str | None
+        Full hex OID of the target branch tip at merge start (first
+        parent of the future merge commit).
     """
 
-    def __init__(self, message: str, conflicting_paths: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        conflicting_paths: list[str] | None = None,
+        *,
+        source_oid: str | None = None,
+        target_branch: str | None = None,
+        target_oid: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.conflicting_paths = conflicting_paths or []
+        self.source_oid = source_oid
+        self.target_branch = target_branch
+        self.target_oid = target_oid
 
 
 class RebaseConflictError(GitError):

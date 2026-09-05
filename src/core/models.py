@@ -64,6 +64,13 @@ class BranchInfo:
     is_remote: bool = False
     upstream: str | None = None
     target_sha: str | None = None
+    # Local-branch tracking state (``None`` when there is no upstream):
+    # the upstream tip OID and how many commits this branch is ahead /
+    # behind it.  The left panel renders these as ↑/↓ counters so a
+    # diverged branch is visible without opening the graph.
+    upstream_sha: str | None = None
+    ahead: int | None = None
+    behind: int | None = None
 
 
 @dataclass

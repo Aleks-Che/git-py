@@ -17,7 +17,7 @@ deletions, context, and the hunk separator.
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QPointF, Qt
-from PySide6.QtGui import QImage, QMouseEvent
+from PySide6.QtGui import QImage, QMouseEvent, QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from src.core.diff_parser import DiffLineType
@@ -591,10 +591,8 @@ def test_set_view_mode_syncs_checked_buttons(qtbot) -> None:
 # ----- scroll-to-first-diff in FULL_DOCUMENT mode ---------------------
 
 
-# A single-file diff with lots of untouched context between two
-# changes. The default ``context_lines=3`` collapses both into a
-# single hunk; the full-document variant preserves the surrounding
-# lines so the first change is far from the top.
+# The full-document variant has enough context on both sides to
+# centre the first change in a realistically sized, visible editor.
 _FIRST_DIFF_DIFF = (
     "diff --git a/big.txt b/big.txt\n"
     "index 1234567..89abcde 100644\n"
@@ -609,45 +607,50 @@ _FIRST_DIFF_DIFF = (
     " ...unchanged lines below the change...\n"
     " ...unchanged lines below the change...\n"
 )
+_FIRST_DIFF_FULL_DOCUMENT = (
+    "@@ -1,201 +1,201 @@\n"
+    + "".join(f" unchanged line {i}\n" for i in range(1, 101))
+    + "-middle-replaced\n+middle-replacement\n"
+    + "".join(f" unchanged line {i}\n" for i in range(102, 202))
+)
+
+
+def _assert_first_change_centered(view: DiffViewWidget, qtbot) -> None:
+    editor = view._editor
+    first_change_idx = next(
+        i for i, info in enumerate(editor._line_info)
+        if info.line_type in (DiffLineType.ADDITION, DiffLineType.DELETION)
+    )
+    cursor = QTextCursor(editor.document().findBlockByNumber(first_change_idx))
+    # Qt scrolls by whole lines, so allow one line of rounding.
+    qtbot.waitUntil(
+        lambda: abs(editor.cursorRect(cursor).center().y() - editor.viewport().height() / 2)
+        <= editor.fontMetrics().height(),
+        timeout=1000,
+    )
 
 
 def test_full_document_scrolls_to_first_diff_on_toggle(qtbot) -> None:
-    """Switching to FULL_DOCUMENT mode scrolls the editor so the first
-    addition or deletion is visible — without it the user lands on the
-    file head and has to scroll past the unchanged context."""
+    """Switching to FULL_DOCUMENT centres the first changed line."""
     _ensure_app()
     view = DiffViewWidget()
     qtbot.addWidget(view)
     view.resize(800, 200)  # short viewport so the scroll matters
-    view.set_diff_pair(_FIRST_DIFF_DIFF, _FIRST_DIFF_DIFF)
-    # Default mode is CHANGES_ONLY — the viewport should NOT be at
-    # the first diff yet (the whole text fits, so this is a no-op
-    # sanity check rather than an equality assertion).
-    pre_first_visible_block = view._editor.firstVisibleBlock().blockNumber()
+    view.show()
+    view.set_diff_pair(_FIRST_DIFF_DIFF, _FIRST_DIFF_FULL_DOCUMENT)
 
     view.set_view_mode(DiffViewMode.FULL_DOCUMENT)
-    qtbot.waitUntil(
-        lambda: view._editor.firstVisibleBlock().blockNumber() > pre_first_visible_block,
-        timeout=1000,
-    )
-    first_visible_idx = view._editor.firstVisibleBlock().blockNumber()
-    # The first block that the parser classified as ADDITION or
-    # DELETION must now be above (or at) the first visible block.
-    line_info = view._editor._line_info
-    first_change_idx = next(
-        i for i, info in enumerate(line_info)
-        if info.line_type in (DiffLineType.ADDITION, DiffLineType.DELETION)
-    )
-    assert first_visible_idx <= first_change_idx
+    _assert_first_change_centered(view, qtbot)
 
 
 def test_full_document_scrolls_to_first_diff_on_new_load(qtbot) -> None:
     """Loading a new diff pair while FULL_DOCUMENT mode is already
-    active scrolls to the first change of the *new* file."""
+    active centres the first change of the *new* file."""
     _ensure_app()
     view = DiffViewWidget()
     qtbot.addWidget(view)
-    view.resize(800, 200)
+    view.resize(800, 600)
+    view.show()
     view.set_view_mode(DiffViewMode.FULL_DOCUMENT)
 
     view.set_diff_pair(
@@ -655,21 +658,13 @@ def test_full_document_scrolls_to_first_diff_on_new_load(qtbot) -> None:
         "@@ -1,1 +1,1 @@\n-old-A\n+new-A\n",
     )
     qtbot.waitUntil(
-        lambda: view._editor.firstVisibleBlock().blockNumber() == 1,
+        lambda: view._editor.textCursor().blockNumber() == 1,
         timeout=1000,
     )
 
     # Swap to a different diff whose first change is on a later line.
-    view.set_diff_pair(_FIRST_DIFF_DIFF, _FIRST_DIFF_DIFF)
-    line_info = view._editor._line_info
-    first_change_idx = next(
-        i for i, info in enumerate(line_info)
-        if info.line_type in (DiffLineType.ADDITION, DiffLineType.DELETION)
-    )
-    qtbot.waitUntil(
-        lambda: view._editor.firstVisibleBlock().blockNumber() <= first_change_idx,
-        timeout=1000,
-    )
+    view.set_diff_pair(_FIRST_DIFF_DIFF, _FIRST_DIFF_FULL_DOCUMENT)
+    _assert_first_change_centered(view, qtbot)
 
 
 def test_changes_only_mode_does_not_scroll_to_first_diff(qtbot) -> None:

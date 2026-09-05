@@ -1,7 +1,8 @@
 # AGENTS.md
 
-## Project status
-- Stage 1 done. Core layer (`RepositoryManager`, `core/operations.py`, `core/diff_parser.py`, domain exceptions, `FileChange` dataclass) is implemented and covered by 66 unit tests. 2 / 11 stages complete.
+## Project status and navigation
+- The implementation includes Core, ViewModels, the GUI, Git workflows, and regression tests. The stage checklist in `docs/IMPLEMENTATION_PLAN.md` marks stages 0–8 and 10 complete; stage 9 (configuration and theming) remains in progress. Older summary counts and test totals are historical.
+- Start with [docs/PROJECT_GUIDE.md](docs/PROJECT_GUIDE.md) for the current file map, data flow, async/undo contracts, configuration, targeted checks, and known differences between older design notes and current code.
 - Progress is tracked in `docs/IMPLEMENTATION_PLAN.md`. Update the stage checklist there when starting/finishing a stage.
 
 ## Authoritative design docs (all in Russian)
@@ -35,7 +36,7 @@ Read these before making structural decisions — they are the source of truth:
 - Performance: synthetic 5000-commit repo, graph layout < 1s.
 
 ## Gotchas for new sessions
-- `README.md` is a one-line placeholder — do not treat it as documentation.
+- `README.md` contains the project overview, requirements, installation, and launch instructions; `docs/PROJECT_GUIDE.md` provides development details.
 - All planning docs are in Russian. If responding in another language is preferable for the user, ask first.
 - Lint/format: `ruff check src/ tests/` (configured in `pyproject.toml`, line-length 100, py310).
 - Tests: `python -m pytest` (set `QT_QPA_PLATFORM=offscreen` on headless Windows/CI for `pytest-qt`).

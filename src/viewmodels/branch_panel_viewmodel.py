@@ -106,25 +106,28 @@ class BranchPanelViewModel(QObject):
     def _suppress_same_name_remotes(
         local: list[BranchInfo], remote: list[BranchInfo],
     ) -> list[BranchInfo]:
-        """Filter remote branches whose ``display-name`` exists as a local.
+        """Filter remote branches that duplicate a local branch *tip*.
 
-        A remote branch like ``origin/release`` is suppressed when a local
-        branch named ``release`` exists in the repository.  This mirrors
-        the graph column's collapse behaviour so the left panel never
-        shows a redundant remote-only entry.
+        A remote branch like ``origin/release`` is suppressed only when
+        a local branch named ``release`` points at the **same commit**.
+        When the tips differ (the remote moved ahead, or the branches
+        diverged) the remote entry carries information the user cannot
+        see anywhere else, so it is kept — hiding it used to make an
+        upstream update invisible until the next fetch+compare.
 
         The special ``refs/remotes/<remote>/HEAD`` pseudo-ref is also
         dropped unconditionally — it is created by ``fetch`` to mark the
         remote's default branch and never carries useful information on
         its own (graph already shows the local HEAD branch).
         """
-        local_names = {b.name for b in local}
+        local_tips = {b.name: b.target_sha for b in local}
         kept: list[BranchInfo] = []
         for b in remote:
             short = _short_name(b.name)
-            if short in local_names:
-                continue
             if short == "HEAD":
+                continue
+            local_tip = local_tips.get(short)
+            if local_tip is not None and local_tip == b.target_sha:
                 continue
             kept.append(b)
         return kept

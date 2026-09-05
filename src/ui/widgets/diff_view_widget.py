@@ -1093,7 +1093,7 @@ class DiffViewWidget(QWidget):
             self._scroll_to_first_diff()
 
     def _scroll_to_first_diff(self) -> None:
-        """Place the first deletion or addition at the top of the view.
+        """Place the first deletion or addition in the centre of the view.
 
         Only invoked in :attr:`DiffViewMode.FULL_DOCUMENT` mode where
         the whole file is rendered and the first change may be far
@@ -1102,7 +1102,7 @@ class DiffViewWidget(QWidget):
         the diff.
 
         The cursor is reset (not extended) so any previous selection
-        is collapsed cleanly. We schedule the actual ``scrollContentsBy``
+        is collapsed cleanly. We schedule the actual ``centerCursor``
         via a zero-delay :class:`QTimer` so the layout engine has a
         chance to compute the new ``maximum()`` and block heights
         before we ask the editor to scroll.
@@ -1129,7 +1129,7 @@ class DiffViewWidget(QWidget):
                 return
             cursor = QTextCursor(block_now)
             self._editor.setTextCursor(cursor)
-            self._editor.ensureCursorVisible()
+            self._editor.centerCursor()
 
         QTimer.singleShot(0, _do_scroll)
 

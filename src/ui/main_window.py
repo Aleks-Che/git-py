@@ -62,17 +62,20 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QTabWidget,
     QToolBar,
+    QVBoxLayout,
     QWidget,
 )
 
 from src.core.exceptions import GitError, RepositoryNotFoundError
 from src.core.repository import RepositoryManager
 from src.ui.dialogs.clone_dialog import CloneDialog
+from src.ui.dialogs.conflict_resolution_dialog import ConflictResolutionDialog
 from src.ui.dialogs.open_or_clone_dialog import OpenOrCloneDialog
 from src.ui.dialogs.remote_manage_dialog import RemoteManageDialog
 from src.ui.dialogs.settings_dialog import SettingsDialog
 from src.ui.icons import toolbar_icon
 from src.ui.widgets.action_history_widget import ActionHistoryWidget
+from src.ui.widgets.conflict_panel import ConflictPanel
 from src.ui.widgets.diff_view_widget import (
     DiffLineActionMode,
     DiffViewMode,
@@ -124,7 +127,7 @@ class MainWindow(QMainWindow):
 
         # ``async_enabled=True`` enables the long-running path for
         # rebase and large merges (see ``MainViewModel.busy_changed``).
-        self._main_vm = MainViewModel(self, async_enabled=True)
+        self._main_vm = MainViewModel(self, async_enabled=True, config_path=config_path)
         self._repo_manager: RepositoryManager | None = None
         # ``config_path`` is the JSON file used for window /
         # splitter persistence. ``None`` disables persistence
@@ -641,6 +644,23 @@ class MainWindow(QMainWindow):
         self._graph_stack.addWidget(self._graph_table)  # index 0
         self._graph_stack.addWidget(self._diff_view)     # index 1
 
+        # Persistent conflict banner (review finding 5): shown above
+        # the graph while a merge / rebase is stopped on conflicts.
+        # Routes the per-file editor, Continue and Abort into the VM.
+        self._conflict_panel = ConflictPanel(self)
+        self._conflict_panel.resolve_requested.connect(self._on_conflict_resolve)
+        self._conflict_panel.continue_requested.connect(
+            self._main_vm.continue_operation,
+        )
+        self._conflict_panel.abort_requested.connect(self._on_conflict_abort)
+        self._main_vm.conflict_state_changed.connect(self._conflict_panel.set_state)
+
+        centre = QWidget(self)
+        centre_layout = QVBoxLayout(centre)
+        centre_layout.setContentsMargins(0, 0, 0, 0)
+        centre_layout.addWidget(self._conflict_panel)
+        centre_layout.addWidget(self._graph_stack, stretch=1)
+
         # Wire the commit panel VM's file selection signals to
         # switch between graph and diff view.
         cp_vm = self._main_vm.commit_panel_view_model()
@@ -684,7 +704,7 @@ class MainWindow(QMainWindow):
 
         top = QSplitter(self)
         top.addWidget(self._left_panel)
-        top.addWidget(self._graph_stack)
+        top.addWidget(centre)
         top.addWidget(self._right_panel)
         # Left panel stretch = 0 so it never grows/shrinks when the
         # right panel is hidden/shown — only the graph absorbs the
@@ -761,6 +781,35 @@ class MainWindow(QMainWindow):
         self._main_vm.repository_changed.connect(self._on_repository_changed)
         self._main_vm.log_message.connect(self._log_widget.append_log)
         self._main_vm.error_occurred.connect(self._log_widget.append_log)
+
+    # ----- conflict workflow (panel + per-file editor) ------------------
+
+    def _on_conflict_resolve(self, path: str) -> None:
+        """Open the per-file resolution dialog for ``path``.
+
+        The dialog emits either ``resolved`` (text) or
+        ``resolved_bytes`` (binary); both are routed to the matching
+        ViewModel verb, which stages the file and finishes the merge /
+        rebase once the last conflict is resolved.
+        """
+        repo = self._main_vm.repository_manager()
+        if repo is None or not repo.is_open:
+            return
+        dialog = ConflictResolutionDialog(repo, path, self)
+        dialog.resolved.connect(
+            lambda text, p=path: self._main_vm.resolve_conflict(p, text),
+        )
+        dialog.resolved_bytes.connect(
+            lambda data, p=path: self._main_vm.resolve_conflict_bytes(p, data),
+        )
+        dialog.exec()
+
+    def _on_conflict_abort(self, operation: str) -> None:
+        """Route the panel's Abort to the matching VM verb."""
+        if operation == "merge":
+            self._main_vm.abort_merge()
+        elif operation == "rebase":
+            self._main_vm.abort_rebase()
 
     # ----- diff view (replaces graph on file selection) ---------------
 
@@ -1746,6 +1795,9 @@ class MainWindow(QMainWindow):
         repo = self._main_vm.repository_manager()
         default_path = str(repo.path) if repo and repo.path else None
         dialog = CloneDialog(default_path=default_path, parent=self)
+        dialog.key_generated.connect(
+            lambda private, public, _contents: self._main_vm.configure_ssh_key(private, public),
+        )
         dialog.accepted.connect(
             lambda url, path: self._main_vm.clone_repository(url, path),
         )

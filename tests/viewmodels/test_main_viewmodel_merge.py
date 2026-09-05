@@ -435,7 +435,7 @@ def test_revert_clean_stages_inverse(
 
 
 def test_set_repository_clears_conflict_state(
-    tmp_git_repo: Path, committed_repo: RepositoryManager,
+    tmp_path: Path, committed_repo: RepositoryManager,
 ) -> None:
     _ensure_app()
     _build_conflict(committed_repo)
@@ -444,13 +444,50 @@ def test_set_repository_clears_conflict_state(
     vm.merge_branch("feature")
     assert vm.conflict_state() is not None
 
-    # Switch to a different repo — conflict state must be cleared.
-    other_mgr = RepositoryManager(str(tmp_git_repo))
+    # Switch to a *genuinely different* repo — conflict state must be
+    # cleared.  (``tmp_git_repo`` and ``committed_repo`` alias the same
+    # directory, so a second manager on it would instead trigger the
+    # in-progress-merge recovery added after the 2026-09 review.)
+    import pygit2
+
+    other_path = tmp_path / "other"
+    pygit2.init_repository(str(other_path), initial_head="main")
+    other_mgr = RepositoryManager(str(other_path))
     states: list[dict] = []
     vm.conflict_state_changed.connect(states.append)
     vm.set_repository(other_mgr)
     assert vm.conflict_state() is None
     assert states and states[-1]["in_progress"] is False
+
+
+def test_set_repository_recovers_in_progress_merge(
+    tmp_git_repo: Path, committed_repo: RepositoryManager,
+) -> None:
+    """Reopening the same repo recovers the unfinished merge (restart).
+
+    The two fixtures alias the same directory: a second manager on it
+    sees the ``MERGE_HEAD`` / conflicted index the first manager left
+    behind, so ``set_repository`` must re-enter the conflict state with
+    the real conflicting paths and the source OID from ``MERGE_HEAD``.
+    """
+    _ensure_app()
+    _build_conflict(committed_repo)
+    vm = MainViewModel()
+    vm.set_repository(committed_repo)
+    vm.merge_branch("feature")
+    assert vm.conflict_state() is not None
+
+    # Simulate an app restart: a brand-new VM binds the same repo.
+    other_mgr = RepositoryManager(str(tmp_git_repo))
+    vm2 = MainViewModel()
+    vm2.set_repository(other_mgr)
+    state = vm2.conflict_state()
+    assert state is not None
+    assert state["operation"] == "merge"
+    assert state["in_progress"] is True
+    assert "hello.txt" in state["conflicting_paths"]
+    assert state["source"]  # recovered from MERGE_HEAD
+    assert state["target"] == "main"
 
 
 def test_set_repository_none_clears_conflict_state(

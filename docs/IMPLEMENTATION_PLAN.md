@@ -135,6 +135,14 @@
   - Комментарий: `CommandProcessor` — 21 команда с undo/redo (8.1: timestamp + undo_stack_snapshot/redo_stack_snapshot аксессоры). Кнопки Undo/Redo на тулбаре Edit (8.2). Конфигурируемые горячие клавиши через `config.py` (8.3: `load_hotkey`, дефолты Ctrl+Z/Ctrl+Y/Fetch/Pull/Push/Stash). `ActionHistoryWidget` — панель истории в нижних вкладках с секциями Applied/Undone (8.4). View-меню — показ/скрытие левой панели, терминала, истории (8.6). **14 новых тестов** (8 snapshot + 6 UI), **657/657 проходят**, `ruff check` чисто.
 
 - [~] **Этап 9: Конфигурация и темизация** — _в работе (под-этапы: темизация ✓, персистентность окна ✓)_
+  - [x] SSH-настройки: генерация в `~/.ssh`, немедленное сохранение путей из Settings/Clone,
+    применение выбранного ключа к clone/push/pull/fetch и checkout удалённой ветки без перезапуска
+    (2026-09-05; регрессии в `test_ssh_auth.py`, `test_ssh_settings.py`, `test_ssh_setup.py`).
+    Проверка: **373 passed** в затронутых core/commands/ViewModel/UI/config-тестах,
+    Ruff и `git diff --check` без ошибок. Полный прогон до актуализации тестовой
+    заглушки `remote.push_url`: **1380 passed, 1 failed**; исправленный тест повторно
+    прошёл в указанной выборке. SSH-вызовы заменены моками, генерация ключа также
+    проверена настоящим `ssh-keygen` во временном каталоге.
   - Дата начала: `2026-06-03`
   - Дата завершения: `—`
   - Комментарий: **Темизация.** `src/utils/theme.py` — `Theme` (frozen dataclass: surface/text/accent/graph-цвета), `DARK_THEME` (палитра VS Code Dark+ поверх существующих цветов графа: bg `#1E1E1E`, text `#D4D4D4`, text_dim `#8B8B8B`, accent `#007ACC`), `get_theme(name)` (резолв из реестра; неизвестное имя → `UserWarning` + `DARK_THEME`), `stylesheet_for_theme(theme)` (pure функция `Theme -> str` через `{name}`-подстановку в QSS-шаблон), `apply_theme(app, theme)` (`app.setStyleSheet`). QSS покрывает QMainWindow/QDialog/QMenuBar/QMenu/QToolBar/QToolButton/QStatusBar/QSplitter/QTabWidget+QTabBar/QLineEdit/QPlainTextEdit/QTextEdit/QComboBox/QPushButton (включая :default с акцентом)/QDialogButtonBox/QListWidget/QTreeWidget/QTableWidget/QHeaderView/QProgressBar/QToolTip/QScrollBar (вертикальный+горизонтальный)/QGraphicsView/QLabel. `src/main.py` — `apply_theme(app, get_theme("dark"))` сразу после создания `QApplication`, до конструктора `MainWindow`. `src/ui/widgets/graph_widget.py::RenderConfig` — цвета переехали на `DARK_THEME.*`; добавлен kw-only `theme: Theme | None = None` в `GraphWidget.__init__`. **Персистентность окна.** `src/utils/config.py` — `default_config_path()` (Qt `AppConfigLocation` / `git-py/config.json`), `load_window_size(config)` / `load_splitter_sizes(config)` (coercion-функции; bool/float/negative/неправильная форма → defaults), `DEFAULT_WINDOW_WIDTH/HEIGHT = 1280/800`, ключи `SPLITTER_KEY_HORIZONTAL` / `SPLITTER_KEY_RIGHT_VERTICAL`. `src/ui/main_window.py` — `__init__(config_path: Path | str | None = None)` (None отключает персистентность — для существующих тестов, чтобы не трогать реальный user config); `_top_splitter` / `_right_splitter` теперь `self.*` (раньше были локальные переменные); `_restore_state()` в конце `__init__` (resize + setSizes для обоих сплиттеров, только если config_path задан); `closeEvent()` сливает текущее состояние в JSON, не теряя чужие ключи. `src/main.py` — `MainWindow(config_path=default_config_path())`. **Тесты.** `tests/ui/test_theme.py` (41 кейс) + `tests/ui/test_window_persistence.py` (31 кейс): 9 параметризованных кейсов на отказ невалидных window_size, 7 на отказ невалидных splitter_sizes, roundtrip save/load, mkdir -p, `MainWindow(config_path=None)` не пишет на диск, persist + restore размера окна через close → reopen, persist + restore splitter sizes, fallback на defaults при битом config, merge с существующими ключами (theme/panel_layout выживают), end-to-end "пользовательский сценарий" (resize + drag horizontal splitter → close → reopen, проверка пропорций). **Все 477/477 тестов проходят, ruff чисто.** Существующие 11 тестов `MainWindow()` без аргументов работают без изменений. Светлая тема + Settings dialog с переключателем — следующая итерация. Stage 7/8 (stash UI, undo UI) — по-прежнему не начаты.
@@ -378,3 +386,45 @@ LeftPanel получил ту же drag-and-drop + context-menu функцион
   **Итого 910 проходят, ruff чисто** для нового кода.
 
 Итого **9 регрессионных тестов** на инварианты раскладки и цвета; pre-existing 47 failures в `tests/ui/test_graph_widget.py` (branch popup, drag-drop edge-кейсы) к этой правке не относятся.
+
+### Свежие правки (2026-09-05) — исправления по ревью `docs/REVIEW_2026-09-05.md`
+
+Обработаны все 12 замечаний ревью. Файлы: `src/core/operations.py`, `src/core/exceptions.py`, `src/core/models.py`, `src/core/repository.py`, `src/viewmodels/commands.py`, `src/viewmodels/main_viewmodel.py`, `src/viewmodels/branch_panel_viewmodel.py`, `src/ui/main_window.py`, `src/ui/widgets/conflict_panel.py` (новый), `src/ui/widgets/left_panel.py`. Новые тесты: `tests/viewmodels/test_review_2026_09_05.py` (13), `tests/ui/test_conflict_workflow.py` (9), `tests/viewmodels/test_branch_tracking_phase3.py` (8) + обновления в `tests/core/test_r1_1_merge_mid_state.py` и `tests/viewmodels/test_main_viewmodel_merge.py`. **Итого 1295 проходят, ruff чисто.**
+
+**Фаза 1 — сохранность данных и refs (замечания 1–4, 7, 11).**
+
+- **#1 reword-undo больше не трогает index/worktree.** И для tip, и для середины истории `EditCommitMessageCommand.undo()` возвращает только ref после проверки OID и имени ветки. Сам reword сохраняет деревья всех коммитов и структуру merge.
+- **#2 drop tip отклоняется при dirty index/worktree** (`DirtyWorkTreeError` с списком файлов) — удаление коммита и удаление правок разведены.
+- **#3 squash tip-диапазона строится из дерева верхнего коммита** (unattached commit + `set_target`), index/worktree пользователя байт-в-байт сохраняются; посторонние staged-файлы не попадают в результат. Undo tip-squash — ref-only.
+- **#4 конфликтный merge в другую ветку держит HEAD на target** до complete/abort; `MergeConflictError` несёт типизированный контекст (`source_oid`, `target_branch`, `target_oid`); `MergeCommand.undo` проверяет ВСЕ затронутые refs (target ref + HEAD) и после abort возвращает HEAD на исходную ветку.
+- **#7 чистый merge очищает MERGE_HEAD/MERGE_MSG/MERGE_MODE/MERGE_AUTO** (новый `_clear_merge_state`, используется и в `complete_merge`).
+- **#11 точный результат переписывания истории.** Todo-скрипт squash сравнивает полный SHA (`full.startswith(abbrev)`). Reword строит явное соответствие старых и новых OID, сохраняя merge-родителей; больше не использует интерактивный rebase и вычисление `HEAD~N`.
+- **Guard'ы undo.** Общие `_ensure_head_at` (HEAD не двигался с execute) и `_ensure_no_uncommitted_changes` (нет staged/dirty перед деструктивным undo) применены к EditCommitMessage/Drop/Squash/Rebase/Pull/Merge-командам; отказ держит команду в undo-стеке.
+
+**Фаза 2 — полный workflow конфликтов (замечания 5, 6, 8, 9).**
+
+- **#5 UI подключено.** Новый `ConflictPanel` над графом: список конфликтующих файлов, `Resolve…` (открывает `ConflictResolutionDialog`, text→`resolve_conflict`, binary→новый `resolve_conflict_bytes`), `Continue` (`continue_operation` — перечитывает index, поддерживает внешнее разрешение), `Abort` (merge/rebase). Проводка в `MainWindow` от `conflict_state_changed` до завершённого merge покрыта сквозными тестами.
+- **#6 контекст фонового merge не теряется**: `_on_async_failed` заполняет состояние из типизированного исключения (OID источника, целевая ветка), fallback читает `MERGE_HEAD` (новый `merge_head_oid`).
+- **#8 завершение конфликтного merge идёт через `CompleteMergeCommand`** (добавлен `target`), Undo отматывает merge-коммит; полный цикл execute→conflict→resolve→complete→Undo→Redo покрыт тестом.
+- **#9 `complete_rebase_continue` возвращает `RebaseContinueResult` (COMPLETED/CONFLICTS_REMAIN)** вместо неоднозначного bool; все входы rebase-конфликта читают реальные пути из index (публичный `conflicting_paths`).
+- **Восстановление после перезапуска**: `set_repository` детектирует незавершённый merge/rebase (`_restore_in_progress_operation`) и возвращает conflict-состояние с реальными путями и контекстом; вызывается также после неудачных undo/redo (redo конфликтного merge снова показывает панель).
+
+**Фаза 3 — очередь фоновых операций, ошибки undo/redo, UX (замечания 10, 12 + п.5 ревью).**
+
+- **#10 последовательная очередь мутаций**: все фоновые мутации (`_run_async`, clone, async redo) стартуют на выделенном `QThreadPool` с `maxThreadCount=1`; read-воркеры остаются на глобальном пуле. Redo сетевых/долгих команд (Push/Pull/Fetch/Merge/Rebase) уходит в ту же очередь (`_run_async_redo`), не блокируя GUI.
+- **#12 ошибки undo/redo доходят до пользователя**: `CommandProcessor.undo/redo` возвращают `bool`, `error_occurred` процессора проброшен в `MainViewModel`; «Undo succeeded» пишется только после подтверждённого успеха.
+- **UX веток**: `BranchInfo` несёт `upstream_sha`/`ahead`/`behind` (через `ahead_behind`); suppression remote-веток в левой панели — только при совпадающем tip (diverged upstream виден); `LeftPanel` показывает `↑N`/`↓N` и tooltip local/upstream OID.
+
+**Отложено:** разбиение крупных модулей (`operations.py`, `commands.py`, `MainViewModel`, `graph_panel.py`) — отдельный этап. Прежние ограничения фонового fetch и общего RepositoryManager устранены в доработке ниже.
+
+### Доработки по повторной проверке (2026-09-05)
+
+- [x] **A1:** Drop и деструктивный Undo проверяют целевое дерево на пересечение с untracked/ignored, включая замену файла каталогом и наоборот. Посторонние untracked-файлы разрешены.
+- [x] **A2:** Undo проверяет символическое имя HEAD вместе с OID; другая ветка с тем же коммитом не изменяется.
+- [x] **A3:** `CompleteMergeCommand` хранит созданный merge-коммит; один Undo → один Redo восстанавливает именно его, включая разрешённые конфликты.
+- [x] **A4–A5:** индекс перечитывается с диска при Continue/Resolve; после Undo/Redo состояние панели сверяется с Git и очищается при завершении операции.
+- [x] **A6:** reword сохраняет граф родителей и деревья, включая ручные разрешения merge, возвращает точный новый коммит. Index/worktree не изменяются даже для середины истории.
+- [x] **A7:** Drop/Squash показывают реальные пути конфликтов из индекса; синхронный и фоновый сценарии обрабатываются одинаково.
+- [x] **A8:** fetch+checkout/reset, Drop/Reword/Squash, Continue rebase и их Undo/Redo используют общий последовательный исполнитель. Воркеры открывают собственный RepositoryManager; история CommandProcessor меняется только в GUI-потоке. Remote drag/drop запускает merge/rebase только после успешного checkout.
+- [x] **Дополнительно:** reset-to-remote изменяет выбранную локальную ветку и сохраняет tip текущей, если это другая ветка. Операция проходит через GitCommand и поддерживает Undo refs; явно отброшенные незакоммиченные изменения не восстанавливаются.
+- [x] **Проверки:** добавлены 33 регрессионных сценария (`tests/viewmodels/test_review_followup.py`). Полный pytest — **1328 passed**, 219,54 с; после последних уточнений защиты индекса повторно проверены затронутые core/commands/async/conflict-пути — **235 passed**, 17,10 с. Ruff — **All checks passed**, `git diff --check` — без ошибок. Qt работает в offscreen-режиме, сетевые сценарии используют локальные bare-репозитории.

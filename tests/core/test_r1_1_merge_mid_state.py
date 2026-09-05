@@ -47,6 +47,7 @@ from src.core.operations import (
     checkout_branch,
     commit_changes,
     create_branch,
+    is_merge_in_progress,
     merge_branch,
 )
 from src.core.repository import RepositoryManager
@@ -338,17 +339,25 @@ def test_merge_fast_forward_does_not_move_head_or_worktree(
     assert str(post_main.target) != pre_main_ref
 
 
-def test_merge_conflict_does_not_touch_head_or_worktree(
+def test_merge_conflict_keeps_head_on_target_with_merge_state(
     committed_repo: RepositoryManager,
 ) -> None:
-    """A conflicting merge raises and leaves ``HEAD``/worktree untouched.
+    """A conflicting merge keeps HEAD on the *target* branch.
 
-    Conflicts are reported through :class:`MergeConflictError`, but
-    the in-memory merge implementation must not have already
-    touched ``HEAD``/index/worktree by the time the exception is
-    raised. The old implementation had a window where the index
-    was left in a conflicted state AND HEAD was switched; the new
-    one short-circuits before touching either.
+    Updated contract (review 2026-09-05, finding 4): the previous
+    implementation restored HEAD to the branch the user started from
+    while leaving the merge index / MERGE_HEAD behind.  ``complete_merge``
+    then created the merge commit on the *wrong* branch (the unrelated
+    starting branch) and moved the target ref as well, so both branches
+    ended up pointing at the merge result.
+
+    The merge state (MERGE_HEAD, conflicted index, worktree conflict
+    markers) belongs to the target branch, so HEAD must stay there
+    until the merge is completed or aborted — mirroring the clean-merge
+    outcome, which also ends with HEAD on the target.  The exception
+    must also carry the typed operation context (source/target OIDs)
+    so the resolve workflow does not depend on ref names that a later
+    fetch could move.
 
     We build the conflict by giving ``main``, ``feature`` and
     ``dev`` independent edits of the same tracked file
@@ -386,10 +395,10 @@ def test_merge_conflict_does_not_touch_head_or_worktree(
     committed_repo.repo.index.read(force=True)
 
     main_tip = _add_commit("refs/heads/main", "main: hello", "main side\n")
-    _add_commit(
+    feat_tip = _add_commit(
         "refs/heads/feature", "feature: hello", "feature side\n",
     )
-    dev_tip = _add_commit("refs/heads/dev", "dev: hello", "dev side\n")
+    _add_commit("refs/heads/dev", "dev: hello", "dev side\n")
 
     # HEAD on dev; pre-merge state captured for post-merge asserts.
     committed_repo.repo.set_head("refs/heads/dev")
@@ -397,19 +406,23 @@ def test_merge_conflict_does_not_touch_head_or_worktree(
         committed_repo.repo.lookup_reference("refs/heads/main").target,
     )
     assert pre_main_ref == main_tip
-    _workdir_files = {p.name for p in Path(committed_repo.path).iterdir() if p.is_file()}
-    assert (Path(committed_repo.path) / "hello.txt").read_text() == "dev side\n"
 
     # ``merge feature into main`` while HEAD = dev → conflict.
     with pytest.raises(MergeConflictError) as exc_info:
         merge_branch(committed_repo, "feature", target="main")
     assert "hello.txt" in exc_info.value.conflicting_paths
 
-    # Conflict state is preserved for resolve_conflict/complete_merge.
-    assert committed_repo.repo.head.shorthand == "dev"
-    assert str(committed_repo.repo.head.target) == dev_tip
+    # The exception carries the typed merge context.
+    assert exc_info.value.source_oid == feat_tip
+    assert exc_info.value.target_branch == "main"
+    assert exc_info.value.target_oid == main_tip
+
+    # Conflict state is preserved for resolve_conflict/complete_merge,
+    # with HEAD on the *target* branch (not the starting branch).
+    assert committed_repo.repo.head.shorthand == "main"
+    assert str(committed_repo.repo.head.target) == main_tip
     assert str(committed_repo.repo.lookup_reference("refs/heads/main").target) == pre_main_ref
-    assert not (Path(committed_repo.path) / "MERGE_HEAD").exists()
+    assert is_merge_in_progress(committed_repo)
     assert any(committed_repo.repo.index.conflicts)
     assert dict(committed_repo.repo.status())
 

@@ -193,17 +193,40 @@ class LeftPanel(QTreeWidget):
         bold = QFont()
         bold.setBold(True)
         for branch in self._vm.local_branches():
-            item = QTreeWidgetItem([branch.name])
+            label = branch.name
+            if branch.name == current:
+                label = f"{branch.name}  (HEAD)"
+            # Tracking state: show ↑ahead / ↓behind counters whenever
+            # the branch diverges from its upstream so the user sees
+            # "push me" / "pull me" state without opening the graph.
+            markers: list[str] = []
+            if branch.ahead:
+                markers.append(f"↑{branch.ahead}")
+            if branch.behind:
+                markers.append(f"↓{branch.behind}")
+            if markers:
+                label = f"{label}  {' '.join(markers)}"
+            item = QTreeWidgetItem([label])
             item.setData(0, _ROLE_KIND, _KIND_LOCAL_BRANCH)
             item.setData(0, _ROLE_NAME, branch.name)
             if branch.name == current:
                 item.setFont(0, bold)
-                item.setText(0, f"{branch.name}  (HEAD)")
+            if branch.upstream:
+                tip = (branch.target_sha or "")[:7]
+                up_tip = (branch.upstream_sha or "")[:7]
+                item.setToolTip(
+                    0,
+                    f"{branch.name} → {branch.upstream}\n"
+                    f"local:   {tip}\n"
+                    f"upstream: {up_tip}",
+                )
             self._group_local.addChild(item)
         for branch in self._vm.remote_branches():
             item = QTreeWidgetItem([branch.name])
             item.setData(0, _ROLE_KIND, _KIND_REMOTE_BRANCH)
             item.setData(0, _ROLE_NAME, branch.name)
+            if branch.target_sha:
+                item.setToolTip(0, f"{branch.name} @ {branch.target_sha[:7]}")
             self._group_remote.addChild(item)
 
         # Hide the ``Remote`` group entirely when the suppression filter
@@ -1104,8 +1127,14 @@ class LeftPanel(QTreeWidget):
         """
         local_source = source
         if source_kind == _KIND_REMOTE_BRANCH:
-            self._main_vm.fetch_and_checkout_remote_branch(source)
             local_source = source.split("/", 1)[1]
+            self._main_vm.fetch_and_checkout_remote_branch(
+                source,
+                on_success=lambda: self._main_vm.merge_branch(
+                    local_source, target=target, no_ff=True,
+                ),
+            )
+            return
         self._main_vm.merge_branch(local_source, target=target, no_ff=True)
 
     def _rebase_drop(self, source: str, target: str, source_kind: str) -> None:
@@ -1119,8 +1148,11 @@ class LeftPanel(QTreeWidget):
         """
         local_source = source
         if source_kind == _KIND_REMOTE_BRANCH:
-            self._main_vm.fetch_and_checkout_remote_branch(source)
             local_source = source.split("/", 1)[1]
+            self._main_vm.fetch_and_checkout_remote_branch(
+                source, on_success=lambda: self._rebase_source_onto_target(local_source, target),
+            )
+            return
         self._rebase_source_onto_target(local_source, target)
 
     def _rebase_source_onto_target(self, source: str, target: str) -> None:

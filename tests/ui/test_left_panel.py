@@ -1137,6 +1137,7 @@ def test_drop_from_remote_branch_fetches_then_merges(
     vm.set_repository(committed_repo)
     vm.branch_panel_view_model().refresh()
 
+    pending = []
     captured: list[tuple[str, str | None, bool]] = []
     monkeypatch.setattr(
         vm, "merge_branch",
@@ -1146,7 +1147,9 @@ def test_drop_from_remote_branch_fetches_then_merges(
     )
     monkeypatch.setattr(
         vm, "fetch_and_checkout_remote_branch",
-        lambda remote_branch: captured.append(("fetch_checkout", remote_branch, None)),
+        lambda remote_branch, *, on_success: (
+            captured.append(("fetch_checkout", remote_branch, None)), pending.append(on_success)
+        ),
     )
 
     branches = _top_level(panel, "Branches")
@@ -1164,6 +1167,8 @@ def test_drop_from_remote_branch_fetches_then_merges(
         if a.text() == "Merge origin/feature into topic"
     )
     merge_action.trigger()
+    assert len(captured) == 1  # Merge waits for successful checkout.
+    pending.pop()()
 
     # First the fetch+checkout of the tracking branch, then the merge.
     assert len(captured) >= 2
@@ -1276,6 +1281,7 @@ def test_submenu_pick_for_remote_source_fetches_first(
     vm.set_repository(committed_repo)
     vm.branch_panel_view_model().refresh()
 
+    pending = []
     captured: list[tuple] = []
     monkeypatch.setattr(
         vm, "merge_branch",
@@ -1285,13 +1291,15 @@ def test_submenu_pick_for_remote_source_fetches_first(
     )
     monkeypatch.setattr(
         vm, "fetch_and_checkout_remote_branch",
-        lambda name: captured.append(("fetch", name)),
+        lambda name, *, on_success: (captured.append(("fetch", name)), pending.append(on_success)),
     )
 
     actions = panel._remote_branch_actions("origin/from-upstream")  # noqa: SLF001
     merge_into = next(a for a in actions if a.text() == "Merge origin/from-upstream into...")
     main_pick = next(a for a in merge_into.menu().actions() if a.text() == "main")
     main_pick.trigger()
+    assert len(captured) == 1  # Merge waits for successful checkout.
+    pending.pop()()
     fetch_calls = [c for c in captured if c[0] == "fetch"]
     merge_calls = [c for c in captured if c[0] == "merge"]
     assert len(fetch_calls) == 1

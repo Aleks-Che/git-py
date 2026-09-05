@@ -431,14 +431,9 @@ def test_fetch_and_checkout_remote_branch_when_busy_emits_error(
 
 
 def test_fetch_and_checkout_remote_branch_toggles_busy_during_fetch(
-    origin_and_clone,
+    origin_and_clone, qtbot,
 ) -> None:
-    """The method is sync, but the re-entrancy guard and spinner are honoured.
-
-    busy_changed must go True then False, regardless of whether
-    ``async_enabled`` is True — the fetch is executed inline to avoid
-    the pygit2 thread-safety issue documented on the method.
-    """
+    """The spinner covers the complete asynchronous fetch/checkout command."""
     _ensure_app()
     _origin, clone = origin_and_clone
     assert clone.path is not None
@@ -449,10 +444,9 @@ def test_fetch_and_checkout_remote_branch_toggles_busy_during_fetch(
     busy: list[bool] = []
     vm.busy_changed.connect(busy.append)
     vm.fetch_and_checkout_remote_branch(f"origin/{branch}")
-    # busy toggles twice: once for the fetch (inside
-    # fetch_and_checkout_remote_branch) and once for the checkout
-    # (inside checkout_branch).
-    assert busy == [True, False, True, False]
+    assert busy == [True]
+    qtbot.waitUntil(lambda: not vm.is_busy(), timeout=5000)
+    assert busy == [True, False]
 
 
 def test_pull_changes_brings_remote(origin_and_clone) -> None:
