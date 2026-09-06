@@ -75,7 +75,9 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
+    QLabel,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QScrollBar,
     QTextEdit,
@@ -120,6 +122,9 @@ _TOOLBAR_VERTICAL_MARGIN = 4
 # this cap the view shows the first lines plus a truncation banner;
 # the full text is still kept for toggles and copy actions.
 _MAX_RENDERED_DIFF_LINES = 20_000
+_MAX_RENDERED_DIFF_CHARS = 1_000_000
+_MAX_RENDERED_LINE_CHARS = 4_000
+_LOADING_DELAY_MS = 150
 
 # Default scrollbar width on Windows is ~16px. The custom scrollbar
 # needs to fit two halves + a divider. We use an *odd* width so the
@@ -822,6 +827,22 @@ class DiffViewWidget(QWidget):
         self._view_mode: DiffViewMode = DiffViewMode.CHANGES_ONLY
         self._editor.line_action_requested.connect(self.line_action_requested)
         self._build_toolbar()
+        self._loading = False
+        self._loading_timer = QTimer(self)
+        self._loading_timer.setSingleShot(True)
+        self._loading_timer.setInterval(_LOADING_DELAY_MS)
+        self._loading_timer.timeout.connect(self._show_loading)
+        self._loading_panel = QWidget(self)
+        loading_layout = QHBoxLayout(self._loading_panel)
+        loading_layout.addStretch()
+        loading_layout.addWidget(QLabel("Loading diff…", self._loading_panel))
+        self._loading_progress = QProgressBar(self._loading_panel)
+        self._loading_progress.setRange(0, 0)
+        self._loading_progress.setTextVisible(False)
+        self._loading_progress.setFixedSize(100, 6)
+        loading_layout.addWidget(self._loading_progress)
+        loading_layout.addStretch()
+        self._loading_panel.hide()
         self._layout_body()
 
     # ── layout ────────────────────────────────────────────────────
@@ -911,6 +932,7 @@ class DiffViewWidget(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
         root.addWidget(self._toolbar)
+        root.addWidget(self._loading_panel)
         root.addWidget(self._editor, 1)
         # The toolbar should not stretch — its preferred height is
         # the row's natural height — so the editor absorbs the rest.
@@ -920,6 +942,22 @@ class DiffViewWidget(QWidget):
         )
 
     # ── public API ────────────────────────────────────────────────
+
+    def set_loading(self, loading: bool) -> None:
+        """Animate the busy indicator only for a noticeable preview delay."""
+        if loading == self._loading:
+            return
+        self._loading = loading
+        self._editor.setEnabled(not loading)
+        if loading:
+            self._loading_timer.start()
+        else:
+            self._loading_timer.stop()
+            self._loading_panel.hide()
+
+    def _show_loading(self) -> None:
+        if self._loading:
+            self._loading_panel.show()
 
     def set_diff(self, text: str) -> None:
         """Set the *changes-only* diff content (legacy entry point).
@@ -1014,6 +1052,7 @@ class DiffViewWidget(QWidget):
 
     def clear(self) -> None:
         """Remove all content, highlights, and cached diff text."""
+        self.set_loading(False)
         self._editor.clear()
         self._editor.set_line_info([])
         self._editor.setExtraSelections([])
@@ -1066,25 +1105,41 @@ class DiffViewWidget(QWidget):
         if self._view_mode == DiffViewMode.CHANGES_ONLY:
             text = self._changes_only_text
         else:
-            text = self._full_document_text
+            text = self._full_document_text or self._changes_only_text
         # Cap the rendered line count — see ``_MAX_RENDERED_DIFF_LINES``.
         # The stored text stays complete; only the document shown in the
         # editor is truncated. The banner line has no diff prefix, so it
         # parses as neutral context and renders unhighlighted.
-        lines = text.split("\n")
+        truncated_chars = len(text) > _MAX_RENDERED_DIFF_CHARS
+        if truncated_chars:
+            # Keep whole rows: partial text must never become a staging action.
+            prefix = text[:_MAX_RENDERED_DIFF_CHARS]
+            text = prefix.rsplit("\n", 1)[0] if "\n" in prefix else ""
+        lines = text.split("\n", _MAX_RENDERED_DIFF_LINES + 1)
         if len(lines) > _MAX_RENDERED_DIFF_LINES:
-            total = len(lines)
+            total = text.count("\n") + 1
             lines = lines[:_MAX_RENDERED_DIFF_LINES]
             lines.append(
                 f"… diff truncated — showing {_MAX_RENDERED_DIFF_LINES} "
                 f"of {total} lines (file too large)",
             )
-            text = "\n".join(lines)
+        if truncated_chars:
+            lines.append("… diff truncated — file too large")
+        text = "\n".join(lines)
         parsed = parse_diff_lines(text)
         # Drop file-level headers — they're noise in a per-file view.
         # Hunk markers, additions, deletions, context, and the
         # ``\\ No newline at end of file`` marker all stay.
         kept = [p for p in parsed if p.line_type != DiffLineType.HEADER]
+        # Minified files can contain megabytes on one line. A neutral row
+        # preserves subsequent line numbers without exposing a partial patch.
+        for index, line in enumerate(kept):
+            if len(line.text) > _MAX_RENDERED_LINE_CHARS:
+                kept[index] = ParsedDiffLine(
+                    text="… diff truncated — line too long to display",
+                    line_type=DiffLineType.CONTEXT,
+                    line_number=None,
+                )
         self._editor.set_line_info(kept)
         self._editor.setPlainText("\n".join(p.text for p in kept))
         self._apply_highlighting(kept)

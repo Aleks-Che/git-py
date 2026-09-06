@@ -57,6 +57,7 @@ from src.ui.widgets.file_list_model import (
     STATUS_TOOLTIP,
 )
 from src.utils.avatar import make_avatar_pixmap
+from src.utils.image_preview import is_image_path
 from src.viewmodels.main_viewmodel import MainViewModel
 
 # When generating the "full document" variant of a diff we want
@@ -399,6 +400,10 @@ class CommitDetailPanel(QWidget):
         MainWindow switches back to the graph.
         """
         self._selected_file = path
+        self._main_vm.cancel_commit_file_diff()
+        self._current_diff_sha = None
+        self._current_diff_path = None
+        self._current_diff_changes_only = ""
         self._highlight_selected_file()
         if path is None:
             self._files.clearSelection()
@@ -406,6 +411,11 @@ class CommitDetailPanel(QWidget):
         if path is None or self._current_sha is None:
             self.diff_ready.emit("")
             self.diff_pair_ready.emit("", "")
+            return
+        if is_image_path(path):
+            self.diff_ready.emit("")
+            self.diff_pair_ready.emit("", "")
+            self._main_vm.request_file_image(path, sha=self._current_sha)
             return
         self._main_vm.request_commit_file_diff(
             self._current_sha, path, context_lines=3,
@@ -419,6 +429,7 @@ class CommitDetailPanel(QWidget):
         highlight a path that no longer exists in the new commit.
         """
         self._current_sha = sha
+        self._main_vm.cancel_commit_file_diff()
         self._selected_file = None
         self._highlight_selected_file()
         self.selected_file_changed.emit(None)
@@ -751,7 +762,10 @@ class CommitDetailPanel(QWidget):
         are dropped.
         """
         if context_lines == _FULL_DOCUMENT_CONTEXT_LINES:
-            if sha != self._current_diff_sha or path != self._current_diff_path:
+            if (
+                sha != self._current_sha or path != self._selected_file
+                or sha != self._current_diff_sha or path != self._current_diff_path
+            ):
                 return
             self.diff_pair_ready.emit(self._current_diff_changes_only, text)
             return

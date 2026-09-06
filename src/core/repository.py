@@ -11,7 +11,6 @@ vocabulary.
 from __future__ import annotations
 
 import contextlib
-import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -26,6 +25,7 @@ from src.core.models import (
     BranchInfo,
     CommitInfo,
     FileChange,
+    FileContent,
     FileStatus,
     StashInfo,
     TagInfo,
@@ -684,31 +684,63 @@ class RepositoryManager:
         :class:`InvalidRefError` if ``sha`` does not resolve to a
         commit, and :class:`GitError` if computing the diff fails.
         """
+        from src.core.operations import commit_file_diff_text
+
+        return commit_file_diff_text(self, sha, path, context_lines)
+
+
+    def read_file_content(
+        self, path: str, *, staged: bool = False, sha: str | None = None,
+    ) -> FileContent:
+        """Read the selected version without decoding binary data or changing Git.
+
+        Commit/stash selections read their tree; staged selections read the
+        index; unstaged selections read the worktree. A deleted file uses its
+        first-parent, HEAD, or index version respectively.
+        """
         try:
-            obj = self.repo.revparse_single(sha).peel(pygit2.Commit)
-        except (KeyError, pygit2.GitError, ValueError) as exc:
-            raise InvalidRefError(f"Unknown revision: {sha!r}") from exc
-        if obj.parent_ids:
+            repo = self.repo
+            if sha is not None:
+                commit = repo.revparse_single(sha).peel(pygit2.Commit)
+                try:
+                    blob = commit.tree[path]
+                except KeyError:
+                    if not commit.parent_ids:
+                        raise GitError(f"File {path!r} does not exist in {sha!r}.") from None
+                    blob = commit.parents[0].tree[path]
+                    return FileContent(self._blob_bytes(blob, path), before_deletion=True)
+                return FileContent(self._blob_bytes(blob, path))
+
+            repo.index.read()
+            if staged:
+                try:
+                    blob = repo[repo.index[path].id]
+                except KeyError:
+                    if repo.head_is_unborn:
+                        raise GitError(f"File {path!r} does not exist in the index.") from None
+                    blob = repo.head.peel(pygit2.Commit).tree[path]
+                    return FileContent(self._blob_bytes(blob, path), before_deletion=True)
+                return FileContent(self._blob_bytes(blob, path))
+
+            if repo.workdir is None:
+                raise GitError("Repository has no working directory.")
+            root = Path(repo.workdir).resolve()
+            full_path = root / path
+            if full_path.is_symlink() or not full_path.resolve().is_relative_to(root):
+                raise GitError(f"Cannot preview a file outside the working directory: {path!r}")
             try:
-                parent_tree = obj.parents[0].tree
-            except (KeyError, ValueError):
-                parent_tree = self.repo.TreeBuilder().write()
-        else:
-            parent_tree = self.repo.TreeBuilder().write()
-        try:
-            diff = self.repo.diff(parent_tree, obj.tree, context_lines=context_lines)
-        except (pygit2.GitError, KeyError, ValueError) as exc:
-            raise GitError(f"Failed to diff {sha!r}: {exc}") from exc
-        pieces: list[str] = []
-        for patch in diff:
-            delta = patch.delta
-            normalized_path = path.casefold() if os.name == "nt" else path
-            if (
-                (delta.new_file.path or "").casefold() == normalized_path
-                or (delta.old_file.path or "").casefold() == normalized_path
-            ):
-                pieces.append(patch.text or "")
-        return "".join(pieces)
+                return FileContent(full_path.read_bytes())
+            except FileNotFoundError:
+                blob = repo[repo.index[path].id]
+                return FileContent(self._blob_bytes(blob, path), before_deletion=True)
+        except (pygit2.GitError, KeyError, ValueError, OSError) as exc:
+            raise GitError(f"Cannot read {path!r}: {exc}") from exc
+
+    @staticmethod
+    def _blob_bytes(blob: object, path: str) -> bytes:
+        if not isinstance(blob, pygit2.Blob):
+            raise GitError(f"Cannot preview {path!r}: it is not a regular file.")
+        return blob.data
 
     def get_workdir_diff_text(self, context_lines: int = 3) -> str:
         """Return the full unified diff of the working tree vs HEAD.

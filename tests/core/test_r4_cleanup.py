@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pygit2
 from PySide6.QtWidgets import QApplication
-from src.core import diff_parser, graph_v2, operations, repository
+from src.core import diff_parser, file_diff, graph_v2, operations, repository
 from src.core.repository import RepositoryManager
 from src.utils import avatar, debug_mode
 from src.viewmodels.main_viewmodel import MainViewModel
@@ -126,5 +126,5 @@ def test_windows_path_case_insensitive(tmp_path: Path, monkeypatch) -> None:
     path.write_text("two\n")
     manager.repo.index.add("file.txt")
     manager.repo.index.write()
-    monkeypatch.setattr(repository.os, "name", "nt")
+    monkeypatch.setattr(file_diff.os, "name", "nt")
     assert manager.get_commit_file_diff_text(str(manager.repo.head.target), "FILE.TXT")

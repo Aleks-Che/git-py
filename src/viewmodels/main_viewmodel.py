@@ -38,7 +38,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pygit2
-from PySide6.QtCore import QObject, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QObject, QThreadPool, QTimer, Signal, Slot
 
 from src.core.diff_parser import ParsedDiffLine
 from src.core.exceptions import (
@@ -57,6 +57,8 @@ from src.utils.config import (
     save_ssh_key_paths,
 )
 from src.utils.debug_mode import debug_print
+from src.utils.image_preview import ImagePreview, decode_image
+from src.utils.latest_worker import LatestWorker
 from src.viewmodels.branch_panel_viewmodel import BranchPanelViewModel
 from src.viewmodels.commands import CommandProcessor
 from src.viewmodels.commit_panel_viewmodel import CommitPanelViewModel
@@ -111,6 +113,7 @@ class MainViewModel(QObject):
     # (sha, path, text, context_lines). ``context_lines`` distinguishes
     # the changes-only variant from the full-document one.
     commit_file_diff_ready = Signal(str, str, str, int)
+    file_image_ready = Signal(str, object, str)  # path, ImagePreview | None, error
     # Lightweight background *reads* (commit detail, per-file diff).
     # Unlike ``busy_changed`` this does NOT engage the mutation guard —
     # it only drives the status-bar spinner so the user sees that a
@@ -137,7 +140,9 @@ class MainViewModel(QObject):
         # looked successful in the log (review finding 12).
         self._command_processor.error_occurred.connect(self._on_command_processor_error)
         self._graph_view_model = GraphViewModel(None, self, async_enabled=async_enabled)
-        self._commit_panel_view_model = CommitPanelViewModel(self, config_path=self._config_path)
+        self._commit_panel_view_model = CommitPanelViewModel(
+            self, config_path=self._config_path, async_enabled=async_enabled,
+        )
         self.busy_changed.connect(self._commit_panel_view_model.invalidate_generation)
         self._branch_panel_view_model = BranchPanelViewModel(self)
         # ``None`` means "no conflict in progress". When a dict is
@@ -161,6 +166,10 @@ class MainViewModel(QObject):
         # result into a VM that no longer holds the right state (R2.2
         # C7).  Stale results are dropped silently in ``_on_result``.
         self._async_generation: int = 0
+        self._image_request_id = 0
+        self._commit_panel_view_model.image_requested.connect(
+            lambda path, staged: self.request_file_image(path, staged=staged),
+        )
         # ``async_enabled`` lets tests run the VM in pure-sync mode by
         # passing ``async_enabled=False`` in the constructor. In
         # production ``MainWindow`` constructs the VM with the default
@@ -217,6 +226,10 @@ class MainViewModel(QObject):
             str, tuple[object, list, BranchAttribution | None]
         ] = OrderedDict()
         self._commit_diff_cache: OrderedDict[tuple[str, str, int], str] = OrderedDict()
+        self._commit_diff_loader = LatestWorker(self)
+        self._commit_diff_loader.finished.connect(self._on_commit_diff_loaded)
+        self._commit_diff_loader.failed.connect(self._on_commit_diff_failed)
+        self._commit_diff_loader.busy_changed.connect(self._on_commit_diff_busy)
         # Reference count of in-flight lightweight background reads;
         # drives ``activity_changed`` (spinner only, no mutation guard).
         self._activity_count: int = 0
@@ -390,6 +403,7 @@ class MainViewModel(QObject):
         self.recently_created_changed.emit(set(self._recently_created_branches))
         self._branch_of_commit_cache.clear()
         self._commit_detail_cache.clear()
+        self._commit_diff_loader.invalidate()
         self._commit_diff_cache.clear()
         if self._activity_count:
             self._activity_count = 0
@@ -2245,6 +2259,76 @@ class MainViewModel(QObject):
         )
         QThreadPool.globalInstance().start(worker)
 
+    def cancel_file_image(self) -> None:
+        """Discard a pending image result when the selection is cleared or replaced."""
+        self._image_request_id += 1
+
+    def request_file_image(
+        self, path: str, *, staged: bool = False, sha: str | None = None,
+    ) -> None:
+        """Read and decode the selected image version off the GUI thread in production."""
+        self.cancel_file_image()
+        request_id = self._image_request_id
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.file_image_ready.emit(path, None, "No repository open.")
+            return
+
+        def _read(manager: RepositoryManager) -> ImagePreview:
+            content = manager.read_file_content(path, staged=staged, sha=sha)
+            version = sha[:7] if sha is not None else ("Staged" if staged else "Working tree")
+            if content.before_deletion:
+                version += " · before deletion"
+            return ImagePreview(decode_image(content.data), version, len(content.data))
+
+        def _publish_error(exc: object) -> None:
+            message = f"Failed to preview {path!r}: {exc}"
+            self.file_image_ready.emit(path, None, message)
+            self.error_occurred.emit(message)
+
+        if not self._async_enabled:
+            try:
+                preview = _read(self._repo_manager)
+            except GitError as exc:
+                _publish_error(exc)
+            else:
+                self.file_image_ready.emit(path, preview, "")
+            return
+
+        repo_path = self._repo_manager.path
+        generation = self._async_generation
+        self._activity_begin()
+
+        def _work() -> ImagePreview:
+            manager = RepositoryManager()
+            try:
+                manager.open(repo_path)
+                return _read(manager)
+            finally:
+                manager.close()
+
+        def _finish_current() -> bool:
+            if generation != self._async_generation:
+                return False
+            self._activity_end()
+            return request_id == self._image_request_id
+
+        def _on_result(preview: ImagePreview) -> None:
+            if _finish_current():
+                self.file_image_ready.emit(path, preview, "")
+
+        def _on_failure(exc: object) -> None:
+            if _finish_current():
+                _publish_error(exc)
+
+        worker = AsyncWorker(_work)
+        worker.signals.finished.connect(_on_result)
+        worker.signals.failed.connect(_on_failure)
+        self._active_workers.add(worker)
+        worker.signals.lifespan_finished.connect(
+            lambda w=worker: self._on_async_finished(w),
+        )
+        QThreadPool.globalInstance().start(worker)
+
     def request_commit_file_diff(
         self, sha: str, path: str, context_lines: int = 3,
     ) -> None:
@@ -2262,6 +2346,7 @@ class MainViewModel(QObject):
         key = (sha, path, context_lines)
         cached = self._commit_diff_cache.get(key)
         if cached is not None:
+            self._commit_diff_loader.invalidate()
             self._commit_diff_cache.move_to_end(key)
             self.commit_file_diff_ready.emit(sha, path, cached, context_lines)
             return
@@ -2278,49 +2363,37 @@ class MainViewModel(QObject):
             return
 
         repo_path = self._repo_manager.path
-        generation = self._async_generation
-        self._activity_begin()
 
-        def _work(
-            repo_path: str = repo_path,
-            sha: str = sha,
-            path: str = path,
-            context_lines: int = context_lines,
-        ) -> str:
-            worker_repo = RepositoryManager()
-            worker_repo.open(repo_path)
+        def _work() -> str:
+            worker_repo = RepositoryManager(repo_path)
             try:
-                return MainViewModel._compute_file_diff(
-                    worker_repo, sha, path, context_lines,
-                )
+                return MainViewModel._compute_file_diff(worker_repo, sha, path, context_lines)
             finally:
                 worker_repo.close()
 
-        def _on_result(result: object) -> None:
-            self._activity_end()
-            if generation != self._async_generation:
-                return
-            text: str = result  # type: ignore[assignment]
-            self._store_file_diff(key, text)
-            self.commit_file_diff_ready.emit(sha, path, text, context_lines)
+        self._commit_diff_loader.submit(key, _work)
 
-        def _on_failure(exc: object) -> None:
-            self._activity_end()
-            if generation != self._async_generation:
-                return
-            self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
-            # The panel still needs a (empty) result so it can leave
-            # the loading state — mirror the old synchronous behaviour.
-            self.commit_file_diff_ready.emit(sha, path, "", context_lines)
+    def cancel_commit_file_diff(self) -> None:
+        self._commit_diff_loader.invalidate()
 
-        worker = AsyncWorker(_work)
-        worker.signals.finished.connect(_on_result)
-        worker.signals.failed.connect(_on_failure)
-        self._active_workers.add(worker)
-        worker.signals.lifespan_finished.connect(
-            lambda w=worker: self._on_async_finished(w),
-        )
-        QThreadPool.globalInstance().start(worker)
+    @Slot(bool)
+    def _on_commit_diff_busy(self, busy: bool) -> None:
+        if busy:
+            self._activity_begin()
+        else:
+            self._activity_end()
+
+    @Slot(object, object)
+    def _on_commit_diff_loaded(self, key: tuple, text: str) -> None:
+        sha, path, context_lines = key
+        self._store_file_diff(key, text)
+        self.commit_file_diff_ready.emit(sha, path, text, context_lines)
+
+    @Slot(object, object)
+    def _on_commit_diff_failed(self, key: tuple, error: object) -> None:
+        sha, path, context_lines = key
+        self.error_occurred.emit(f"Failed to diff {path!r}: {error}")
+        self.commit_file_diff_ready.emit(sha, path, "", context_lines)
 
     @staticmethod
     def _compute_file_diff(
@@ -3337,11 +3410,12 @@ class MainViewModel(QObject):
             SquashCommitsCommand,
         )
 
-        return isinstance(command, (
-            ContinueRebaseCommand, DropCommitCommand, EditCommitMessageCommand,
-            FetchAndCheckoutCommand, FetchCommand, MergeCommand, PullCommand,
-            PushCommand, RebaseCommand, SquashCommitsCommand,
-        ))
+        return isinstance(
+            command,
+            ContinueRebaseCommand | DropCommitCommand | EditCommitMessageCommand
+            | FetchAndCheckoutCommand | FetchCommand | MergeCommand | PullCommand
+            | PushCommand | RebaseCommand | SquashCommitsCommand,
+        )
 
     def _run_async_redo(self, command: object) -> None:
         """Redo through the same worker dispatch without duplicating history."""

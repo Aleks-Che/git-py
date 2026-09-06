@@ -1507,8 +1507,8 @@ def commit_file_diff_text(
 
     For a root commit (no parents) the diff is against the empty tree,
     so every file it introduces is reported as ``new file``.  Only the
-    patch for ``path`` is extracted from the commit-wide diff, so the
-    cost stays proportional to the commit, not the working tree.
+    patch for ``path`` is materialized; unrelated deltas are inspected
+    without loading their file contents.
 
     ``context_lines`` controls how many unchanged lines surround each
     change: ``3`` produces a compact review diff; a value large enough
@@ -1534,12 +1534,9 @@ def commit_file_diff_text(
             diff = r.diff(parent_tree, obj.tree, context_lines=context_lines)
         except (pygit2.GitError, KeyError, ValueError) as exc:
             raise GitError(f"Failed to diff {sha!r}: {exc}") from exc
-        pieces: list[str] = []
-        for patch in diff:
-            delta = patch.delta
-            if (delta.new_file.path == path) or (delta.old_file.path == path):
-                pieces.append(patch.text or "")
-        return "".join(pieces)
+        from src.core.file_diff import extract_file_patch
+
+        return extract_file_patch(diff, path)
 
 
 def squash_commits(

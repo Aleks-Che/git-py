@@ -27,13 +27,14 @@ files and prepares data. The actual commit is created by
 """
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 
 import pygit2
 from PySide6.QtCore import QObject, QThreadPool, Signal, Slot
 
-from src.core.diff_parser import filter_staged_diff_lines
 from src.core.exceptions import GitError
+from src.core.file_diff import read_workdir_file_diff, workdir_file_diff
 from src.core.models import FileChange, FileStatus
 from src.core.repository import RepositoryManager
 from src.core.staged_diff import read_staged_snapshot, staged_identity
@@ -41,6 +42,8 @@ from src.utils.ai_client import AIClient, AIError, CommitMessage
 from src.utils.ai_config import AISettings
 from src.utils.async_worker import AsyncWorker
 from src.utils.config import default_config_path, load_config
+from src.utils.image_preview import is_image_path
+from src.utils.latest_worker import LatestWorker
 
 
 def _generate_message(path: str, identity: str, settings: AISettings) -> CommitMessage:
@@ -86,8 +89,13 @@ class CommitPanelViewModel(QObject):
     selected_file_changed = Signal(object)
     """Emitted with the new selected path (or ``None``)."""
 
+    diff_loading_changed = Signal(bool)
+
     diff_ready = Signal(str)
     """Emitted with the unified-diff text for the selected file."""
+
+    image_requested = Signal(str, bool)
+    """Ask the main VM to load an image (path, staged), including after refresh."""
 
     diff_pair_ready = Signal(str, str)
     """Emitted with the (changes-only, full-document) diff pair.
@@ -116,9 +124,18 @@ class CommitPanelViewModel(QObject):
 
     def __init__(
         self, parent: QObject | None = None, *, config_path: Path | str | None = None,
+        async_enabled: bool = False,
     ) -> None:
         super().__init__(parent)
         self._config_path = config_path
+        self._async_enabled = async_enabled
+        self._diff_loader = LatestWorker(self)
+        self._diff_loader.busy_changed.connect(self.diff_loading_changed)
+        self._diff_loader.finished.connect(self._on_diff_loaded)
+        self._diff_loader.failed.connect(self._on_diff_failed)
+        self._full_document_requested = False
+        self._current_diff_path: str | None = None
+        self._current_diff_staged = False
         self._generation_worker: AsyncWorker | None = None
         self._input_revision = 0
         self._generation_revision = 0
@@ -188,7 +205,7 @@ class CommitPanelViewModel(QObject):
     def selected_file_supports_line_actions(self) -> bool:
         """Return whether the selected side is a tracked text modification."""
         path = self._selected_file
-        if path is None or self._repo is None or not self._repo.is_open:
+        if path is None or is_image_path(path) or self._repo is None or not self._repo.is_open:
             return False
         flag = self._raw_status.get(path, pygit2.GIT_STATUS_CURRENT)
         required = (
@@ -212,6 +229,17 @@ class CommitPanelViewModel(QObject):
 
     def current_diff(self) -> str | None:
         return self._current_diff
+
+    def _is_binary(self, path: str) -> bool:
+        """Probe a small prefix, without reading an entire large file on a click."""
+        workdir = self._repo.repo.workdir
+        if workdir is None:
+            return False
+        try:
+            with (Path(workdir) / path).open("rb") as stream:
+                return b"\0" in stream.read(8192)
+        except OSError:
+            return False
 
     def commit_summary(self) -> str:
         return self._commit_summary
@@ -255,6 +283,7 @@ class CommitPanelViewModel(QObject):
         Pass ``refresh=False`` to defer the status re-read so the
         caller can batch it inside a background worker.
         """
+        self.cancel_diff_loading()
         self._repo = manager
         self.generation_status_changed.emit("")
         self._raw_status = {}
@@ -338,7 +367,7 @@ class CommitPanelViewModel(QObject):
         if self._generation_revision != self._input_revision:
             self.generation_status_changed.emit("Input or repository changed; generate again.")
             return
-        message = str(error) if isinstance(error, (AIError, GitError)) else "LLM generation failed."
+        message = str(error) if isinstance(error, AIError | GitError) else "LLM generation failed."
         self.generation_status_changed.emit("Generation failed; your message was preserved.")
         self.error_occurred.emit(message)
 
@@ -689,196 +718,78 @@ class CommitPanelViewModel(QObject):
             self.error_occurred.emit(str(exc))
             return set()
 
+    def cancel_diff_loading(self) -> None:
+        self._diff_loader.invalidate()
+        self._current_diff_path = None
+        self._full_document_requested = False
+
     def _compute_and_emit_diff(self, path: str | None) -> None:
-        """Compute the diff for ``path`` and emit the diff signals.
-
-        Emits :attr:`diff_ready` (changes-only text) eagerly so the
-        default diff view is responsive; the *full document* variant
-        is computed lazily on :meth:`request_full_document` because
-        rendering 2^31 context lines is expensive on large files
-        (R3.2 P4). For backwards compatibility we still emit
-        :attr:`diff_pair_ready` with an empty ``full_document`` here
-        and rely on the widget to call :meth:`request_full_document`
-        when the user toggles into full-document mode.
-
-        For untracked files the "full document" view is just the file
-        itself, so both variants are identical to avoid showing an
-        empty editor when the user toggles modes on such a file.
-        """
+        self.cancel_diff_loading()
+        self._current_diff = ""
         if self._repo is None or not self._repo.is_open or path is None:
-            self._current_diff = ""
             self.diff_ready.emit("")
             self.diff_pair_ready.emit("", "")
             return
-        try:
-            changes_only = self.build_diff_text(
-                path,
-                staged=self._selected_file_staged,
-                context_lines=3,
-            )
-        except GitError as exc:
-            self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
-            self._current_diff = ""
+        if is_image_path(path):
             self.diff_ready.emit("")
             self.diff_pair_ready.emit("", "")
+            self.image_requested.emit(path, self._selected_file_staged)
             return
-        self._current_diff = changes_only
-        # Track the selected path so a subsequent ``request_full_document``
-        # can recompute the full variant lazily (R3.2 P4).
         self._current_diff_path = path
         self._current_diff_staged = self._selected_file_staged
-        self.diff_ready.emit(changes_only)
-        # Full document is intentionally empty here — the widget will
-        # trigger ``request_full_document()`` on mode switch.  We send
-        # an empty second slot so listeners that compare both strings
-        # still receive *some* signal.
-        self.diff_pair_ready.emit(changes_only, "")
+        self._request_diff(path, 3)
 
     def request_full_document(self) -> None:
-        """Recompute and emit the full-document diff for the current selection.
+        path = self._current_diff_path
+        if path is None or not self._current_diff or self._full_document_requested:
+            return
+        self._full_document_requested = True
+        self._request_diff(path, _FULL_DOCUMENT_CONTEXT_LINES)
 
-        R3.2 (P4): ``_compute_and_emit_diff`` used to build both
-        changes-only and full-document eagerly.  ``full_document`` is
-        expensive (2^31 context lines) and only matters when the user
-        has toggled the right-panel viewer into "full document" mode,
-        so we now defer it to this explicit request.  Emits
-        :attr:`diff_pair_ready` with the recomputed text.
-        """
-        path = getattr(self, "_current_diff_path", None)
-        if (
-            self._repo is None
-            or not self._repo.is_open
-            or path is None
-            or self._current_diff == ""
-        ):
+    def _request_diff(self, path: str, context_lines: int) -> None:
+        key = (path, context_lines)
+        if self._async_enabled:
+            self._diff_loader.submit(key, partial(
+                read_workdir_file_diff, self._repo.path, path,
+                self._current_diff_staged, context_lines,
+            ))
             return
         try:
-            full_document = self.build_diff_text(
-                path,
-                staged=self._current_diff_staged,
-                context_lines=_FULL_DOCUMENT_CONTEXT_LINES,
-            )
+            text = self.build_diff_text(path, self._current_diff_staged, context_lines)
         except GitError as exc:
-            self.error_occurred.emit(f"Failed to diff {path!r}: {exc}")
-            return
-        self.diff_pair_ready.emit(self._current_diff, full_document)
+            self._on_diff_failed(key, exc)
+        else:
+            self._on_diff_loaded(key, text)
+
+    @Slot(object, object)
+    def _on_diff_loaded(self, key: tuple, text: str) -> None:
+        _, context_lines = key
+        if context_lines == _FULL_DOCUMENT_CONTEXT_LINES:
+            self._full_document_requested = False
+            self.diff_pair_ready.emit(self._current_diff or "", text)
+        else:
+            self._current_diff = text
+            self.diff_ready.emit(text)
+            self.diff_pair_ready.emit(text, "")
+
+    @Slot(object, object)
+    def _on_diff_failed(self, key: tuple, error: object) -> None:
+        path, context_lines = key
+        self.error_occurred.emit(f"Failed to diff {path!r}: {error}")
+        if context_lines == _FULL_DOCUMENT_CONTEXT_LINES:
+            self._full_document_requested = False
+            # Keep the compact preview on failure; do not start an automatic retry loop.
+            self.diff_pair_ready.emit(self._current_diff or "", "")
+        else:
+            self._current_diff = ""
+            self.diff_ready.emit("")
+            self.diff_pair_ready.emit("", "")
 
     def build_diff_text(
-        self,
-        path: str,
-        staged: bool = False,
-        context_lines: int = 3,
+        self, path: str, staged: bool = False, context_lines: int = 3,
     ) -> str:
-        """Return the unified diff for ``path``.
-
-        When ``staged=False`` (default), shows the tracked worktree
-        changes that are not represented in the index. When
-        ``staged=True``, shows the index diff against ``HEAD`` — what
-        would be committed if you ran ``git commit`` right now.
-
-        ``context_lines`` controls how many unchanged lines surround
-        each change: ``3`` (the default) produces a compact, change-
-        focused diff suitable for review; a very large value
-        (e.g. ``2**31 - 1``, used by the *Full document* viewer mode)
-        makes the surrounding hunks grow until they span the whole
-        file, so the entire document is rendered with diff colouring.
-
-        Public — the *Copy Diff* context-menu action in the right
-        panel's commit-input view calls this to grab the text that
-        gets pushed onto the system clipboard.
-        """
-        repo = self._repo.repo
-        if not staged and self._is_untracked(path):
-            return self._untracked_diff_text(path)
-        if self._is_binary(path):
-            label = "staged" if staged else "HEAD"
-            return f"Binary file {path} differs from {label}.\n"
-        try:
-            flags = (
-                pygit2.enums.DiffOption.INCLUDE_UNTRACKED
-                | pygit2.enums.DiffOption.RECURSE_UNTRACKED_DIRS
-            )
-            diff = repo.diff(
-                "HEAD",
-                cached=staged,
-                context_lines=context_lines,
-                flags=flags,
-            )
-        except (pygit2.GitError, KeyError) as exc:
-            raise GitError(str(exc)) from exc
-        text = self._extract_patch_for(diff, path)
-        if staged or not text:
-            return text
-        return self._without_staged_diff_lines(path, text)
-
-    def _is_untracked(self, path: str) -> bool:
-        """Return ``True`` if ``path`` is not present in the index/HEAD tree."""
-        try:
-            self._repo.repo.revparse_single(f"HEAD:{path}")
-        except (KeyError, pygit2.GitError, ValueError):
-            return True
-        return False
-
-    @staticmethod
-    def _extract_patch_for(diff, path: str) -> str:  # noqa: ANN001 - pygit2.Diff
-        """Return the patch text for ``path`` from a multi-file ``pygit2.Diff``.
-
-        pygit2 1.x's ``Diff`` is iterable over :class:`Patch` objects;
-        each has a ``.delta.new_file.path`` / ``.delta.old_file.path``
-        we can match against. Concatenates the per-file patch strings
-        when both sides of a rename point at ``path``.
-        """
-        pieces: list[str] = []
-        for patch in diff:
-            delta = patch.delta
-            if (delta.new_file.path == path) or (delta.old_file.path == path):
-                pieces.append(patch.text or "")
-        return "".join(pieces)
-
-    def _without_staged_diff_lines(self, path: str, text: str) -> str:
-        repo = self._repo.repo
-        try:
-            staged_diff = repo.diff("HEAD", cached=True, context_lines=3)
-        except (pygit2.GitError, KeyError) as exc:
-            raise GitError(str(exc)) from exc
-        staged_text = self._extract_patch_for(staged_diff, path)
-        return filter_staged_diff_lines(text, staged_text)[0]
-
-    def _is_binary(self, path: str) -> bool:
-        """Best-effort binary detection: read up to 8 KiB and look for NUL bytes."""
-        from pathlib import Path as _Path
-
-        workdir = self._repo.repo.workdir
-        if workdir is None:
-            return False
-        try:
-            blob = (_Path(workdir) / path).read_bytes()[:8192]
-        except OSError:
-            return False
-        return b"\x00" in blob
-
-    def _untracked_diff_text(self, path: str) -> str:
-        """Produce a unified-diff-shaped string for an untracked file."""
-        from pathlib import Path as _Path
-
-        workdir = self._repo.repo.workdir
-        full = _Path(workdir) / path if workdir is not None else None
-        if full is None or not full.exists():
-            return f"New file: {path} (not found on disk)\n"
-        try:
-            content = full.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            raise GitError(f"Cannot read {path}: {exc}") from exc
-        new_lines = content.splitlines() or [""]
-        added = "\n".join(f"+{line}" for line in new_lines)
-        header = (
-            f"diff --git a/{path} b/{path}\n"
-            f"new file mode 100644\n"
-            f"--- /dev/null\n"
-            f"+++ b/{path}\n"
-            f"@@ -0,0 +1,{len(new_lines)} @@\n"
-        )
-        return header + added + "\n"
+        """Read a patch synchronously for copy actions and non-async callers."""
+        return workdir_file_diff(self._repo, path, staged, context_lines)
 
 
 __all__ = ["CommitPanelViewModel"]

@@ -42,6 +42,14 @@ class FileStatus(str, Enum):
     TYPE_CHANGED = "type_changed"
 
 
+@dataclass(frozen=True)
+class FileContent:
+    """Raw selected-file contents, optionally from the side before deletion."""
+
+    data: bytes
+    before_deletion: bool = False
+
+
 @dataclass
 class CommitInfo:
     sha: str

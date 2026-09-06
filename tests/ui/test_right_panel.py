@@ -512,12 +512,12 @@ def test_full_document_loads_for_wip_file_on_mode_toggle(
     window._main_vm.select_commit(WIP_SHA)  # noqa: SLF001
     cp_vm = window._main_vm.commit_panel_view_model()  # noqa: SLF001
     cp_vm.select_file("f.txt")
-    assert window._diff_view.has_changes_only()  # noqa: SLF001
+    qtbot.waitUntil(window._diff_view.has_changes_only, timeout=5000)
     assert not window._diff_view.has_full_document()  # noqa: SLF001
 
     window._diff_view.set_view_mode(DiffViewMode.FULL_DOCUMENT)  # noqa: SLF001
 
-    assert window._diff_view.has_full_document()  # noqa: SLF001
+    qtbot.waitUntil(window._diff_view.has_full_document, timeout=5000)
     text = window._diff_view.toPlainText()  # noqa: SLF001
     assert "base 0" in text
     assert "base 10 dirty" in text
@@ -836,7 +836,7 @@ def test_selecting_file_switches_graph_stack(qtbot, tmp_git_repo: Path) -> None:
     assert window._graph_stack.currentIndex() == 1
     assert window._diff_view.isVisible()
     # The diff text should be non-empty (the file is modified).
-    assert len(window._diff_view.toPlainText()) > 0
+    qtbot.waitUntil(lambda: bool(window._diff_view.toPlainText()), timeout=5000)
 
 
 def test_deselecting_file_returns_graph(qtbot, tmp_git_repo: Path) -> None:
@@ -874,7 +874,7 @@ def test_selecting_staged_file_shows_diff(qtbot, tmp_git_repo: Path) -> None:
     cp_vm.select_file("f.txt", staged=True)
     assert window._graph_stack.currentIndex() == 1
     assert window._diff_view.isVisible()
-    assert len(window._diff_view.toPlainText()) > 0
+    qtbot.waitUntil(lambda: bool(window._diff_view.toPlainText()), timeout=5000)
 
 
 def test_unstaged_modified_file_enables_green_line_actions(
@@ -938,6 +938,7 @@ def test_diff_line_signal_stages_and_hides_that_line(
     window._main_vm.select_commit(WIP_SHA)
     cp_vm = window._main_vm.commit_panel_view_model()
     cp_vm.select_file("f.txt")
+    qtbot.waitUntil(window._diff_view.has_changes_only, timeout=5000)
     line = next(
         item
         for item in window._diff_view._editor._line_info
@@ -964,6 +965,7 @@ def test_unstage_all_button_refreshes_open_partial_diff(
     cp_vm = window._main_vm.commit_panel_view_model()
     cp_vm.select_file("f.txt")
     for text in ("+one", "+two", "+three"):
+        qtbot.waitUntil(window._diff_view.has_changes_only, timeout=5000)
         line = next(
             item
             for item in window._diff_view._editor._line_info
@@ -971,6 +973,7 @@ def test_unstage_all_button_refreshes_open_partial_diff(
         )
         window._diff_view.line_action_requested.emit(line)
     cp_vm.select_file("f.txt", staged=True)
+    qtbot.waitUntil(window._diff_view.has_changes_only, timeout=5000)
     assert "+four" not in window._diff_view.toPlainText()
 
     window._right_panel._commit_input._unstage_all_button.click()
@@ -979,6 +982,7 @@ def test_unstage_all_button_refreshes_open_partial_diff(
     assert cp_vm.selected_file() == "f.txt"
     assert not cp_vm.selected_file_is_staged()
     assert window._diff_view.line_action_mode() == DiffLineActionMode.STAGE
+    qtbot.waitUntil(window._diff_view.has_changes_only, timeout=5000)
     assert all(
         text in window._diff_view.toPlainText()
         for text in ("+one", "+two", "+three", "+four")

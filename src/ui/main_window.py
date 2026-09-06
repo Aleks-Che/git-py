@@ -82,6 +82,7 @@ from src.ui.widgets.diff_view_widget import (
     DiffViewWidget,
 )
 from src.ui.widgets.graph_panel import GraphTableWidget
+from src.ui.widgets.image_view_widget import ImageViewWidget
 from src.ui.widgets.left_panel import LeftPanel
 from src.ui.widgets.log_widget import LogWidget
 from src.ui.widgets.repo_bar_widget import RepoBarWidget
@@ -100,6 +101,7 @@ from src.utils.config import (
     save_graph_column_widths,
 )
 from src.utils.debug_mode import debug_print
+from src.utils.image_preview import is_image_path
 from src.utils.theme import DARK_THEME
 from src.viewmodels.main_viewmodel import MainViewModel
 from src.viewmodels.repo_tabs_viewmodel import RepoTabViewModel
@@ -643,6 +645,9 @@ class MainWindow(QMainWindow):
         self._graph_stack = QStackedWidget(self)
         self._graph_stack.addWidget(self._graph_table)  # index 0
         self._graph_stack.addWidget(self._diff_view)     # index 1
+        self._image_view = ImageViewWidget(self)
+        self._graph_stack.addWidget(self._image_view)    # index 2
+        self._main_vm.file_image_ready.connect(self._image_view.show_result)
 
         # Persistent conflict banner (review finding 5): shown above
         # the graph while a merge / rebase is stopped on conflicts.
@@ -665,7 +670,9 @@ class MainWindow(QMainWindow):
         # switch between graph and diff view.
         cp_vm = self._main_vm.commit_panel_view_model()
         cp_vm.selected_file_changed.connect(self._on_commit_file_selected)
-        cp_vm.diff_ready.connect(self._on_diff_ready)
+        cp_vm.diff_loading_changed.connect(
+            lambda loading: self._on_diff_loading_changed(loading, cp_vm),
+        )
         # The full-document variant is computed lazily (R3.2 P4): the
         # pair arrives with an empty full-document slot, and we ask
         # the emitting source for the expensive variant when the user
@@ -690,7 +697,6 @@ class MainWindow(QMainWindow):
         self._right_panel._commit_detail.selected_file_changed.connect(
             self._on_commit_detail_file_selected,
         )
-        self._right_panel._commit_detail.diff_ready.connect(self._on_diff_ready)
         self._right_panel._commit_detail.diff_pair_ready.connect(
             lambda changes_only, full_document: self._on_diff_pair_ready(
                 changes_only, full_document, self._right_panel._commit_detail,
@@ -815,6 +821,7 @@ class MainWindow(QMainWindow):
 
     def _on_commit_file_selected(self, path: str | None) -> None:
         cp_vm = self._main_vm.commit_panel_view_model()
+        self._diff_source = cp_vm if path is not None else None
         mode: DiffLineActionMode | None = None
         if path is not None and cp_vm.selected_file_supports_line_actions():
             mode = (
@@ -826,6 +833,7 @@ class MainWindow(QMainWindow):
         self._on_selected_file_changed(path)
 
     def _on_commit_detail_file_selected(self, path: str | None) -> None:
+        self._diff_source = self._right_panel._commit_detail if path is not None else None
         self._diff_view.set_line_action_mode(None)
         self._on_selected_file_changed(path)
 
@@ -861,11 +869,19 @@ class MainWindow(QMainWindow):
         :meth:`QSplitter.setSizes`. The same widths are restored
         when the file is deselected.
         """
+        self._main_vm.cancel_file_image()
+        self._image_view.clear()
+        self._requesting_full_document = False
+        self._diff_view.clear()
+        self._diff_view.set_loading(path is not None and not is_image_path(path))
         if path is not None:
             if self._top_splitter is not None and self._left_panel.isVisible():
                 self._last_normal_splitter_sizes = self._top_splitter.sizes()
-            self._graph_stack.setCurrentIndex(1)
-            self._diff_view.setVisible(True)
+            if is_image_path(path):
+                self._image_view.show_loading(path)
+                self._graph_stack.setCurrentWidget(self._image_view)
+            else:
+                self._graph_stack.setCurrentWidget(self._diff_view)
             self._left_panel.setVisible(False)
             if (
                 self._top_splitter is not None
@@ -915,12 +931,23 @@ class MainWindow(QMainWindow):
         lazily-computed full-document variant (R3.2 P4) can later be
         requested from the same place.
         """
-        self._diff_source = source
+        if source is not self._diff_source:
+            return
+        requested_full_document = self._requesting_full_document
+        self._requesting_full_document = False
+        self._diff_view.set_loading(False)
         self._diff_view.set_diff_pair(changes_only, full_document)
         # Selecting another file while already in FULL_DOCUMENT mode
         # arrives with an empty full-document slot — fetch it now so
         # the view does not stay blank.
-        self._maybe_request_full_document()
+        if not requested_full_document:
+            self._maybe_request_full_document()
+
+    def _on_diff_loading_changed(self, loading: bool, source: object) -> None:
+        if source is self._diff_source:
+            if loading and not self._requesting_full_document:
+                self._diff_view.clear()
+            self._diff_view.set_loading(loading)
 
     def _on_diff_view_mode_changed(self, mode: DiffViewMode) -> None:
         """Fetch the lazy full-document diff on first toggle (R3.2 P4)."""
@@ -938,6 +965,8 @@ class MainWindow(QMainWindow):
         """
         if self._requesting_full_document:
             return
+        if self._graph_stack.currentWidget() is not self._diff_view:
+            return
         if self._diff_view.view_mode() != DiffViewMode.FULL_DOCUMENT:
             return
         if not self._diff_view.has_changes_only():
@@ -948,10 +977,8 @@ class MainWindow(QMainWindow):
         if source is None:
             return
         self._requesting_full_document = True
-        try:
-            source.request_full_document()
-        finally:
-            self._requesting_full_document = False
+        self._diff_view.set_loading(True)
+        source.request_full_document()
 
     def _on_copy_diff(self, sha: str) -> None:
         """Copy the full unified diff to the system clipboard."""
@@ -1437,6 +1464,10 @@ class MainWindow(QMainWindow):
         those zeroed-out values and instead fall back to the last
         sizes we observed while the panel was visible.
         """
+        self._diff_source = None
+        self._main_vm.commit_panel_view_model().cancel_diff_loading()
+        self._main_vm.cancel_commit_file_diff()
+        self._diff_view.set_loading(False)
         if self._config_path is not None:
             config = load_config(self._config_path)
             config["window_size"] = [self.width(), self.height()]
