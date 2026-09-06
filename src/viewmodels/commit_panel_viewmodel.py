@@ -27,13 +27,27 @@ files and prepares data. The actual commit is created by
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pygit2
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QThreadPool, Signal, Slot
 
 from src.core.diff_parser import filter_staged_diff_lines
 from src.core.exceptions import GitError
 from src.core.models import FileChange, FileStatus
 from src.core.repository import RepositoryManager
+from src.core.staged_diff import read_staged_snapshot, staged_identity
+from src.utils.ai_client import AIClient, AIError, CommitMessage
+from src.utils.ai_config import AISettings
+from src.utils.async_worker import AsyncWorker
+from src.utils.config import default_config_path, load_config
+
+
+def _generate_message(path: str, identity: str, settings: AISettings) -> CommitMessage:
+    snapshot = read_staged_snapshot(path, settings.max_diff_chars)
+    if snapshot.identity != identity:
+        raise GitError("Staged changes moved before generation started. Please try again.")
+    return AIClient(settings).generate_commit_message(snapshot.diff, snapshot.branch)
 
 # Bitmask of pygit2 status flags that mean "the change is already
 # recorded in the index" (i.e. would be picked up by the next commit).
@@ -97,9 +111,20 @@ class CommitPanelViewModel(QObject):
     care about the final string still work."""
 
     error_occurred = Signal(str)
+    generation_busy_changed = Signal(bool)
+    generation_status_changed = Signal(str)
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(
+        self, parent: QObject | None = None, *, config_path: Path | str | None = None,
+    ) -> None:
         super().__init__(parent)
+        self._config_path = config_path
+        self._generation_worker: AsyncWorker | None = None
+        self._input_revision = 0
+        self._generation_revision = 0
+        self._generation_path = ""
+        self._generation_identity = ""
+        self.commit_message_changed.connect(self.invalidate_generation)
         self._repo: RepositoryManager | None = None
         self._file_changes: list[FileChange] = []
         self._raw_status: dict[str, int] = {}
@@ -231,6 +256,7 @@ class CommitPanelViewModel(QObject):
         caller can batch it inside a background worker.
         """
         self._repo = manager
+        self.generation_status_changed.emit("")
         self._raw_status = {}
         self._selected_file = None
         self._selected_file_staged = False
@@ -247,6 +273,79 @@ class CommitPanelViewModel(QObject):
             self.refresh_status()
 
     # ----- verb methods ------------------------------------------------
+
+    @property
+    def is_generating(self) -> bool:
+        return self._generation_worker is not None
+
+    def invalidate_generation(self, *_args) -> None:
+        """Prevent a pending result from overwriting newer input or repository state."""
+        self._input_revision += 1
+
+    def generate_commit_message(self) -> None:
+        if self.is_generating:
+            return
+        if self._repo is None or not self._repo.is_open or not self._repo.path:
+            self.error_occurred.emit("Open a repository before generating a commit message.")
+            return
+        try:
+            config = load_config(self._config_path or default_config_path())
+            settings = AISettings.from_config(config)
+            if not settings.base_url.strip() or not settings.model.strip():
+                raise AIError("Configure the API URL and model in Settings → AI first.")
+            AIClient(settings)  # Validate before starting a worker.
+            self._generation_path = self._repo.path
+            self._generation_identity = staged_identity(self._generation_path)
+        except (AIError, GitError) as exc:
+            self.error_occurred.emit(str(exc))
+            return
+        self._generation_revision = self._input_revision
+        worker = AsyncWorker(
+            _generate_message, self._generation_path, self._generation_identity, settings,
+        )
+        self._generation_worker = worker
+        worker.signals.finished.connect(self._on_generation_result)
+        worker.signals.failed.connect(self._on_generation_error)
+        worker.signals.lifespan_finished.connect(self._on_generation_finished)
+        self.generation_status_changed.emit("Generating summary and description…")
+        self.generation_busy_changed.emit(True)
+        QThreadPool.globalInstance().start(worker)
+
+    @Slot(object)
+    def _on_generation_result(self, message: CommitMessage) -> None:
+        if self._generation_revision != self._input_revision:
+            self.generation_status_changed.emit("Input or repository changed; generate again.")
+            return
+        try:
+            if staged_identity(self._generation_path) != self._generation_identity:
+                self.generation_status_changed.emit("Staged changes changed; generate again.")
+                return
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            return
+        # Publish one coherent message, with both fields already updated for listeners.
+        self._commit_summary = message.summary
+        self._commit_description = message.description
+        self.commit_summary_changed.emit(message.summary)
+        self.commit_description_changed.emit(message.description)
+        self.commit_message_changed.emit(self.combined_commit_message())
+        self.generation_status_changed.emit(
+            "Generated from staged changes. Review before committing.",
+        )
+
+    @Slot(object)
+    def _on_generation_error(self, error: Exception) -> None:
+        if self._generation_revision != self._input_revision:
+            self.generation_status_changed.emit("Input or repository changed; generate again.")
+            return
+        message = str(error) if isinstance(error, (AIError, GitError)) else "LLM generation failed."
+        self.generation_status_changed.emit("Generation failed; your message was preserved.")
+        self.error_occurred.emit(message)
+
+    @Slot()
+    def _on_generation_finished(self) -> None:
+        self._generation_worker = None
+        self.generation_busy_changed.emit(False)
 
     def refresh_status(self) -> None:
         """Re-read the working-tree status and rebuild the staged set.

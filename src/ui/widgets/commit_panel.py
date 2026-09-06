@@ -60,6 +60,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.models import FileChange
+from src.ui.icons import spinner_icon, toolbar_icon
 from src.ui.widgets.file_list_model import (
     FileChangeRole,
     FileListDelegate,
@@ -261,6 +262,20 @@ class CommitPanel(QWidget):
         self._summary = QLineEdit(self)
         self._summary.setPlaceholderText("Commit Summary")
         self._summary.setClearButtonEnabled(True)
+        self._generate_action = self._summary.addAction(
+            toolbar_icon("sparkles"), QLineEdit.ActionPosition.TrailingPosition,
+        )
+        self._generate_action.setText("Generate commit message with AI")
+        self._generate_action.setToolTip("Generate summary and description from staged changes")
+        self._generate_action.triggered.connect(self._main_vm.generate_commit_message)
+        self._generation_angle = 0
+        self._generation_timer = QTimer(self)
+        self._generation_timer.setInterval(80)
+        self._generation_timer.timeout.connect(self._animate_generation)
+        self._generation_status = QLabel()
+        self._generation_status.setWordWrap(True)
+        self._generation_status.setTextFormat(Qt.TextFormat.PlainText)
+        self._generation_status.hide()
 
         self._description = QPlainTextEdit(self)
         self._description.setPlaceholderText("Description")
@@ -285,6 +300,7 @@ class CommitPanel(QWidget):
         commit_layout.setSpacing(4)
         commit_layout.addWidget(self._summary)
         commit_layout.addWidget(self._description, stretch=1)
+        commit_layout.addWidget(self._generation_status)
         commit_layout.addWidget(self._commit_button)
 
         commit_container = QWidget(self)
@@ -315,6 +331,10 @@ class CommitPanel(QWidget):
         self._vm.staged_files_changed.connect(self._refresh_file_lists)
         self._vm.commit_summary_changed.connect(self._on_summary_from_vm)
         self._vm.commit_description_changed.connect(self._on_description_from_vm)
+        self._vm.commit_message_changed.connect(self._refresh_commit_button)
+        self._vm.generation_busy_changed.connect(self._on_generation_busy)
+        self._vm.generation_status_changed.connect(self._show_generation_status)
+        self._main_vm.busy_changed.connect(self._refresh_commit_button)
         self._vm.selected_file_changed.connect(self._on_selected_file_changed)
 
         # Track multi-selection changes for the counter badge.
@@ -338,6 +358,23 @@ class CommitPanel(QWidget):
         self._staged_list.model().modelReset.connect(self._on_selection_changed)
 
     # ----- VM -> UI ---------------------------------------------------
+
+    def _on_generation_busy(self, busy: bool) -> None:
+        if busy:
+            self._generation_timer.start()
+            self._animate_generation()
+        else:
+            self._generation_timer.stop()
+            self._generate_action.setIcon(toolbar_icon("sparkles"))
+        self._refresh_commit_button()
+
+    def _animate_generation(self) -> None:
+        self._generation_angle = (self._generation_angle - 30) % 360
+        self._generate_action.setIcon(spinner_icon(self._generation_angle))
+
+    def _show_generation_status(self, text: str) -> None:
+        self._generation_status.setText(text)
+        self._generation_status.setVisible(bool(text))
 
     def _refresh_all(self) -> None:
         """Populate every section from the current VM state."""
@@ -616,6 +653,9 @@ class CommitPanel(QWidget):
         )
         self._commit_button.setText(label)
         self._commit_button.setEnabled(has_input and staged_count > 0)
+        self._generate_action.setEnabled(
+            staged_count > 0 and not self._vm.is_generating and not self._main_vm.is_busy(),
+        )
 
 
 # ---------------------------------------------------------------------------

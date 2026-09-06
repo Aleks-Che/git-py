@@ -129,7 +129,24 @@ def _draw_copy(p: QPainter) -> None:
     p.drawRect(QRectF(5.5, 6.0, 8.0, 7.5))
 
 
+def _draw_sparkles(p: QPainter) -> None:
+    for x, y, radius in ((6.0, 9.5, 4.5), (12.0, 4.0, 2.5), (13.0, 13.0, 1.5)):
+        path = QPainterPath(QPointF(x, y - radius))
+        path.quadTo(QPointF(x, y), QPointF(x + radius, y))
+        path.quadTo(QPointF(x, y), QPointF(x, y + radius))
+        path.quadTo(QPointF(x, y), QPointF(x - radius, y))
+        path.quadTo(QPointF(x, y), QPointF(x, y - radius))
+        p.drawPath(path)
+
+
+def spinner_icon(angle: int) -> QIcon:
+    """An animated progress arc on the same high-DPI grid as toolbar icons."""
+    return QIcon(_render(lambda p: p.drawArc(QRectF(3, 3, 10, 10), angle * 16, 270 * 16),
+                         _COLOR_ACTIVE))
+
+
 _DRAWERS: dict[str, DrawFn] = {
+    "sparkles": _draw_sparkles,
     "undo": _draw_undo,
     "redo": _draw_redo,
     "fetch": _draw_fetch,

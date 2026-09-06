@@ -18,8 +18,11 @@ from __future__ import annotations
 
 import json
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from src.utils.ai_config import AISettings
 
 if TYPE_CHECKING:
     import pygit2
@@ -45,6 +48,7 @@ SPLITTER_KEY_GRAPH = "graph"
 GRAPH_CONFIGS_KEY = "graph_configs"
 
 _DEFAULT_CONFIG: dict[str, Any] = {
+    "ai": AISettings().to_dict(),
     "theme": "dark",
     "panel_layout": {},
     "hotkeys": {
@@ -151,19 +155,20 @@ def load_config(path: Path | str) -> dict[str, Any]:
     *copy* so the caller can mutate it freely without affecting other
     callers.
     """
+    defaults = deepcopy(_DEFAULT_CONFIG)
     p = Path(path)
     if not p.is_file():
-        return dict(_DEFAULT_CONFIG)
+        return defaults
     try:
         with p.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return dict(_DEFAULT_CONFIG)
+        return defaults
     if not isinstance(data, dict):
         # Top-level JSON must be an object to merge with defaults; lists,
         # numbers, booleans, and ``null`` cannot be updated.
-        return dict(_DEFAULT_CONFIG)
-    return {**_DEFAULT_CONFIG, **data}
+        return defaults
+    return {**defaults, **data}
 
 
 def save_config(path: Path | str, data: dict[str, Any]) -> None:

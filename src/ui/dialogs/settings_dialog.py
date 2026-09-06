@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QTabWidget,
     QToolButton,
     QToolTip,
     QVBoxLayout,
@@ -32,6 +33,8 @@ from PySide6.QtWidgets import (
 
 from src.ui.dialogs.clone_dialog import SshKeyDialog, _find_ssh_keygen
 from src.ui.icons import toolbar_icon
+from src.ui.widgets.ai_settings_panel import AISettingsPanel
+from src.utils.ai_config import AISettings
 from src.utils.config import default_ssh_key_path, load_config, save_config, save_ssh_key_paths
 
 
@@ -52,7 +55,7 @@ class SettingsDialog(QDialog):
     def __init__(self, config_path: str | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(640, 480)
+        self.resize(720, 560)
 
         self._config_path = config_path
         self._config = load_config(config_path) if config_path else {}
@@ -69,6 +72,13 @@ class SettingsDialog(QDialog):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
+        self._tabs = QTabWidget()
+        general = QWidget()
+        general_layout = QVBoxLayout(general)
+        self._tabs.addTab(general, "General / SSH")
+        self._ai_panel = AISettingsPanel(AISettings.from_config(self._config), self)
+        self._tabs.addTab(self._ai_panel, "AI")
+        layout.addWidget(self._tabs)
 
         form = QFormLayout()
 
@@ -147,8 +157,8 @@ class SettingsDialog(QDialog):
         self._ssh_priv_edit.textChanged.connect(self._on_path_changed)
         self._ssh_pub_edit.textChanged.connect(self._on_path_changed)
 
-        layout.addLayout(form)
-        layout.addStretch(1)
+        general_layout.addLayout(form)
+        general_layout.addStretch(1)
 
         self._button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -180,8 +190,17 @@ class SettingsDialog(QDialog):
         c["use_default_git_credentials"] = self._use_default_cred_cb.isChecked()
         c["ssh_private_key"] = self._ssh_priv_edit.text().strip()
         c["ssh_public_key"] = self._ssh_pub_edit.text().strip()
+        previous_ai = c.get("ai", {})
+        c["ai"] = {
+            **(previous_ai if isinstance(previous_ai, dict) else {}),
+            **self._ai_panel.settings().to_dict(),
+        }
         if self._config_path:
-            save_config(self._config_path, c)
+            try:
+                save_config(self._config_path, c)
+            except OSError as exc:
+                QMessageBox.warning(self, "Settings", f"Could not save settings: {exc}")
+                return
         self.accept()
 
     # ----- internal helpers -----------------------------------------------

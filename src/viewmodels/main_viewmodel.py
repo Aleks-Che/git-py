@@ -137,7 +137,8 @@ class MainViewModel(QObject):
         # looked successful in the log (review finding 12).
         self._command_processor.error_occurred.connect(self._on_command_processor_error)
         self._graph_view_model = GraphViewModel(None, self, async_enabled=async_enabled)
-        self._commit_panel_view_model = CommitPanelViewModel(self)
+        self._commit_panel_view_model = CommitPanelViewModel(self, config_path=self._config_path)
+        self.busy_changed.connect(self._commit_panel_view_model.invalidate_generation)
         self._branch_panel_view_model = BranchPanelViewModel(self)
         # ``None`` means "no conflict in progress". When a dict is
         # present it carries the operation context (see class docstring).
@@ -687,6 +688,15 @@ class MainViewModel(QObject):
         new_sha = str(self._repo_manager.repo.head.target)
         self.set_selected_commit(new_sha)
         self._log("commit", "Commit succeeded")
+
+    def generate_commit_message(self) -> None:
+        """Generate a draft from staged changes without mutating Git or its command history."""
+        if self._is_busy:
+            self.error_occurred.emit(
+                "Wait for the current Git operation before generating a message.",
+            )
+            return
+        self._commit_panel_view_model.generate_commit_message()
 
     def stage_file(self, path: str) -> None:
         """Delegate to :meth:`CommitPanelViewModel.stage_file`."""

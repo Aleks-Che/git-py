@@ -369,6 +369,17 @@ QToolButton:disabled {{
     color: {text_disabled};
 }}
 
+QToolButton#ai-prompt-preset {{
+    background-color: {bg_elevated};
+    border-color: {border};
+}}
+
+QToolButton#ai-prompt-preset:checked {{
+    background-color: {bg_selected};
+    border-color: {accent};
+    color: {text_on_accent};
+}}
+
 QStatusBar {{
     background-color: {bg_elevated};
     color: {text};

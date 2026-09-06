@@ -64,12 +64,14 @@ git-py/
 │   │   ├── models.py               # CommitInfo, BranchInfo, FileChange и другие данные
 │   │   ├── exceptions.py           # GitError и специализированные ошибки
 │   │   ├── diff_parser.py          # разбор diff на файлы, блоки и строки
+│   │   ├── staged_diff.py          # снимок HEAD → index для ИИ-сообщений
 │   │   └── graph_v2.py             # раскладка графа по ячейкам, линии и цвета
 │   ├── viewmodels/
 │   │   ├── main_viewmodel.py       # Git, панели, конфликты и фоновые задачи
 │   │   ├── commands.py             # GitCommand, CommandProcessor и конкретные команды
 │   │   ├── graph_viewmodel.py      # история, stash, граф, поиск, подгрузка
 │   │   ├── commit_panel_viewmodel.py # staged/unstaged, файл, diff, сообщение коммита
+│   │   ├── ai_settings_viewmodel.py # фоновое получение моделей и тест LLM
 │   │   ├── branch_panel_viewmodel.py # локальные/удалённые ветки, теги, stash
 │   │   └── repo_tabs_viewmodel.py  # RepoTabViewModel: пути вкладок и активная вкладка
 │   ├── ui/
@@ -81,6 +83,7 @@ git-py/
 │   │   │   ├── left_panel.py       # дерево веток, тегов, stash и контекстные действия
 │   │   │   ├── right_panel.py      # переключение WIP / деталей коммита
 │   │   │   ├── commit_panel.py     # интерфейс подготовки коммита
+│   │   │   ├── ai_settings_panel.py # URL, ключ, провайдер и выбор модели
 │   │   │   ├── commit_detail_panel.py # сведения и файлы выбранного коммита
 │   │   │   ├── diff_view_widget.py # отображение diff и действия над строками
 │   │   │   ├── file_list_model.py  # модель списка файлов
@@ -95,9 +98,12 @@ git-py/
 │   │       ├── clone_dialog.py     # клонирование и SshKeyDialog
 │   │       ├── conflict_resolution_dialog.py
 │   │       ├── remote_manage_dialog.py
-│   │       └── settings_dialog.py  # автор и SSH-ключи
+│   │       ├── ai_prompts_dialog.py # промпт, язык и пресеты сообщения
+│   │       └── settings_dialog.py  # автор, SSH-ключи и AI
 │   └── utils/
 │       ├── config.py               # JSON, defaults, пути, сохранение состояния
+│       ├── ai_config.py            # настройки и пресеты промптов
+│       ├── ai_client.py            # OpenAI-совместимый HTTP-клиент
 │       ├── theme.py                # Theme, тёмная палитра и QSS
 │       ├── async_worker.py         # AsyncWorker (QRunnable) и сигналы результата
 │       ├── signals.py              # общие сигналы; проверяйте фактические подключения VM
@@ -302,6 +308,7 @@ Qt-тестам нужен event loop даже без видимых окон. �
 | `author_name`, `author_email` | пустые строки; профиль автора |
 | `use_default_git_credentials` | `true`; имя/email из глобального Git config |
 | `ssh_private_key`, `ssh_public_key` | пустые строки; пути к SSH-ключам |
+| `ai` | URL, ключ, провайдер, модель, язык, пресет и промпт генерации; см. [ИИ-сообщения](AI_COMMIT_MESSAGES.md) |
 | `hotkeys` | Undo `Ctrl+Z`, Redo `Ctrl+Y`, Fetch/Pull/Push `Ctrl+Shift+F/P/U`, Stash/Pop `Ctrl+Shift+S/O` |
 
 Справочник ключей не является примером полного файла: сохраняйте текущие
