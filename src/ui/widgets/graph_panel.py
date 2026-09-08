@@ -217,6 +217,7 @@ class GraphTableWidget(QWidget):
 
     commit_selected = Signal(str)
     checkout_commit_requested = Signal(str)
+    create_tag_requested = Signal(str)  # target commit SHA
     cherry_pick_commit_requested = Signal(str)
     drop_commit_requested = Signal(str)
     edit_commit_message_requested = Signal(str)
@@ -974,6 +975,7 @@ class GraphTableWidget(QWidget):
           :attr:`copy_diff_requested`. The WIP marker has no real
           SHA so the "Copy SHA" verb is intentionally absent.
         * ``commit`` — :attr:`checkout_commit_requested` /
+          :attr:`create_tag_requested` /
           :attr:`cherry_pick_commit_requested` /
           :attr:`drop_commit_requested` (disabled for merge commits) /
           :attr:`edit_commit_message_requested` /
@@ -1022,6 +1024,10 @@ class GraphTableWidget(QWidget):
             checkout_action = menu.addAction("Checkout this commit")
             checkout_action.triggered.connect(
                 lambda checked=False, s=sha: self.checkout_commit_requested.emit(s),
+            )
+            create_tag_action = menu.addAction("Create tag here…")
+            create_tag_action.triggered.connect(
+                lambda checked=False, s=sha: self.create_tag_requested.emit(s),
             )
             cherry_pick_action = menu.addAction("Cherry-pick commit")
             cherry_pick_action.triggered.connect(
@@ -1138,6 +1144,14 @@ class GraphTableWidget(QWidget):
             )
             actions.append(create_action)
 
+        row_sha = chip.get("row_sha") or ""
+        if row_sha:
+            create_tag_action = QAction("Create tag here…", self)
+            create_tag_action.triggered.connect(
+                lambda checked=False, s=row_sha: self.create_tag_requested.emit(s),
+            )
+            actions.append(create_tag_action)
+
         # ----- copy (matches the left panel's section) -------------------
 
         actions.append(self._make_separator())
@@ -1147,7 +1161,6 @@ class GraphTableWidget(QWidget):
         )
         actions.append(copy_name)
 
-        row_sha = chip.get("row_sha") or ""
         if row_sha:
             copy_sha = QAction("Copy commit sha", self)
             copy_sha.triggered.connect(

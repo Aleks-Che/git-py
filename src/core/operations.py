@@ -2905,40 +2905,55 @@ def create_tag(
     target_sha: str,
     message: str | None = None,
     tagger: pygit2.Signature | None = None,
-) -> None:
-    """Create a tag — lightweight (``message is None``) or annotated."""
+) -> str:
+    """Create a tag and return its direct reference target OID.
+
+    ``message is None`` creates a lightweight ref; otherwise create an
+    annotated tag object. Existing tags are never overwritten.
+    """
+    ref_name = f"refs/tags/{name}"
+    if name.startswith("-") or not pygit2.reference_is_valid_name(ref_name):
+        raise InvalidRefError(f"Invalid tag name: {name!r}")
     with unwrap(repo) as r:
         try:
             target = r.get(pygit2.Oid(hex=target_sha))
-        except (KeyError, ValueError) as exc:
+        except (KeyError, ValueError, pygit2.GitError) as exc:
             raise InvalidRefError(f"Cannot resolve {target_sha[:7]!r}") from exc
-        if target is None:
-            raise InvalidRefError(f"Cannot resolve {target_sha[:7]!r}")
+        if not isinstance(target, pygit2.Commit):
+            raise InvalidRefError(f"Not a commit: {target_sha[:7]!r}")
         try:
-            if message:
+            if message is not None:
                 tagger = tagger or _now_signature()
-                r.create_tag(name, target.oid, pygit2.GIT_OBJECT_COMMIT, tagger, message)
-            else:
-                r.create_tag(name, target.oid, pygit2.GIT_OBJECT_COMMIT)
-        except pygit2.GitError as exc:
-            kind = "annotated tag" if message else "lightweight tag"
+                return str(r.create_tag(name, target.id, pygit2.GIT_OBJECT_COMMIT, tagger, message))
+            return str(r.create_reference(ref_name, target.id).target)
+        except (ValueError, pygit2.GitError) as exc:
+            kind = "annotated tag" if message is not None else "lightweight tag"
             raise GitError(f"Failed to create {kind} {name!r}: {exc}") from exc
 
 
 def delete_tag(
     repo: RepositoryManager | pygit2.Repository,
     name: str,
+    *,
+    expected_target: str | None = None,
+    missing_ok: bool = False,
 ) -> None:
-    """Delete a tag by its *name* (without ``refs/tags/`` prefix)."""
+    """Delete a tag, optionally guarding against external replacement."""
     with unwrap(repo) as r:
         ref_name = f"refs/tags/{name}"
         try:
             ref = r.lookup_reference(ref_name)
         except KeyError as exc:
+            if missing_ok:
+                return
             raise InvalidRefError(f"Unknown tag: {name!r}") from exc
+        except (ValueError, pygit2.GitError) as exc:
+            raise GitError(f"Cannot resolve tag {name!r}: {exc}") from exc
+        if expected_target is not None and str(ref.target) != expected_target:
+            raise GitError(f"Cannot delete tag {name!r}: it changed after creation.")
         try:
             ref.delete()
-        except pygit2.GitError as exc:
+        except (ValueError, pygit2.GitError) as exc:
             raise GitError(f"Failed to delete tag {name!r}: {exc}") from exc
 
 

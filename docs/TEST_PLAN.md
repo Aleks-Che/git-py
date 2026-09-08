@@ -108,6 +108,19 @@
 - `test_circle_avatar_no_inner_border_by_default_for_graph`: без белого матового кольца при `inner_border=False`.
 - `test_square_badge_keeps_full_bleed_grid_and_border`: квадратный бейдж правой панели не регрессировал.
 
+### Создание тегов из контекстного меню графа
+
+- `tests/core/test_tags.py`: lightweight/annotated на выбранном коммите,
+  сохранность HEAD/index/worktree, недопустимые имена и объекты вместо коммита,
+  запрет перезаписи существующего тега.
+- `tests/viewmodels/test_tag_commands.py`: Undo/Redo и обновление панелей,
+  защита тега после внешней замены, удаление извне, конфликт имени при Redo;
+  ошибки через `error_occurred`, отказ при busy и без репозитория.
+- `tests/ui/test_graph_tags.py`: меню коммита, локальной, удалённой и текущей
+  ветки → диалог → тег на SHA клика, независимо от выделения; обновление меток
+  графа и левой панели, Undo/Redo через toolbar. Cancel/пустое имя/смена
+  репозитория не создают тег; пункта нет в меню WIP/stash.
+
 ### Операции над историей из контекстного меню графа (update2)
 - Core (`tests/core/test_operations.py`): `cherry_pick(create_commit=True)` двигает HEAD и сохраняет автора; `drop_commit` tip (reset --hard) и середина (rebase --onto) с undo-совместимостью; запреты drop/edit для merge/root/not-ancestor; `edit_commit_message` tip (pygit2 amend без затрагивания index) и середина (interactive rebase reword); `is_commit_pushed` по refs/remotes; `squash_commits` tip-диапазона (reset --soft) и в середине (interactive rebase squash), невалидные диапазоны.
 - Команды (`tests/viewmodels/test_merge_commands.py`): `CherryPickCommand(auto_commit)`, `DropCommitCommand`, `EditCommitMessageCommand`, `SquashCommitsCommand` — execute + undo через CommandProcessor; ошибки валидации не пушатся в undo-стек.

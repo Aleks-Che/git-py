@@ -1701,7 +1701,7 @@ class MainViewModel(QObject):
             return
         from src.viewmodels.commands import CreateTagCommand
 
-        kind = "annotated tag" if message else "lightweight tag"
+        kind = "annotated tag" if message is not None else "lightweight tag"
         self._log("tag", f"Creating {kind} {name!r} at {target_sha[:7]}")
         command = CreateTagCommand(self._repo_manager, name, target_sha, message)
         try:

@@ -256,6 +256,22 @@ Continue и Abort через сигналы, подключённые в `MainWi
 
 ## Где менять и что проверять
 
+### Создание тегов на графе
+
+Меню коммита и чипа локальной/удалённой ветки содержит `Create tag here…`.
+`GraphTableWidget.create_tag_requested(sha)` передаёт SHA строки в
+`MainWindow._on_create_tag_here()`: диалог запрашивает имя и вызывает
+`MainViewModel.create_tag()`. Создаётся локальный lightweight-тег без checkout;
+после успеха обновляются граф и левая панель. Отмена, пустое имя или смена
+репозитория во время диалога не создают тег. В меню WIP/stash этого пункта нет.
+
+`CreateTagCommand` проходит через `CommandProcessor`. Core `create_tag()`
+возвращает OID созданной ссылки: commit для lightweight или объект annotated-тега.
+Undo передаёт его в `delete_tag(expected_target=..., missing_ok=True)`, чтобы
+сохранить тег, заменённый внешней операцией; ошибки остаются в истории для повтора.
+Регрессии: `tests/core/test_tags.py`, `tests/viewmodels/test_tag_commands.py`,
+`tests/ui/test_graph_tags.py`.
+
 ### Просмотр изображений
 
 Клик по изображению в правой панели открывает `ImageViewWidget` в той же центральной

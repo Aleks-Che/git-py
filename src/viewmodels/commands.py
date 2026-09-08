@@ -1915,9 +1915,8 @@ class DiscardChangesCommand(GitCommand):
 class CreateTagCommand(GitCommand):
     """Create a tag (lightweight or annotated); undo by deleting it.
 
-    :meth:`execute` records whether the tag already existed *before*
-    the call. If it did, :meth:`undo` is a no-op — we would otherwise
-    destroy a tag the user did not create through this command.
+    Undo only deletes the reference created by this command. A tag
+    replaced externally is preserved and the undo reports an error.
 
     Annotated tags carry a message (and an optional tagger signature);
     lightweight tags have ``message=None``.
@@ -1936,24 +1935,23 @@ class CreateTagCommand(GitCommand):
         self._target_sha = target_sha
         self._message = message
         self._tagger = tagger
-        self._existed_before = False
+        self._created_oid: str | None = None
 
     def execute(self) -> None:
-        existing = {t.name for t in self._repo.tags}
-        self._existed_before = self._name in existing
-        create_tag(self._repo, self._name, self._target_sha, self._message, self._tagger)
+        self._created_oid = create_tag(
+            self._repo, self._name, self._target_sha, self._message, self._tagger,
+        )
 
     def undo(self) -> None:
-        if self._existed_before:
+        if self._created_oid is None:
             return
-        try:
-            delete_tag(self._repo, self._name)
-        except Exception:
-            pass  # best-effort: tag may have been deleted externally
+        delete_tag(
+            self._repo, self._name, expected_target=self._created_oid, missing_ok=True,
+        )
 
     @property
     def name(self) -> str:
-        suffix = " (annotated)" if self._message else ""
+        suffix = " (annotated)" if self._message is not None else ""
         return f"create tag {self._name}{suffix}"
 
 

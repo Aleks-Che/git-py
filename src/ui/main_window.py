@@ -559,6 +559,7 @@ class MainWindow(QMainWindow):
         self._graph_table.checkout_commit_requested.connect(
             self._main_vm.checkout_commit,
         )
+        self._graph_table.create_tag_requested.connect(self._on_create_tag_here)
         self._graph_table.cherry_pick_commit_requested.connect(
             self._main_vm.cherry_pick_commit,
         )
@@ -1107,6 +1108,22 @@ class MainWindow(QMainWindow):
         """
         del sha
         self._main_vm.stash_push("WIP")
+
+    def _on_create_tag_here(self, sha: str) -> None:
+        """Ask for a tag name at the clicked commit or branch tip."""
+        if not sha or sha == "WIP":
+            return
+        from PySide6.QtWidgets import QInputDialog
+
+        repo = self._main_vm.repository_manager()
+        name, ok = QInputDialog.getText(
+            self, "Create Tag", f"Tag name (at commit {sha[:7]}):",
+        )
+        if not ok or not name.strip():
+            return
+        if self._main_vm.repository_manager() is not repo:
+            return
+        self._main_vm.create_tag(name.strip(), sha)
 
     def _on_create_branch_here(self, sha: str, name: str) -> None:
         """Create a branch at *sha* with the user-supplied *name*.
