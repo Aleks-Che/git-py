@@ -24,6 +24,7 @@ from PySide6.QtCore import QObject, Signal
 from src.core.diff_parser import ParsedDiffLine
 from src.core.exceptions import GitError, MergeConflictError
 from src.core.operations import (
+    DEFAULT_PUSH_TIMEOUT_SECONDS,
     abort_merge,
     abort_rebase,
     add_remote,
@@ -1260,17 +1261,20 @@ class PushCommand(GitCommand):
         refspec: str | None = None,
         callbacks: pygit2.RemoteCallbacks | None = None,
         ssh_key_path: str | None = None,
+        timeout: float = DEFAULT_PUSH_TIMEOUT_SECONDS,
     ) -> None:
         self._repo = repo
         self._remote_name = remote_name
         self._refspec = refspec
         self._callbacks = callbacks
         self._ssh_key_path = ssh_key_path
+        self._timeout = timeout
 
     def execute(self) -> None:
         push(
             self._repo, self._remote_name, self._refspec,
             callbacks=self._callbacks, ssh_key_path=self._ssh_key_path,
+            timeout=self._timeout,
         )
 
     def undo(self) -> None:

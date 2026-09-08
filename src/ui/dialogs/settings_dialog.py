@@ -1,4 +1,4 @@
-"""Settings dialog: author identity and SSH key paths.
+"""Settings dialog: author identity, SSH connection and AI settings.
 
 Opened from ``File > Settings…``. Reads current values from the app
 config JSON, lets the user edit them, and saves back on accept.
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QTabWidget,
     QToolButton,
     QToolTip,
@@ -35,7 +36,14 @@ from src.ui.dialogs.clone_dialog import SshKeyDialog, _find_ssh_keygen
 from src.ui.icons import toolbar_icon
 from src.ui.widgets.ai_settings_panel import AISettingsPanel
 from src.utils.ai_config import AISettings
-from src.utils.config import default_ssh_key_path, load_config, save_config, save_ssh_key_paths
+from src.utils.config import (
+    MAX_PUSH_TIMEOUT_SECONDS,
+    default_ssh_key_path,
+    load_config,
+    load_push_timeout,
+    save_config,
+    save_ssh_key_paths,
+)
 
 
 class SettingsDialog(QDialog):
@@ -48,6 +56,7 @@ class SettingsDialog(QDialog):
     * **Use default Git Credentials** — when checked, the app reads
       author info from ``git config`` instead of the fields above.
     * **SSH Private Key / SSH Public Key** — file paths for SSH auth.
+    * **Push timeout (SSH)** — total push time limit in seconds.
     * **Generate SSH Key…** — opens ``ssh-keygen`` to create a new
       ed25519 key pair, pre-fills the path fields and saves those paths immediately.
     """
@@ -153,6 +162,16 @@ class SettingsDialog(QDialog):
         pub_view_widget.setLayout(pub_view_row)
         form.addRow("Public Key:", pub_view_widget)
 
+        self._push_timeout_spin = QSpinBox()
+        self._push_timeout_spin.setRange(1, MAX_PUSH_TIMEOUT_SECONDS)
+        self._push_timeout_spin.setSuffix(" s")
+        self._push_timeout_spin.setToolTip(
+            "Maximum total duration of an SSH push, including packing and upload. "
+            "Default: 1800 s (30 minutes). Maximum: 86400 s (24 hours). "
+            "Increase for large uploads. Applies to the next push."
+        )
+        form.addRow("Push timeout (SSH):", self._push_timeout_spin)
+
         # React to path changes → debounced refresh.
         self._ssh_priv_edit.textChanged.connect(self._on_path_changed)
         self._ssh_pub_edit.textChanged.connect(self._on_path_changed)
@@ -179,6 +198,7 @@ class SettingsDialog(QDialog):
         )
         self._ssh_priv_edit.setText(c.get("ssh_private_key", ""))
         self._ssh_pub_edit.setText(c.get("ssh_public_key", ""))
+        self._push_timeout_spin.setValue(load_push_timeout(c))
         # Load public key content synchronously at startup so the user
         # sees it immediately when they open Settings.
         self._refresh_public_key_view()
@@ -190,6 +210,7 @@ class SettingsDialog(QDialog):
         c["use_default_git_credentials"] = self._use_default_cred_cb.isChecked()
         c["ssh_private_key"] = self._ssh_priv_edit.text().strip()
         c["ssh_public_key"] = self._ssh_pub_edit.text().strip()
+        c["push_timeout_seconds"] = self._push_timeout_spin.value()
         previous_ai = c.get("ai", {})
         c["ai"] = {
             **(previous_ai if isinstance(previous_ai, dict) else {}),

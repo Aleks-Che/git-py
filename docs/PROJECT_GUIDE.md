@@ -340,6 +340,7 @@ Qt-тестам нужен event loop даже без видимых окон. �
 | `recent_repos`, `active_repo` | `[]`, `null`; вкладки и активный репозиторий |
 | `graph_history_limit` | `500`; размер начальной порции истории, далее подгрузка |
 | `auto_fetch_enabled`, `auto_fetch_interval_ms` | `false`, `60000` |
+| `push_timeout_seconds` | `1800`; общий таймаут SSH push, 1–86400 секунд; Settings → General / SSH, применяется к следующему push |
 | `merge_async_threshold` | `50`; порог по числу файлов для фонового merge |
 | `command_processor_history_size` | `100`; предел истории команд |
 | `discard_file_max_backup_bytes` | `1048576`; предел резервной копии файла для discard |

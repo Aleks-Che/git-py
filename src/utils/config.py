@@ -22,6 +22,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from src.core.operations import DEFAULT_PUSH_TIMEOUT_SECONDS
 from src.utils.ai_config import AISettings
 
 if TYPE_CHECKING:
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
 # upgrade keep the same starting geometry.
 DEFAULT_WINDOW_WIDTH = 1280
 DEFAULT_WINDOW_HEIGHT = 800
+MAX_PUSH_TIMEOUT_SECONDS = 24 * 60 * 60
 
 # ``splitter_sizes`` is a ``{name: [int, ...]}`` mapping; this constant
 # lists the splitter names :class:`MainWindow` writes. The two
@@ -70,6 +72,8 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     # Whether the auto-fetch timer is enabled. Default off; the UI
     # toggle (Stage 9) will flip this on first launch.
     "auto_fetch_enabled": False,
+    # Total duration of a push through the SSH CLI transport, in seconds.
+    "push_timeout_seconds": DEFAULT_PUSH_TIMEOUT_SECONDS,
     # Persisted window size. Filled in by :class:`MainWindow` on
     # close; restored on next launch. Missing / invalid → use
     # :data:`DEFAULT_WINDOW_WIDTH` / :data:`DEFAULT_WINDOW_HEIGHT`.
@@ -143,6 +147,14 @@ def get_int(config: dict[str, Any], key: str, default: int) -> int:
     if isinstance(value, int):
         return value
     return default
+
+
+def load_push_timeout(config: dict[str, Any]) -> int:
+    """Return the SSH push timeout in seconds (1 s–24 h); default to 30 min."""
+    timeout = get_int(config, "push_timeout_seconds", DEFAULT_PUSH_TIMEOUT_SECONDS)
+    if not 1 <= timeout <= MAX_PUSH_TIMEOUT_SECONDS:
+        return DEFAULT_PUSH_TIMEOUT_SECONDS
+    return timeout
 
 
 def load_config(path: Path | str) -> dict[str, Any]:
@@ -396,9 +408,11 @@ def _git_config_get(key: str) -> str:
 
 
 __all__ = [
+    "DEFAULT_PUSH_TIMEOUT_SECONDS",
     "DEFAULT_WINDOW_HEIGHT",
     "DEFAULT_WINDOW_WIDTH",
     "GRAPH_CONFIGS_KEY",
+    "MAX_PUSH_TIMEOUT_SECONDS",
     "SPLITTER_KEY_GRAPH",
     "SPLITTER_KEY_HORIZONTAL",
     "SPLITTER_KEY_RIGHT_VERTICAL",
@@ -410,6 +424,7 @@ __all__ = [
     "load_diff_view_mode",
     "load_graph_column_widths",
     "load_hotkey",
+    "load_push_timeout",
     "load_splitter_sizes",
     "save_config",
     "save_graph_column_widths",

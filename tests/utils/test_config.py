@@ -17,12 +17,27 @@ import pytest
 from src.utils.config import (
     _DEFAULT_CONFIG,
     load_config,
+    load_push_timeout,
     save_config,
 )
 
 
 def _default_keys() -> set[str]:
     return set(_DEFAULT_CONFIG.keys())
+
+
+@pytest.mark.parametrize("value", [0, -1, 86401, True, False, "3600", 1.5, None, [], {}])
+def test_invalid_push_timeout_falls_back_to_thirty_minutes(tmp_path, value):
+    config_path = tmp_path / "config.json"
+    save_config(config_path, {"push_timeout_seconds": value})
+    assert load_push_timeout(load_config(config_path)) == 1800
+
+
+@pytest.mark.parametrize("timeout", [1, 3600, 86400])
+def test_push_timeout_roundtrip(tmp_path, timeout):
+    config_path = tmp_path / "config.json"
+    save_config(config_path, {"push_timeout_seconds": timeout})
+    assert load_push_timeout(load_config(config_path)) == timeout
 
 
 def test_load_config_with_non_dict_json_returns_defaults(tmp_path: Path) -> None:

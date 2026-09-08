@@ -11,8 +11,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from PySide6.QtWidgets import QDialogButtonBox
 from src.ui.dialogs.clone_dialog import SshKeyDialog
 from src.ui.dialogs.settings_dialog import SettingsDialog
+from src.utils.config import load_config, save_config
 
 
 def _make_settings_dialog(qtbot, tmp_path: Path) -> SettingsDialog:
@@ -21,6 +23,31 @@ def _make_settings_dialog(qtbot, tmp_path: Path) -> SettingsDialog:
     dialog = SettingsDialog(config_path=str(config))
     qtbot.addWidget(dialog)
     return dialog
+
+
+def test_push_timeout_defaults_and_saves_without_losing_other_settings(qtbot, tmp_path):
+    config_path = tmp_path / "settings.json"
+    save_config(config_path, {"custom_setting": "initial"})
+    dialog = _make_settings_dialog(qtbot, tmp_path)
+    assert dialog._push_timeout_spin.value() == 1800
+    dialog._push_timeout_spin.setValue(7200)
+    # Saving the dialog must merge with the latest config on disk.
+    save_config(config_path, {"custom_setting": "updated"})
+    dialog._button_box.button(QDialogButtonBox.StandardButton.Ok).click()
+    saved = load_config(config_path)
+    assert saved["push_timeout_seconds"] == 7200
+    assert saved["custom_setting"] == "updated"
+    reopened = _make_settings_dialog(qtbot, tmp_path)
+    assert reopened._push_timeout_spin.value() == 7200
+
+
+def test_cancelling_settings_keeps_saved_push_timeout(qtbot, tmp_path):
+    config_path = tmp_path / "settings.json"
+    save_config(config_path, {"push_timeout_seconds": 3600})
+    dialog = _make_settings_dialog(qtbot, tmp_path)
+    dialog._push_timeout_spin.setValue(86400)
+    dialog._button_box.button(QDialogButtonBox.StandardButton.Cancel).click()
+    assert load_config(config_path)["push_timeout_seconds"] == 3600
 
 
 def test_settings_dialog_generate_passes_current_path_as_default(

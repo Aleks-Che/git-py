@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 from src.core import operations
-from src.core.exceptions import AuthError
+from src.core.exceptions import AuthError, GitError
 
 
 @pytest.mark.parametrize("action", ["clone", "push", "fetch"])
@@ -81,6 +81,35 @@ def test_push_uses_ssh_push_url_when_fetch_url_is_https(committed_repo, tmp_path
 
 def test_no_selected_key_preserves_system_ssh_selection():
     assert operations._ssh_environment(None) is None
+
+
+@pytest.mark.parametrize("timeout", [None, 7200])
+def test_large_ssh_push_uses_extended_timeout(committed_repo, monkeypatch, timeout):
+    committed_repo.repo.remotes.create("origin", "git@example.invalid:team/repo.git")
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(kwargs["timeout"])
+        # A two-minute upload exceeded the old one-minute subprocess limit.
+        if kwargs["timeout"] < 120:
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(operations.subprocess, "run", run)
+    options = {} if timeout is None else {"timeout": timeout}
+    operations.push(committed_repo, **options)
+    assert calls == [1800 if timeout is None else timeout]
+
+
+def test_ssh_push_timeout_reports_configured_limit(committed_repo, monkeypatch):
+    committed_repo.repo.remotes.create("origin", "git@example.invalid:team/repo.git")
+
+    def run(args, **kwargs):
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+    monkeypatch.setattr(operations.subprocess, "run", run)
+    with pytest.raises(GitError, match="git push origin HEAD timed out after 3600s"):
+        operations.push(committed_repo, timeout=3600)
 
 
 def test_ssh_key_path_expands_home(tmp_path, monkeypatch):

@@ -75,3 +75,44 @@ def test_configure_ssh_key_reports_save_failure(qtbot, tmp_path, monkeypatch):
     monkeypatch.setattr("src.viewmodels.main_viewmodel.save_ssh_key_paths", fail)
     vm.configure_ssh_key("private", "public")
     assert errors and "settings read-only" in errors[0]
+
+
+@pytest.mark.parametrize("async_enabled", [False, True])
+def test_push_reloads_timeout_and_can_retry_after_timeout(
+    qtbot, committed_repo, tmp_path, monkeypatch, async_enabled,
+):
+    config_path = tmp_path / "settings.json"
+    # An existing config without the new key also gets the extended default.
+    save_config(config_path, {"custom_setting": "keep"})
+    vm = MainViewModel(config_path=config_path, async_enabled=async_enabled)
+    committed_repo.repo.remotes.create("origin", "git@example.invalid:team/repo.git")
+    vm.set_repository(committed_repo)
+    errors = []
+    vm.error_occurred.connect(errors.append)
+    calls = []
+    original_run = subprocess.run
+
+    def run(args, **kwargs):
+        if args[1] != "push":
+            return original_run(args, **kwargs)
+        calls.append(kwargs["timeout"])
+        if len(calls) == 2:
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(operations.subprocess, "run", run)
+    try:
+        for index, timeout in enumerate([1800, 3600, 7200]):
+            if index:
+                config = load_config(config_path)
+                config["push_timeout_seconds"] = timeout
+                save_config(config_path, config)
+            vm.push_changes()
+            qtbot.waitUntil(lambda: not vm.is_busy(), timeout=5000)
+            assert calls == [1800, 3600, 7200][:index + 1]
+            assert errors == ([] if index == 0 else [
+                "git push origin HEAD timed out after 3600s",
+            ])
+        assert not vm.command_processor().can_undo
+    finally:
+        vm.close_repository()

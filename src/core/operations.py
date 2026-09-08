@@ -58,6 +58,7 @@ if TYPE_CHECKING:
 
 
 _FULL_DIFF_CONTEXT_LINES = 2**31 - 1
+DEFAULT_PUSH_TIMEOUT_SECONDS = 30 * 60
 
 
 # Status flags that block a ``GIT_CHECKOUT_SAFE`` operation.  These
@@ -2762,6 +2763,7 @@ def push(
     refspec: str | None = None,
     callbacks: pygit2.RemoteCallbacks | None = None,
     ssh_key_path: str | None = None,
+    timeout: float = DEFAULT_PUSH_TIMEOUT_SECONDS,
 ) -> None:
     """Push ``refspec`` to ``remote_name`` (default: push ``HEAD``).
 
@@ -2769,6 +2771,8 @@ def push(
     the system ``git`` CLI because prebuilt pygit2 wheels on Windows
     are built without libssh2 support. HTTPS / ``file://`` / ``git://``
     URLs go through :meth:`pygit2.Remote.push` as before.
+    ``timeout`` limits the total SSH push duration in seconds; it does
+    not apply to pygit2 transports.
     """
     spec = refspec or "HEAD"
     with unwrap(repo) as r:
@@ -2778,7 +2782,9 @@ def push(
             raise InvalidRefError(f"Unknown remote: {remote_name!r}") from exc
         url = remote.push_url or remote.url or ""
         if _url_needs_cli_fallback(url):
-            _push_via_cli(r, remote_name, refspec, ssh_key_path=ssh_key_path)
+            _push_via_cli(
+                r, remote_name, refspec, ssh_key_path=ssh_key_path, timeout=timeout,
+            )
             return
         try:
             remote.push([spec], callbacks=callbacks)
@@ -2820,6 +2826,7 @@ def _push_via_cli(
     remote_name: str,
     refspec: str | None,
     ssh_key_path: str | None = None,
+    timeout: float = DEFAULT_PUSH_TIMEOUT_SECONDS,
 ) -> None:
     """Run ``git push <remote> [refspec]`` in ``repo``'s workdir.
 
@@ -2829,7 +2836,9 @@ def _push_via_cli(
     spec = refspec or "HEAD"
     args: list[str] = ["push", remote_name, spec]
     try:
-        completed = _run_git_in_workdir(repo, args, env=_ssh_environment(ssh_key_path))
+        completed = _run_git_in_workdir(
+            repo, args, timeout=timeout, env=_ssh_environment(ssh_key_path),
+        )
     except GitNotInstalledError:
         raise
     if completed.returncode != 0:
@@ -3074,6 +3083,7 @@ def apply_file_from_stash(
 
 
 __all__ = [
+    "DEFAULT_PUSH_TIMEOUT_SECONDS",
     "RebaseContinueResult",
     "abort_merge",
     "branch_of_commit",

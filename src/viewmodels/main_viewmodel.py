@@ -54,6 +54,7 @@ from src.utils.config import (
     default_config_path,
     load_author_signature,
     load_config,
+    load_push_timeout,
     save_ssh_key_paths,
 )
 from src.utils.debug_mode import debug_print
@@ -2767,6 +2768,7 @@ class MainViewModel(QObject):
         self._log("push", f"Push {remote_name}/{spec}")
         command = PushCommand(
             self._repo_manager, remote_name, refspec, ssh_key_path=self._ssh_key_path(),
+            timeout=load_push_timeout(load_config(self._config_path or default_config_path())),
         )
         if self._async_enabled:
             self._run_async(
