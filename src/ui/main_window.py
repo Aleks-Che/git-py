@@ -90,6 +90,7 @@ from src.ui.widgets.right_panel import RightPanel
 from src.ui.widgets.search_bar import SearchBar
 from src.ui.widgets.terminal_widget import TerminalWidget
 from src.utils.config import (
+    GRAPH_CONFIGS_KEY,
     SPLITTER_KEY_HORIZONTAL,
     load_config,
     load_diff_view_mode,
@@ -142,6 +143,8 @@ class MainWindow(QMainWindow):
         self._config: dict[str, object] = (
             load_config(self._config_path) if self._config_path is not None else {}
         )
+        self._graph_layout_repo_path: str | None = None
+        self._graph_layout_updates: dict[str, object] = {}
 
         # The top horizontal splitter (left | graph | right) is kept
         # on ``self`` so the persistence layer can read / write its
@@ -174,6 +177,7 @@ class MainWindow(QMainWindow):
         self._search_bar.search_requested.connect(self._on_search_commits)
         self._build_toolbar()
         self._build_central()
+        self._default_graph_dividers = self._graph_table.divider_positions()
         self._build_status_bar()
         self._activity_active = False
         self._main_vm.busy_changed.connect(self._on_busy_changed)
@@ -1450,14 +1454,8 @@ class MainWindow(QMainWindow):
             # Fire the handler manually so the tab bar widget updates
             # and the repo opens.
             self._on_tab_changed(self._repo_tabs_vm.active_index)
-        # Restore per-repo graph column widths for the active repo.
-        # Ignore saved values whose total is unreasonably small
-        # (stale config from a previous version).
-        graph_widths = load_graph_column_widths(config, active_repo)
-        if graph_widths is not None and len(graph_widths) == 3 and sum(graph_widths) >= 300:
-            self._graph_table.set_divider_positions(
-                [graph_widths[0], graph_widths[0] + graph_widths[1]],
-            )
+        # Graph widths are restored by repository_changed, including when
+        # switching tabs later. A failed open must not change another repo's layout.
         # Restore the diff-view mode (Changes only / Full document).
         # The widget's default is CHANGES_ONLY; setting a new mode
         # re-renders, which is safe even when no file is selected
@@ -1481,14 +1479,10 @@ class MainWindow(QMainWindow):
         those zeroed-out values and instead fall back to the last
         sizes we observed while the panel was visible.
         """
-        self._diff_source = None
-        self._main_vm.commit_panel_view_model().cancel_diff_loading()
-        self._main_vm.cancel_commit_file_diff()
-        self._diff_view.set_loading(False)
         if self._config_path is not None:
             config = load_config(self._config_path)
             config["window_size"] = [self.width(), self.height()]
-            splitter_sizes: dict[str, list[int]] = {}
+            splitter_sizes = load_splitter_sizes(config)
             if self._top_splitter is not None:
                 if self._left_panel.isVisible() and self._right_panel.isVisible():
                     splitter_sizes[SPLITTER_KEY_HORIZONTAL] = (
@@ -1522,15 +1516,29 @@ class MainWindow(QMainWindow):
             tab_state = self._repo_tabs_vm.save_to_state()
             config["recent_repos"] = tab_state["paths"]
             config["active_repo"] = tab_state["active_path"]
-            # Persist per-repo graph column widths.
-            active = tab_state["active_path"]
-            if active and self._graph_table is not None:
-                divs = self._graph_table.divider_positions()
-                save_graph_column_widths(
-                    config, active,
-                    [divs[0], divs[1] - divs[0], 100],  # [branch_w, graph_w, _]
+            # Merge only layouts visited in this window with the latest disk state.
+            self._remember_graph_layout()
+            for path, widths in self._graph_layout_updates.get(GRAPH_CONFIGS_KEY, {}).items():
+                save_graph_column_widths(config, path, widths)
+            try:
+                save_config(self._config_path, config)
+            except OSError as exc:
+                choice = QMessageBox.warning(
+                    self, "Settings",
+                    f"Could not save settings: {exc}\n\n"
+                    "Discard these layout changes and close? "
+                    "Cancel keeps the window open so you can retry.",
+                    QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
                 )
-            save_config(self._config_path, config)
+                if choice != QMessageBox.StandardButton.Discard:
+                    event.ignore()
+                    return
+        self._diff_source = None
+        self._main_vm.commit_panel_view_model().cancel_diff_loading()
+        self._main_vm.cancel_commit_file_diff()
+        self._diff_view.set_loading(False)
+        self._main_vm.set_auto_fetch_enabled(False)
         self._terminal.close()
         super().closeEvent(event)
 
@@ -1734,7 +1742,32 @@ class MainWindow(QMainWindow):
 
         timer.start()
 
+    def _remember_graph_layout(self) -> None:
+        """Keep the visible layout under the repository that actually owns it."""
+        if self._graph_layout_repo_path is not None:
+            first, second = self._graph_table.divider_positions()
+            save_graph_column_widths(
+                self._graph_layout_updates, self._graph_layout_repo_path,
+                [first, second - first, 100],
+            )
+
+    def _restore_graph_layout(self, path: str | None) -> None:
+        previous = self._graph_layout_repo_path
+        if previous == path or (previous and path and _same_path(previous, path)):
+            return
+        self._remember_graph_layout()
+        self._graph_layout_repo_path = path
+        widths = (
+            load_graph_column_widths(self._graph_layout_updates, path)
+            or load_graph_column_widths(self._config, path)
+        )
+        positions = self._default_graph_dividers
+        if widths is not None and sum(widths) >= 300:
+            positions = [widths[0], widths[0] + widths[1]]
+        self._graph_table.set_divider_positions(positions)
+
     def _on_repository_changed(self, path: str | None) -> None:
+        self._restore_graph_layout(path)
         if path is None:
             self._status.showMessage("No repository")
             self._action_close.setEnabled(False)

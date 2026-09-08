@@ -126,21 +126,32 @@ class MainViewModel(QObject):
         parent: QObject | None = None,
         *,
         async_enabled: bool = False,
-        merge_async_threshold: int = 50,
-        auto_fetch_enabled: bool = False,
-        auto_fetch_interval_ms: int = 60_000,
+        merge_async_threshold: int | None = None,
+        auto_fetch_enabled: bool | None = None,
+        auto_fetch_interval_ms: int | None = None,
         config_path: Path | str | None = None,
     ) -> None:
         super().__init__(parent)
         self._config_path = Path(config_path) if config_path is not None else None
+        config = load_config(self._config_path or default_config_path())
+        if merge_async_threshold is None:
+            merge_async_threshold = config["merge_async_threshold"]
+        if auto_fetch_enabled is None:
+            auto_fetch_enabled = config["auto_fetch_enabled"]
+        if auto_fetch_interval_ms is None:
+            auto_fetch_interval_ms = config["auto_fetch_interval_ms"]
         self._repo_manager: RepositoryManager | None = None
-        self._command_processor = CommandProcessor(self)
+        self._command_processor = CommandProcessor(
+            self, max_undo=config["command_processor_history_size"],
+        )
         # Forward command failures (undo/redo/execute-after-failure
         # retries) to the user-visible error channel.  Without this the
         # processor's ``error_occurred`` went nowhere and a failed undo
         # looked successful in the log (review finding 12).
         self._command_processor.error_occurred.connect(self._on_command_processor_error)
-        self._graph_view_model = GraphViewModel(None, self, async_enabled=async_enabled)
+        self._graph_view_model = GraphViewModel(
+            None, self, async_enabled=async_enabled, history_limit=config["graph_history_limit"],
+        )
         self._commit_panel_view_model = CommitPanelViewModel(
             self, config_path=self._config_path, async_enabled=async_enabled,
         )
@@ -180,15 +191,14 @@ class MainViewModel(QObject):
         self._async_enabled: bool = async_enabled
         self._merge_async_threshold: int = merge_async_threshold
 
-        # Auto-fetch timer. Default off so tests do not see surprise
-        # network calls. ``MainWindow`` flips this on when the user
-        # enables it in the config (Stage 9).
+        # Timer preferences come from the same configuration as the other VMs.
+        # Explicit constructor arguments still take precedence for callers/tests.
         self._auto_fetch_enabled: bool = auto_fetch_enabled
-        self._auto_fetch_interval_ms: int = auto_fetch_interval_ms
+        self._auto_fetch_interval_ms: int = 60_000
         self._auto_fetch_timer = QTimer(self)
-        self._auto_fetch_timer.setInterval(auto_fetch_interval_ms)
         self._auto_fetch_timer.setSingleShot(False)
         self._auto_fetch_timer.timeout.connect(self._on_auto_fetch_tick)
+        self.set_auto_fetch_interval_ms(auto_fetch_interval_ms)
 
         # Forward errors from child VMs so the UI has a single place
         # to listen (e.g. the status bar).
@@ -1182,7 +1192,10 @@ class MainViewModel(QObject):
         from src.viewmodels.commands import DiscardFileCommand
 
         self._log("discard", f"Discarding changes for {path!r}")
-        command = DiscardFileCommand(self._repo_manager, path)
+        config = load_config(self._config_path or default_config_path())
+        command = DiscardFileCommand(
+            self._repo_manager, path, max_backup_bytes=config["discard_file_max_backup_bytes"],
+        )
         try:
             self._command_processor.execute(command)
         except GitError as exc:
