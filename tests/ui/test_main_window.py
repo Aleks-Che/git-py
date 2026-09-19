@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pygit2
@@ -9,6 +10,33 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 from src.core.repository import RepositoryManager
 from src.ui.main_window import MainWindow
+from src.utils.config import save_config
+
+
+def test_focus_refresh_shows_new_edits_to_staged_file(qtbot, committed_repo, tmp_path):
+    config = tmp_path / "window.json"
+    save_config(config, {"worktree_refresh_interval_ms": 60_000})
+    window = MainWindow(config_path=config)
+    qtbot.addWidget(window)
+    # Finish the initial deferred config restore before binding the test repo.
+    qtbot.wait(10)
+    window.set_repository(committed_repo)
+    vm = window._main_vm
+    panel = vm.commit_panel_view_model()
+    root = Path(committed_repo.path)
+    (root / "hello.txt").write_bytes(b"staged version\n")
+    vm.stage_file("hello.txt")
+    staged_tree = committed_repo.repo.index.write_tree()
+    (root / "hello.txt").write_bytes(b"saved in editor after staging\n")
+    assert panel.unstaged_paths() == []
+
+    QApplication.instance().applicationStateChanged.emit(Qt.ApplicationState.ApplicationActive)
+    qtbot.waitUntil(lambda: panel.unstaged_paths() == ["hello.txt"], timeout=5000)
+    qtbot.waitUntil(lambda: not vm.is_busy())
+    assert panel.staged_files() == ["hello.txt"]
+    assert pygit2.Repository(str(root)).index.write_tree() == staged_tree
+    window.close()
+    assert not vm._worktree_refresh_timer.isActive()
 
 
 def test_main_window_builds(qtbot) -> None:

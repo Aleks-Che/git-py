@@ -38,10 +38,9 @@ class _CloseTabButton(QWidget):
     style‑sheet or platform‑style padding is added — the tab bar
     sees exactly the size we report.
 
-    The :attr:`clicked_signal` carries no payload (H16): the index
-    of the tab to close is resolved at emit-time by the slot via
-    :meth:`QTabBar.tabAt` so a stale cached index cannot survive a
-    drag-and-drop reorder of the tab bar.
+    The :attr:`clicked_signal` carries the click position in the parent
+    tab bar's coordinates. The slot resolves the current tab via
+    :meth:`QTabBar.tabAt`, without caching its index on the button.
     """
 
     clicked_signal = Signal(QPoint)
@@ -70,11 +69,9 @@ class _CloseTabButton(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            # H16: ship the click position (in *tab-bar* coordinates)
-            # so the slot can call ``QTabBar.tabAt(pos)`` and resolve
-            # the current tab — the index is no longer cached on the
-            # button instance and therefore survives DnD reorder.
-            self.clicked_signal.emit(event.pos())
+            # Mouse events are local to this button; tabAt needs coordinates
+            # in its parent QTabBar, including the tab's current offset.
+            self.clicked_signal.emit(self.mapToParent(event.position().toPoint()))
 
     def paintEvent(self, _event: object) -> None:  # noqa: N802
         if not self._hovered:
@@ -123,6 +120,7 @@ class RepoBarWidget(QWidget):
         self._tab_bar.setMouseTracking(True)
         self._tab_bar.installEventFilter(self)
         self._tab_bar.currentChanged.connect(self._on_tab_selected)
+        self._tab_bar.tabMoved.connect(self._on_tab_moved)
         self._tab_bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tab_bar.customContextMenuRequested.connect(self._on_tab_context_menu)
         layout.addWidget(self._tab_bar, stretch=1)
@@ -185,6 +183,8 @@ class RepoBarWidget(QWidget):
     # ----- internals ----------------------------------------------------
 
     def _rebuild_tabs(self, paths: list[str]) -> None:
+        if self._updating_tab_bar:
+            return
         self._close_buttons.clear()
         self._updating_tab_bar = True
         self._tab_bar.blockSignals(True)
@@ -221,18 +221,27 @@ class RepoBarWidget(QWidget):
         if 0 <= index < self._tab_bar.count():
             self._vm.set_active_tab(index)
 
+    def _on_tab_moved(self, source: int, destination: int) -> None:
+        # Qt has already moved the tabs and their buttons. Update the model
+        # without rebuilding widgets while Qt is handling the drag.
+        self._updating_tab_bar = True
+        try:
+            self._vm.move_tab(source, destination)
+        finally:
+            self._updating_tab_bar = False
+        self._close_buttons = {
+            index: self._tab_bar.tabButton(index, QTabBar.ButtonPosition.RightSide)
+            for index in range(self._tab_bar.count())
+        }
+        self._set_hovered_tab(-1)
+
     def _on_tab_close_requested(self, local_pos: QPoint) -> None:
         """Resolve the clicked tab via :meth:`QTabBar.tabAt` (H16).
 
-        The position is delivered in the tab-bar's local coordinate
-        system (the button re-broadcast ``mousePressEvent``'s
-        ``event.pos()``); we then call ``tabAt`` so the index is
-        always the *current* one — a drag-and-drop reorder or an
-        external :meth:`removeTab` cannot leave a stale cached
-        index behind.
-
-        Falls back to ``-1`` so the VM sees "no such tab" instead of
-        a bogus close.
+        The button maps its local mouse position to tab-bar coordinates.
+        Tab order is synchronised with the ViewModel after a drag, so the
+        hit index identifies the same repository in the widget and model.
+        A click outside the tabs is ignored.
         """
         index = self._tab_bar.tabAt(local_pos)
         if index < 0 or index >= self._tab_bar.count():

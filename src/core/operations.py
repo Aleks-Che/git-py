@@ -131,14 +131,20 @@ def commit_changes(
     file is added to the index first. Untracked files are *not* staged
     — add them explicitly via the ViewModel layer.
 
+    Read the index from disk before committing: another Git client or a
+    worker may have changed it since this repository handle was opened.
+    Unless supplied explicitly, the committer uses the author's signature.
+
     Returns the :class:`CommitInfo` of the new commit.
     """
     if not message or not message.strip():
         raise GitError("Commit message must not be empty.")
     author = author or _now_signature()
-    committer = committer or _now_signature()
+    committer = committer or author
     with unwrap(repo) as r:
         try:
+            index = r.index
+            index.read(force=True)
             if stage_all:
                 # ``Index.add_all()`` without a pathspec also stages WT_NEW
                 # entries. Build an explicit pathspec so "stage all" means
@@ -153,9 +159,9 @@ def commit_changes(
                     if flags & tracked_change_flags and not flags & excluded_flags
                 ]
                 if tracked_paths:
-                    r.index.add_all(tracked_paths)
-                r.index.write()
-            tree_oid = r.index.write_tree()
+                    index.add_all(tracked_paths)
+                index.write()
+            tree_oid = index.write_tree()
             parents = [] if r.head_is_unborn else [r.head.target]
             commit_oid = r.create_commit(
                 "HEAD",
@@ -166,7 +172,7 @@ def commit_changes(
                 parents,
             )
             return _to_commit_info(r[commit_oid])
-        except (KeyError, TypeError, ValueError, pygit2.GitError) as exc:
+        except (KeyError, TypeError, ValueError, OSError, pygit2.GitError) as exc:
             raise GitError(f"Commit failed: {exc}") from exc
 
 
@@ -3017,12 +3023,14 @@ def add_to_gitignore(
     gitignore_path = Path(workdir) / ".gitignore"
     try:
         gitignore_path.parent.mkdir(parents=True, exist_ok=True)
-        existing = []
+        existing = ""
         if gitignore_path.exists():
-            existing = gitignore_path.read_text(encoding="utf-8").splitlines()
-        if pattern in existing:
+            existing = gitignore_path.read_text(encoding="utf-8")
+        if pattern in existing.splitlines():
             return  # already ignored
         with gitignore_path.open("a", encoding="utf-8") as f:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
             f.write(pattern + "\n")
     except OSError as exc:
         raise GitError(f"Failed to write .gitignore: {exc}") from exc

@@ -223,6 +223,8 @@ class MainWindow(QMainWindow):
         Thin shim over :meth:`MainViewModel.set_repository` kept for
         Stage 2 tests (``test_graph_widget.py::test_main_window_wires_graph_view_model``).
         """
+        if not self._main_vm.commit_panel_view_model().file_editor.finish_editing():
+            return
         self._repo_manager = manager
         self._main_vm.set_repository(manager)
         if manager is not None:
@@ -241,6 +243,8 @@ class MainWindow(QMainWindow):
         freezing the UI.
         """
         debug_print("[repo] _open_repository_async start")
+        if not self._main_vm.commit_panel_view_model().file_editor.finish_editing():
+            return
         self._repo_manager = manager
         debug_print("[repo] calling set_repository(refresh=False)...")
         self._main_vm.set_repository(manager, refresh=False)
@@ -284,6 +288,7 @@ class MainWindow(QMainWindow):
         self._repo_bar.show_folder_requested.connect(self._on_show_repo_folder)
         self._repo_bar.copy_path_requested.connect(self._on_copy_repo_path)
         self._repo_tabs_vm.active_tab_changed.connect(self._on_tab_changed)
+        self._main_vm.open_worktree_requested.connect(self._repo_tabs_vm.add_tab)
 
     def _on_add_repository(self) -> None:
         """Show ``OpenOrCloneDialog`` when the ``+`` tab is clicked."""
@@ -309,7 +314,10 @@ class MainWindow(QMainWindow):
         To avoid a signal feedback loop the ``active_tab_changed``
         signal is temporarily disconnected during the restoration.
         """
-        if self._main_vm.is_busy():
+        if (
+            self._main_vm.is_busy()
+            or not self._main_vm.commit_panel_view_model().file_editor.finish_editing()
+        ):
             current = self._main_vm.repository_manager()
             if current is not None and current.path is not None:
                 # Temporarily unhook to avoid triggering
@@ -376,7 +384,7 @@ class MainWindow(QMainWindow):
             QKeySequence(load_hotkey(self._config, "undo", "Ctrl+Z")),
         )
         self._action_undo.setEnabled(False)
-        self._action_undo.triggered.connect(self._main_vm.undo)
+        self._action_undo.triggered.connect(self._on_undo)
         edit_menu.addAction(self._action_undo)
 
         self._action_redo = QAction("&Redo", self)
@@ -384,7 +392,7 @@ class MainWindow(QMainWindow):
             QKeySequence(load_hotkey(self._config, "redo", "Ctrl+Y")),
         )
         self._action_redo.setEnabled(False)
-        self._action_redo.triggered.connect(self._main_vm.redo)
+        self._action_redo.triggered.connect(self._on_redo)
         edit_menu.addAction(self._action_redo)
 
         remote_menu = bar.addMenu("&Remote")
@@ -538,9 +546,26 @@ class MainWindow(QMainWindow):
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, search_toolbar)
 
     def _update_undo_redo_actions(self) -> None:
+        if hasattr(self, "_diff_view") and self._diff_view.is_editing():
+            ready = not self._main_vm.is_busy()
+            self._action_undo.setEnabled(ready and self._diff_view.can_undo_edit())
+            self._action_redo.setEnabled(ready and self._diff_view.can_redo_edit())
+            return
         proc = self._main_vm.command_processor()
-        self._action_undo.setEnabled(proc.can_undo)
-        self._action_redo.setEnabled(proc.can_redo)
+        self._action_undo.setEnabled(proc.can_undo and not self._main_vm.is_busy())
+        self._action_redo.setEnabled(proc.can_redo and not self._main_vm.is_busy())
+
+    def _on_undo(self) -> None:
+        if self._diff_view.is_editing():
+            self._diff_view.undo_edit()
+        else:
+            self._main_vm.undo()
+
+    def _on_redo(self) -> None:
+        if self._diff_view.is_editing():
+            self._diff_view.redo_edit()
+        else:
+            self._main_vm.redo()
 
     def _build_central(self) -> None:
         self._left_panel = LeftPanel(
@@ -558,6 +583,7 @@ class MainWindow(QMainWindow):
         # behaviour (click-same-commit-toggles-off) lives in
         # MainViewModel.select_commit.
         self._graph_table.commit_selected.connect(self._main_vm.select_commit)
+        self._graph_table.open_worktree_requested.connect(self._main_vm.open_worktree)
 
         # Wire context-menu actions from the graph table.
         self._graph_table.checkout_commit_requested.connect(
@@ -675,6 +701,18 @@ class MainWindow(QMainWindow):
         # switch between graph and diff view.
         cp_vm = self._main_vm.commit_panel_view_model()
         cp_vm.selected_file_changed.connect(self._on_commit_file_selected)
+        editor_vm = cp_vm.file_editor
+        self._diff_view.edit_requested.connect(self._on_file_edit_requested)
+        self._diff_view.edit_exit_requested.connect(self._on_file_edit_exit_requested)
+        self._diff_view.save_requested.connect(editor_vm.save_file)
+        self._diff_view.cancel_requested.connect(cp_vm.cancel_file_editing)
+        self._diff_view.file_text_changed.connect(editor_vm.set_text)
+        self._diff_view.editor_history_changed.connect(self._update_undo_redo_actions)
+        self._diff_view.set_save_shortcut(
+            QKeySequence(load_hotkey(self._config, "save_file", "Ctrl+S")),
+        )
+        editor_vm.text_loaded.connect(self._diff_view.set_file_text)
+        editor_vm.state_changed.connect(self._sync_file_editor)
         cp_vm.diff_loading_changed.connect(
             lambda loading: self._on_diff_loading_changed(loading, cp_vm),
         )
@@ -806,12 +844,9 @@ class MainWindow(QMainWindow):
         repo = self._main_vm.repository_manager()
         if repo is None or not repo.is_open:
             return
-        dialog = ConflictResolutionDialog(repo, path, self)
-        dialog.resolved.connect(
-            lambda text, p=path: self._main_vm.resolve_conflict(p, text),
-        )
-        dialog.resolved_bytes.connect(
-            lambda data, p=path: self._main_vm.resolve_conflict_bytes(p, data),
+        dialog = ConflictResolutionDialog(repo, path, self, config_path=self._config_path)
+        dialog.save_result = lambda data: self._main_vm.resolve_conflict_bytes(
+            path, data, snapshot=dialog.viewmodel.snapshot,
         )
         dialog.exec()
 
@@ -827,6 +862,7 @@ class MainWindow(QMainWindow):
     def _on_commit_file_selected(self, path: str | None) -> None:
         cp_vm = self._main_vm.commit_panel_view_model()
         self._diff_source = cp_vm if path is not None else None
+        self._diff_view.set_edit_available(path is not None and not is_image_path(path))
         mode: DiffLineActionMode | None = None
         if path is not None and cp_vm.selected_file_supports_line_actions():
             mode = (
@@ -838,12 +874,15 @@ class MainWindow(QMainWindow):
         self._on_selected_file_changed(path)
 
     def _on_commit_detail_file_selected(self, path: str | None) -> None:
+        self._diff_view.set_edit_available(False)
         self._diff_source = self._right_panel._commit_detail if path is not None else None
         self._diff_view.set_line_action_mode(None)
         self._on_selected_file_changed(path)
 
     def _on_diff_line_action_requested(self, line) -> None:
         cp_vm = self._main_vm.commit_panel_view_model()
+        if cp_vm.file_editor.active:
+            return
         path = cp_vm.selected_file()
         if path is None or not cp_vm.selected_file_supports_line_actions():
             return
@@ -851,6 +890,23 @@ class MainWindow(QMainWindow):
             self._main_vm.unstage_diff_line(path, line)
         else:
             self._main_vm.stage_diff_line(path, line)
+
+    def _sync_file_editor(self) -> None:
+        editor = self._main_vm.commit_panel_view_model().file_editor
+        self._diff_view.set_edit_state(editor.active, editor.dirty, editor.loading, editor.blocked)
+
+    def _on_file_edit_requested(self, active: bool) -> None:
+        panel = self._main_vm.commit_panel_view_model()
+        if active and self._diff_source is panel:
+            panel.begin_file_editing()
+        elif not active:
+            panel.finish_file_editing()
+        self._sync_file_editor()
+
+    def _on_file_edit_exit_requested(self, mode: DiffViewMode) -> None:
+        if self._main_vm.commit_panel_view_model().finish_file_editing():
+            self._diff_view.set_view_mode(mode)
+            self._maybe_request_full_document()
 
     def _on_selected_file_changed(self, path: str | None) -> None:
         """Switch between graph and diff view when a file is selected.
@@ -949,6 +1005,8 @@ class MainWindow(QMainWindow):
             self._maybe_request_full_document()
 
     def _on_diff_loading_changed(self, loading: bool, source: object) -> None:
+        if self._diff_view.is_editing():
+            return
         if source is self._diff_source:
             if loading and not self._requesting_full_document:
                 self._diff_view.clear()
@@ -969,6 +1027,8 @@ class MainWindow(QMainWindow):
         lands back in :meth:`_on_diff_pair_ready`.
         """
         if self._requesting_full_document:
+            return
+        if self._diff_view.is_editing():
             return
         if self._graph_stack.currentWidget() is not self._diff_view:
             return
@@ -1479,6 +1539,9 @@ class MainWindow(QMainWindow):
         those zeroed-out values and instead fall back to the last
         sizes we observed while the panel was visible.
         """
+        if not self._main_vm.commit_panel_view_model().file_editor.finish_editing():
+            event.ignore()
+            return
         if self._config_path is not None:
             config = load_config(self._config_path)
             config["window_size"] = [self.width(), self.height()]
@@ -1539,6 +1602,8 @@ class MainWindow(QMainWindow):
         self._main_vm.cancel_commit_file_diff()
         self._diff_view.set_loading(False)
         self._main_vm.set_auto_fetch_enabled(False)
+        self._main_vm.stop_worktree_refresh()
+        self._main_vm.release_repository_handles()
         self._terminal.close()
         super().closeEvent(event)
 
@@ -1598,8 +1663,7 @@ class MainWindow(QMainWindow):
             # Restore enabled state for undo/redo based on actual
             # command-processor state; close action is enabled only if
             # a repo is open.
-            self._action_undo.setEnabled(self._main_vm.command_processor().can_undo)
-            self._action_redo.setEnabled(self._main_vm.command_processor().can_redo)
+            self._update_undo_redo_actions()
             self._action_close.setEnabled(self._main_vm.repository_manager() is not None)
             self._status.clearMessage()
         # Disable the toolbar buttons that could race with the worker.

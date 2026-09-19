@@ -68,6 +68,20 @@ class RepoTabViewModel(QObject):
         self.set_active_tab(len(self._tabs) - 1)
         return len(self._tabs) - 1
 
+    def move_tab(self, source: int, destination: int) -> None:
+        """Reorder tabs while keeping the same repository active."""
+        if not (0 <= source < len(self._tabs) and 0 <= destination < len(self._tabs)):
+            return
+        if source == destination:
+            return
+        active_path = self.active_path
+        previous_index = self._active_index
+        self._tabs.insert(destination, self._tabs.pop(source))
+        self._active_index = self._tabs.index(active_path) if active_path is not None else -1
+        self._tabs_changed()
+        if self._active_index != previous_index:
+            self.active_tab_changed.emit(self._active_index)
+
     def remove_tab(self, index: int) -> None:
         """Remove the tab at *index* (the repo itself is untouched).
 

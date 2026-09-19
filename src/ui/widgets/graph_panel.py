@@ -216,6 +216,7 @@ class GraphTableWidget(QWidget):
     """
 
     commit_selected = Signal(str)
+    open_worktree_requested = Signal(str)
     checkout_commit_requested = Signal(str)
     create_tag_requested = Signal(str)  # target commit SHA
     cherry_pick_commit_requested = Signal(str)
@@ -983,6 +984,13 @@ class GraphTableWidget(QWidget):
           :attr:`copy_commit_sha_requested` (the row's full SHA).
         """
         menu = QMenu(self)
+        row = self._row_by_sha(sha)
+        if row and row.get("worktree"):
+            action = menu.addAction("Open worktree in new tab")
+            action.triggered.connect(
+                lambda checked=False: self.open_worktree_requested.emit(sha),
+            )
+            return menu
         if kind == "stash":
             apply_action = menu.addAction("Apply Stash")
             apply_action.triggered.connect(
@@ -3328,7 +3336,7 @@ def _row_kind(row: dict) -> str:
 def _row_subject(row: dict) -> str:
     """Extract subject from a row dict."""
     if row.get("is_uncommitted"):
-        return "WIP: Uncommitted changes"
+        return row.get("subject") or "WIP: Uncommitted changes"
     commit = row.get("commit")
     if commit is not None:
         return commit.get("subject", "")

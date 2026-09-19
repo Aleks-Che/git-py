@@ -21,8 +21,10 @@ from pathlib import Path
 import pygit2
 from PySide6.QtCore import QObject, Signal
 
+from src.core.conflict_resolution import ConflictSnapshot, write_resolution
 from src.core.diff_parser import ParsedDiffLine
 from src.core.exceptions import GitError, MergeConflictError
+from src.core.file_edit import TextFileSnapshot, replace_text_file
 from src.core.operations import (
     DEFAULT_PUSH_TIMEOUT_SECONDS,
     abort_merge,
@@ -1860,6 +1862,29 @@ class StashSingleFileCommand(GitCommand):
         return f"stash {self._path}"
 
 
+class SaveFileCommand(GitCommand):
+    """Save worktree text without staging; Undo/Redo preserve later disk edits."""
+
+    def __init__(self, snapshot: TextFileSnapshot, text: str) -> None:
+        self._snapshot = snapshot
+        self._data = snapshot.encode(text)
+        self.is_noop = self._data == snapshot.data
+
+    def execute(self) -> None:
+        replace_text_file(
+            self._snapshot.root, self._snapshot.path, self._snapshot.data, self._data,
+        )
+
+    def undo(self) -> None:
+        replace_text_file(
+            self._snapshot.root, self._snapshot.path, self._data, self._snapshot.data,
+        )
+
+    @property
+    def name(self) -> str:
+        return f"save {self._snapshot.path}"
+
+
 class IgnoreCommand(GitCommand):
     """Add a pattern to ``.gitignore``; undo removes the last line.
 
@@ -2094,6 +2119,31 @@ class ContinueRebaseCommand(GitCommand):
             raise GitError("Original rebase HEAD is missing; cannot undo.")
         ensure_safe_tree_update(self._repo, self._previous_oid, "undo rebase")
         reset(self._repo, self._previous_oid, mode="hard")
+
+
+class ResolveConflictCommand(GitCommand):
+    """Stage a guarded resolution as part of the current merge/rebase transaction.
+
+    The enclosing operation owns Undo: recording this intermediate index edit
+    would leave an unusable undo entry after CompleteMerge resets the worktree.
+    """
+
+    is_noop = True
+
+    def __init__(self, repo_manager, snapshot: ConflictSnapshot, data: bytes) -> None:
+        self._repo = repo_manager
+        self._snapshot = snapshot
+        self._data = data
+
+    @property
+    def name(self) -> str:
+        return "ResolveConflict"
+
+    def execute(self) -> None:
+        write_resolution(self._repo, self._snapshot, self._data)
+
+    def undo(self) -> None:
+        pass  # The enclosing merge/rebase command owns rollback.
 
 
 class CompleteMergeCommand(GitCommand):

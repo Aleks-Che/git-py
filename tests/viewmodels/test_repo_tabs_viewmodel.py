@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from PySide6.QtWidgets import QApplication
 from src.viewmodels.repo_tabs_viewmodel import RepoTabViewModel
 
@@ -37,6 +38,58 @@ def _add(vm: RepoTabViewModel, base: Path, name: str) -> str:
 
 def _tabs_as_set(vm: RepoTabViewModel) -> set[Path]:
     return {Path(p).resolve() for p in vm.tabs}
+
+
+@pytest.mark.parametrize(
+    "source,destination,active,expected_order,expected_active",
+    [
+        (2, 0, 2, [2, 0, 1], 0),  # Move the active tab left.
+        (0, 2, 0, [1, 2, 0], 2),  # Move the active tab right.
+        (2, 0, 1, [2, 0, 1], 2),  # Move another tab across the active one.
+        (0, 2, 1, [1, 2, 0], 0),
+        (1, 2, 0, [0, 2, 1], 0),  # Active index stays unchanged.
+        (0, 2, -1, [1, 2, 0], -1),  # No active repository.
+    ],
+)
+def test_move_tab_preserves_active_repository_and_saved_order(
+    qapp, tmp_path, source, destination, active, expected_order, expected_active,
+):
+    vm = RepoTabViewModel()
+    for name in ("a", "b", "c"):
+        _add(vm, tmp_path, name)
+    paths = vm.tabs
+    vm.set_active_tab(active)
+    active_path = vm.active_path
+    tab_changes = []
+    active_changes = []
+    vm.tabs_changed.connect(lambda paths: tab_changes.append((paths, vm.active_path)))
+    vm.active_tab_changed.connect(active_changes.append)
+
+    vm.move_tab(source, destination)
+
+    expected = [paths[index] for index in expected_order]
+    assert vm.tabs == expected
+    assert vm.active_path == active_path
+    assert vm.active_index == expected_active
+    assert tab_changes == [(expected, active_path)]
+    assert active_changes == ([expected_active] if active != expected_active else [])
+    assert vm.save_to_state() == {"paths": expected, "active_path": active_path}
+
+
+@pytest.mark.parametrize("source,destination", [(-1, 0), (0, -1), (2, 0), (0, 2), (0, 0)])
+def test_move_tab_invalid_or_unchanged_indices_are_noop(qapp, tmp_path, source, destination):
+    vm = RepoTabViewModel()
+    _add(vm, tmp_path, "a")
+    _add(vm, tmp_path, "b")
+    before = vm.save_to_state()
+    signals = []
+    vm.tabs_changed.connect(signals.append)
+    vm.active_tab_changed.connect(signals.append)
+
+    vm.move_tab(source, destination)
+
+    assert vm.save_to_state() == before
+    assert signals == []
 
 
 # ----- remove_tab (existing contract, kept here too) --------------------

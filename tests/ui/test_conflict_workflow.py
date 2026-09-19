@@ -120,6 +120,59 @@ def test_conflict_resolve_dialog_routes_to_vm(
     window.close()
 
 
+@pytest.mark.parametrize("change", ["worktree", "index", "head"])
+def test_resolution_rejects_external_changes(committed_repo, change):
+    from src.core.conflict_resolution import load_conflict
+
+    _ensure_app()
+    _build_conflict(committed_repo)
+    vm = MainViewModel()
+    vm.set_repository(committed_repo)
+    vm.merge_branch("feature")
+    snapshot = load_conflict(committed_repo, "hello.txt")
+    target = Path(committed_repo.path) / "hello.txt"
+    if change == "worktree":
+        target.write_bytes(b"external edit\n")
+    elif change == "index":
+        committed_repo.repo.index.add("hello.txt")
+        committed_repo.repo.index.write()
+    else:
+        create_branch(committed_repo, "other")
+        committed_repo.repo.set_head("refs/heads/other")
+    expected = target.read_bytes()
+    errors = []
+    vm.error_occurred.connect(errors.append)
+    assert not vm.resolve_conflict_bytes("hello.txt", b"AI draft\n", snapshot=snapshot)
+    assert errors
+    assert target.read_bytes() == expected
+
+
+def test_resolution_routes_through_command_processor_and_preserves_crlf(
+    committed_repo, monkeypatch,
+):
+    from src.core.conflict_resolution import load_conflict
+    from src.viewmodels.commands import ResolveConflictCommand
+
+    _ensure_app()
+    _build_conflict(committed_repo)
+    vm = MainViewModel()
+    vm.set_repository(committed_repo)
+    vm.merge_branch("feature")
+    snapshot = load_conflict(committed_repo, "hello.txt")
+    commands = []
+    execute = vm.command_processor().execute
+
+    def record(command):
+        commands.append(command)
+        return execute(command)
+
+    monkeypatch.setattr(vm.command_processor(), "execute", record)
+    assert vm.resolve_conflict_bytes("hello.txt", b"result\r\n", snapshot=snapshot)
+    assert isinstance(commands[0], ResolveConflictCommand)
+    assert (Path(committed_repo.path) / "hello.txt").read_bytes() == b"result\r\n"
+    assert vm.conflict_state() is None
+
+
 def test_conflict_abort_rolls_back_merge(
     qtbot,
     committed_repo: RepositoryManager,

@@ -67,20 +67,22 @@ def test_dialog_initializes_with_no_conflict(qtbot) -> None:
     dialog.show()
     # No conflict loaded yet — all panels empty.
     assert dialog.ours_view.toPlainText() == ""  # noqa: SLF001
-    assert dialog.base_view.toPlainText() == ""  # noqa: SLF001
+    assert not hasattr(dialog, "base_view")
     assert dialog.theirs_view.toPlainText() == ""  # noqa: SLF001
     assert dialog.result_text() == ""
 
 
-def test_dialog_loads_three_sides_from_index(qtbot, tmp_path: Path) -> None:
+def test_dialog_loads_two_sides_from_index(qtbot, tmp_path: Path) -> None:
     mgr = _build_conflict_repo(tmp_path)
     _trigger_conflict(mgr)
     dialog = ConflictResolutionDialog(mgr, "hello.txt")
     qtbot.addWidget(dialog)
     dialog.show()
-    assert dialog.ours_view.toPlainText() == "main says hi\n"  # noqa: SLF001
-    assert dialog.base_view.toPlainText() == "common\n"  # noqa: SLF001
-    assert dialog.theirs_view.toPlainText() == "feature says hi\n"  # noqa: SLF001
+    assert dialog.ours_view.toPlainText() == "main says hi"
+    assert dialog.viewmodel.snapshot.base == b"common\n"
+    assert dialog.theirs_view.toPlainText() == "feature says hi"
+    assert "main" in dialog.ours_check.toolTip()
+    assert "feature" in dialog.theirs_check.toolTip()
 
 
 def test_dialog_set_conflict_via_method(qtbot, tmp_path: Path) -> None:
@@ -90,8 +92,8 @@ def test_dialog_set_conflict_via_method(qtbot, tmp_path: Path) -> None:
     qtbot.addWidget(dialog)
     dialog.show()
     dialog.set_conflict(mgr, "hello.txt")
-    assert dialog.ours_view.toPlainText() == "main says hi\n"  # noqa: SLF001
-    assert dialog.theirs_view.toPlainText() == "feature says hi\n"  # noqa: SLF001
+    assert dialog.ours_view.toPlainText() == "main says hi"
+    assert dialog.theirs_view.toPlainText() == "feature says hi"
 
 
 def test_dialog_path_label_updates(qtbot, tmp_path: Path) -> None:
@@ -110,7 +112,7 @@ def test_accept_ours_copies_to_result(qtbot, tmp_path: Path) -> None:
     _trigger_conflict(mgr)
     dialog = ConflictResolutionDialog(mgr, "hello.txt")
     qtbot.addWidget(dialog)
-    dialog._accept_ours_btn.click()  # noqa: SLF001
+    dialog.ours_check.click()
     assert dialog.result_text() == "main says hi\n"
 
 
@@ -119,7 +121,7 @@ def test_accept_theirs_copies_to_result(qtbot, tmp_path: Path) -> None:
     _trigger_conflict(mgr)
     dialog = ConflictResolutionDialog(mgr, "hello.txt")
     qtbot.addWidget(dialog)
-    dialog._accept_theirs_btn.click()  # noqa: SLF001
+    dialog.theirs_check.click()
     assert dialog.result_text() == "feature says hi\n"
 
 
@@ -128,8 +130,9 @@ def test_accept_both_concatenates(qtbot, tmp_path: Path) -> None:
     _trigger_conflict(mgr)
     dialog = ConflictResolutionDialog(mgr, "hello.txt")
     qtbot.addWidget(dialog)
-    dialog._accept_both_btn.click()  # noqa: SLF001
-    assert dialog.result_text() == "main says hi\n\nfeature says hi\n"
+    dialog.ours_check.click()
+    dialog.theirs_check.click()
+    assert dialog.result_text() == "main says hi\nfeature says hi\n"
 
 
 def test_result_view_is_editable(qtbot, tmp_path: Path) -> None:

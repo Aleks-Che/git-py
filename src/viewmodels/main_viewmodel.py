@@ -38,7 +38,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pygit2
-from PySide6.QtCore import QObject, QThreadPool, QTimer, Signal, Slot
+from PySide6.QtCore import QAbstractEventDispatcher, QObject, QThreadPool, QTimer, Signal, Slot
 
 from src.core.diff_parser import ParsedDiffLine
 from src.core.exceptions import (
@@ -49,6 +49,7 @@ from src.core.exceptions import (
 )
 from src.core.models import BranchAttribution, RemoteInfo
 from src.core.repository import RepositoryManager
+from src.core.worktree_status import read_other_worktree_changes, read_worktree_status
 from src.utils.async_worker import AsyncWorker
 from src.utils.config import (
     default_config_path,
@@ -89,6 +90,8 @@ def _guard_mutation(method):
             )
             self._log("busy", f"{method.__name__} rejected: another op in progress", level="warn")
             return None
+        if not self._commit_panel_view_model.file_editor.finish_editing():
+            return None
         return method(self, *args, **kwargs)
 
     return wrapper
@@ -104,6 +107,7 @@ class MainViewModel(QObject):
     log_message = Signal(str)  # human-readable timestamped log line
     recently_created_changed = Signal(object)  # set[str] — branches newly created in this session
     selection_changed = Signal(object)  # str | None — currently selected SHA, or WIP_SHA, or None
+    open_worktree_requested = Signal(str)  # worktree path to open in a repository tab
     # Commit-detail loading (right panel). The payload is the requested
     # SHA, the ``CommitInfo`` (or ``None`` when unknown) and the list of
     # ``FileChange``. Results may arrive synchronously (cache hit /
@@ -152,9 +156,12 @@ class MainViewModel(QObject):
         self._graph_view_model = GraphViewModel(
             None, self, async_enabled=async_enabled, history_limit=config["graph_history_limit"],
         )
+        self._graph_view_model.graph_updated.connect(self._on_worktree_graph_updated)
         self._commit_panel_view_model = CommitPanelViewModel(
             self, config_path=self._config_path, async_enabled=async_enabled,
+            command_processor=self._command_processor,
         )
+        self.busy_changed.connect(self._commit_panel_view_model.file_editor.set_blocked)
         self.busy_changed.connect(self._commit_panel_view_model.invalidate_generation)
         self._branch_panel_view_model = BranchPanelViewModel(self)
         # ``None`` means "no conflict in progress". When a dict is
@@ -200,6 +207,19 @@ class MainViewModel(QObject):
         self._auto_fetch_timer.timeout.connect(self._on_auto_fetch_tick)
         self.set_auto_fetch_interval_ms(auto_fetch_interval_ms)
 
+        self._worktree_refresh_timer = QTimer(self)
+        self._worktree_refresh_timer.setInterval(config["worktree_refresh_interval_ms"])
+        self._worktree_refresh_timer.timeout.connect(self.refresh_worktree)
+        self._worktree_refresh_worker: AsyncWorker | None = None
+        self._worktree_refresh_revision = 0
+        self._worktree_selected_version = None
+        self._worktree_refresh_error = ""
+        self._refresh_pending = False
+        self._commit_panel_view_model.file_changes_changed.connect(
+            self._invalidate_worktree_refresh,
+        )
+        self.busy_changed.connect(self._on_refresh_busy_changed)
+
         # Forward errors from child VMs so the UI has a single place
         # to listen (e.g. the status bar).
         self._graph_view_model.error_occurred.connect(self.error_occurred)
@@ -244,6 +264,22 @@ class MainViewModel(QObject):
         # Reference count of in-flight lightweight background reads;
         # drives ``activity_changed`` (spinner only, no mutation guard).
         self._activity_count: int = 0
+
+        # Release libgit2's cached pack mappings whenever GUI work settles.
+        # Worker tasks own separate managers and release theirs in close().
+        # Connecting a QObject slot also disconnects it when this VM is deleted.
+        dispatcher = QAbstractEventDispatcher.instance(self.thread())
+        if dispatcher is not None:
+            dispatcher.aboutToBlock.connect(self.release_repository_handles)
+
+    @Slot()
+    def release_repository_handles(self) -> None:
+        """Let external Git tools replace pack files while the client is idle."""
+        if self._repo_manager is not None:
+            try:
+                self._repo_manager.release_handles()
+            except GitError as exc:
+                self.error_occurred.emit(str(exc))
 
     # ----- destructive-action confirmation ------------------------------
 
@@ -383,6 +419,8 @@ class MainViewModel(QObject):
         any async worker that captured the previous token will see
         its result dropped in ``_on_result`` (R2.2 C7).
         """
+        if not self._commit_panel_view_model.file_editor.finish_editing():
+            return
         # Bump the generation token first so even a refused call
         # invalidates pending workers whose result might otherwise
         # slip into the (unchanged) current VM state.
@@ -403,6 +441,10 @@ class MainViewModel(QObject):
             self._log("repo", f"set_repository({new_path}) refused: busy", level="warn")
             return
 
+        self.stop_worktree_refresh()
+        self._worktree_selected_version = None
+        self._worktree_refresh_error = ""
+        self.release_repository_handles()
         self._repo_manager = manager
         self._command_processor.clear()
         self._clear_conflict_state()
@@ -441,6 +483,8 @@ class MainViewModel(QObject):
 
         self.repository_changed.emit(manager.path)
         self._restore_in_progress_operation()
+        if self._async_enabled and manager.is_open and not manager.is_bare:
+            self._worktree_refresh_timer.start()
 
     def _restore_in_progress_operation(self) -> None:
         """Re-enter the conflict state when Git reports an unfinished op.
@@ -551,10 +595,13 @@ class MainViewModel(QObject):
             worker_repo.open(repo_path)
             debug_print(f"[worker::bg] open took {_wt.monotonic() - _t0:.2f}s")
             try:
+                file_changes, staged, raw_status = (
+                    CommitPanelViewModel._compute_status_data(worker_repo)
+                )
                 debug_print("[worker::bg] _compute_graph...")
                 _t1 = _wt.monotonic()
                 rows, err = GraphViewModel._compute_graph(
-                    worker_repo, history_limit=history_limit,
+                    worker_repo, history_limit=history_limit, raw_status=raw_status,
                 )
                 _elapsed = _wt.monotonic() - _t1
                 _nrows = len(rows) if rows else 0
@@ -573,17 +620,6 @@ class MainViewModel(QObject):
                     )
                 except (GitError, pygit2.GitError, OSError):
                     truncated_count = 0
-                debug_print("[worker::bg] _compute_status_data...")
-                _t2 = _wt.monotonic()
-                file_changes, staged, raw_status = (
-                    CommitPanelViewModel._compute_status_data(worker_repo)
-                )
-                _elapsed2 = _wt.monotonic() - _t2
-                _nchanges = len(file_changes)
-                debug_print(
-                    f"[worker::bg] _compute_status_data took {_elapsed2:.2f}s, "
-                    f"changes={_nchanges}"
-                )
                 debug_print("[worker::bg] _compute_branch_data...")
                 _t3 = _wt.monotonic()
                 branch_data = (
@@ -632,13 +668,10 @@ class MainViewModel(QObject):
 
             self._graph_view_model._truncated_count = data.get("truncated_count", 0)
             self._graph_view_model.graph_updated.emit(rows)
-            self._commit_panel_view_model._file_changes = file_changes
-            self._commit_panel_view_model._staged_files = staged
-            self._commit_panel_view_model._raw_status = raw_status
-            self._commit_panel_view_model.file_changes_changed.emit()
-            self._commit_panel_view_model.staged_files_changed.emit(
-                sorted(staged),
+            self._commit_panel_view_model.apply_status_data(
+                file_changes, staged, raw_status,
             )
+            self._commit_panel_view_model.recompute_selected_diff()
             self._branch_panel_view_model._apply_branch_data(branch_data)
             debug_print("[worker::ui] data applied, calling _on_repo_load_finished")
             self._on_repo_load_finished()
@@ -845,12 +878,34 @@ class MainViewModel(QObject):
         """
         if sha == self._selected_commit_sha:
             return
+        if not self._commit_panel_view_model.file_editor.finish_editing():
+            return
         self._selected_commit_sha = sha
         self.selection_changed.emit(sha)
 
     def selected_commit_sha(self) -> str | None:
         """Return the currently selected commit SHA, ``WIP_SHA``, or ``None``."""
         return self._selected_commit_sha
+
+    def _on_worktree_graph_updated(self, _rows: list[dict]) -> None:
+        selected = self._selected_commit_sha
+        if selected and selected.startswith("WIP:"):
+            if self._graph_view_model.worktree_changes(selected) is None:
+                self.set_selected_commit(None)
+            else:
+                self.selection_changed.emit(selected)
+
+    def open_worktree(self, node_id: str | None = None) -> None:
+        """Request a repository tab for the selected sibling worktree."""
+        if self._is_busy:
+            self.error_occurred.emit("Another operation is in progress — wait until it completes.")
+            return
+        entry = self._graph_view_model.worktree_changes(node_id or self._selected_commit_sha)
+        if entry is None:
+            return
+        if not self._commit_panel_view_model.file_editor.finish_editing():
+            return
+        self.open_worktree_requested.emit(entry.path)
 
     def refresh_state(self) -> None:
         """Re-read the repository state from disk and refresh every panel.
@@ -861,9 +916,9 @@ class MainViewModel(QObject):
         Also a useful escape hatch for manual refresh — the toolbar
         or a keyboard shortcut can be wired to it later.
 
-        No-op when no repository is open or when a long-running async
-        operation is in flight. In either case the current panel state is
-        preserved; callers can retry after the operation completes.
+        No-op when no repository is open. While a long-running async
+        operation is in flight, preserve the panel state and defer the
+        refresh until that operation completes.
 
         When ``async_enabled`` is on (production) the refresh is routed
         through :meth:`load_repository_data`, which does the heavy
@@ -881,6 +936,7 @@ class MainViewModel(QObject):
         if self._repo_manager is None or not self._repo_manager.is_open:
             return
         if self._is_busy:
+            self._refresh_pending = True
             return
         self._log("refresh", "Refreshing repository state from disk")
         if self._async_enabled:
@@ -891,6 +947,105 @@ class MainViewModel(QObject):
         except GitError as exc:
             self.error_occurred.emit(f"Failed to refresh: {exc}")
             self._log("refresh", f"Refresh failed: {exc}", level="error")
+
+    def _invalidate_worktree_refresh(self) -> None:
+        self._worktree_refresh_revision += 1
+
+    def stop_worktree_refresh(self) -> None:
+        """Stop monitoring and discard late reads without waiting for a worker."""
+        self._worktree_refresh_timer.stop()
+        self._invalidate_worktree_refresh()
+        self._refresh_pending = False
+
+    def _on_refresh_busy_changed(self, busy: bool) -> None:
+        self._invalidate_worktree_refresh()
+        if not busy and self._refresh_pending:
+            QTimer.singleShot(0, self._retry_pending_refresh)
+
+    def _retry_pending_refresh(self) -> None:
+        if self._refresh_pending:
+            self._refresh_pending = False
+            self.refresh_state()
+
+    def refresh_worktree(self) -> None:
+        """Poll local changes off the GUI thread; never stage files or block commands."""
+        manager = self._repo_manager
+        if (
+            self._is_busy or self._worktree_refresh_worker is not None
+            or not self._worktree_refresh_timer.isActive()
+            or manager is None or not manager.is_open
+        ):
+            return
+        panel = self._commit_panel_view_model
+        path = manager.path
+        revision = self._worktree_refresh_revision
+        selected = panel.selected_file()
+        staged_side = panel.selected_file_is_staged()
+        previous_count = len(panel.file_changes())
+        previous_worktrees = self._graph_view_model.other_worktrees()
+        history_limit = self._graph_view_model.history_limit
+
+        def read():
+            worker_manager = RepositoryManager(path)
+            try:
+                snapshot = read_worktree_status(worker_manager, selected, staged_side)
+                changes = worker_manager.get_status_from_raw(snapshot.raw_status)
+                staged = CommitPanelViewModel._compute_staged_files_from_raw(snapshot.raw_status)
+                other_worktrees = read_other_worktree_changes(worker_manager)
+                rows = None
+                error = None
+                # Rebuild only when a WIP count, checkout, branch or HEAD changes.
+                # Ordinary saves and idle ticks must not walk the entire history.
+                if len(changes) != previous_count or other_worktrees != previous_worktrees:
+                    rows, error = GraphViewModel._compute_graph(
+                        worker_manager, history_limit=history_limit,
+                        other_worktrees=other_worktrees,
+                        raw_status=snapshot.raw_status,
+                    )
+                return snapshot, changes, staged, rows, error
+            finally:
+                worker_manager.close()
+
+        def apply(result):
+            if revision != self._worktree_refresh_revision:
+                return
+            self._worktree_refresh_error = ""
+            snapshot, changes, staged, rows, graph_error = result
+            changed = snapshot.raw_status != panel._raw_status
+            if changed:
+                panel.apply_status_data(changes, staged, snapshot.raw_status)
+            if rows is not None:
+                self._graph_view_model.graph_updated.emit(rows)
+            if graph_error is not None:
+                self._log("refresh", f"WIP graph refresh failed: {graph_error}", level="error")
+            if (selected, staged_side) == (
+                panel.selected_file(), panel.selected_file_is_staged(),
+            ) and selected is not None:
+                if changed or snapshot.selected_version != self._worktree_selected_version:
+                    self._worktree_selected_version = snapshot.selected_version
+                    panel.recompute_selected_diff()
+
+        def fail(error):
+            if revision != self._worktree_refresh_revision:
+                return
+            message = f"Working-tree refresh failed: {error}"
+            if message != self._worktree_refresh_error:
+                self._worktree_refresh_error = message
+                self.error_occurred.emit(message)
+
+        def finish():
+            self._worktree_refresh_worker = None
+            # Leave a full idle interval after a slow scan instead of polling
+            # continuously whenever its duration exceeds the timer interval.
+            if self._worktree_refresh_timer.isActive():
+                self._worktree_refresh_timer.start()
+
+        worker = AsyncWorker(read)
+        self._worktree_refresh_worker = worker
+        worker.signals.finished.connect(apply)
+        worker.signals.failed.connect(fail)
+        worker.signals.lifespan_finished.connect(finish)
+        QThreadPool.globalInstance().start(worker)
 
     @_guard_mutation
     def undo(self) -> None:
@@ -1409,7 +1564,7 @@ class MainViewModel(QObject):
         self._log("checkout", f"Checkout {name!r} — switching HEAD to refs/heads/{name}")
         # Log pre-checkout working-tree state for diagnostics.
         try:
-            status = self._repo_manager.repo.status()
+            status = self._repo_manager.get_raw_status()
             dirty_pre = [p for p, _ in status.items()]
             if dirty_pre:
                 self._log(
@@ -2946,7 +3101,10 @@ class MainViewModel(QObject):
         def _work() -> None:
             manager = RepositoryManager()
             ssh_key = self._ssh_key_path()
-            manager.clone(url, path, ssh_key_path=ssh_key)
+            try:
+                manager.clone(url, path, ssh_key_path=ssh_key)
+            finally:
+                manager.close()
 
         def _on_success(_: object) -> None:
             if generation != self._async_generation:
@@ -3031,7 +3189,7 @@ class MainViewModel(QObject):
         if self._is_busy:
             return
         try:
-            if self._repo_manager.repo.status():
+            if self._repo_manager.get_raw_status():
                 return  # working tree is dirty — skip auto-fetch
         except Exception:
             pass
@@ -3055,67 +3213,43 @@ class MainViewModel(QObject):
         On errors the failure is surfaced through
         :attr:`error_occurred` and the conflict state is unchanged.
         """
+        self.resolve_conflict_bytes(path, resolution.encode("utf-8"))
+
+    @_guard_mutation
+    def resolve_conflict_bytes(self, path: str, resolution: bytes, *, snapshot=None) -> bool:
+        """Stage exact bytes through a command, retaining encoding and line endings.
+
+        The editor passes its original snapshot to reject external changes made
+        while the draft was open. A failed save leaves that draft in the dialog.
+        """
         if self._repo_manager is None or not self._repo_manager.is_open:
             self.error_occurred.emit("No repository open.")
-            return
+            return False
         if self._conflict_state is None:
             self.error_occurred.emit("No conflict in progress.")
-            return
+            return False
         if self._repo_manager.path is None:
             self.error_occurred.emit("Repository has no working directory.")
-            return
-        from pathlib import Path
+            return False
+        from src.core.conflict_resolution import load_conflict
+        from src.viewmodels.commands import ResolveConflictCommand
 
         self._log("conflict", f"Resolving conflict in {path!r}")
 
         try:
-            full_path = Path(self._repo_manager.path) / path
-            full_path.parent.mkdir(parents=True, exist_ok=True)
-            full_path.write_text(resolution, encoding="utf-8")
-            self._repo_manager.repo.index.read(force=True)
-            self._repo_manager.repo.index.add(path)
-            self._repo_manager.repo.index.write()
-        except (OSError, ValueError, pygit2.GitError) as exc:
+            snapshot = snapshot or load_conflict(self._repo_manager, path)
+            if snapshot.path != path:
+                raise GitError("The resolution belongs to a different file.")
+            self._command_processor.execute(
+                ResolveConflictCommand(self._repo_manager, snapshot, resolution),
+            )
+        except GitError as exc:
             self.error_occurred.emit(f"Failed to resolve {path!r}: {exc}")
             self._log("conflict", f"Failed to write resolution for {path!r}: {exc}", level="error")
-            return
+            return False
 
         self._finalize_resolved_path(path)
-
-    @_guard_mutation
-    def resolve_conflict_bytes(self, path: str, resolution: bytes) -> None:
-        """Binary twin of :meth:`resolve_conflict`.
-
-        Writes raw bytes (e.g. the chosen side of a binary conflict
-        from the resolution dialog) instead of UTF-8 text — encoding
-        a binary payload as text would corrupt it.
-        """
-        if self._repo_manager is None or not self._repo_manager.is_open:
-            self.error_occurred.emit("No repository open.")
-            return
-        if self._conflict_state is None:
-            self.error_occurred.emit("No conflict in progress.")
-            return
-        if self._repo_manager.path is None:
-            self.error_occurred.emit("Repository has no working directory.")
-            return
-        from pathlib import Path
-
-        self._log("conflict", f"Resolving binary conflict in {path!r}")
-
-        try:
-            full_path = Path(self._repo_manager.path) / path
-            full_path.parent.mkdir(parents=True, exist_ok=True)
-            full_path.write_bytes(resolution)
-            self._repo_manager.repo.index.read(force=True)
-            self._repo_manager.repo.index.add(path)
-            self._repo_manager.repo.index.write()
-        except (OSError, ValueError, pygit2.GitError) as exc:
-            self.error_occurred.emit(f"Failed to resolve {path!r}: {exc}")
-            self._log("conflict", f"Failed to write resolution for {path!r}: {exc}", level="error")
-            return
-
-        self._finalize_resolved_path(path)
+        return True
 
     def _finalize_resolved_path(self, path: str) -> None:
         """Drop ``path`` from the conflict list; finish the op when done."""
@@ -3325,7 +3459,7 @@ class MainViewModel(QObject):
             head_tree = r[r.head.target].tree
             source_tree = source_commit.tree
             diff = r.diff(head_tree, source_tree)
-            return sum(1 for _ in diff)
+            return sum(1 for _ in diff.deltas)
         except GitError:
             return 0
 

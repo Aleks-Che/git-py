@@ -4,6 +4,8 @@ import threading
 from dataclasses import replace
 from pathlib import Path
 
+import pygit2
+import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog, QLineEdit
 from src.ui.dialogs.ai_prompts_dialog import AIPromptsDialog
@@ -13,6 +15,94 @@ from src.utils.ai_client import AIClient, AIError, CommitMessage
 from src.utils.ai_config import PROMPT_PRESETS, AISettings
 from src.utils.config import load_config, save_config
 from src.viewmodels.main_viewmodel import MainViewModel
+
+
+@pytest.mark.parametrize("generate_message", [False, True])
+@pytest.mark.parametrize("stage_in_client", [False, True])
+def test_commit_after_external_commit_and_background_refresh(
+    qtbot, committed_repo, tmp_path, monkeypatch, generate_message, stage_in_client,
+):
+    root = Path(committed_repo.path)
+    config_path = tmp_path / "settings.json"
+    save_config(config_path, {
+        "use_default_git_credentials": False,
+        "author_name": "Actual User",
+        "author_email": "user@example.com",
+        "ai": AISettings(base_url="http://localhost/v1", model="test").to_dict(),
+    })
+    vm = MainViewModel(config_path=config_path, async_enabled=True)
+    vm.set_repository(committed_repo)
+    panel = CommitPanel(vm)
+    qtbot.addWidget(panel)
+    errors = []
+    vm.error_occurred.connect(errors.append)
+    old_tree = committed_repo.repo.index.write_tree()
+
+    # GitKraken/CLI advances HEAD while the application keeps its old index.
+    external = pygit2.Repository(str(root))
+    signature = pygit2.Signature("External User", "external@example.com")
+    (root / "external.txt").write_bytes(b"keep the external commit\n")
+    (root / "deleted.txt").write_bytes(b"delete in the next commit\n")
+    external.index.add_all()
+    external.index.write()
+    external_head = external.create_commit(
+        "HEAD", signature, signature, "external commit", external.index.write_tree(),
+        [external.head.target],
+    )
+    (root / "hello.txt").write_bytes(b"next version\n")
+    (root / "added.txt").write_bytes(b"new file\n")
+    (root / "deleted.txt").unlink()
+    expected_index = pygit2.Repository(str(root)).index
+    expected_index.add_all()
+    expected_tree = expected_index.write_tree()
+    if not stage_in_client:
+        expected_index.write()
+
+    # The real background refresh updates displayed data via its own handle.
+    vm.load_repository_data()
+    qtbot.waitUntil(lambda: not vm.is_busy(), timeout=5000)
+    if stage_in_client:
+        assert panel._stage_all_button.isEnabled()
+        panel._stage_all_button.click()
+    assert not vm.commit_panel_view_model().unstaged_paths()
+    assert set(vm.commit_panel_view_model().staged_files()) == {
+        "hello.txt", "added.txt", "deleted.txt",
+    }
+    index_path = Path(external.path) / "index"
+    index_before_generation = index_path.read_bytes()
+    head_before_generation = external.head.target
+    messages = []
+
+    def generate(_client, diff, _branch):
+        messages.append(diff)
+        return CommitMessage("feat: next changes", "Generated from the staged files")
+
+    monkeypatch.setattr(AIClient, "generate_commit_message", generate)
+    if generate_message:
+        panel._generate_action.trigger()
+        qtbot.waitUntil(lambda: not vm.commit_panel_view_model().is_generating, timeout=5000)
+        assert len(messages) == 1
+        assert 'Added: "added.txt"' in messages[0]
+        assert 'Deleted: "deleted.txt"' in messages[0]
+        assert "external.txt" not in messages[0]
+    else:
+        panel._summary.setText("Manual message")
+    assert index_path.read_bytes() == index_before_generation
+    assert external.head.target == head_before_generation
+    assert not vm.command_processor().can_undo
+    assert panel._commit_button.isEnabled()
+    panel._commit_button.click()
+
+    fresh = pygit2.Repository(str(root))
+    commit = fresh.head.peel()
+    assert not errors
+    assert commit.parent_ids == [external_head]
+    assert commit.tree_id == expected_tree != old_tree
+    assert fresh.status() == {}
+    assert commit.author == commit.committer
+    assert commit.committer.email == "user@example.com"
+    assert vm.commit_panel_view_model().file_changes() == []
+    assert vm.command_processor().can_undo
 
 
 def test_settings_round_trip_preserves_unrelated_keys_and_masks_key(qtbot, tmp_path):

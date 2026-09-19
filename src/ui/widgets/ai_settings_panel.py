@@ -53,7 +53,7 @@ class AISettingsPanel(QWidget):
         self._prompt_settings = settings
         self._vm = AISettingsViewModel(self)
         layout = QVBoxLayout(self)
-        intro = QLabel("Generate a commit summary and description from staged changes.")
+        intro = QLabel("Generate commit messages and resolve merge conflicts with AI.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
         form = QFormLayout()
@@ -103,6 +103,7 @@ class AISettingsPanel(QWidget):
         layout.addStretch()
         note = QLabel(
             "Generation sends staged diffs and the branch name to this server. "
+            "Conflict resolution sends conflicting regions and nearby context. "
             "Test connection sends only a short test message. Settings are saved with OK.",
         )
         note.setWordWrap(True)
@@ -188,5 +189,6 @@ class AISettingsPanel(QWidget):
     def _refresh_prompt_label(self) -> None:
         style = PROMPT_PRESETS.get(self._prompt_settings.preset, ("Custom", ""))[0]
         self._prompt_label.setText(
-            f"Commit message language: {self._prompt_settings.language} · Style: {style}",
+            f"Commit message language: {self._prompt_settings.language} · Style: {style}\n"
+            f"Conflict prompt language: {self._prompt_settings.conflict_language}",
         )

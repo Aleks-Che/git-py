@@ -21,6 +21,7 @@ import os
 from copy import deepcopy
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from threading import Lock
 from typing import TYPE_CHECKING, Any
 
 from src.core.operations import DEFAULT_PUSH_TIMEOUT_SECONDS
@@ -50,6 +51,10 @@ SPLITTER_KEY_GRAPH = "graph"
 # Value is ``{repo_path: [branch_lbl_w, graph_w, commit_msg_w]}``.
 GRAPH_CONFIGS_KEY = "graph_configs"
 
+# Concurrent MoveFileEx calls targeting the same JSON can fail with WinError 5.
+# Serialize only replacement; independent temporary files can still be prepared in parallel.
+_CONFIG_REPLACE_LOCK = Lock()
+
 _DEFAULT_CONFIG: dict[str, Any] = {
     "ai": AISettings().to_dict(),
     "theme": "dark",
@@ -57,6 +62,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "hotkeys": {
         "undo": "Ctrl+Z",
         "redo": "Ctrl+Y",
+        "save_file": "Ctrl+S",
         "fetch": "Ctrl+Shift+F",
         "pull": "Ctrl+Shift+P",
         "push": "Ctrl+Shift+U",
@@ -73,6 +79,8 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     # Whether the auto-fetch timer is enabled. Default off; the UI
     # toggle (Stage 9) will flip this on first launch.
     "auto_fetch_enabled": False,
+    # Local filesystem polling, independent of network auto-fetch.
+    "worktree_refresh_interval_ms": 1000,
     # Total duration of a push through the SSH CLI transport, in seconds.
     "push_timeout_seconds": DEFAULT_PUSH_TIMEOUT_SECONDS,
     # Persisted window size. Filled in by :class:`MainWindow` on
@@ -102,6 +110,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     # values so deployments can tune safety/performance without code changes.
     "command_processor_history_size": 100,
     "discard_file_max_backup_bytes": 1024 * 1024,
+    "file_editor_max_bytes": 2 * 1024 * 1024,
     # Diff-view mode in the centre pane (``"changes_only"`` or
     # ``"full_document"``). Restored on launch, persisted on close.
     # See :class:`src.ui.widgets.diff_view_widget.DiffViewWidget`.
@@ -122,8 +131,10 @@ _MAX_QT_INT = 2**31 - 1
 _INT_RANGES = {
     "merge_async_threshold": (0, _MAX_QT_INT),
     "auto_fetch_interval_ms": (-_MAX_QT_INT, _MAX_QT_INT),
+    "worktree_refresh_interval_ms": (100, 60_000),
     "command_processor_history_size": (1, _MAX_QT_INT),
     "discard_file_max_backup_bytes": (0, _MAX_QT_INT),
+    "file_editor_max_bytes": (1, _MAX_QT_INT),
     "graph_history_limit": (1, _MAX_QT_INT),
     "push_timeout_seconds": (1, MAX_PUSH_TIMEOUT_SECONDS),
 }
@@ -218,7 +229,7 @@ def normalize_config(data: dict[str, Any]) -> dict[str, Any]:
     if not _is_path_string(config.get("active_repo")):
         config["active_repo"] = None
     # Validate known nested fields without discarding extension keys.
-    config["ai"].update(AISettings.from_config(config).to_dict())
+    config["ai"].update(AISettings.from_config(data).to_dict())
     for action, default in defaults["hotkeys"].items():
         config["hotkeys"][action] = load_hotkey(config, action, default)
     if not isinstance(config.get(GRAPH_CONFIGS_KEY, {}), dict):
@@ -267,7 +278,8 @@ def save_config(path: Path | str, data: dict[str, Any]) -> None:
                 # fsync isn't supported on some filesystems (e.g. some FUSE
                 # mounts); the rename is still atomic, so swallow.
                 pass
-        os.replace(tmp, p)
+        with _CONFIG_REPLACE_LOCK:
+            os.replace(tmp, p)
     except Exception:
         if tmp is not None:
             tmp.unlink(missing_ok=True)

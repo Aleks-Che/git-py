@@ -716,6 +716,8 @@ def build_graph(
             commit_color_index = color_assigner.assign_main_color(lane, primary_branch)
         else:
             commit_color_index = color_assigner.assign_color(lane, primary_branch)
+        if commit.kind == "wip":
+            commit_color_index = UNCOMMITTED_COLOR_INDEX
         oid_color_index[commit.sha] = commit_color_index
         lane_color_index[lane] = commit_color_index
 
@@ -1127,6 +1129,7 @@ def build_graph(
                 color_index=final_color_index,
                 branch_names=branch_names,
                 is_head=is_head,
+                is_uncommitted=commit.kind == "wip",
                 cells=cells,
             )
         )

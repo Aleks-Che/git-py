@@ -1,6 +1,6 @@
 """Right panel: container that swaps the WIP and commit-detail views.
 
-The right side of the main window has two distinct modes:
+The right side of the main window has three distinct modes:
 
 * **Commit-input mode** — :class:`CommitPanel` is shown. This is the
   state when the user has selected the WIP (uncommitted-changes) node
@@ -9,12 +9,14 @@ The right side of the main window has two distinct modes:
 * **Commit-detail mode** — :class:`CommitDetailPanel` is shown. This
   is the state when the user has selected a real commit. Read-only
   message / info / file list.
+* **Other-worktree mode** — branch, path, changed-file count and a button
+  requesting a repository tab for that checkout.
 
 The panel is hidden entirely when no commit is selected. The
 :class:`MainViewModel.selection_changed` signal is the single source
 of truth for which mode (if any) is active: ``None`` → hidden,
-``WIP_SHA`` → commit-input, anything else → commit-detail for that
-SHA.
+``WIP_SHA`` → commit-input, a sibling WIP ID → worktree navigation,
+and a real SHA → commit-detail.
 
 A *click-same-commit-toggles-off* policy is implemented at the VM
 level (see :meth:`MainViewModel.select_commit`); the panel just
@@ -22,7 +24,8 @@ reacts to the resulting ``selection_changed`` emissions.
 """
 from __future__ import annotations
 
-from PySide6.QtWidgets import QStackedWidget, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QLabel, QPushButton, QStackedWidget, QVBoxLayout, QWidget
 
 from src.viewmodels.graph_viewmodel import WIP_SHA
 from src.viewmodels.main_viewmodel import MainViewModel
@@ -34,7 +37,7 @@ from .commit_panel import CommitPanel
 class RightPanel(QWidget):
     """Top-level container for the right side of the main window.
 
-    The widget is a thin shell: it owns the two sub-panels and shows
+    The widget is a thin shell: it owns the sub-panels and shows
     exactly one of them (or nothing) at a time. It is driven by
     :attr:`MainViewModel.selection_changed` — a single signal connects
     the central VM to the panel's visible state.
@@ -46,10 +49,29 @@ class RightPanel(QWidget):
 
         self._commit_input = CommitPanel(main_view_model, self)
         self._commit_detail = CommitDetailPanel(main_view_model, self)
+        self._worktree_panel = QWidget(self)
+        worktree_layout = QVBoxLayout(self._worktree_panel)
+        title = QLabel("Uncommitted changes in another worktree", self._worktree_panel)
+        title.setWordWrap(True)
+        worktree_layout.addWidget(title)
+        self._worktree_info = QLabel(self._worktree_panel)
+        self._worktree_info.setTextFormat(Qt.TextFormat.PlainText)
+        self._worktree_info.setWordWrap(True)
+        self._worktree_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        worktree_layout.addWidget(self._worktree_info)
+        self._open_worktree_button = QPushButton("Open worktree in new tab", self._worktree_panel)
+        self._open_worktree_button.clicked.connect(lambda: self._main_vm.open_worktree())
+        self._main_vm.busy_changed.connect(
+            lambda busy: self._open_worktree_button.setEnabled(not busy),
+        )
+        self._open_worktree_button.setEnabled(not self._main_vm.is_busy())
+        worktree_layout.addWidget(self._open_worktree_button)
+        worktree_layout.addStretch()
 
         self._stack = QStackedWidget(self)
         self._stack.addWidget(self._commit_input)   # index 0
         self._stack.addWidget(self._commit_detail)  # index 1
+        self._stack.addWidget(self._worktree_panel)  # index 2
         self._stack.setCurrentIndex(0)
 
         layout = QVBoxLayout(self)
@@ -72,8 +94,8 @@ class RightPanel(QWidget):
     def _on_selection_changed(self, sha: str | None) -> None:
         """Show / hide the panel and pick the right sub-view.
 
-        ``None`` → hidden. ``WIP_SHA`` → commit-input. Any other
-        value → commit-detail populated for that SHA.
+        ``None`` → hidden, ``WIP_SHA`` → commit-input, sibling WIP →
+        worktree navigation, real SHA → commit-detail.
 
         When leaving the WIP / commit-input view the file selection
         in the commit panel VM is cleared so the diff view (which
@@ -89,7 +111,17 @@ class RightPanel(QWidget):
             self.setVisible(False)
             return
         self.setVisible(True)
-        if sha == WIP_SHA:
+        worktree = self._main_vm.graph_view_model().worktree_changes(sha)
+        if worktree is not None:
+            self._main_vm.commit_panel_view_model().select_file(None)
+            self._commit_detail.select_file(None)
+            branch = worktree.branch or "Detached HEAD"
+            self._worktree_info.setText(
+                f"Branch: {branch}\n\n{worktree.path}\n\n"
+                f"{worktree.count} changed file(s)",
+            )
+            self._stack.setCurrentIndex(2)
+        elif sha == WIP_SHA:
             self._commit_detail.select_file(None)
             self._stack.setCurrentIndex(0)
             self._commit_input._refresh_all()
