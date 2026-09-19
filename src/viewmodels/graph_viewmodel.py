@@ -28,7 +28,11 @@ from src.core.graph_v2 import (
 )
 from src.core.models import CommitInfo, StashInfo
 from src.core.repository import RepositoryManager
-from src.core.worktree_status import WorktreeChanges, read_other_worktree_changes
+from src.core.worktree_status import (
+    WorktreeChanges,
+    read_branch_worktrees,
+    read_other_worktree_changes,
+)
 from src.utils.async_worker import AsyncWorker
 from src.utils.config import default_config_path, get_int, load_config
 from src.utils.debug_mode import dump_graph, is_debug_mode
@@ -146,6 +150,7 @@ class GraphViewModel(QObject):
         super().__init__(parent)
         self._repo: RepositoryManager | None = repo_manager
         self._other_worktrees: dict[str, WorktreeChanges] = {}
+        self._branch_worktrees: dict[str, str] = {}
         self.graph_updated.connect(self._remember_worktrees)
         # R3.1 (P2): cap the visible history.  When ``history_limit``
         # is ``None`` we read the value from the user config; an
@@ -204,6 +209,7 @@ class GraphViewModel(QObject):
         """
         self._repo = manager
         self._other_worktrees = {}
+        self._branch_worktrees = {}
         # Reset the infinite-scroll window: a different repository
         # starts at one page regardless of how far the user scrolled
         # the previous one.  The generation bump also invalidates any
@@ -218,6 +224,7 @@ class GraphViewModel(QObject):
         return self._repo
 
     def _remember_worktrees(self, rows: list[dict]) -> None:
+        self._branch_worktrees = dict(rows[0].get("branch_worktrees", {})) if rows else {}
         self._other_worktrees = {
             row["sha"]: row["worktree"] for row in rows if row.get("worktree")
         }
@@ -227,6 +234,10 @@ class GraphViewModel(QObject):
 
     def other_worktrees(self) -> list[WorktreeChanges]:
         return sorted(self._other_worktrees.values(), key=lambda entry: entry.path)
+
+    def branch_worktrees(self) -> dict[str, str]:
+        """Latest branch-to-checkout snapshot, including clean and off-screen worktrees."""
+        return dict(self._branch_worktrees)
 
     @property
     def history_limit(self) -> int:
@@ -530,6 +541,7 @@ class GraphViewModel(QObject):
         history_limit: int = DEFAULT_GRAPH_HISTORY_LIMIT,
         other_worktrees: list[WorktreeChanges] | None = None,
         raw_status: dict[str, int] | None = None,
+        branch_worktrees: dict[str, str] | None = None,
     ) -> tuple[list[dict], str | None]:
         """Pure data-in/data-out — safe for background threads.
 
@@ -542,6 +554,8 @@ class GraphViewModel(QObject):
         walks the un-truncated history.
         """
         try:
+            if branch_worktrees is None:
+                branch_worktrees = read_branch_worktrees(repo, error_callback)
             if other_worktrees is None:
                 other_worktrees = read_other_worktree_changes(repo, error_callback)
             extra_tips = [w.head_sha for w in other_worktrees if w.head_sha and w.branch is None]
@@ -620,6 +634,10 @@ class GraphViewModel(QObject):
             dump_graph(layout, stash_sha_set)
 
         rows = graph_to_dicts(layout)
+        # Carry the full snapshot through sync, async and paginated graph updates.
+        # Keeping off-screen branches prevents repeated refreshes with a history cap.
+        if rows:
+            rows[0]["branch_worktrees"] = branch_worktrees
 
         # Enrich rows with refs and branch_refs for the widget.
         refs_by_sha = _build_refs_map(tags, head_target)
@@ -629,6 +647,9 @@ class GraphViewModel(QObject):
             sha = commit["sha"] if commit else ""
             row["refs"] = refs_by_sha.get(sha, [])
             row["branch_refs"] = [b.to_dict() for b in branch_refs_by_sha.get(sha, [])]
+            for branch in row["branch_refs"]:
+                if not branch.get("is_remote") and branch["name"] in branch_worktrees:
+                    branch["worktree_path"] = branch_worktrees[branch["name"]]
 
             # Backward-compatible flat keys.
             if row.get("is_uncommitted") and not commit:

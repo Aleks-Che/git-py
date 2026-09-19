@@ -84,18 +84,28 @@ def find_branch_worktree(manager: RepositoryManager, branch_name: str) -> str | 
     def fail(message: str) -> None:
         raise GitError(message)
 
-    for path in _other_worktree_paths(manager, fail):
+    return read_branch_worktrees(manager, fail).get(branch_name)
+
+
+def read_branch_worktrees(
+    manager: RepositoryManager,
+    error_callback: Callable[[str], None] | None = None,
+) -> dict[str, str]:
+    """Map local branches to sibling checkout paths using HEAD, without status scans."""
+    result = {}
+    for path in _other_worktree_paths(manager, error_callback):
         sibling = RepositoryManager()
         try:
             sibling.open(str(path))
-            head = sibling.repo.lookup_reference("HEAD")
-            if head.target == f"refs/heads/{branch_name}":
-                return path.as_posix()
+            target = sibling.repo.lookup_reference("HEAD").target
+            if isinstance(target, str) and target.startswith("refs/heads/"):
+                result[target[len("refs/heads/"):]] = path.as_posix()
         except (GitError, pygit2.GitError, OSError, ValueError, KeyError) as exc:
-            raise GitError(f"Cannot read worktree {path}: {exc}") from exc
+            if error_callback:
+                error_callback(f"Cannot read worktree {path}: {exc}")
         finally:
             sibling.close()
-    return None
+    return result
 
 
 def read_other_worktree_changes(

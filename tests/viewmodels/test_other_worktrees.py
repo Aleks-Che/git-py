@@ -9,6 +9,63 @@ from src.viewmodels.graph_viewmodel import GraphViewModel
 from src.viewmodels.main_viewmodel import MainViewModel
 
 
+def test_clean_worktree_marks_only_its_local_branch_and_clears_on_detach(
+    committed_repo, linked_worktree,
+):
+    branch = linked_worktree.repo.head.shorthand
+    committed_repo.repo.create_reference(f"refs/remotes/origin/{branch}",
+                                         linked_worktree.repo.head.target)
+    rows, error = GraphViewModel._compute_graph(committed_repo)
+    assert error is None
+    refs = {b["name"]: b for row in rows for b in row["branch_refs"]}
+    assert refs[branch]["worktree_path"] == Path(linked_worktree.path).as_posix()
+    assert "worktree_path" not in refs[f"origin/{branch}"]
+    assert "worktree_path" not in refs["main"]
+    assert not any(row.get("worktree") for row in rows)
+    linked_worktree.repo.set_head(linked_worktree.repo.head.target)
+    rows, error = GraphViewModel._compute_graph(committed_repo)
+    assert error is None
+    assert not any(b.get("worktree_path") for row in rows for b in row["branch_refs"])
+
+
+def test_monitor_tracks_clean_worktree_branches_outside_visible_history(
+    qtbot, committed_repo, linked_worktree, tmp_path, monkeypatch,
+):
+    repo = committed_repo.repo
+    head = repo.head.peel()
+    repo.create_commit("HEAD", head.author, head.committer, "new main tip", head.tree_id, [head.id])
+    config = tmp_path / "settings.json"
+    save_config(config, {"worktree_refresh_interval_ms": 100, "graph_history_limit": 1})
+    vm = MainViewModel(config_path=config, async_enabled=True)
+    vm.set_repository(committed_repo)
+    graph = vm.graph_view_model()
+    branch = linked_worktree.repo.head.shorthand
+    expected = {branch: Path(linked_worktree.path).as_posix()}
+    assert graph.branch_worktrees() == expected
+    calls = []
+    original = GraphViewModel._compute_graph
+
+    def compute(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(GraphViewModel, "_compute_graph", compute)
+    try:
+        qtbot.wait(300)
+        assert calls == []
+        linked_worktree.repo.set_head(linked_worktree.repo.head.target)
+        qtbot.waitUntil(lambda: graph.branch_worktrees() == {})
+        assert graph.other_worktrees() == []
+        linked_worktree.repo.set_head(f"refs/heads/{branch}")
+        qtbot.waitUntil(lambda: graph.branch_worktrees() == expected)
+        assert len(calls) == 2
+        qtbot.wait(250)
+        assert len(calls) == 2
+    finally:
+        vm.stop_worktree_refresh()
+        qtbot.waitUntil(lambda: vm._worktree_refresh_worker is None)
+
+
 def test_sibling_wip_has_unique_id_own_parent_and_wip_style(committed_repo, linked_worktree):
     repo = linked_worktree.repo
     sig = pygit2.Signature("test", "test@example.com")

@@ -157,6 +157,30 @@ def _icon_pen(color: QColor, width: float) -> QPen:
     return pen
 
 
+def _draw_worktree_icon(
+    painter: QPainter, x: float, cy: float, size: float, color: QColor,
+) -> None:
+    """Draw a small evergreen with a trunk, shared by graph chips and popup rows."""
+    painter.save()
+    painter.translate(x, cy - size / 2)
+    painter.scale(size / 12, size / 12)
+    tree = QPainterPath()
+    tree.moveTo(6, 0.8)
+    tree.lineTo(2.8, 4.4)
+    tree.lineTo(4.3, 4.4)
+    tree.lineTo(1.3, 8.4)
+    tree.lineTo(10.7, 8.4)
+    tree.lineTo(7.7, 4.4)
+    tree.lineTo(9.2, 4.4)
+    tree.closeSubpath()
+    tree.moveTo(6, 8.4)
+    tree.lineTo(6, 11.2)
+    painter.setPen(_icon_pen(color, 1.2))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawPath(tree)
+    painter.restore()
+
+
 # Mapping from CellType integer to cell-type name (for debugging).
 _CELL_TYPE_NAMES: dict[int, int] = {
     0: "EMPTY",
@@ -848,6 +872,8 @@ class GraphTableWidget(QWidget):
 
         content_w = pad
         if primary.get("is_head"):
+            content_w += icon_size + gap
+        if primary.get("worktree_path") and not primary.get("is_remote"):
             content_w += icon_size + gap
         content_w += fm.horizontalAdvance(_branch_display_name(primary))
         if not primary.get("is_remote"):
@@ -1989,6 +2015,7 @@ class GraphTableWidget(QWidget):
         for idx, branch in enumerate(branches_to_render):
             is_head = branch.get("is_head")
             is_remote = branch.get("is_remote")
+            worktree_path = branch.get("worktree_path") if not is_remote else None
             display = _branch_display_name(branch)
             # ``is_remote_only`` distinguishes "remote ref with no
             # same-name local counterpart" from the suppressed-remote
@@ -2001,6 +2028,8 @@ class GraphTableWidget(QWidget):
 
             content_w = pad
             if is_head:
+                content_w += icon_size + gap
+            if worktree_path:
                 content_w += icon_size + gap
             content_w += text_w
             if not is_remote:
@@ -2074,6 +2103,7 @@ class GraphTableWidget(QWidget):
                 "is_remote": bool(is_remote),
                 "is_remote_only": is_remote_only,
                 "is_head": bool(is_head),
+                "worktree_path": worktree_path,
                 "full_name": branch["name"],
                 "display": display,
                 "row_sha": row_sha,
@@ -2103,6 +2133,10 @@ class GraphTableWidget(QWidget):
                     painter.setPen(_icon_pen(content_color, 1.6))
                     painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
                     painter.drawPath(ck)
+                    inner_x += icon_size + gap
+
+                if worktree_path:
+                    _draw_worktree_icon(painter, inner_x, inner_cy, icon_size, content_color)
                     inner_x += icon_size + gap
 
                 painter.setPen(QPen(content_color))
@@ -3744,6 +3778,24 @@ class BranchStackPopup(QFrame):
                 indicator.setStyleSheet("color: white; font-weight: bold;")
                 indicator.setFixedWidth(12)
                 hbox.addWidget(indicator)
+
+            worktree_path = branch.get("worktree_path") if not branch.get("is_remote") else None
+            if worktree_path:
+                indicator = QLabel(self)
+                indicator.setObjectName("worktree-indicator")
+                size = RenderConfig().branch_icon_size
+                ratio = self.devicePixelRatioF()
+                pixmap = QPixmap(round(size * ratio), round(size * ratio))
+                pixmap.setDevicePixelRatio(ratio)
+                pixmap.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(pixmap)
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                _draw_worktree_icon(painter, 0, size / 2, size, QColor("white"))
+                painter.end()
+                indicator.setPixmap(pixmap)
+                indicator.setFixedSize(size, size)
+                hbox.addWidget(indicator)
+                self.setToolTip(f"Worktree: {worktree_path}")
 
             name_label = QLabel(
                 _branch_display_name(branch) or branch.get("name", ""),

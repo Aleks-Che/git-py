@@ -50,7 +50,11 @@ from src.core.exceptions import (
 )
 from src.core.models import BranchAttribution, RemoteInfo
 from src.core.repository import RepositoryManager
-from src.core.worktree_status import read_other_worktree_changes, read_worktree_status
+from src.core.worktree_status import (
+    read_branch_worktrees,
+    read_other_worktree_changes,
+    read_worktree_status,
+)
 from src.utils.async_worker import AsyncWorker
 from src.utils.config import (
     default_config_path,
@@ -1000,6 +1004,7 @@ class MainViewModel(QObject):
         staged_side = panel.selected_file_is_staged()
         previous_count = len(panel.file_changes())
         previous_worktrees = self._graph_view_model.other_worktrees()
+        previous_branch_worktrees = self._graph_view_model.branch_worktrees()
         history_limit = self._graph_view_model.history_limit
 
         def read():
@@ -1009,15 +1014,20 @@ class MainViewModel(QObject):
                 changes = worker_manager.get_status_from_raw(snapshot.raw_status)
                 staged = CommitPanelViewModel._compute_staged_files_from_raw(snapshot.raw_status)
                 other_worktrees = read_other_worktree_changes(worker_manager)
+                branch_worktrees = read_branch_worktrees(worker_manager)
                 rows = None
                 error = None
                 # Rebuild only when a WIP count, checkout, branch or HEAD changes.
                 # Ordinary saves and idle ticks must not walk the entire history.
-                if len(changes) != previous_count or other_worktrees != previous_worktrees:
+                if (
+                    len(changes) != previous_count or other_worktrees != previous_worktrees
+                    or branch_worktrees != previous_branch_worktrees
+                ):
                     rows, error = GraphViewModel._compute_graph(
                         worker_manager, history_limit=history_limit,
                         other_worktrees=other_worktrees,
                         raw_status=snapshot.raw_status,
+                        branch_worktrees=branch_worktrees,
                     )
                 return snapshot, changes, staged, rows, error
             finally:
