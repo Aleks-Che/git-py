@@ -536,14 +536,33 @@ def build_graph(
         parent for parent, children in parent_children.items() if len(children) >= 2
     }
 
+    # Reserve HEAD's lane for WIP before routing any stash edges. Moving
+    # stash nodes after layout would leave their intervening pipes behind.
+    # A clean worktree needs no reservation: its newest stash can naturally
+    # occupy the same lane as its base commit.
+    has_wip = uncommitted_count is not None and uncommitted_count >= 0
+    reserve_head_lane = has_wip and head_oid in oid_to_row and any(
+        c.kind == "stash" and c.parents and c.parents[0] == head_oid
+        for c in commits[:oid_to_row[head_oid]]
+    )
+    if reserve_head_lane:
+        # WIP is another child of HEAD, though its row is inserted later.
+        # All stash edges must converge at HEAD rather than at a stash.
+        fork_points.add(head_oid)
+
     # Lane tracking: each lane holds the SHA it is currently tracking (or None)
-    lanes: list[str | None] = []
+    lanes: list[str | None] = [head_oid] if reserve_head_lane else []
     nodes: list[GraphNode] = []
     max_lane: int = 0
 
     color_assigner = ColorAssigner()
     oid_color_index: dict[str, int] = {}
     lane_color_index: dict[int, int] = {}
+    if reserve_head_lane:
+        head_names = oid_to_branches.get(head_oid, [])
+        head_color = color_assigner.assign_main_color(0, head_names[0] if head_names else None)
+        oid_color_index[head_oid] = head_color
+        lane_color_index[0] = UNCOMMITTED_COLOR_INDEX
     # Lane -> colour of a pending merge connector: set when a second
     # (non-first) parent is placed on a fresh lane.  Unlike
     # ``lane_color_index`` this is written even for the branch-name
@@ -712,7 +731,7 @@ def build_graph(
                 )
             else:
                 commit_color_index = color_assigner.continue_lane(lane)
-        elif not nodes or all(n.commit is None for n in nodes):
+        elif not reserve_head_lane and (not nodes or all(n.commit is None for n in nodes)):
             commit_color_index = color_assigner.assign_main_color(lane, primary_branch)
         else:
             commit_color_index = color_assigner.assign_color(lane, primary_branch)
@@ -1174,20 +1193,6 @@ def build_graph(
                     lane_color_index.pop(ending_l, None)
                     connector_lane_color.pop(ending_l, None)
 
-    # --- Rebalance stashes above HEAD onto offset lanes -------------------
-    # Without this step, a stash whose first parent is HEAD inherits
-    # lane 0 from the main loop (its parent is HEAD which lives on lane
-    # 0), and the WIP node below then has to take the next free offset
-    # lane — visually putting the WIP marker on a side branch.
-    #
-    # The rebalance moves every stash whose first parent is HEAD to a
-    # fresh offset lane (1, 2, 3, …), updates the stash's own row to
-    # draw a TEE_LEFT (or COMMIT + HORIZONTAL) connection back to HEAD,
-    # and re-renders HEAD's fork connector so it joins every lane that
-    # has a branch into HEAD — including the freshly-shifted stashes
-    # and any pre-existing branches the main loop already placed.
-    max_lane = _rebalance_stashes_for_wip(nodes, head_oid, max_lane, uncommitted_count)
-
     # --- Insert uncommitted changes node ---
     if uncommitted_count is not None and uncommitted_count >= 0:
         head_node_idx: int | None = None
@@ -1317,212 +1322,6 @@ def _is_wip_compatible(
     return True
 
 
-def _rebalance_stashes_for_wip(
-    nodes: list[GraphNode],
-    head_oid: str | None,
-    max_lane: int,
-    uncommitted_count: int | None = None,
-) -> int:
-    """Move stash nodes above HEAD to offset lanes, freeing lane 0 for WIP.
-
-    Stashes above HEAD whose first parent is HEAD are normally assigned
-    lane 0 by the main loop (their parent HEAD lives on lane 0, so the
-    stash inherits the lane when no other commit claims it first).  The
-    WIP insertion step below then has to take the next free offset
-    lane, which puts the WIP marker on a side branch.  This rebalance
-    shifts every such stash to the next free offset lane (1, 2, 3, …)
-    and re-draws the connection in both the stash's row (TEE_LEFT or
-    COMMIT + HORIZONTAL) and HEAD's row (a fresh fork connector that
-    joins all branches into HEAD, including the shifted stashes and
-    any pre-existing branches the main loop already placed).
-
-    The function is a no-op when there are no stashes above HEAD.
-
-    ``uncommitted_count`` — pass the value the caller is about to use
-    for WIP insertion so the rebalance knows whether the head-lane
-    cell it clears will be refilled by a WIP pipe. Clearing the cell
-    when no WIP is coming leaves the lane 0 line with an EMPTY cell
-    that breaks its visual continuity above HEAD (see fix note in
-    the per-stash loop below).
-
-    Returns the updated ``max_lane``.
-    """
-    if head_oid is None:
-        return max_lane
-
-    head_node_idx: int | None = None
-    for i, n in enumerate(nodes):
-        if n.commit is not None and n.commit.sha == head_oid:
-            head_node_idx = i
-            break
-
-    if head_node_idx is None:
-        return max_lane
-
-    # Find stash rows above HEAD whose first parent is HEAD — these are
-    # the only stashes the rebalance needs to move.
-    stash_indices: list[int] = [
-        i
-        for i in range(head_node_idx)
-        if nodes[i].commit is not None
-        and nodes[i].commit.kind == "stash"
-        and nodes[i].commit.parents
-        and nodes[i].commit.parents[0] == head_oid
-    ]
-
-    if not stash_indices:
-        return max_lane
-
-    stash_indices.sort()  # top to bottom in the rendered output
-
-    head_node = nodes[head_node_idx]
-    head_lane = head_node.lane
-    head_color = head_node.color_index
-
-    # Lanes already in use by *non-stash* commits above HEAD — the
-    # stash gets the first offset lane (1, 2, 3, …) that does not
-    # collide with one of these.  Stash lanes are excluded because
-    # the rebalance is about to free them.
-    used_lanes: set[int] = {
-        nodes[i].lane
-        for i in range(head_node_idx)
-        if nodes[i].commit is None or nodes[i].commit.kind != "stash"
-    }
-
-    stash_assignments: list[tuple[int, int]] = []  # (stash_idx, target_lane)
-    next_lane = max(1, head_lane + 1)
-    for stash_idx in stash_indices:
-        while next_lane in used_lanes:
-            next_lane += 1
-        stash_assignments.append((stash_idx, next_lane))
-        used_lanes.add(next_lane)
-        next_lane += 1
-
-    new_max_lane = max(max_lane, max((t for _, t in stash_assignments), default=0))
-    required_cells = (new_max_lane + 1) * 2
-    for node in nodes:
-        while len(node.cells) < required_cells:
-            node.cells.append(CellInfo.empty())
-
-    # --- move each stash to its new lane --------------------------------
-    # Prepare a mapping from lane → owning stash's colour so PIPE cells
-    # drawn at each lane use the correct colour (not all head_color).
-    stash_assignments.sort(key=lambda x: x[0])  # top to bottom
-    single_color_map: dict[int, int] = {}
-    for stash_idx, target_lane in stash_assignments:
-        single_color_map[target_lane] = nodes[stash_idx].color_index
-
-    # Also seed the map with non-stash lanes above HEAD so intermediate
-    # PIPE cells pick up pre-existing branch colours (e.g. a feature
-    # branch on lane 1 while a stash ends up on lane 3).
-    for i in range(head_node_idx):
-        if nodes[i].lane not in single_color_map:
-            single_color_map[nodes[i].lane] = nodes[i].color_index
-
-    for stash_idx, target_lane in stash_assignments:
-        stash = nodes[stash_idx]
-        old_lane = stash.lane
-
-        # Clear the stash's old COMMIT cell so the new position can take over.
-        old_cell_idx = old_lane * 2
-        if old_cell_idx < len(stash.cells):
-            stash.cells[old_cell_idx] = CellInfo.empty()
-        # Also handle the head-lane cell — three cases:
-        #
-        # 1. The stash was already on ``head_lane``: ``old_cell_idx`` IS
-        #    ``head_cell_idx`` so the clear above already emptied it.
-        # 2. The stash was on an offset lane: the cell at ``head_lane``
-        #    is a PIPE drawn by the main loop's active-lane tracking
-        #    and belongs to the lane 0 line above HEAD.
-        # 3. WIP will be inserted: the WIP refill step only writes a new
-        #    PIPE into EMPTY cells, so anything left in the way blocks it.
-        #
-        # Case (2) + no WIP is the visual bug we are fixing: clearing the
-        # PIPE when nothing will refill it leaves an EMPTY cell that
-        # severs the lane 0 line above HEAD.  With WIP (case 3) the clear
-        # is required to make way for the uniform UNCOMMITTED pipe.
-        has_wip = uncommitted_count is not None and uncommitted_count >= 0
-        head_cell_idx = head_lane * 2
-        if head_cell_idx < len(stash.cells) and head_cell_idx != old_cell_idx:
-            if has_wip:
-                stash.cells[head_cell_idx] = CellInfo.empty()
-            # else: preserve the main-loop PIPE — it is the lane 0 line
-            # passing through the stash's row.
-
-        # When the stash moved *away* from ``head_lane``, the cell at
-        # ``head_lane`` was just emptied (it was the stash's old COMMIT).
-        # With WIP, the WIP insertion would have refilled it; without
-        # WIP we restore a PIPE here so the lane 0 line above HEAD stays
-        # continuous through every row.
-        #
-        # Skip the restore at the very top of the graph (``stash_idx ==
-        # 0``): there is no row above to bridge to, so the PIPE would
-        # be an orphan stub that extends ``node_radius`` pixels up into
-        # the empty space above the topmost commit.  An EMPTY cell lets
-        # the bridge from the row below terminate at the topmost row's
-        # commit edge with no dangling stub.
-        if (
-            not has_wip
-            and stash_idx > 0
-            and head_cell_idx < len(stash.cells)
-            and stash.cells[head_cell_idx].cell_type == CellType.EMPTY
-        ):
-            stash.cells[head_cell_idx] = CellInfo.pipe(head_color)
-
-        # Update the stash's lane and draw the commit at its new lane.
-        # No vertical PIPE is added above the stash — the commit's own
-        # upward nub (node_radius) is sufficient, matching how the main
-        # loop renders the topmost commit of a side branch.
-        stash.lane = target_lane
-        new_cell_idx = target_lane * 2
-        stash_color = single_color_map[target_lane]
-        stash.cells[new_cell_idx] = CellInfo.commit(stash_color)
-
-        # Plain COMMIT at the stash's lane — no TEE_LEFT, no HORIZONTAL.
-        # For non-adjacent lanes, add PIPE at intermediate lanes so the
-        # gap bridge maintains vertical continuity through all rows
-        # (matching how the main loop renders side branches between
-        # regular commits — PIPE at every active lane).
-        stash.cells[new_cell_idx] = CellInfo.commit(stash_color)
-        for between_lane in range(head_lane + 1, target_lane):
-            between_cell_idx = between_lane * 2
-            if between_cell_idx >= len(stash.cells):
-                continue
-            existing = stash.cells[between_cell_idx]
-            if existing.cell_type == CellType.EMPTY:
-                lane_color = single_color_map.get(between_lane, head_color)
-                stash.cells[between_cell_idx] = CellInfo.pipe(lane_color)
-
-    # --- rebuild HEAD's fork connector ----------------------------------
-    # Collect every branch above HEAD that shares HEAD as its first
-    # parent — both the stashes we just shifted and any pre-existing
-    # branches the main loop already placed on offset lanes.
-    merging_lanes: list[tuple[int, int]] = []
-    for i in range(head_node_idx):
-        n = nodes[i]
-        if n.commit is not None and n.commit.parents and n.commit.parents[0] == head_oid:
-            merging_lanes.append((n.lane, n.color_index))
-    merging_lanes.sort()
-
-    active_lanes: list[str | None] = [None] * (new_max_lane + 1)
-    fork_cells = _build_fork_connector_cells(
-        head_lane,
-        head_color,
-        merging_lanes,
-        active_lanes,
-        {},
-        {},
-        new_max_lane,
-    )
-
-    # Overlay the fork connector on HEAD's row.  HEAD's PIPE at the
-    # main lane is replaced by TEE_RIGHT, which keeps the vertical line
-    # intact and adds the horizontal that starts the connector.
-    for fci, fc in enumerate(fork_cells):
-        if fc.cell_type != CellType.EMPTY:
-            head_node.cells[fci] = fc
-
-    return new_max_lane
 
 
 def _build_row_cells(

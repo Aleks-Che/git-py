@@ -86,6 +86,8 @@ class ConflictPanel(QFrame):
         """Render a ``conflict_state_changed`` snapshot (or hide)."""
         if not state or not state.get("in_progress"):
             self._operation = None
+            self._files.clear()
+            self._resolve_btn.setEnabled(False)
             self.hide()
             return
         self._operation = state.get("operation")
@@ -105,10 +107,16 @@ class ConflictPanel(QFrame):
         self._subtitle.setText("; ".join(context_bits))
         self._subtitle.setVisible(bool(context_bits))
 
+        selected_path = self._selected_path()
         self._files.clear()
         for path in paths:
             QListWidgetItem(path, self._files)
         has_paths = bool(paths)
+        if has_paths:
+            # Keep the user's file across refreshes; otherwise make Resolve
+            # immediately usable, including when several files conflict.
+            row = paths.index(selected_path) if selected_path in paths else 0
+            self._files.setCurrentRow(row)
         self._resolve_btn.setEnabled(has_paths)
         # Continue is meaningful for the operations the VM can finish
         # (merge / rebase); cherry-pick / revert finish via the normal
@@ -125,7 +133,7 @@ class ConflictPanel(QFrame):
 
     def _selected_path(self) -> str | None:
         item = self._files.currentItem()
-        if item is None and self._files.count() == 1:
+        if item is None and self._files.count():
             item = self._files.item(0)
         return item.text() if item is not None else None
 

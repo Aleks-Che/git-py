@@ -686,7 +686,7 @@ class MainWindow(QMainWindow):
         self._conflict_panel = ConflictPanel(self)
         self._conflict_panel.resolve_requested.connect(self._on_conflict_resolve)
         self._conflict_panel.continue_requested.connect(
-            self._main_vm.continue_operation,
+            self._main_vm.request_continue_operation,
         )
         self._conflict_panel.abort_requested.connect(self._on_conflict_abort)
         self._main_vm.conflict_state_changed.connect(self._conflict_panel.set_state)
@@ -1232,15 +1232,18 @@ class MainWindow(QMainWindow):
 
         ``name`` is the ref name as stored on the chip — local branches
         come through as bare ``"main"``, remote-tracking refs as
-        ``"origin/main"``.  The VM's :meth:`checkout_branch` handles
-        the local case directly; remote refs check whether a local
+        ``"origin/main"``. Local names can also contain slashes; they
+        are looked up before interpreting a remote prefix. The VM's
+        ``request_checkout_branch`` opens the branch's existing worktree
+        tab or performs a local checkout; remote refs check whether a local
         tracking branch exists — if not, the safe fetch+create+checkout
         is used; if it does, the user gets a confirmation dialog asking
         whether to hard-reset the local branch to the remote tip
         (matching the left panel's double-click behaviour).
         """
-        if "/" not in name:
-            self._main_vm.checkout_branch(name)
+        # Local names may contain slashes (e.g. agents-ide/run/<id>).
+        if self._main_vm.local_branch_exists(name) or "/" not in name:
+            self._main_vm.request_checkout_branch(name)
             return
         local_name = name.split("/", 1)[1]
         if not self._main_vm.local_branch_exists(local_name):

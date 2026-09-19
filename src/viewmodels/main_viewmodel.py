@@ -173,6 +173,8 @@ class MainViewModel(QObject):
         # they are not garbage collected while the worker thread is running.
         # Removed in :meth:`_on_async_finished`.
         self._active_workers: set[object] = set()
+        self._repo_load_worker: AsyncWorker | None = None
+        self._continue_after_repo_load: Callable[[], None] | None = None
         # Sequential mutation queue (review finding 10): every
         # *mutating* background operation (push / pull / fetch / merge /
         # rebase / clone / async redo) is started on this pool, which
@@ -426,6 +428,7 @@ class MainViewModel(QObject):
         # invalidates pending workers whose result might otherwise
         # slip into the (unchanged) current VM state.
         self._async_generation += 1
+        self._continue_after_repo_load = None
 
         current_path = (
             self._repo_manager.path if self._repo_manager is not None else None
@@ -578,8 +581,7 @@ class MainViewModel(QObject):
         generation = self._async_generation
 
         debug_print(f"[worker] load_repository_data: starting worker for {repo_path}")
-        self._is_busy = True
-        self.busy_changed.emit(True)
+        load_succeeded = False
 
         def _work(
             repo_path: str = repo_path,
@@ -646,6 +648,7 @@ class MainViewModel(QObject):
             }
 
         def _on_result(result: object) -> None:
+            nonlocal load_succeeded
             if generation != self._async_generation:
                 # Stale result — the user opened a different repo
                 # while the worker was in flight.  Drop silently (R2.2
@@ -674,6 +677,7 @@ class MainViewModel(QObject):
             )
             self._commit_panel_view_model.recompute_selected_diff()
             self._branch_panel_view_model._apply_branch_data(branch_data)
+            load_succeeded = True
             debug_print("[worker::ui] data applied, calling _on_repo_load_finished")
             self._on_repo_load_finished()
 
@@ -687,9 +691,21 @@ class MainViewModel(QObject):
         worker.signals.finished.connect(_on_result)
         worker.signals.failed.connect(_on_failure)
         self._active_workers.add(worker)
-        worker.signals.lifespan_finished.connect(
-            lambda w=worker: self._on_async_finished(w),
-        )
+        self._repo_load_worker = worker
+
+        def _on_load_stopped() -> None:
+            pending_continue = None
+            if self._repo_load_worker is worker:
+                self._repo_load_worker = None
+                pending_continue = self._continue_after_repo_load
+                self._continue_after_repo_load = None
+            self._on_async_finished(worker)
+            if load_succeeded and generation == self._async_generation and pending_continue:
+                pending_continue()
+
+        worker.signals.lifespan_finished.connect(_on_load_stopped)
+        self._is_busy = True
+        self.busy_changed.emit(True)
         debug_print("[worker] dispatching to thread pool...")
         QThreadPool.globalInstance().start(worker)
         debug_print("[worker] dispatched")
@@ -1539,6 +1555,31 @@ class MainViewModel(QObject):
             clipboard.setText(text)
 
     # ----- branch commands ---------------------------------------------
+
+    @_guard_mutation
+    def request_checkout_branch(self, name: str) -> None:
+        """Navigate to a branch's worktree, or check it out in the active one.
+
+        User checkout gestures use this entry point. Multi-command workflows
+        keep using checkout_branch so their repository cannot change mid-operation.
+        """
+        from src.core.worktree_status import find_branch_worktree
+
+        manager = self._repo_manager
+        if manager is None or not manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        try:
+            path = find_branch_worktree(manager, name)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("checkout", f"Cannot locate worktree for {name!r}: {exc}", level="error")
+            return
+        if path is not None:
+            self._log("checkout", f"Opening worktree for {name!r}: {path}")
+            self.open_worktree_requested.emit(path)
+            return
+        self.checkout_branch(name)
 
     def checkout_branch(self, name: str) -> bool:
         """Switch ``HEAD`` to ``name`` via :class:`CheckoutCommand`.
@@ -3334,6 +3375,59 @@ class MainViewModel(QObject):
         self._clear_conflict_state()
         self._refresh_all_views()
 
+    def request_continue_operation(self) -> None:
+        """Keep one Continue click made during the activation refresh.
+
+        Only the read-only repository load can defer this intent. Mutating
+        operations still go through the normal busy guard. Bind the request
+        to the repository and operation the user saw, and recheck Git before
+        executing it so an externally completed merge is never repeated.
+        """
+        if self._repo_load_worker is None:
+            self.continue_operation()
+            return
+        if self._continue_after_repo_load is not None:
+            return
+        manager = self._repo_manager
+        state = self._conflict_state
+        if manager is None or not manager.is_open or state is None:
+            return
+        from src.core.operations import is_rebase_in_progress, merge_head_oid
+
+        generation = self._async_generation
+        try:
+            head_sha = manager.head_commit.sha
+            merge_source = merge_head_oid(manager)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            return
+
+        def continue_after_load() -> None:
+            if (
+                generation != self._async_generation
+                or manager is not self._repo_manager
+                or state is not self._conflict_state
+            ):
+                return
+            try:
+                operation = state.get("operation")
+                if (
+                    manager.head_commit.sha != head_sha
+                    or merge_head_oid(manager) != merge_source
+                    or (operation == "merge" and merge_source is None)
+                    or (operation == "rebase" and not is_rebase_in_progress(manager))
+                ):
+                    self._restore_in_progress_operation()
+                    self._log("conflict", "Pending Continue cancelled: Git operation changed")
+                    return
+            except GitError as exc:
+                self.error_occurred.emit(str(exc))
+                return
+            self.continue_operation()
+
+        self._continue_after_repo_load = continue_after_load
+        self._log("conflict", "Continue queued until repository refresh completes")
+
     @_guard_mutation
     def continue_operation(self) -> None:
         """Finish the in-progress conflicted operation (Continue button).
@@ -3688,20 +3782,13 @@ class MainViewModel(QObject):
 
     def _on_repo_load_finished(self) -> None:
         """Called on the UI thread after the background repo data load succeeds."""
-        self._is_busy = False
-        self.busy_changed.emit(False)
         self._log("repo", "Repository data loaded")
-        # Drain any events queued by the worker's signal emissions so
-        # the graph / side panels render without waiting for the next
-        # event-loop iteration.
-        from PySide6.QtCore import QEventLoop
-        from PySide6.QtWidgets import QApplication
-        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+        # Keep the busy guard until lifespan_finished removes the worker.
+        # Pumping events here could start a queued refresh or Git operation
+        # while this result handler still owns the load's lifecycle.
 
     def _on_repo_load_failed(self, message: str) -> None:
         """Called on the UI thread when the background repo data load raises."""
-        self._is_busy = False
-        self.busy_changed.emit(False)
         self.error_occurred.emit(f"Failed to load repository data: {message}")
         self._log("repo", f"Repository data load failed: {message}", level="error")
 
@@ -3735,6 +3822,7 @@ class MainViewModel(QObject):
             return
         op = self._conflict_state.get("operation", "unknown")
         self._conflict_state = None
+        self._continue_after_repo_load = None
         self._log(op, "Conflict state cleared")
         self.conflict_state_changed.emit(
             {

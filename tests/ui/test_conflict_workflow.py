@@ -8,13 +8,17 @@ Undo/Redo round-trip of a merge that was completed after a conflict
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Event
 
 import pygit2
 import pytest
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QApplication
+from src.core.exceptions import GitError
 from src.core.operations import (
     checkout_branch,
     commit_changes,
+    complete_merge,
     create_branch,
     is_merge_in_progress,
     is_rebase_in_progress,
@@ -23,6 +27,7 @@ from src.core.repository import RepositoryManager
 from src.ui.dialogs.conflict_resolution_dialog import ConflictResolutionDialog
 from src.ui.main_window import MainWindow
 from src.ui.widgets.conflict_panel import ConflictPanel
+from src.viewmodels.commit_panel_viewmodel import CommitPanelViewModel
 from src.viewmodels.main_viewmodel import MainViewModel
 
 
@@ -30,21 +35,25 @@ def _ensure_app() -> None:
     QApplication.instance() or QApplication([])
 
 
-def _build_conflict(mgr: RepositoryManager) -> None:
-    """Fork ``feature``/``main`` with a conflicting ``hello.txt``.
+def _build_conflict(
+    mgr: RepositoryManager, paths: tuple[str, ...] = ("hello.txt",),
+) -> None:
+    """Fork ``feature``/``main`` with conflicting files (default: ``hello.txt``).
 
     Leaves HEAD on ``main``; ``merge feature`` conflicts on
-    ``hello.txt``.
+    each requested path.
     """
     create_branch(mgr, "feature")
     checkout_branch(mgr, "feature")
-    (Path(mgr.path) / "hello.txt").write_text("feature hi\n")
-    mgr.repo.index.add("hello.txt")
+    for path in paths:
+        (Path(mgr.path) / path).write_text("feature hi\n")
+        mgr.repo.index.add(path)
     mgr.repo.index.write()
     commit_changes(mgr, "feature: hi", stage_all=False)
     checkout_branch(mgr, "main")
-    (Path(mgr.path) / "hello.txt").write_text("main hi\n")
-    mgr.repo.index.add("hello.txt")
+    for path in paths:
+        (Path(mgr.path) / path).write_text("main hi\n")
+        mgr.repo.index.add(path)
     mgr.repo.index.write()
     commit_changes(mgr, "main: hi", stage_all=False)
 
@@ -118,6 +127,49 @@ def test_conflict_resolve_dialog_routes_to_vm(
     )
     assert len(_head_commit(committed_repo).parent_ids) == 2
     window.close()
+
+
+@pytest.mark.parametrize("selected_row", [None, 1])
+def test_resolve_button_opens_dialog_with_multiple_conflicts(
+    qtbot, committed_repo, selected_row,
+) -> None:
+    """Resolve opens the editor even before the user selects a file."""
+    paths = ("hello.txt", "second.txt", "third.txt")
+    _build_conflict(committed_repo, paths)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(committed_repo)
+    window._main_vm.merge_branch("feature")
+    panel = window._conflict_panel
+    assert panel._files.count() == 3
+    if selected_row is not None:
+        panel._files.setCurrentRow(selected_row)
+    expected_path = panel._files.item(selected_row or 0).text()
+    opened_paths = []
+
+    def close_editor() -> None:
+        dialog = QApplication.activeModalWidget()
+        if isinstance(dialog, ConflictResolutionDialog):
+            try:
+                assert dialog.isVisible()
+                opened_paths.append(dialog.viewmodel.snapshot.path)
+            finally:
+                dialog.reject()
+
+    timer = QTimer(window)
+    timer.setSingleShot(True)
+    timer.timeout.connect(close_editor)
+    timer.start(0)
+    try:
+        qtbot.mouseClick(panel._resolve_btn, Qt.MouseButton.LeftButton)
+    finally:
+        timer.stop()
+        window.close()
+
+    assert opened_paths == [expected_path]
+    assert is_merge_in_progress(committed_repo)
+    assert window._main_vm.conflict_state()["conflicting_paths"] == list(paths)
 
 
 @pytest.mark.parametrize("change", ["worktree", "index", "head"])
@@ -338,6 +390,150 @@ def test_continue_operation_reports_remaining_conflicts(
     assert is_merge_in_progress(committed_repo)
 
 
+# ----- Continue during the application-activation refresh ---------------------
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "completed", "repeat_refresh", "rebase", "read_error", "switched",
+        "external_commit", "unresolved",
+    ],
+)
+def test_continue_click_during_repository_refresh(
+    qtbot, committed_repo, monkeypatch, outcome,
+) -> None:
+    """An activation refresh must not swallow Continue or run it twice."""
+    _build_conflict(committed_repo)
+    if outcome == "rebase":
+        checkout_branch(committed_repo, "feature")
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(committed_repo)
+    vm = window._main_vm
+    if outcome == "rebase":
+        vm.rebase_branch("main")
+        qtbot.waitUntil(lambda: not vm.is_busy() and not vm._active_workers, timeout=6000)
+        assert vm.conflict_state()["operation"] == "rebase"
+    else:
+        vm.merge_branch("feature")
+    vm.stop_worktree_refresh()
+    qtbot.waitUntil(lambda: vm._worktree_refresh_worker is None)
+    panel = window._conflict_panel
+    original_head = committed_repo.head_commit.sha
+    history_size = len(vm.command_processor().undo_stack_snapshot())
+    if outcome != "unresolved":
+        (Path(committed_repo.path) / "hello.txt").write_text("external resolution\n")
+        committed_repo.repo.index.add("hello.txt")
+        committed_repo.repo.index.write()
+
+    started, release = Event(), Event()
+    original_read = CommitPanelViewModel._compute_status_data
+
+    def slow_read(manager):
+        started.set()
+        assert release.wait(5)
+        if outcome == "read_error":
+            raise GitError("refresh failed for test")
+        return original_read(manager)
+
+    monkeypatch.setattr(CommitPanelViewModel, "_compute_status_data", staticmethod(slow_read))
+    errors = []
+    vm.error_occurred.connect(errors.append)
+    try:
+        vm.refresh_state()
+        qtbot.waitUntil(started.is_set)
+        assert vm.is_busy()
+        for _ in range(3):
+            qtbot.mouseClick(panel._continue_btn, Qt.MouseButton.LeftButton)
+        assert errors == []
+        assert committed_repo.head_commit.sha == original_head
+        assert (
+            is_rebase_in_progress(committed_repo) if outcome == "rebase"
+            else is_merge_in_progress(committed_repo)
+        )
+        if outcome == "switched":
+            vm.set_repository(None, force=True)
+        elif outcome == "repeat_refresh":
+            vm.refresh_state()
+        elif outcome == "external_commit":
+            complete_merge(committed_repo, "feature")
+            external_head = committed_repo.head_commit.sha
+        release.set()
+        qtbot.waitUntil(
+            lambda: not vm._active_workers and not vm.is_busy() and not vm._refresh_pending,
+            timeout=6000,
+        )
+
+        if outcome in ("completed", "repeat_refresh", "rebase"):
+            assert errors == []
+            assert vm.conflict_state() is None
+            assert panel.isHidden()
+            assert not is_merge_in_progress(committed_repo)
+            if outcome == "rebase":
+                assert not is_rebase_in_progress(committed_repo)
+                assert committed_repo.repo.head.shorthand == "feature"
+            else:
+                assert len(_head_commit(committed_repo).parent_ids) == 2
+            assert len(vm.command_processor().undo_stack_snapshot()) == history_size + 1
+        elif outcome == "external_commit":
+            assert errors == []
+            assert committed_repo.head_commit.sha == external_head
+            assert vm.conflict_state() is None
+            assert panel.isHidden()
+            assert len(vm.command_processor().undo_stack_snapshot()) == history_size
+        else:
+            assert committed_repo.head_commit.sha == original_head
+            assert is_merge_in_progress(committed_repo)
+            if outcome == "read_error":
+                assert errors == ["Failed to load repository data: refresh failed for test"]
+                # A later successful refresh must not replay the cancelled click.
+                monkeypatch.setattr(
+                    CommitPanelViewModel, "_compute_status_data", staticmethod(original_read),
+                )
+                vm.refresh_state()
+                qtbot.waitUntil(lambda: not vm._active_workers and not vm.is_busy(), timeout=6000)
+                assert committed_repo.head_commit.sha == original_head
+                assert is_merge_in_progress(committed_repo)
+                panel._continue_btn.click()
+                assert vm.conflict_state() is None
+                assert panel.isHidden()
+            elif outcome == "unresolved":
+                assert len(errors) == 1 and "still need resolution" in errors[0]
+                assert vm.conflict_state()["conflicting_paths"] == ["hello.txt"]
+            else:
+                assert errors == []
+                assert vm.repository_manager() is None
+    finally:
+        release.set()
+        qtbot.waitUntil(lambda: not vm._active_workers and not vm.is_busy(), timeout=6000)
+        window.close()
+
+
+def test_continue_button_during_mutating_operation_remains_guarded(qtbot, committed_repo):
+    _build_conflict(committed_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.set_repository(committed_repo)
+    vm = window._main_vm
+    vm.merge_branch("feature")
+    vm.stop_worktree_refresh()
+    qtbot.waitUntil(lambda: vm._worktree_refresh_worker is None)
+    original_head = committed_repo.head_commit.sha
+    errors = []
+    vm.error_occurred.connect(errors.append)
+    vm._is_busy = True
+    try:
+        window._conflict_panel._continue_btn.click()
+        assert len(errors) == 1 and "Another operation is in progress" in errors[0]
+        assert committed_repo.head_commit.sha == original_head
+        assert is_merge_in_progress(committed_repo)
+    finally:
+        vm._is_busy = False
+        window.close()
+
+
 # ----- ConflictPanel unit behaviour -------------------------------------------
 
 
@@ -403,3 +599,47 @@ def test_conflict_panel_emits_resolve_and_abort(qtbot) -> None:
 
     panel._continue_btn.click()
     assert continued == [True]
+
+
+@pytest.mark.parametrize("paths", [["a.txt"], ["a.txt", "b.txt", "c.txt"]])
+def test_conflict_panel_resolve_defaults_to_first_file(qtbot, paths) -> None:
+    panel = ConflictPanel()
+    qtbot.addWidget(panel)
+    panel.set_state({"in_progress": True, "operation": "merge", "conflicting_paths": paths})
+    resolved = []
+    panel.resolve_requested.connect(resolved.append)
+
+    qtbot.mouseClick(panel._resolve_btn, Qt.MouseButton.LeftButton)
+
+    assert resolved == [paths[0]]
+    assert panel._files.currentItem().text() == paths[0]
+
+
+@pytest.mark.parametrize(
+    ("paths", "expected"),
+    [
+        (["a.txt", "b.txt", "c.txt"], "b.txt"),
+        (["c.txt", "a.txt", "b.txt"], "b.txt"),
+        (["a.txt", "c.txt"], "a.txt"),
+        ([], None),
+    ],
+)
+def test_conflict_panel_refresh_preserves_selection(qtbot, paths, expected) -> None:
+    panel = ConflictPanel()
+    qtbot.addWidget(panel)
+    state = {
+        "in_progress": True, "operation": "merge",
+        "conflicting_paths": ["a.txt", "b.txt", "c.txt"],
+    }
+    panel.set_state(state)
+    panel._files.setCurrentRow(1)
+    resolved = []
+    panel.resolve_requested.connect(resolved.append)
+
+    panel.set_state({**state, "conflicting_paths": paths})
+    qtbot.mouseClick(panel._resolve_btn, Qt.MouseButton.LeftButton)
+
+    assert resolved == ([expected] if expected else [])
+    assert panel._resolve_btn.isEnabled() == bool(expected)
+    item = panel._files.currentItem()
+    assert (item.text() if item else None) == expected

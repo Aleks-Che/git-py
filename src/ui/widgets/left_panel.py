@@ -446,7 +446,7 @@ class LeftPanel(QTreeWidget):
             item.setExpanded(not item.isExpanded())
             return
         if kind == _KIND_LOCAL_BRANCH and name:
-            self._main_vm.checkout_branch(name)
+            self._main_vm.request_checkout_branch(name)
         elif kind == _KIND_REMOTE_BRANCH and name:
             self._handle_remote_double_click(name)
         elif kind == _KIND_TAG and name:
@@ -664,7 +664,7 @@ class LeftPanel(QTreeWidget):
         # ----- checkout / merge / rebase --------------------------------
 
         checkout = QAction("Checkout", self)
-        checkout.triggered.connect(lambda: self._main_vm.checkout_branch(name))
+        checkout.triggered.connect(lambda: self._main_vm.request_checkout_branch(name))
         actions.append(checkout)
 
         actions.extend(self._merge_rebase_against_current(name))

@@ -32,16 +32,11 @@ class WorktreeChanges:
         return f"WIP:{os.path.normcase(self.path)}"
 
 
-def read_other_worktree_changes(
+def _other_worktree_paths(
     manager: RepositoryManager,
     error_callback: Callable[[str], None] | None = None,
-) -> list[WorktreeChanges]:
-    """Inspect registered worktrees, including the main checkout from a linked one.
-
-    Each checkout owns its index and HEAD. Missing/pruned checkouts are skipped;
-    a temporarily unreadable sibling must not hide the active repository graph.
-    No index, refs or registration files are written.
-    """
+) -> list[Path]:
+    """List existing sibling checkouts, including the primary from a linked one."""
     primary = RepositoryManager()
     try:
         current = Path(manager.repo.workdir).resolve() if manager.repo.workdir else None
@@ -65,15 +60,53 @@ def read_other_worktree_changes(
         primary.close()
 
     seen = {current}
-    result = []
+    paths = []
     for candidate in candidates:
         path = Path(candidate)
-        sibling = RepositoryManager()
         try:
             path = path.resolve()
             if path in seen or not (path / ".git").exists():
                 continue
             seen.add(path)
+            paths.append(path)
+        except (OSError, ValueError) as exc:
+            if error_callback:
+                error_callback(f"Cannot read worktree {path}: {exc}")
+    return paths
+
+
+def find_branch_worktree(manager: RepositoryManager, branch_name: str) -> str | None:
+    """Return another checkout using this local branch, whether clean or dirty.
+
+    Only registration and HEAD are read; this does not scan or refresh indexes.
+    The active checkout and detached HEADs never match a local branch.
+    """
+    def fail(message: str) -> None:
+        raise GitError(message)
+
+    for path in _other_worktree_paths(manager, fail):
+        sibling = RepositoryManager()
+        try:
+            sibling.open(str(path))
+            head = sibling.repo.lookup_reference("HEAD")
+            if head.target == f"refs/heads/{branch_name}":
+                return path.as_posix()
+        except (GitError, pygit2.GitError, OSError, ValueError, KeyError) as exc:
+            raise GitError(f"Cannot read worktree {path}: {exc}") from exc
+        finally:
+            sibling.close()
+    return None
+
+
+def read_other_worktree_changes(
+    manager: RepositoryManager,
+    error_callback: Callable[[str], None] | None = None,
+) -> list[WorktreeChanges]:
+    """Read each sibling's HEAD and index, skipping clean or unavailable checkouts."""
+    result = []
+    for path in _other_worktree_paths(manager, error_callback):
+        sibling = RepositoryManager()
+        try:
             sibling.open(str(path))
             snapshot = read_worktree_status(sibling, None, False)
             count = len(sibling.get_status_from_raw(snapshot.raw_status))

@@ -582,9 +582,8 @@ class GraphViewModel(QObject):
                 idx += 1
             while idx < len(history) and history[idx].author_time == t:
                 idx += 1
-            # Stashes whose first parent is HEAD must appear above HEAD
-            # so the rebalance step in build_graph can move them to
-            # offset lanes, freeing lane 0 for the WIP node.
+            # Keep children before their parent even with equal/skewed
+            # timestamps, so build_graph routes stash edges down to HEAD.
             if stash_ci.parents and stash_ci.parents[0] == head_target:
                 idx = min(idx, head_idx)
             history.insert(idx, stash_ci)

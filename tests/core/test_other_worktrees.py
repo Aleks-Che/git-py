@@ -2,7 +2,7 @@
 from pathlib import Path
 
 import pygit2
-from src.core.worktree_status import read_other_worktree_changes
+from src.core.worktree_status import find_branch_worktree, read_other_worktree_changes
 
 
 def _state(manager):
@@ -61,6 +61,7 @@ def test_missing_worktree_is_skipped_without_pruning_registration(
     linked_worktree.close()
     path.rename(path.with_name("temporarily moved"))
     assert read_other_worktree_changes(committed_repo) == []
+    assert find_branch_worktree(committed_repo, "agents-ide/run/test-worktree") is None
     assert "linked" in committed_repo.repo.list_worktrees()
 
 
@@ -87,3 +88,32 @@ def test_detached_and_unborn_worktree_heads(committed_repo, linked_worktree):
     assert changes[0].head_sha is None
     assert changes[0].count >= 1
     assert linked_worktree.repo.status()["new.txt"] & pygit2.GIT_STATUS_WT_NEW
+
+
+def test_find_branch_worktree_reads_head_without_scanning_index(
+    committed_repo, linked_worktree, monkeypatch,
+):
+    def no_status(*args):
+        raise AssertionError("Locating a branch must not scan worktree status")
+
+    monkeypatch.setattr(type(committed_repo), "get_raw_status", no_status)
+    (Path(linked_worktree.repo.path) / "index").unlink()
+    assert find_branch_worktree(committed_repo, "agents-ide/run/test-worktree") == (
+        Path(linked_worktree.path).as_posix()
+    )
+    assert find_branch_worktree(linked_worktree, "main") == Path(committed_repo.path).as_posix()
+    assert find_branch_worktree(committed_repo, "main") is None
+
+
+def test_find_branch_worktree_rereads_head_and_does_not_match_commit_oid(
+    committed_repo, linked_worktree,
+):
+    branch = linked_worktree.repo.head.shorthand
+    linked_worktree.repo.set_head(linked_worktree.repo.head.target)
+    assert find_branch_worktree(committed_repo, branch) is None
+    linked_worktree.repo.create_branch("other/local", linked_worktree.repo.head.peel())
+    linked_worktree.repo.set_head("refs/heads/other/local")
+    assert find_branch_worktree(committed_repo, branch) is None
+    assert find_branch_worktree(committed_repo, "other/local") == (
+        Path(linked_worktree.path).as_posix()
+    )

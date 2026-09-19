@@ -455,6 +455,9 @@ def test_no_pipe_between_sibling_stash_and_unrelated_row_above(
     mgr = _make_stash_around_commit_repo(tmp_git_repo)
     assert mgr.get_status() == []
     assert len(mgr.stash_list) == 2
+    # WIP reserves lane 0; the upper stash ends at Y on lane 1, which
+    # the older stash then reuses. A clean graph now needs no offset.
+    (tmp_git_repo / "f.txt").write_text("new edits\n")
 
     vm = GraphViewModel(mgr)
     widget = GraphTableWidget(vm)
@@ -466,8 +469,8 @@ def test_no_pipe_between_sibling_stash_and_unrelated_row_above(
         vm.refresh_graph()
     _force_paint(widget)
 
-    # Sanity: four rows laid out newest-first as Stash 2, Commit Y,
-    # Stash 1, Commit X. The bug requires Stash 1 and Commit Y to
+    # Below WIP: Stash 2, Commit Y, Stash 1, Commit X.
+    # The bug requires Stash 1 and Commit Y to
     # both have something at the offset lane (lane 1 in our setup) —
     # pin those preconditions so a future refactor that strips the
     # shape surfaces here rather than as a "passes for the wrong
@@ -510,8 +513,10 @@ def test_no_pipe_between_sibling_stash_and_unrelated_row_above(
     # Stash 1's ellipse (y_center - node_radius). Probe the middle of
     # that band; a stray pipe shows up as a coloured pixel there.
     # Skip a few pixels at each end to avoid ellipse antialiasing.
-    stash1_y_center = cfg.header_height + cfg.row_height * 2 + cfg.row_height // 2
-    commit_y_y_center = cfg.header_height + cfg.row_height * 1 + cfg.row_height // 2
+    stash1_idx = widget._rows.index(stash1_row)
+    commit_y_idx = widget._rows.index(commit_y_row)
+    stash1_y_center = cfg.header_height + cfg.row_height * stash1_idx + cfg.row_height // 2
+    commit_y_y_center = cfg.header_height + cfg.row_height * commit_y_idx + cfg.row_height // 2
     probe_y_start = commit_y_y_center + cfg.node_radius + 4
     probe_y_end = stash1_y_center - cfg.node_radius - 4
     assert probe_y_end > probe_y_start, (
@@ -535,182 +540,56 @@ def test_no_pipe_between_sibling_stash_and_unrelated_row_above(
         )
 
 
-def _make_stash_ladder_repo(path: Path) -> RepositoryManager:
-    """Build a repo with one stash below and three stashes above.
+def test_no_pipe_from_horizontal_into_stash_below(qtbot) -> None:
+    """A horizontal crossing cannot start a vertical into the next stash.
 
-    Timeline (chronological):
-
-    1. Commit X
-    2. Stash 1 (just above Commit X)
-    3. Commit Y
-    4. Stash 2
-    5. Stash 3
-    6. Stash 4 (newest, top)
-
-    In the graph (newest first): Stash 4, 3, 2, Commit Y, Stash 1,
-    Commit X. The ``_rebalance_stashes_for_wip`` step in
-    :mod:`src.core.graph_v2` moves the upper stashes onto offset
-    lanes (1, 2, 3, …) so that Commit Y can sit on lane 0. Commit Y
-    ends up with a multi-step fork connector (``TEE_RIGHT``,
-    ``HORIZONTAL``, ``TEE_UP`` cells) describing the merge of all
-    three upper stashes.
-
-    The bug this test pins: even after the single-stash fix, the
-    presence of a *group* of stashes above Stash 1 made the
-    ``HORIZONTAL`` cells in the fork connector at Commit Y register
-    as "downward continuation" at the offset lane. A pipe was then
-    drawn between Commit Y's ``HORIZONTAL`` and Stash 1's ``COMMIT``
-    at that lane — a red stub going up out of Stash 1.
+    Supply the two renderer rows directly: stash lane allocation may change,
+    but this cell geometry must always be covered independently of layout.
     """
-    mgr = RepositoryManager(str(path))
-    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
-
-    (path / "f.txt").write_text("a\n")
-    mgr.repo.index.add("f.txt")
-    mgr.repo.index.write()
-    tree = mgr.repo.index.write_tree()
-    c_x = mgr.repo.create_commit("refs/heads/main", sig, sig, "first", tree, [])
-
-    time.sleep(1)
-    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
-    (path / "f.txt").write_text("b\n")
-    from src.core.operations import stash_push
-    stash_push(mgr, "stash1", include_untracked=False)
-
-    time.sleep(1)
-    sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
-    (path / "f.txt").write_text("c\n")
-    mgr.repo.index.add("f.txt")
-    mgr.repo.index.write()
-    tree = mgr.repo.index.write_tree()
-    mgr.repo.create_commit(
-        "refs/heads/main", sig, sig, "second", tree, [c_x],
-    )
-
-    for label in ("stash2", "stash3", "stash4"):
-        time.sleep(1)
-        sig = pygit2.Signature("tester", "t@example.com", int(time.time()), 0)
-        (path / "f.txt").write_text(label + "\n")
-        stash_push(mgr, label, include_untracked=False)
-
-    return mgr
-
-
-def test_no_pipe_from_horizontal_into_stash_below(
-    qtbot, tmp_git_repo: Path,
-) -> None:
-    """A fork-connector ``HORIZONTAL`` at one row must not draw a pipe
-    into a stash sitting on the same lane one row below.
-
-    Companion to :func:`test_no_pipe_between_sibling_stash_and_unrelated_row_above`:
-    that test covers the case where a single fork-connector cell
-    (``MERGE_LEFT``) is the source of the stray pipe. This test
-    covers the case where the source is a plain ``HORIZONTAL`` cell
-    (no vertical at all) at one of the offset lanes — the
-    multi-stash-ladder rendering exercises that path.
-    """
-    from src.core.graph_v2 import CellType
+    from PySide6.QtGui import QImage, QPainter
+    from src.core.graph_v2 import CellInfo
     from src.ui.widgets.graph_panel import GraphTableWidget
 
-    mgr = _make_stash_ladder_repo(tmp_git_repo)
-    assert mgr.get_status() == []
-    assert len(mgr.stash_list) == 4
-
-    vm = GraphViewModel(mgr)
+    vm = GraphViewModel()
     widget = GraphTableWidget(vm)
-    widget.resize(900, 600)
+    widget.resize(900, 400)
     qtbot.addWidget(widget)
-    widget.show()
+    vm.graph_updated.emit([
+        {
+            "commit": {"sha": "above", "subject": "crossing", "kind": "commit"},
+            "lane": 0, "color_index": 1,
+            "cells": [c.to_dict() for c in (
+                CellInfo.commit(1), CellInfo.horizontal(2), CellInfo.horizontal(2),
+            )],
+        },
+        {
+            "commit": {"sha": "stash", "subject": "Stash", "kind": "stash"},
+            "lane": 1, "color_index": 2,
+            "cells": [c.to_dict() for c in (
+                CellInfo.empty(), CellInfo.empty(), CellInfo.commit(2),
+            )],
+        },
+    ])
+    image = QImage(widget.size(), QImage.Format.Format_ARGB32)
+    image.fill(0)
+    painter = QPainter(image)
+    try:
+        widget._draw_cells(painter, widget._cfg.header_height)
+    finally:
+        painter.end()
 
-    with qtbot.waitSignal(vm.graph_updated, timeout=2000):
-        vm.refresh_graph()
-    _force_paint(widget)
-
-    # Sanity: Stash 1 and Commit Y sit on adjacent rows, and the
-    # commit row has a fork-connector that includes a ``HORIZONTAL``
-    # at the offset lane. Without that fork connector the bug
-    # wouldn't manifest; pin the precondition so a future refactor
-    # surfaces here instead of as a "passes for the wrong reason"
-    # false positive.
-    stash1_row = next(
-        r for r in widget._rows
-        if r.get("commit") and r["commit"]["kind"] == "stash"
-        and r["commit"]["subject"].startswith("Stash @{3}")
-    )
-    commit_y_row = next(
-        r for r in widget._rows
-        if r.get("commit") and r["commit"]["subject"].startswith("second")
-    )
-    stash1_row_idx = widget._rows.index(stash1_row)
-    commit_y_row_idx = widget._rows.index(commit_y_row)
-    assert commit_y_row_idx == stash1_row_idx - 1, (
-        "test setup broken — Stash 1 and Commit Y are not adjacent"
-    )
-    commit_y_cell_types = {c["t"] for c in commit_y_row["cells"]}
-    assert CellType.HORIZONTAL in commit_y_cell_types, (
-        "commit Y missing HORIZONTAL cell — fork connector shape "
-        "changed: " + repr(commit_y_cell_types)
-    )
-    stash1_lanes = {
-        c["t"] for c in stash1_row["cells"] if c.get("t", 0) != CellType.EMPTY
-    }
-    assert CellType.COMMIT in stash1_lanes, (
-        "stash 1 missing COMMIT cell: " + repr(stash1_lanes)
-    )
-
-    # Find the offset lane where Commit Y has HORIZONTAL and Stash 1
-    # has COMMIT — that is the lane where the bug used to draw a pipe.
     cfg = widget._cfg
-    dpr = widget.devicePixelRatio()
-    img = widget.grab().toImage()
-    lane_w = cfg.node_radius * 2 + 8
-
-    stash1_commit_lane = None
-    for ci, c in enumerate(stash1_row["cells"]):
-        if c.get("t") == CellType.COMMIT and ci % 2 == 0:
-            stash1_commit_lane = ci // 2
-            break
-    assert stash1_commit_lane is not None
-    assert stash1_commit_lane > 0, (
-        "stash 1 sits on the main lane — test layout does not exercise "
-        "the offset-lane bug"
-    )
-
-    commit_y_has_horizontal_at_lane = False
-    for ci, c in enumerate(commit_y_row["cells"]):
-        if (
-            c.get("t") == CellType.HORIZONTAL
-            and ci // 2 == stash1_commit_lane
-        ):
-            commit_y_has_horizontal_at_lane = True
-            break
-    assert commit_y_has_horizontal_at_lane, (
-        "test setup broken — Commit Y has no HORIZONTAL at the "
-        "Stash 1 offset lane"
-    )
-
-    # Probe the gap between Commit Y and Stash 1 at the offset
-    # lane — that is where the bug drew a red pipe.
-    commit_y_y_center = cfg.header_height + commit_y_row_idx * cfg.row_height + cfg.row_height // 2
-    stash1_y_center = cfg.header_height + stash1_row_idx * cfg.row_height + cfg.row_height // 2
-    offset_lane_x = widget._dividers[0] + cfg.graph_left_padding + stash1_commit_lane * lane_w
-    probe_y_start = commit_y_y_center + cfg.node_radius + 4
-    probe_y_end = stash1_y_center - cfg.node_radius - 4
-    assert probe_y_end > probe_y_start, (
-        "test geometry broken — probe range collapsed"
-    )
-
-    for probe_y in range(probe_y_start, probe_y_end + 1):
-        ix = int(offset_lane_x * dpr)
-        iy = int(probe_y * dpr)
-        if not (0 <= ix < img.width() and 0 <= iy < img.height()):
-            continue
-        color = img.pixelColor(ix, iy)
-        assert max(color.red(), color.green(), color.blue()) < 50, (
-            f"stray pipe at lane {stash1_commit_lane} between Stash 1 "
-            f"and Commit Y: probe ({offset_lane_x}, {probe_y}) is "
-            f"{color.name()}, rgb=({color.red()}, {color.green()}, {color.blue()})"
-        )
+    x = int(widget._lane_x(1, cfg.node_radius * 2 + 8))
+    above_y = int(widget._row_y(0) + cfg.row_height / 2)
+    stash_y = int(widget._row_y(1) + cfg.row_height / 2)
+    # Both endpoints are painted; only the vertical gap must stay empty.
+    assert image.pixelColor(x, above_y).alpha() > 0
+    assert image.pixelColor(x, stash_y).alpha() > 0
+    probe_start = above_y + cfg.node_radius + 4
+    probe_end = stash_y - cfg.node_radius - 4
+    assert probe_start < probe_end
+    for y in range(probe_start, probe_end + 1):
+        assert image.pixelColor(x, y).alpha() == 0, f"stray vertical at ({x}, {y})"
 
 
 def _make_root_with_stash_and_wip_repo(

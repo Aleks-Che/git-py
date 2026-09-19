@@ -654,15 +654,15 @@ def merge_branch(
         # merge commit even on a fast-forwardable history.
         head_oid = r.head.target
         if is_fastforward:
-            # ``r.merge`` is a no-op on a fast-forward: the working
-            # tree already matches ``source_oid``. The merge commit
-            # carries the *source*'s tree (which is what a fast-
-            # forward would have done), with two parents so it
-            # shows up in the graph as a real merge. Fast-forward
-            # trees are clean by definition (no conflicts to
-            # resolve), so we can skip the conflict check.
+            # Update the index/worktree while HEAD still names the old
+            # target. After create_commit moves HEAD, SAFE checkout treats
+            # the old index entries as staged edits and preserves them,
+            # leaving reverse changes for every modified/deleted file.
+            # SAFE also refuses overlapping local edits before HEAD moves.
             try:
-                tree_oid = r[source_oid].tree.id
+                source_tree = r[source_oid].tree
+                r.checkout_tree(source_tree, strategy=pygit2.GIT_CHECKOUT_SAFE)
+                tree_oid = source_tree.id
             except pygit2.GitError as exc:
                 raise GitError(f"Fast-forward no-ff merge failed: {exc}") from exc
         else:
