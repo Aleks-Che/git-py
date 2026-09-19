@@ -49,6 +49,7 @@ from src.core.exceptions import (
     MergeConflictError,
     NetworkError,
     RebaseConflictError,
+    StashSaveError,
 )
 from src.core.models import BranchAttribution, CommitInfo, RemoteInfo
 from src.core.repository import RepositoryManager, unwrap
@@ -2093,6 +2094,75 @@ def reset(
 # ----- stash ----------------------------------------------------------------
 
 
+def _stash_ref_oid(repo: pygit2.Repository) -> str | None:
+    """Read the stash tip; distinguish a missing stash from an unreadable ref."""
+    try:
+        return str(repo.lookup_reference("refs/stash").resolve().target)
+    except KeyError:
+        return None
+    except (pygit2.GitError, ValueError) as exc:
+        raise GitError(f"Stash lookup failed: {exc}") from exc
+
+
+def _file_lock_details(details: str) -> tuple[str | None, bool, bool]:
+    """Extract libgit2's path and recognize a sharing/locking violation.
+
+    pygit2 exposes libgit2 filesystem errors as text, without WinError codes.
+    Match the OS descriptions for codes 32/33 in the current Windows language,
+    as well as English/Russian diagnostics. Access denied alone is not a lock.
+    """
+    match = re.search(r"could not (rmdir|remove|unlink|open) '(.+)': (.*)", details, re.S)
+    path = match[2] if match else None
+    reason = (match[3] if match else details).casefold()
+    markers = [
+        "being used by another process",
+        "another process has locked",
+        "занят другим процессом",
+        "другой процесс заблокировал",
+        "sharing violation",
+    ]
+    if os.name == "nt":
+        import ctypes
+
+        markers.extend(ctypes.FormatError(code).strip().casefold() for code in (32, 33))
+    locked = any(marker and marker in reason for marker in markers)
+    return path, bool(match and match[1] == "rmdir"), locked
+
+
+def _stash_save_error(
+    repo: pygit2.Repository, previous_oid: str | None, details: str,
+) -> StashSaveError:
+    try:
+        current_oid = _stash_ref_oid(repo)
+    except GitError:
+        # If verification fails, retain the original error and do not claim
+        # that an archive has been created.
+        current_oid = None
+    saved_oid = current_oid if current_oid != previous_oid else None
+    path, is_directory, locked = _file_lock_details(details)
+    if saved_oid:
+        message = (
+            f"Stash {saved_oid[:12]} сохранён, но очистка рабочей папки не завершена.\n"
+            "Часть изменений осталась в Uncommitted Changes."
+        )
+    else:
+        message = "Не удалось завершить создание stash."
+    if locked:
+        subject = "Папка занята" if is_directory else "Файл занят" if path else "Путь занят"
+        message += f"\n\n{subject} другим процессом."
+        if path:
+            message += f"\n{path}"
+        message += (
+            "\n\nЗакройте использующую этот путь программу или перейдите из этой папки "
+            "в терминале. Затем проверьте оставшиеся изменения."
+        )
+    else:
+        message += f"\n\nПричина: {details}"
+    return StashSaveError(
+        message, details=details, saved_oid=saved_oid, blocked_path=path, is_locked=locked,
+    )
+
+
 def stash_push(
     repo: RepositoryManager | pygit2.Repository,
     message: str = "WIP",
@@ -2101,10 +2171,9 @@ def stash_push(
 ) -> str | None:
     """Stash uncommitted changes; returns the stash OID, or ``None`` if there was nothing to stash.
 
-    ``include_untracked`` defaults to ``True`` (matches the common
-    "stash everything I'm working on" expectation); pass ``False`` to
-    only stash tracked-file changes, like ``git stash --keep-index``
-    vs. plain ``git stash``.
+    ``include_untracked`` defaults to ``True``; pass ``False`` to save
+    only tracked-file changes. Neither setting keeps staged changes in place.
+    ``StashSaveError.saved_oid`` reports a stash saved before cleanup failed.
 
     ``paths`` is an optional whitelist of working-tree paths to stash.
     When supplied, the list is passed to :meth:`pygit2.Repository.stash` as
@@ -2112,6 +2181,7 @@ def stash_push(
     therefore those of the installed pygit2 version.
     """
     with unwrap(repo) as r:
+        previous_oid = _stash_ref_oid(r)
         try:
             oid = r.stash(
                 _now_signature(),
@@ -2123,7 +2193,7 @@ def stash_push(
             msg = str(exc).lower()
             if "nothing to stash" in msg:
                 return None
-            raise GitError(f"Stash failed: {exc}") from exc
+            raise _stash_save_error(r, previous_oid, str(exc)) from exc
     return str(oid) if oid else None
 
 
@@ -2154,13 +2224,14 @@ def stash_push_staged(
         workdir = r.workdir
         if workdir is None:
             raise GitError("Cannot stash in a bare repository.")
+        previous_oid = _stash_ref_oid(r)
     args = ["stash", "push", "-m", message, "--"] + staged_paths
     completed = _run_git_in_workdir(r, args, timeout=30.0)
     if completed.returncode != 0:
         stderr = (completed.stderr or completed.stdout or "").strip()
         if "no local changes to save" in stderr.lower():
             return None
-        raise GitError(f"git stash push failed: {stderr}")
+        raise _stash_save_error(r, previous_oid, stderr) from None
     return stash_oid_at(repo, 0)
 
 

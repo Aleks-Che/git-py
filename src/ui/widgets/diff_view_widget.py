@@ -1043,6 +1043,7 @@ class DiffViewWidget(QWidget):
         self._loading = loading
         self._editor.setEnabled(not loading)
         if loading:
+            self._editor.setPlaceholderText("")
             self._loading_timer.start()
         else:
             self._loading_timer.stop()
@@ -1147,6 +1148,7 @@ class DiffViewWidget(QWidget):
         """Remove all content, highlights, and cached diff text."""
         self.set_loading(False)
         self._editor.clear()
+        self._editor.setPlaceholderText("")
         self._editor.set_line_info([])
         self._editor.setExtraSelections([])
         self._editor._diff_scrollbar.set_diff_blocks([], [])
@@ -1206,6 +1208,14 @@ class DiffViewWidget(QWidget):
             text = self._changes_only_text
         else:
             text = self._full_document_text or self._changes_only_text
+        # A completed read can legitimately be empty (for example, Git's
+        # LF/CRLF normalization). Keep the explanation outside the document
+        # so it cannot be copied or treated as a stageable diff line.
+        self._editor.setPlaceholderText(
+            "No diff to display.\n"
+            "Changes limited to line endings (LF/CRLF) may be ignored by Git."
+            if not text and not self._loading else ""
+        )
         # Cap the rendered line count — see ``_MAX_RENDERED_DIFF_LINES``.
         # The stored text stays complete; only the document shown in the
         # editor is truncated. The banner line has no diff prefix, so it

@@ -46,6 +46,7 @@ from src.core.exceptions import (
     MergeConflictError,
     RebaseConflictError,
     RepositoryNotFoundError,
+    StashSaveError,
 )
 from src.core.models import BranchAttribution, RemoteInfo
 from src.core.repository import RepositoryManager
@@ -1375,8 +1376,7 @@ class MainViewModel(QObject):
         try:
             self._command_processor.execute(command)
         except GitError as exc:
-            self.error_occurred.emit(str(exc))
-            self._log("stash", f"Stash {path!r} failed: {exc}", level="error")
+            self._report_stash_save_error(exc, f"Stash {path!r}")
             return
         self._refresh_all_views()
         self._log("stash", f"File {path!r} stashed")
@@ -2691,6 +2691,19 @@ class MainViewModel(QObject):
 
     # ----- stash: push / pop / apply / drop -----------------------------
 
+    def _report_stash_save_error(self, error: GitError, action: str) -> None:
+        if isinstance(error, StashSaveError):
+            # A save can fail after creating a stash and removing some files.
+            # Reject an older status worker before publishing the actual state.
+            self._invalidate_worktree_refresh()
+            try:
+                self._refresh_all_views()
+            except GitError as refresh_error:
+                self._log("stash", f"Refresh after failed stash: {refresh_error}", level="error")
+        self.error_occurred.emit(str(error))
+        details = error.details if isinstance(error, StashSaveError) else str(error)
+        self._log("stash", f"{action} failed: {error}\nDetails: {details}", level="error")
+
     def stash_push(self, message: str = "WIP") -> bool:
         """Push the current WIP onto the stash list via :class:`StashPushCommand`.
 
@@ -2715,8 +2728,7 @@ class MainViewModel(QObject):
         try:
             self._command_processor.execute(command)
         except GitError as exc:
-            self.error_occurred.emit(str(exc))
-            self._log("stash", f"Stash push failed: {exc}", level="error")
+            self._report_stash_save_error(exc, "Stash push")
             return False
         self._refresh_all_views()
         self._log("stash", "Stash push succeeded")
@@ -2824,8 +2836,7 @@ class MainViewModel(QObject):
         try:
             self._command_processor.execute(command)
         except GitError as exc:
-            self.error_occurred.emit(str(exc))
-            self._log("stash", f"Stash staged failed: {exc}", level="error")
+            self._report_stash_save_error(exc, "Stash staged")
             return False
         self._refresh_all_views()
         self._log("stash", "Stash staged succeeded")

@@ -1740,6 +1740,7 @@ class MainWindow(QMainWindow):
         )
 
         label = QLabel(message, container)
+        label.setTextFormat(Qt.TextFormat.PlainText)
         label.setWordWrap(True)
         label.setMaximumWidth(380)
         label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
