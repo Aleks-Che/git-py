@@ -92,6 +92,63 @@ def test_commit_changes_rejects_empty_message(committed_repo: RepositoryManager)
         commit_changes(committed_repo, "   ")
 
 
+@pytest.mark.parametrize("explicit_committer", [False, True])
+def test_commit_signature_uses_author_unless_committer_is_explicit(
+    committed_repo, explicit_committer,
+):
+    author = pygit2.Signature("Actual User", "user@example.com", 1700000000, 300)
+    committer = (
+        pygit2.Signature("Integrator", "integrator@example.com", 1700000100, 60)
+        if explicit_committer else None
+    )
+    info = commit_changes(
+        committed_repo, "signature", author=author, committer=committer, stage_all=False,
+    )
+    commit = committed_repo.repo[pygit2.Oid(hex=info.sha)]
+    expected = committer or author
+    assert commit.author == author
+    assert commit.committer == expected
+    assert (info.committer_name, info.committer_email) == (expected.name, expected.email)
+
+
+def test_commit_uses_disk_index_and_preserves_unstaged_edits(committed_repo):
+    root = Path(committed_repo.path)
+    # Keep the application's index cached while another Git handle stages edits.
+    old_tree = committed_repo.repo.index.write_tree()
+    external = pygit2.Repository(str(root))
+    (root / "hello.txt").write_bytes(b"staged version\n")
+    (root / "added.txt").write_bytes(b"staged addition\n")
+    external.index.add_all()
+    external.index.write()
+    staged_tree = external.index.write_tree()
+    assert staged_tree != old_tree
+    (root / "hello.txt").write_bytes(b"later unstaged version\n")
+    (root / "untracked.txt").write_bytes(b"do not commit\n")
+
+    info = commit_changes(committed_repo, "only staged", stage_all=False)
+
+    assert committed_repo.repo[pygit2.Oid(hex=info.sha)].tree_id == staged_tree
+    assert (root / "hello.txt").read_bytes() == b"later unstaged version\n"
+    assert pygit2.Repository(str(root)).status() == {
+        "hello.txt": pygit2.GIT_STATUS_WT_MODIFIED,
+        "untracked.txt": pygit2.GIT_STATUS_WT_NEW,
+    }
+
+
+def test_commit_index_read_failure_keeps_head_and_reports_domain_error(
+    committed_repo, monkeypatch,
+):
+    head = committed_repo.repo.head.target
+
+    def fail_read(*_args, **_kwargs):
+        raise OSError("cannot read index")
+
+    monkeypatch.setattr(pygit2.Index, "read", fail_read)
+    with pytest.raises(GitError, match="cannot read index"):
+        commit_changes(committed_repo, "must fail", stage_all=False)
+    assert committed_repo.repo.head.target == head
+
+
 def test_commit_changes_allows_empty_first_commit(tmp_git_repo: Path) -> None:
     mgr = RepositoryManager(str(tmp_git_repo))
     info = commit_changes(mgr, "empty first commit")

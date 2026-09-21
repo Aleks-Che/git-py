@@ -19,8 +19,8 @@ File-level header lines (``diff --git``, ``index``, ``--- a/…``,
 ``+++ b/…``, ``old mode``, etc.) are not displayed: the viewer is
 opened from a specific file, so the file header is redundant noise.
 
-The widget is read-only and has no file-io or Git logic — it only
-receives a diff string via :meth:`set_diff`.
+The diff pane is read-only. An optional plain-text editing pane receives
+the full worktree text from its ViewModel; this widget has no file I/O or Git logic.
 
 View modes
 ----------
@@ -67,7 +67,9 @@ from PySide6.QtGui import (
     QColor,
     QCursor,
     QFont,
+    QKeySequence,
     QPainter,
+    QShortcut,
     QTextCharFormat,
     QTextCursor,
     QTextDocument,
@@ -789,7 +791,7 @@ class _DiffEditor(QPlainTextEdit):
 
 
 class DiffViewWidget(QWidget):
-    """Colour-coded, read-only diff viewer with a line-number gutter.
+    """Colour-coded diff viewer with an optional worktree text editor.
 
     Usage
     -----
@@ -815,6 +817,12 @@ class DiffViewWidget(QWidget):
 
     view_mode_changed = Signal(object)
     line_action_requested = Signal(object)
+    edit_requested = Signal(bool)
+    edit_exit_requested = Signal(object)
+    save_requested = Signal()
+    cancel_requested = Signal()
+    file_text_changed = Signal(str)
+    editor_history_changed = Signal()
     """Emitted with the new :class:`DiffViewMode` when the user toggles
     the toolbar buttons (also fires when the mode is set programmatically
     via :meth:`set_view_mode`, but only when the value actually changes)."""
@@ -822,11 +830,26 @@ class DiffViewWidget(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._editor = _DiffEditor(self)
+        self._editing = False
+        self._file_editor = QPlainTextEdit(self)
+        self._file_editor.setFont(self._editor.font())
+        self._file_editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self._file_editor.setStyleSheet(self._editor.styleSheet())
+        self._file_editor.hide()
+        self._file_editor.textChanged.connect(
+            lambda: self.file_text_changed.emit(self._file_editor.toPlainText()),
+        )
+        self._file_editor.undoAvailable.connect(lambda _: self.editor_history_changed.emit())
+        self._file_editor.redoAvailable.connect(lambda _: self.editor_history_changed.emit())
         self._changes_only_text: str = ""
         self._full_document_text: str = ""
         self._view_mode: DiffViewMode = DiffViewMode.CHANGES_ONLY
         self._editor.line_action_requested.connect(self.line_action_requested)
         self._build_toolbar()
+        self._save_shortcut = QShortcut(self)
+        self._save_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._save_shortcut.setEnabled(False)
+        self._save_shortcut.activated.connect(self.save_requested)
         self._loading = False
         self._loading_timer = QTimer(self)
         self._loading_timer.setSingleShot(True)
@@ -835,7 +858,8 @@ class DiffViewWidget(QWidget):
         self._loading_panel = QWidget(self)
         loading_layout = QHBoxLayout(self._loading_panel)
         loading_layout.addStretch()
-        loading_layout.addWidget(QLabel("Loading diff…", self._loading_panel))
+        self._loading_label = QLabel("Loading diff…", self._loading_panel)
+        loading_layout.addWidget(self._loading_label)
         self._loading_progress = QProgressBar(self._loading_panel)
         self._loading_progress.setRange(0, 0)
         self._loading_progress.setTextVisible(False)
@@ -875,6 +899,7 @@ class DiffViewWidget(QWidget):
         "QPushButton:checked:hover { background-color: #1F8AD2; }"
         "QPushButton:pressed { background-color: #005A9E; }"
         "QPushButton:focus { outline: none; }"
+        "QPushButton:disabled { color: #666666; border-color: #333333; }"
     )
 
     def _build_toolbar(self) -> None:
@@ -898,12 +923,29 @@ class DiffViewWidget(QWidget):
         self._document_button.setStyleSheet(self._BUTTON_STYLESHEET)
         self._document_button.setCursor(Qt.CursorShape.PointingHandCursor)
 
+        self._edit_button = QPushButton("Edit", self)
+        self._edit_button.setCheckable(True)
+        self._edit_button.setToolTip("Edit the working-directory file")
+        self._edit_button.clicked.connect(lambda: self.edit_requested.emit(not self._editing))
+        self._save_button = QPushButton("Save", self)
+        self._save_button.clicked.connect(self.save_requested)
+        self._cancel_button = QPushButton("Cancel", self)
+        self._cancel_button.clicked.connect(self.cancel_requested)
+        for button in (self._edit_button, self._save_button, self._cancel_button):
+            button.setStyleSheet(self._BUTTON_STYLESHEET)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.hide()
+        self._save_button.setEnabled(False)
+
         group_row = QHBoxLayout()
         group_row.setContentsMargins(0, 0, 0, 0)
         group_row.setSpacing(6)
         group_row.addStretch(1)
         group_row.addWidget(self._changes_button)
         group_row.addWidget(self._document_button)
+        group_row.addWidget(self._edit_button)
+        group_row.addWidget(self._save_button)
+        group_row.addWidget(self._cancel_button)
         group_row.addStretch(1)
 
         self._mode_group = QButtonGroup(self)
@@ -934,6 +976,7 @@ class DiffViewWidget(QWidget):
         root.addWidget(self._toolbar)
         root.addWidget(self._loading_panel)
         root.addWidget(self._editor, 1)
+        root.addWidget(self._file_editor, 1)
         # The toolbar should not stretch — its preferred height is
         # the row's natural height — so the editor absorbs the rest.
         self._toolbar.setSizePolicy(
@@ -943,6 +986,56 @@ class DiffViewWidget(QWidget):
 
     # ── public API ────────────────────────────────────────────────
 
+    def set_edit_available(self, available: bool) -> None:
+        self._edit_button.setVisible(available)
+
+    def set_save_shortcut(self, sequence: QKeySequence) -> None:
+        self._save_shortcut.setKey(sequence)
+        self._save_button.setToolTip(f"Save ({sequence.toString()})")
+
+    def set_file_text(self, text: str) -> None:
+        self._file_editor.setPlainText(text)
+
+    def set_edit_state(self, active: bool, dirty: bool, loading: bool, blocked: bool) -> None:
+        entering = active and not self._editing
+        self._editing = active
+        self._edit_button.setChecked(active)
+        self._edit_button.setEnabled(not blocked)
+        self._save_button.setVisible(active)
+        self._cancel_button.setVisible(active)
+        self._save_button.setEnabled(active and dirty and not loading and not blocked)
+        self._save_shortcut.setEnabled(self._save_button.isEnabled())
+        self._file_editor.setVisible(active)
+        self._file_editor.setReadOnly(loading or blocked)
+        self._loading_label.setText("Loading file…" if active else "Loading diff…")
+        self._editor.setVisible(not active)
+        self._mode_group.setExclusive(False)
+        self._changes_button.setChecked(not active and self._view_mode == DiffViewMode.CHANGES_ONLY)
+        self._document_button.setChecked(
+            not active and self._view_mode == DiffViewMode.FULL_DOCUMENT,
+        )
+        self._mode_group.setExclusive(True)
+        if active:
+            self.set_loading(loading)
+        if entering:
+            self._file_editor.setFocus()
+        self.editor_history_changed.emit()
+
+    def is_editing(self) -> bool:
+        return self._editing
+
+    def can_undo_edit(self) -> bool:
+        return self._file_editor.document().isUndoAvailable()
+
+    def can_redo_edit(self) -> bool:
+        return self._file_editor.document().isRedoAvailable()
+
+    def undo_edit(self) -> None:
+        self._file_editor.undo()
+
+    def redo_edit(self) -> None:
+        self._file_editor.redo()
+
     def set_loading(self, loading: bool) -> None:
         """Animate the busy indicator only for a noticeable preview delay."""
         if loading == self._loading:
@@ -950,6 +1043,7 @@ class DiffViewWidget(QWidget):
         self._loading = loading
         self._editor.setEnabled(not loading)
         if loading:
+            self._editor.setPlaceholderText("")
             self._loading_timer.start()
         else:
             self._loading_timer.stop()
@@ -1054,6 +1148,7 @@ class DiffViewWidget(QWidget):
         """Remove all content, highlights, and cached diff text."""
         self.set_loading(False)
         self._editor.clear()
+        self._editor.setPlaceholderText("")
         self._editor.set_line_info([])
         self._editor.setExtraSelections([])
         self._editor._diff_scrollbar.set_diff_blocks([], [])
@@ -1086,6 +1181,13 @@ class DiffViewWidget(QWidget):
             mode = DiffViewMode(button_id)
         except ValueError:
             return
+        if self._editing:
+            self._mode_group.setExclusive(False)
+            self._changes_button.setChecked(False)
+            self._document_button.setChecked(False)
+            self._mode_group.setExclusive(True)
+            self.edit_exit_requested.emit(mode)
+            return
         self.set_view_mode(mode)
 
     def _render(self) -> None:
@@ -1106,6 +1208,14 @@ class DiffViewWidget(QWidget):
             text = self._changes_only_text
         else:
             text = self._full_document_text or self._changes_only_text
+        # A completed read can legitimately be empty (for example, Git's
+        # LF/CRLF normalization). Keep the explanation outside the document
+        # so it cannot be copied or treated as a stageable diff line.
+        self._editor.setPlaceholderText(
+            "No diff to display.\n"
+            "Changes limited to line endings (LF/CRLF) may be ignored by Git."
+            if not text and not self._loading else ""
+        )
         # Cap the rendered line count — see ``_MAX_RENDERED_DIFF_LINES``.
         # The stored text stays complete; only the document shown in the
         # editor is truncated. The banner line has no diff prefix, so it

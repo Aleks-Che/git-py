@@ -133,6 +133,7 @@ class RepositoryManager:
         except pygit2.GitError as exc:
             raise RepositoryNotFoundError(f"Not a Git repository: {path}") from exc
         # Atomic-ish: only commit state once construction has fully succeeded.
+        self.release_handles()
         self._repo = repo
         self._path = str(p)
 
@@ -154,6 +155,7 @@ class RepositoryManager:
             repo = pygit2.init_repository(path, bare=bare, initial_head=initial_head)
         except pygit2.GitError as exc:
             raise GitError(f"Failed to initialize repository at {path}: {exc}") from exc
+        self.release_handles()
         self._repo = repo
         self._path = str(Path(path))
 
@@ -197,14 +199,15 @@ class RepositoryManager:
             # local-filesystem only, no SSH transport needed).
             _clone_via_cli(url, path, bare=bare, ssh_key_path=ssh_key_path)
             try:
-                self._repo = pygit2.Repository(path)
+                repo = pygit2.Repository(path)
             except pygit2.GitError as exc:
-                self._repo = None
-                self._path = None
+                self.close()
                 raise GitError(
                     f"Cloned {url} to {path}, but failed to open the "
                     f"resulting repository: {exc}",
                 ) from exc
+            self.release_handles()
+            self._repo = repo
             self._path = str(Path(path))
             return
 
@@ -212,11 +215,28 @@ class RepositoryManager:
             repo = pygit2.clone_repository(url, path, bare=bare, callbacks=callbacks)
         except pygit2.GitError as exc:
             raise GitError(f"Failed to clone {url} -> {path}: {exc}") from exc
+        self.release_handles()
         self._repo = repo
         self._path = str(Path(path))
 
+    def release_handles(self) -> None:
+        """Release cached database files while keeping the repository usable.
+
+        libgit2 retains pack mappings after reads, preventing external repack,
+        deletion and directory renames on Windows. ``Repository.free()`` closes
+        those handles without destroying the repository; the next read reopens
+        them. Call only between operations on this manager's owning thread.
+        This never removes Git lock files or changes repository data.
+        """
+        if self._repo is not None:
+            try:
+                self._repo.free()
+            except pygit2.GitError as exc:
+                raise GitError(f"Cannot release repository handles: {exc}") from exc
+
     def close(self) -> None:
-        """Drop the underlying ``pygit2.Repository`` (the on-disk repo is untouched)."""
+        """Release database handles even if a traceback or caller retains the repo."""
+        self.release_handles()
         self._repo = None
         self._path = None
 
@@ -401,13 +421,19 @@ class RepositoryManager:
 
     # ----- queries (methods) -------------------------------------------
 
+    def get_raw_status(self) -> dict[str, int]:
+        """Read status without holding the Python GIL during the worktree scan."""
+        from src.core.status import read_status
+
+        return read_status(self.repo)
+
     def get_status(self) -> list[FileChange]:
         """Working-tree and index status as a list of :class:`FileChange`.
 
         When a file is both staged and modified in the worktree, the
         staged (index) status is reported — matching ``git status``.
         """
-        return self.get_status_from_raw(self.repo.status())
+        return self.get_status_from_raw(self.get_raw_status())
 
     def get_status_from_raw(
         self,
@@ -477,7 +503,8 @@ class RepositoryManager:
         """
         if self.repo.head_is_unborn:
             return set()
-        tip_oids: set[pygit2.Oid] = set()
+        # A linked worktree may be detached at a commit unreachable from refs.
+        tip_oids: set[pygit2.Oid] = {self.repo.head.target}
         for name in self.repo.branches.local:
             branch = self.repo.lookup_branch(name)
             if branch.target is not None:
@@ -501,7 +528,9 @@ class RepositoryManager:
                     tip_oids.add(ref.target)
         return tip_oids
 
-    def get_all_history(self, max_count: int = 500) -> list[CommitInfo]:
+    def get_all_history(
+        self, max_count: int = 500, *, extra_tips: list[str] | None = None,
+    ) -> list[CommitInfo]:
         """Walk the full commit DAG reachable from any branch (local/remote) or tag.
 
         Used by the graph view, which needs every commit visible in the
@@ -524,23 +553,30 @@ class RepositoryManager:
 
         Returns an empty list if the repository has no commits or
         ``max_count <= 0``.
+
+        ``extra_tips`` includes detached sibling-worktree HEADs in the same
+        topological walk without creating or moving any references.
         """
         if max_count <= 0 or self.repo.head_is_unborn:
             return []
-        tip_oids = self._collect_all_tip_oids()
-        if not tip_oids:
-            return []
+        try:
+            tip_oids = self._collect_all_tip_oids()
+            tip_oids.update(pygit2.Oid(hex=sha) for sha in (extra_tips or []))
+            if not tip_oids:
+                return []
 
-        revwalk = self.repo.walk(None, SORT_TOPOLOGICAL_TIME)
-        for tip in tip_oids:
-            revwalk.push(tip)
+            revwalk = self.repo.walk(None, SORT_TOPOLOGICAL_TIME)
+            for tip in tip_oids:
+                revwalk.push(tip)
 
-        result: list[CommitInfo] = []
-        for commit in revwalk:
-            if len(result) >= max_count:
-                break
-            result.append(self._to_commit_info(commit))
-        return result
+            result: list[CommitInfo] = []
+            for commit in revwalk:
+                if len(result) >= max_count:
+                    break
+                result.append(self._to_commit_info(commit))
+            return result
+        except (pygit2.GitError, ValueError, KeyError) as exc:
+            raise GitError(f"Cannot read repository history: {exc}") from exc
 
     def count_all_history(self) -> int:
         """Return the total number of commits reachable from any tip.

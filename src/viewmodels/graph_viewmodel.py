@@ -5,15 +5,15 @@ and the Qt-flavoured UI: holds a reference to a :class:`RepositoryManager`,
 recomputes the layout whenever the repository changes, and exposes the
 result plus user-driven ``commit_selected`` events as Qt signals.
 
-The WIP (uncommitted changes) node is now handled by :func:`build_graph`
-itself — the ViewModel only supplies the uncommitted file count and the
-HEAD SHA.  Stash entries are still synthesised as :class:`CommitInfo`
-objects and inserted into the history before calling the engine.
+The active WIP node is handled by :func:`build_graph` using the file count
+and HEAD SHA. Sibling-worktree WIP and stash entries are synthesised as
+:class:`CommitInfo` objects with their own parents before calling the engine.
 """
 from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 import pygit2
 from PySide6.QtCore import QObject, QThreadPool, Signal
@@ -28,6 +28,11 @@ from src.core.graph_v2 import (
 )
 from src.core.models import CommitInfo, StashInfo
 from src.core.repository import RepositoryManager
+from src.core.worktree_status import (
+    WorktreeChanges,
+    read_branch_worktrees,
+    read_other_worktree_changes,
+)
 from src.utils.async_worker import AsyncWorker
 from src.utils.config import default_config_path, get_int, load_config
 from src.utils.debug_mode import dump_graph, is_debug_mode
@@ -144,6 +149,9 @@ class GraphViewModel(QObject):
     ) -> None:
         super().__init__(parent)
         self._repo: RepositoryManager | None = repo_manager
+        self._other_worktrees: dict[str, WorktreeChanges] = {}
+        self._branch_worktrees: dict[str, str] = {}
+        self.graph_updated.connect(self._remember_worktrees)
         # R3.1 (P2): cap the visible history.  When ``history_limit``
         # is ``None`` we read the value from the user config; an
         # explicit argument (used by tests, and by the background
@@ -200,6 +208,8 @@ class GraphViewModel(QObject):
         Passing ``None`` clears the graph (emits an empty list).
         """
         self._repo = manager
+        self._other_worktrees = {}
+        self._branch_worktrees = {}
         # Reset the infinite-scroll window: a different repository
         # starts at one page regardless of how far the user scrolled
         # the previous one.  The generation bump also invalidates any
@@ -212,6 +222,22 @@ class GraphViewModel(QObject):
 
     def repository(self) -> RepositoryManager | None:
         return self._repo
+
+    def _remember_worktrees(self, rows: list[dict]) -> None:
+        self._branch_worktrees = dict(rows[0].get("branch_worktrees", {})) if rows else {}
+        self._other_worktrees = {
+            row["sha"]: row["worktree"] for row in rows if row.get("worktree")
+        }
+
+    def worktree_changes(self, node_id: str | None) -> WorktreeChanges | None:
+        return self._other_worktrees.get(node_id)
+
+    def other_worktrees(self) -> list[WorktreeChanges]:
+        return sorted(self._other_worktrees.values(), key=lambda entry: entry.path)
+
+    def branch_worktrees(self) -> dict[str, str]:
+        """Latest branch-to-checkout snapshot, including clean and off-screen worktrees."""
+        return dict(self._branch_worktrees)
 
     @property
     def history_limit(self) -> int:
@@ -513,6 +539,9 @@ class GraphViewModel(QObject):
         repo: RepositoryManager,
         error_callback: Callable[[str], None] | None = None,
         history_limit: int = DEFAULT_GRAPH_HISTORY_LIMIT,
+        other_worktrees: list[WorktreeChanges] | None = None,
+        raw_status: dict[str, int] | None = None,
+        branch_worktrees: dict[str, str] | None = None,
     ) -> tuple[list[dict], str | None]:
         """Pure data-in/data-out — safe for background threads.
 
@@ -525,11 +554,21 @@ class GraphViewModel(QObject):
         walks the un-truncated history.
         """
         try:
-            history = repo.get_all_history(max_count=history_limit)
+            if branch_worktrees is None:
+                branch_worktrees = read_branch_worktrees(repo, error_callback)
+            if other_worktrees is None:
+                other_worktrees = read_other_worktree_changes(repo, error_callback)
+            extra_tips = [w.head_sha for w in other_worktrees if w.head_sha and w.branch is None]
+            history = (
+                repo.get_all_history(max_count=history_limit, extra_tips=extra_tips)
+                if extra_tips else repo.get_all_history(max_count=history_limit)
+            )
             branches = repo.branches
             tags = repo.tags
             head_target, head_shorthand = GraphViewModel._head_info_from(repo)
-            status = repo.get_status()
+            status = (
+                repo.get_status() if raw_status is None else repo.get_status_from_raw(raw_status)
+            )
         except GitError as exc:
             return [], str(exc)
 
@@ -557,9 +596,8 @@ class GraphViewModel(QObject):
                 idx += 1
             while idx < len(history) and history[idx].author_time == t:
                 idx += 1
-            # Stashes whose first parent is HEAD must appear above HEAD
-            # so the rebalance step in build_graph can move them to
-            # offset lanes, freeing lane 0 for the WIP node.
+            # Keep children before their parent even with equal/skewed
+            # timestamps, so build_graph routes stash edges down to HEAD.
             if stash_ci.parents and stash_ci.parents[0] == head_target:
                 idx = min(idx, head_idx)
             history.insert(idx, stash_ci)
@@ -567,6 +605,23 @@ class GraphViewModel(QObject):
                 head_idx += 1
 
         uncommitted_count: int | None = len(status) if status else None
+
+        # Use ordinary DAG edges for sibling WIP nodes: each has its own HEAD,
+        # including multiple worktrees at the same commit and detached checkouts.
+        worktrees_by_id = {entry.node_id: entry for entry in other_worktrees}
+        for entry in other_worktrees:
+            label = entry.branch or f"detached HEAD {entry.head_sha[:7] if entry.head_sha else ''}"
+            marker = CommitInfo(
+                sha=entry.node_id, short_sha="WIP",
+                message=f"WIP: {entry.count} files · {label} · {Path(entry.path).name}",
+                author_name="", author_email="", author_time=0,
+                committer_name="", committer_email="", committer_time=0,
+                parents=[entry.head_sha] if entry.head_sha else [], kind="wip",
+            )
+            parent_index = next(
+                (i for i, commit in enumerate(history) if commit.sha == entry.head_sha), 0,
+            )
+            history.insert(parent_index, marker)
 
         try:
             layout = build_graph(history, branches, uncommitted_count=uncommitted_count,
@@ -579,6 +634,10 @@ class GraphViewModel(QObject):
             dump_graph(layout, stash_sha_set)
 
         rows = graph_to_dicts(layout)
+        # Carry the full snapshot through sync, async and paginated graph updates.
+        # Keeping off-screen branches prevents repeated refreshes with a history cap.
+        if rows:
+            rows[0]["branch_worktrees"] = branch_worktrees
 
         # Enrich rows with refs and branch_refs for the widget.
         refs_by_sha = _build_refs_map(tags, head_target)
@@ -588,9 +647,12 @@ class GraphViewModel(QObject):
             sha = commit["sha"] if commit else ""
             row["refs"] = refs_by_sha.get(sha, [])
             row["branch_refs"] = [b.to_dict() for b in branch_refs_by_sha.get(sha, [])]
+            for branch in row["branch_refs"]:
+                if not branch.get("is_remote") and branch["name"] in branch_worktrees:
+                    branch["worktree_path"] = branch_worktrees[branch["name"]]
 
             # Backward-compatible flat keys.
-            if row.get("is_uncommitted"):
+            if row.get("is_uncommitted") and not commit:
                 row["sha"] = "WIP"
             else:
                 row["sha"] = sha
@@ -621,6 +683,9 @@ class GraphViewModel(QObject):
                 row["author_time"] = 0
                 row["parents"] = []
                 row["kind"] = "commit"
+            if sha in worktrees_by_id:
+                row["worktree"] = worktrees_by_id[sha]
+                row["uncommitted_count"] = worktrees_by_id[sha].count
         return rows, None
 
     def select_commit(self, sha: str) -> None:

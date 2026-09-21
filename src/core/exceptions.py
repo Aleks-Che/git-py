@@ -18,6 +18,25 @@ class GitError(Exception):
     """Base class for all domain errors raised by ``core/``."""
 
 
+class StashSaveError(GitError):
+    """A failed stash save, possibly after the stash itself was created.
+
+    ``saved_oid`` identifies a newly observed stash, never a pre-existing entry.
+    Keep the original diagnostic in ``details`` for logs; the exception message
+    explains the partial result and any file lock to the user.
+    """
+
+    def __init__(
+        self, message: str, *, details: str, saved_oid: str | None = None,
+        blocked_path: str | None = None, is_locked: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.details = details
+        self.saved_oid = saved_oid
+        self.blocked_path = blocked_path
+        self.is_locked = is_locked
+
+
 class RepositoryNotFoundError(GitError):
     """The given path does not contain a Git repository (or does not exist)."""
 
@@ -92,4 +111,5 @@ __all__ = [
     "NetworkError",
     "RebaseConflictError",
     "RepositoryNotFoundError",
+    "StashSaveError",
 ]

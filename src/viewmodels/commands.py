@@ -21,8 +21,10 @@ from pathlib import Path
 import pygit2
 from PySide6.QtCore import QObject, Signal
 
+from src.core.conflict_resolution import ConflictSnapshot, write_resolution
 from src.core.diff_parser import ParsedDiffLine
 from src.core.exceptions import GitError, MergeConflictError
+from src.core.file_edit import TextFileSnapshot, replace_text_file
 from src.core.operations import (
     DEFAULT_PUSH_TIMEOUT_SECONDS,
     abort_merge,
@@ -1741,14 +1743,23 @@ class DiscardFileCommand(GitCommand):
     """Discard uncommitted changes for a single file, restoring it from HEAD.
 
     Untracked files are handled specially: the content is read into memory
-    and the file is removed from disk; undo writes it back.
+    and the file is removed from disk; undo writes it back. Files exceeding
+    the backup limit are left untouched and reported through GitError.
     """
 
-    def __init__(self, repo: RepositoryManager, path: str) -> None:
+    def __init__(
+        self, repo: RepositoryManager, path: str, *, max_backup_bytes: int | None = None,
+    ) -> None:
         self._repo = repo
         self._path = path
         self._untracked_backup: bytes | None = None
-        self._backup_exceeded = False
+        if max_backup_bytes is None:
+            from src.utils.config import default_config_path, load_config
+
+            max_backup_bytes = load_config(default_config_path())["discard_file_max_backup_bytes"]
+        if type(max_backup_bytes) is not int or max_backup_bytes < 0:
+            raise ValueError("max_backup_bytes must be a non-negative integer")
+        self._max_backup_bytes = max_backup_bytes
 
     def _is_untracked(self) -> bool:
         flag = self._repo.repo.status().get(self._path)
@@ -1777,21 +1788,28 @@ class DiscardFileCommand(GitCommand):
         if workdir is None:
             return
         full_path = Path(workdir) / self._path
-        if not full_path.exists():
-            return
-        from src.utils.config import default_config_path, get_int, load_config
-
-        cap = get_int(
-            load_config(default_config_path()),
-            "discard_file_max_backup_bytes",
-            1024 * 1024,
-        )
-        if full_path.stat().st_size > max(0, cap):
-            self._backup_exceeded = True
+        cap = self._max_backup_bytes
+        try:
+            if not full_path.exists():
+                self.is_noop = True
+                return
+            if full_path.stat().st_size > cap:
+                raise GitError(
+                    f"Cannot discard {self._path!r}: the file exceeds the undo backup "
+                    f"limit ({cap} bytes). The file has been kept."
+                )
+            # Bound the read too: the file may have grown since stat().
+            with full_path.open("rb") as source:
+                backup = source.read(cap + 1)
+            if len(backup) > cap:
+                raise GitError(
+                    f"Cannot discard {self._path!r}: the file grew beyond the undo "
+                    f"backup limit ({cap} bytes). The file has been kept."
+                )
             full_path.unlink()
-            return
-        self._untracked_backup = full_path.read_bytes()
-        full_path.unlink()
+        except OSError as exc:
+            raise GitError(f"Could not discard {self._path!r}: {exc}") from exc
+        self._untracked_backup = backup
 
     def undo(self) -> None:
         if self._untracked_backup is None:
@@ -1802,8 +1820,13 @@ class DiscardFileCommand(GitCommand):
             workdir = r.workdir
         if workdir is not None:
             full_path = Path(workdir) / self._path
-            full_path.parent.mkdir(parents=True, exist_ok=True)
-            full_path.write_bytes(self._untracked_backup)
+            try:
+                full_path.parent.mkdir(parents=True, exist_ok=True)
+                # Never overwrite a file created after the original discard.
+                with full_path.open("xb") as target:
+                    target.write(self._untracked_backup)
+            except OSError as exc:
+                raise GitError(f"Could not restore {self._path!r}: {exc}") from exc
         self._untracked_backup = None
 
     @property
@@ -1837,6 +1860,29 @@ class StashSingleFileCommand(GitCommand):
     @property
     def name(self) -> str:
         return f"stash {self._path}"
+
+
+class SaveFileCommand(GitCommand):
+    """Save worktree text without staging; Undo/Redo preserve later disk edits."""
+
+    def __init__(self, snapshot: TextFileSnapshot, text: str) -> None:
+        self._snapshot = snapshot
+        self._data = snapshot.encode(text)
+        self.is_noop = self._data == snapshot.data
+
+    def execute(self) -> None:
+        replace_text_file(
+            self._snapshot.root, self._snapshot.path, self._snapshot.data, self._data,
+        )
+
+    def undo(self) -> None:
+        replace_text_file(
+            self._snapshot.root, self._snapshot.path, self._data, self._snapshot.data,
+        )
+
+    @property
+    def name(self) -> str:
+        return f"save {self._snapshot.path}"
 
 
 class IgnoreCommand(GitCommand):
@@ -2073,6 +2119,31 @@ class ContinueRebaseCommand(GitCommand):
             raise GitError("Original rebase HEAD is missing; cannot undo.")
         ensure_safe_tree_update(self._repo, self._previous_oid, "undo rebase")
         reset(self._repo, self._previous_oid, mode="hard")
+
+
+class ResolveConflictCommand(GitCommand):
+    """Stage a guarded resolution as part of the current merge/rebase transaction.
+
+    The enclosing operation owns Undo: recording this intermediate index edit
+    would leave an unusable undo entry after CompleteMerge resets the worktree.
+    """
+
+    is_noop = True
+
+    def __init__(self, repo_manager, snapshot: ConflictSnapshot, data: bytes) -> None:
+        self._repo = repo_manager
+        self._snapshot = snapshot
+        self._data = data
+
+    @property
+    def name(self) -> str:
+        return "ResolveConflict"
+
+    def execute(self) -> None:
+        write_resolution(self._repo, self._snapshot, self._data)
+
+    def undo(self) -> None:
+        pass  # The enclosing merge/rebase command owns rollback.
 
 
 class CompleteMergeCommand(GitCommand):

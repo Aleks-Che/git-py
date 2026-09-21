@@ -478,11 +478,12 @@ class CommitPanel(QWidget):
             return
         current = self._vm.selected_file()
         if current == path and not self._vm.selected_file_is_staged():
-            self._vm.select_file(None)
-            self._unstaged_list.clearSelection()
-            self._staged_list.clearSelection()
+            if self._vm.select_file(None):
+                self._unstaged_list.clearSelection()
+                self._staged_list.clearSelection()
         else:
             self._vm.select_file(path)
+        self._highlight_selected_file()
 
     def _on_staged_index_clicked(self, index: QModelIndex) -> None:
         change = index.data(FileChangeRole) if index.isValid() else None
@@ -494,11 +495,12 @@ class CommitPanel(QWidget):
             return
         current = self._vm.selected_file()
         if current == path and self._vm.selected_file_is_staged():
-            self._vm.select_file(None)
-            self._unstaged_list.clearSelection()
-            self._staged_list.clearSelection()
+            if self._vm.select_file(None):
+                self._unstaged_list.clearSelection()
+                self._staged_list.clearSelection()
         else:
             self._vm.select_file(path, staged=True)
+        self._highlight_selected_file()
 
     def _on_unstage_all_clicked(self) -> None:
         if len(self._staged_list.selected_paths()) >= 2:
@@ -542,13 +544,13 @@ class CommitPanel(QWidget):
         elif action == "ignore":
             self._main_vm.ignore_pattern(path)
         elif action == "ignore_dir":
-            parent_dir = _os.path.dirname(path)
+            parent_dir = _os.path.dirname(path.replace("\\", "/"))
             if parent_dir:
                 self._main_vm.ignore_pattern(parent_dir + "/")
         elif action == "ignore_parent_dir":
             parts = path.replace("\\", "/").split("/")
-            if len(parts) >= 2:
-                self._main_vm.ignore_pattern("/".join(parts[:-1]) + "/")
+            if len(parts) >= 3:
+                self._main_vm.ignore_pattern("/".join(parts[:-2]) + "/")
         elif action == "ignore_ext":
             _, ext = _os.path.splitext(path)
             if ext:
@@ -572,13 +574,13 @@ class CommitPanel(QWidget):
         elif action == "ignore":
             self._main_vm.ignore_pattern(path)
         elif action == "ignore_dir":
-            parent_dir = _os.path.dirname(path)
+            parent_dir = _os.path.dirname(path.replace("\\", "/"))
             if parent_dir:
                 self._main_vm.ignore_pattern(parent_dir + "/")
         elif action == "ignore_parent_dir":
             parts = path.replace("\\", "/").split("/")
-            if len(parts) >= 2:
-                self._main_vm.ignore_pattern("/".join(parts[:-1]) + "/")
+            if len(parts) >= 3:
+                self._main_vm.ignore_pattern("/".join(parts[:-2]) + "/")
         elif action == "ignore_ext":
             _, ext = _os.path.splitext(path)
             if ext:

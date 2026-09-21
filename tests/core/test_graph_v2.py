@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import pygit2
+import pytest
 from src.core.graph_v2 import (
     BRANCH_PALETTE,
     UNCOMMITTED_COLOR_INDEX,
@@ -1105,15 +1106,76 @@ def test_stash_kind_nodes() -> None:
     assert len(stash_nodes) >= 1
 
 
-# ---- stash rebalancing around WIP ---------------------------------------
+# ---- stash routing around WIP -------------------------------------------
+
+
+@pytest.mark.parametrize("detached", [False, True])
+@pytest.mark.parametrize("uncommitted_count", [None, 2])
+@pytest.mark.parametrize("stash_count", [1, 2])
+def test_stash_connections_span_intervening_branch_commits(
+    detached: bool, uncommitted_count: int | None, stash_count: int,
+) -> None:
+    """A saved stash stays connected when a different branch is ahead of HEAD.
+
+    Reproduces the 9b80 worktree: a newest stash, three newer commits on
+    dev, then detached HEAD. Check the entire path, not just its endpoints.
+    Also cover new edits after saving and multiple stashes sharing HEAD.
+    """
+    head = "a" * 40
+    stashes = [
+        _c(str(i) * 40, parents=[head], kind="stash", ts=10 - i)
+        for i in range(stash_count)
+    ]
+    commits = [
+        *stashes,
+        _c("d" * 40, parents=["c" * 40], ts=5),
+        _c("c" * 40, parents=["b" * 40], ts=4),
+        _c("b" * 40, parents=[head], ts=3),
+        _c(head, parents=["e" * 40], ts=2),
+        _c("e" * 40, ts=1),
+    ]
+    branches = [_b("dev", "d" * 40)]
+    if not detached:
+        branches.append(_b("main", head, is_head=True))
+    layout = build_graph(commits, branches, uncommitted_count, head)
+    head_idx = next(i for i, n in enumerate(layout.nodes) if n.is_head)
+    head_node = layout.nodes[head_idx]
+    stash_nodes = [n for n in layout.nodes if n.commit and n.commit.kind == "stash"]
+    if uncommitted_count is None:
+        assert stash_nodes[0].lane == head_node.lane
+        assert not any(n.is_uncommitted for n in layout.nodes)
+    else:
+        assert layout.nodes[0].is_uncommitted
+        assert layout.nodes[0].lane == head_node.lane
+        assert all(n.lane != head_node.lane for n in stash_nodes)
+
+    for stash in stash_nodes:
+        stash_idx = layout.nodes.index(stash)
+        col = stash.lane * 2
+        assert stash.cells[col].cell_type == CellType.COMMIT
+        for row in layout.nodes[:stash_idx]:
+            assert col >= len(row.cells) or row.cells[col].cell_type == CellType.EMPTY
+        for row in layout.nodes[stash_idx + 1:head_idx]:
+            assert row.cells[col].cell_type == CellType.PIPE
+            assert row.cells[col].color_index == stash.color_index
+        if stash.lane != head_node.lane:
+            assert head_node.cells[col].cell_type in (CellType.MERGE_LEFT, CellType.TEE_UP)
+
+    # Every vertical above HEAD must start at a real node on that lane.
+    started_lanes: set[int] = set()
+    for row in layout.nodes[:head_idx]:
+        if row.commit or row.is_uncommitted:
+            started_lanes.add(row.lane)
+        for col, cell in enumerate(row.cells):
+            if cell.cell_type == CellType.PIPE:
+                assert col // 2 in started_lanes
 
 
 def test_wip_sits_on_main_lane_above_stash() -> None:
     """WIP marker must sit on lane 0; the stash goes to the first offset lane.
 
-    Without the rebalance, the stash inherits lane 0 from its parent
-    HEAD and the WIP has to take lane 1, visually placing the WIP
-    marker on a side branch.
+    Reserving HEAD's lane before routing stash edges keeps the WIP
+    marker on the main line and the stash on a separate connected lane.
     """
     c1 = "a" * 40  # HEAD
     c0 = "b" * 40  # parent
@@ -1143,8 +1205,7 @@ def test_wip_sits_on_main_lane_above_stash() -> None:
 
     assert stash.commit.kind == "stash"
     assert stash.lane == 1, "stash must be on the first offset lane (1)"
-    # The stash's old COMMIT at lane 0 must be cleared so the WIP
-    # can flow down through it.
+    # The reserved lane carries WIP through the stash row.
     assert stash.cells[0].cell_type == CellType.PIPE
     # The stash just shows COMMIT at lane 1 — no horizontal
     # at the stash row.  The connection is at HEAD's row below.
@@ -1205,13 +1266,7 @@ def test_consecutive_stashes_form_ladder_via_wip_rebalancing() -> None:
 
 
 def test_stash_alongside_commit_inherits_main_loop_ladder() -> None:
-    """A stash sharing HEAD with a regular commit uses the next free lane.
-
-    The main loop already places the regular commit on lane 1 via its
-    fork detection, so the rebalance must place the stash on lane 2
-    (next free after 0 and 1), and the fork connector at HEAD must
-    cover both branches.
-    """
+    """WIP reserves HEAD's lane; stash and feature get lanes in row order."""
     c1 = "a" * 40
     c0 = "b" * 40
     feat = "c" * 40
@@ -1237,11 +1292,11 @@ def test_stash_alongside_commit_inherits_main_loop_ladder() -> None:
     assert len(layout.nodes) == 5
     wip, stash, feature, head, _parent = layout.nodes
     assert wip.is_uncommitted and wip.lane == 0
-    assert stash.lane == 2
-    assert feature.lane == 1
+    assert stash.lane == 1
+    assert feature.lane == 2
 
-    # The fork connector at HEAD must include both feature (lane 1)
-    # and stash (lane 2) — feature is intermediate (TEE_UP), stash
+    # The fork connector at HEAD must include both stash (lane 1)
+    # and feature (lane 2) — stash is intermediate (TEE_UP), feature
     # is the rightmost merge (MERGE_LEFT).
     assert head.cells[0].cell_type == CellType.TEE_RIGHT
     assert head.cells[2].cell_type == CellType.TEE_UP
@@ -1266,23 +1321,20 @@ def test_stash_below_head_is_not_moved() -> None:
         head_commit_sha=c2,
     )
 
-    # Stash sits on whatever lane the main loop gave it (not above
-    # HEAD, so the rebalance is a no-op).  WIP still ends up on lane 0
+    # Stash sits on its normal lane below HEAD. WIP still ends up on lane 0
     # because the stash is below HEAD and does not occupy lane 0
     # in any row above HEAD.
     assert layout.nodes[0].is_uncommitted
     assert layout.nodes[0].lane == 0
     stash = next(n for n in layout.nodes if n.commit is not None and n.commit.kind == "stash")
-    # The stash's parent is c1 (HEAD's parent), so the rebalance
-    # never touches it — its lane is whatever the main loop assigned.
+    # The stash's parent is c1 (HEAD's parent); it needs no WIP reservation.
     assert stash.commit.parents[0] == c1
 
 
 def test_wip_compatibility_allows_pipe_at_head_lane() -> None:
     """A vertical PIPE at lane 0 above HEAD does not block the WIP.
 
-    This is the post-rebalance state: the stash is on an offset lane
-    and the cell at lane 0 in the stash's row holds a PIPE for the
+    The stash is on an offset lane and the cell at lane 0 holds a PIPE for the
     WIP's own vertical.  The WIP must be allowed to sit on lane 0
     even though that cell is no longer EMPTY.
     """
@@ -1342,26 +1394,11 @@ def test_horizontal_across_head_lane_blocks_wip() -> None:
 
 
 def test_lane0_pipe_continues_through_offset_stash_when_no_wip() -> None:
-    """Lane 0 line above HEAD stays continuous through an offset-lane stash.
-
-    HEAD is a fork point: it has a regular child branch (``feature``) and
-    a stash as siblings. The main loop places ``feature`` on lane 1 (fork
-    detection) and the stash on lane 2 (next free) — neither is on lane 0.
-    The lane 0 line above HEAD must therefore be a continuous PIPE
-    through both rows.
-
-    The rebalance originally cleared the PIPE at lane 0 in the stash row
-    (the logic is only justified when a WIP node will refill the cell);
-    for a clean workdir (no WIP) the cleared cell stayed EMPTY and broke
-    the visual line at the main lane.
-    """
+    """The newest stash's line passes through the older stash and feature."""
     c1 = "a" * 40  # HEAD
     c0 = "b" * 40  # parent
     feat = "c" * 40  # feature branch tip, parent=c1
     s1 = "s" * 40  # stash, parent=c1
-    # Stash has a *newer* feature commit above it so the stash is NOT
-    # the topmost row — the rebalance needs to add a PIPE at lane 0
-    # here so the line stays continuous into the row above.
     s2 = "t" * 40  # stash #2, parent=c1, newer than s1
     commits = [
         _c(s2, parents=[c1], ts=5, kind="stash", message="Stash @1: newer"),
@@ -1385,34 +1422,15 @@ def test_lane0_pipe_continues_through_offset_stash_when_no_wip() -> None:
     # Layout: [s2 (newer stash), s1 (older stash), feature, HEAD, parent]
     newer_stash, older_stash, feature, _head, _parent = layout.nodes
 
-    # The older stash was placed on an offset lane (next free after feature).
-    assert older_stash.lane >= 2
-    # The PIPE at lane 0 in the older stash's row must survive — it is
-    # the lane 0 line passing through the stash's row, drawn by the
-    # main loop because lane 0 was still tracking HEAD's parent above
-    # HEAD.  The rebalance must NOT clear it (no WIP to refill it).
-    assert older_stash.cells[0].cell_type == CellType.PIPE, (
-        "Lane 0 PIPE through the stash row was cleared by the stash "
-        "rebalance even though no WIP node was inserted; this severs "
-        "the lane 0 line above HEAD for clean-workdir views."
-    )
+    assert newer_stash.lane == _head.lane == 0
+    assert older_stash.lane == 1
+    assert older_stash.cells[0].cell_type == CellType.PIPE
     # Same for the feature branch's row.
     assert feature.cells[0].cell_type == CellType.PIPE
 
 
-def test_lane0_pipe_restored_after_stash_moved_off_head_lane_when_no_wip() -> None:
-    """Stash moved off head_lane restores a PIPE there when no WIP, but
-    only when the stash is NOT the topmost row.
-
-    Setup: a regular commit (``feature``) above HEAD sits on lane 0;
-    HEAD is a fork point with both a feature child and a stash child.
-    The stash lands on an offset lane (the main loop's fork detection
-    gives lane 0 to ``feature``).  The lane 0 line above HEAD must pass
-    through the stash's row as a PIPE.
-
-    The companion test for the stash-at-topmost case lives in
-    ``test_topmost_stash_has_no_orphan_pipe_at_head_lane``.
-    """
+def test_lane0_pipe_passes_through_stash_below_feature_when_no_wip() -> None:
+    """A newer feature occupies HEAD's lane; its line crosses the stash row."""
     c1 = "a" * 40  # HEAD
     c0 = "b" * 40  # parent
     feat = "c" * 40  # feature branch tip, parent=c1
@@ -1439,23 +1457,13 @@ def test_lane0_pipe_restored_after_stash_moved_off_head_lane_when_no_wip() -> No
     # Stash was placed on an offset lane (the main loop reserves lane 0
     # for ``feature`` because the fork sibling detection uses lane 0).
     assert stash.lane >= 1
-    # The PIPE at lane 0 in the stash's row must be restored — the line
+    # The PIPE at lane 0 in the stash's row must be preserved — the line
     # at lane 0 passes through the stash row to reach HEAD.
     assert stash.cells[0].cell_type == CellType.PIPE
 
 
 def test_topmost_stash_has_no_orphan_pipe_at_head_lane() -> None:
-    """A stash sitting at the very top of the graph must not have a PIPE
-    stub going up into empty space at head_lane.
-
-    Reproduces the gpt-service bug: the user's only stash is the
-    topmost commit (no commit above it), so adding a PIPE at lane 0 of
-    the stash's row would draw a ``node_radius``-pixel vertical stub
-    pointing up into the empty header / row above.  The line at head_lane
-    simply has nowhere to continue; an EMPTY cell lets the bridge from
-    the row below terminate at the topmost row's commit edge with no
-    dangling stub.
-    """
+    """A clean worktree's only stash starts HEAD's line without orphan pipes."""
     c1 = "a" * 40  # HEAD
     c0 = "b" * 40  # parent
     s1 = "s" * 40  # stash, parent=c1, the only entry above HEAD
@@ -1474,13 +1482,11 @@ def test_topmost_stash_has_no_orphan_pipe_at_head_lane() -> None:
 
     # Layout: [stash, HEAD, parent] — stash is the topmost.
     stash, _head, _parent = layout.nodes
-    # The stash moved to lane 1 (the first offset lane).
-    assert stash.lane == 1
+    assert stash.lane == _head.lane == 0
     # The cell at lane 0 must NOT be a PIPE — there is no row above to
     # bridge to, so a PIPE here would be an orphan stub extending
     # ``node_radius`` pixels up into the empty space above the topmost
-    # commit.  An EMPTY cell lets the line terminate cleanly at the
-    # topmost row's commit edge.
+    # commit. The stash's COMMIT cell starts the line at that node.
     assert stash.cells[0].cell_type != CellType.PIPE, (
         "Topmost stash row has a PIPE at head_lane; the cell has no "
         "row above to connect to and the PIPE draws a stub into the "
@@ -1488,7 +1494,7 @@ def test_topmost_stash_has_no_orphan_pipe_at_head_lane() -> None:
     )
 
 
-# ---- stash rebalance: scenario-driven coverage ---------------------------
+# ---- stash placement: scenario-driven coverage --------------------------
 #
 # The three tests below mirror the scenarios in
 # ``scripts/sim_topmost_stash.py`` (which the simulator runs against
@@ -1497,16 +1503,7 @@ def test_topmost_stash_has_no_orphan_pipe_at_head_lane() -> None:
 
 
 def test_sim_topmost_stash_no_wip() -> None:
-    """Scenario 1: topmost stash, clean workdir — no PIPE stub at lane 0.
-
-    Mirrors the gpt-service bug: a stash whose first parent is HEAD is
-    the *only* entry above HEAD and therefore the topmost commit in
-    the rendered graph.  The stash rebalance must move it to an
-    offset lane (so the WIP node could sit on lane 0 if any), but
-    without WIP there is no row above the stash to bridge to — adding
-    a PIPE at lane 0 of the stash row would draw an orphan stub up
-    into empty space.
-    """
+    """Scenario 1: clean worktree — stash starts the line at HEAD's lane."""
     c0 = "0" * 40
     c1 = "1" * 40  # HEAD
     s1 = "2" * 40  # stash, parent=c1
@@ -1523,8 +1520,7 @@ def test_sim_topmost_stash_no_wip() -> None:
     )
     assert len(layout.nodes) == 3
     stash, _head, _parent = layout.nodes
-    # Stash was placed on an offset lane by the rebalance.
-    assert stash.lane == 1, f"stash should be on lane 1, got {stash.lane}"
+    assert stash.lane == _head.lane == 0
     # The cell at lane 0 must NOT be a PIPE (would draw a stub upward).
     assert stash.cells[0].cell_type != CellType.PIPE, (
         "topmost stash has a PIPE at lane 0 — orphan stub into empty "
@@ -1536,9 +1532,8 @@ def test_sim_topmost_stash_with_wip_is_clean() -> None:
     """Scenario 2: topmost stash with WIP — control / regression guard.
 
     The WIP node sits on lane 0 above every other row; the stash row
-    is therefore *not* the topmost in the rendered list.  The stash
-    rebalance must clear the head-lane cell so the WIP insertion can
-    fill it with a uniform UNCOMMITTED-color PIPE.  This test pins
+    is therefore *not* the topmost in the rendered list. The reserved
+    head-lane cells must carry a uniform UNCOMMITTED-color PIPE. This test pins
     that the WIP path still produces a sane layout (no crash, no
     orphan stub, WIP at the top) when the stash happens to be the
     newest commit in history.
@@ -1576,7 +1571,7 @@ def test_sim_middle_stash_keeps_lane0_pipe() -> None:
     Companion to ``test_sim_topmost_stash_no_wip``: when the stash
     is sandwiched between a regular commit (above) and HEAD (below),
     the line at lane 0 above HEAD has to pass through the stash row
-    as a PIPE.  Clearing it would break the visual line.  The rebalance
+    as a PIPE. Clearing it would break the visual line. The layout
     must therefore keep the PIPE at lane 0 of the stash's row intact
     when there is no WIP to refill it.
     """

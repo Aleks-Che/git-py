@@ -12,9 +12,11 @@ terminal output uses the theme's text / accent colours rather than
 plain monochrome text. The theme is passed when the widget is
 constructed and reused for each process launch — no hot-reloading.
 
-Lifecycle: the process is started when :meth:`set_repo_path` is
-called with a non-``None`` path and stopped when it is set to
-``None`` or the widget is hidden/destroyed.
+Lifecycle: the process starts on the first command and stops when
+the repository changes or the terminal is closed. Merely displaying
+a repository must not launch a shell: its working directory prevents
+external directory renames on Windows. Hiding a running terminal keeps
+the session and any user-started command alive.
 """
 from __future__ import annotations
 
@@ -167,26 +169,19 @@ class TerminalWidget(QWidget):
     # ----- lifecycle ---------------------------------------------------
 
     def set_repo_path(self, path: str | None) -> None:
-        """(Re-)start the shell in ``path``, or stop if ``None``.
+        """Set the next shell's directory, stopping any previous session.
 
         Called by :class:`MainWindow` when a repository is opened
         (:attr:`MainViewModel.repository_changed` signal).
         """
-        if path == self._repo_path and self._process is not None:
+        if path == self._repo_path:
             return
         self._stop_shell()
         self._repo_path = path
-        if path is not None:
-            # Defer startup by one event-loop tick so the window
-            # rendering completes first (the QProcess does not block,
-            # but its output instantly hits the text widget).
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(
-                0, lambda p=path: self._start_shell(p) if self._repo_path == p else None,
-            )
 
     def close(self) -> None:
         """Stop the shell and clear the widget."""
+        self._repo_path = None
         self._stop_shell()
         self._output.clear()
 
@@ -202,8 +197,8 @@ class TerminalWidget(QWidget):
         proc.readyReadStandardError.connect(self._on_stderr)
         proc.finished.connect(self._on_finished)
         proc.errorOccurred.connect(self._on_error)
-        proc.start(shell, args)
         self._process = proc
+        proc.start(shell, args)
 
     def _stop_shell(self) -> None:
         if self._process is None:
@@ -219,29 +214,36 @@ class TerminalWidget(QWidget):
         except (RuntimeError, TypeError):
             pass
         if proc.state() != QProcess.ProcessState.NotRunning:
+            # Keep the QProcess alive until termination is acknowledged. Deleting
+            # it immediately can block in its destructor while the shell exits.
+            proc.finished.connect(proc.deleteLater)
+            if proc.state() == QProcess.ProcessState.Starting:
+                proc.started.connect(proc.kill)
             proc.kill()
-        # deleteLater queues the QProcess for deferred deletion
-        # without blocking the UI thread — waitForFinished() was
-        # the culprit that froze the window for up to 2s on every
-        # repository switch.
-        proc.deleteLater()
+        else:
+            proc.deleteLater()
 
     def _on_input(self) -> None:
         text = self._input.text()
         if not text.strip() and not text:
             return
         self._input.clear()
-        if self._process is None or self._process.state() != QProcess.ProcessState.Running:
+        if self._repo_path is None:
             self._append_html(
                 f"<span style='color: #8B8B8B'>"
                 f"$ {text} [no shell running]</span><br>"
             )
             return
+        if self._process is None:
+            self._start_shell(self._repo_path)
         self._append_html(
             f"<span style='color: {self._theme.accent}; font-weight: bold'>"
             f"> {text}</span><br>"
         )
-        self._process.write(_encode_terminal_input(text + "\r\n"))
+        # QProcess buffers writes while the shell is still starting, so the
+        # first command is delivered as well as subsequent interactive input.
+        if self._process is not None:
+            self._process.write(_encode_terminal_input(text + "\r\n"))
 
     def _on_stdout(self) -> None:
         if self._process is None:
@@ -270,6 +272,7 @@ class TerminalWidget(QWidget):
             f"<span style='color: #8B8B8B'>"
             f"[process exited with code {exit_code}]</span><br>"
         )
+        self._process.deleteLater()
         self._process = None
 
     def _on_error(self, error: QProcess.ProcessError) -> None:
@@ -286,6 +289,9 @@ class TerminalWidget(QWidget):
             f"<span style='color: #E8685A; font-weight: bold'>"
             f"[{msg}]</span><br>"
         )
+        if error == QProcess.ProcessError.FailedToStart and self._process is not None:
+            self._process.deleteLater()
+            self._process = None
 
     def _append_html(self, html: str) -> None:
         cursor = self._output.textCursor()

@@ -167,8 +167,10 @@ def _identity(repo: pygit2.Repository, index: pygit2.Index) -> str:
 
 def staged_identity(path: str) -> str:
     """Reopen the repo and index so external staging and branch switches are visible."""
+    manager = RepositoryManager()
     try:
-        repo = RepositoryManager(path).repo
+        manager.open(path)
+        repo = manager.repo
         index = repo.index
         index.read()
         if index.conflicts is not None:
@@ -176,6 +178,8 @@ def staged_identity(path: str) -> str:
         return _identity(repo, index)
     except (pygit2.GitError, KeyError, ValueError, OSError) as exc:
         raise GitError(f"Cannot read the staged index: {exc}") from exc
+    finally:
+        manager.close()
 
 
 def read_staged_snapshot(path: str, max_chars: int) -> StagedSnapshot:
@@ -184,8 +188,10 @@ def read_staged_snapshot(path: str, max_chars: int) -> StagedSnapshot:
     Deleted files, unchanged moves and assets have no content patch. Other patches
     are included when they fit; working-tree contents are never read.
     """
+    manager = RepositoryManager()
     try:
-        repo = RepositoryManager(path).repo
+        manager.open(path)
+        repo = manager.repo
         index = repo.index
         index.read()
         if index.conflicts is not None:
@@ -206,3 +212,5 @@ def read_staged_snapshot(path: str, max_chars: int) -> StagedSnapshot:
         return StagedSnapshot(identity, str(branch).removeprefix("refs/heads/"), text)
     except (pygit2.GitError, KeyError, ValueError, OSError) as exc:
         raise GitError(f"Cannot read staged changes: {exc}") from exc
+    finally:
+        manager.close()

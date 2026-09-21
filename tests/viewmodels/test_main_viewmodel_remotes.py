@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from unittest.mock import Mock
 
 import pygit2
 import pytest
@@ -598,7 +599,9 @@ def test_auto_fetch_stops_when_repo_closes(committed_repo: RepositoryManager) ->
     assert not vm._auto_fetch_timer.isActive()  # noqa: SLF001
 
 
-def test_auto_fetch_tick_calls_fetch_silent(committed_repo: RepositoryManager) -> None:
+def test_auto_fetch_tick_calls_fetch_silent(
+    committed_repo: RepositoryManager, qtbot, monkeypatch,
+) -> None:
     _ensure_app()
     vm = MainViewModel(
         async_enabled=False,
@@ -608,10 +611,17 @@ def test_auto_fetch_tick_calls_fetch_silent(committed_repo: RepositoryManager) -
     vm.set_repository(committed_repo)
     errors: list[str] = []
     vm.error_occurred.connect(errors.append)
-    # ``no-such-remote`` would normally emit; silent=False call from
-    # the timer must NOT emit.
-    vm.fetch_changes("no-such-remote", silent=True)
-    assert errors == []
+    fetch = Mock(wraps=vm.fetch_changes)
+    monkeypatch.setattr(vm, "fetch_changes", fetch)
+    try:
+        # This repo has no origin. An actual timer tick must fetch silently.
+        qtbot.waitUntil(lambda: fetch.call_count > 0)
+        fetch.assert_called_with("origin", silent=True)
+        assert errors == []
+    finally:
+        # A live timer here used to fire during later async tests, calling their
+        # blocking fetch mock on the GUI thread and deadlocking its release.
+        vm.set_auto_fetch_enabled(False)
 
 
 def test_auto_fetch_set_interval_zero_disables(committed_repo: RepositoryManager) -> None:

@@ -90,6 +90,7 @@ from src.ui.widgets.right_panel import RightPanel
 from src.ui.widgets.search_bar import SearchBar
 from src.ui.widgets.terminal_widget import TerminalWidget
 from src.utils.config import (
+    GRAPH_CONFIGS_KEY,
     SPLITTER_KEY_HORIZONTAL,
     load_config,
     load_diff_view_mode,
@@ -142,6 +143,8 @@ class MainWindow(QMainWindow):
         self._config: dict[str, object] = (
             load_config(self._config_path) if self._config_path is not None else {}
         )
+        self._graph_layout_repo_path: str | None = None
+        self._graph_layout_updates: dict[str, object] = {}
 
         # The top horizontal splitter (left | graph | right) is kept
         # on ``self`` so the persistence layer can read / write its
@@ -174,6 +177,7 @@ class MainWindow(QMainWindow):
         self._search_bar.search_requested.connect(self._on_search_commits)
         self._build_toolbar()
         self._build_central()
+        self._default_graph_dividers = self._graph_table.divider_positions()
         self._build_status_bar()
         self._activity_active = False
         self._main_vm.busy_changed.connect(self._on_busy_changed)
@@ -219,6 +223,8 @@ class MainWindow(QMainWindow):
         Thin shim over :meth:`MainViewModel.set_repository` kept for
         Stage 2 tests (``test_graph_widget.py::test_main_window_wires_graph_view_model``).
         """
+        if not self._main_vm.commit_panel_view_model().file_editor.finish_editing():
+            return
         self._repo_manager = manager
         self._main_vm.set_repository(manager)
         if manager is not None:
@@ -237,6 +243,8 @@ class MainWindow(QMainWindow):
         freezing the UI.
         """
         debug_print("[repo] _open_repository_async start")
+        if not self._main_vm.commit_panel_view_model().file_editor.finish_editing():
+            return
         self._repo_manager = manager
         debug_print("[repo] calling set_repository(refresh=False)...")
         self._main_vm.set_repository(manager, refresh=False)
@@ -280,6 +288,7 @@ class MainWindow(QMainWindow):
         self._repo_bar.show_folder_requested.connect(self._on_show_repo_folder)
         self._repo_bar.copy_path_requested.connect(self._on_copy_repo_path)
         self._repo_tabs_vm.active_tab_changed.connect(self._on_tab_changed)
+        self._main_vm.open_worktree_requested.connect(self._repo_tabs_vm.add_tab)
 
     def _on_add_repository(self) -> None:
         """Show ``OpenOrCloneDialog`` when the ``+`` tab is clicked."""
@@ -305,7 +314,10 @@ class MainWindow(QMainWindow):
         To avoid a signal feedback loop the ``active_tab_changed``
         signal is temporarily disconnected during the restoration.
         """
-        if self._main_vm.is_busy():
+        if (
+            self._main_vm.is_busy()
+            or not self._main_vm.commit_panel_view_model().file_editor.finish_editing()
+        ):
             current = self._main_vm.repository_manager()
             if current is not None and current.path is not None:
                 # Temporarily unhook to avoid triggering
@@ -372,7 +384,7 @@ class MainWindow(QMainWindow):
             QKeySequence(load_hotkey(self._config, "undo", "Ctrl+Z")),
         )
         self._action_undo.setEnabled(False)
-        self._action_undo.triggered.connect(self._main_vm.undo)
+        self._action_undo.triggered.connect(self._on_undo)
         edit_menu.addAction(self._action_undo)
 
         self._action_redo = QAction("&Redo", self)
@@ -380,7 +392,7 @@ class MainWindow(QMainWindow):
             QKeySequence(load_hotkey(self._config, "redo", "Ctrl+Y")),
         )
         self._action_redo.setEnabled(False)
-        self._action_redo.triggered.connect(self._main_vm.redo)
+        self._action_redo.triggered.connect(self._on_redo)
         edit_menu.addAction(self._action_redo)
 
         remote_menu = bar.addMenu("&Remote")
@@ -534,9 +546,26 @@ class MainWindow(QMainWindow):
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, search_toolbar)
 
     def _update_undo_redo_actions(self) -> None:
+        if hasattr(self, "_diff_view") and self._diff_view.is_editing():
+            ready = not self._main_vm.is_busy()
+            self._action_undo.setEnabled(ready and self._diff_view.can_undo_edit())
+            self._action_redo.setEnabled(ready and self._diff_view.can_redo_edit())
+            return
         proc = self._main_vm.command_processor()
-        self._action_undo.setEnabled(proc.can_undo)
-        self._action_redo.setEnabled(proc.can_redo)
+        self._action_undo.setEnabled(proc.can_undo and not self._main_vm.is_busy())
+        self._action_redo.setEnabled(proc.can_redo and not self._main_vm.is_busy())
+
+    def _on_undo(self) -> None:
+        if self._diff_view.is_editing():
+            self._diff_view.undo_edit()
+        else:
+            self._main_vm.undo()
+
+    def _on_redo(self) -> None:
+        if self._diff_view.is_editing():
+            self._diff_view.redo_edit()
+        else:
+            self._main_vm.redo()
 
     def _build_central(self) -> None:
         self._left_panel = LeftPanel(
@@ -554,6 +583,7 @@ class MainWindow(QMainWindow):
         # behaviour (click-same-commit-toggles-off) lives in
         # MainViewModel.select_commit.
         self._graph_table.commit_selected.connect(self._main_vm.select_commit)
+        self._graph_table.open_worktree_requested.connect(self._main_vm.open_worktree)
 
         # Wire context-menu actions from the graph table.
         self._graph_table.checkout_commit_requested.connect(
@@ -656,7 +686,7 @@ class MainWindow(QMainWindow):
         self._conflict_panel = ConflictPanel(self)
         self._conflict_panel.resolve_requested.connect(self._on_conflict_resolve)
         self._conflict_panel.continue_requested.connect(
-            self._main_vm.continue_operation,
+            self._main_vm.request_continue_operation,
         )
         self._conflict_panel.abort_requested.connect(self._on_conflict_abort)
         self._main_vm.conflict_state_changed.connect(self._conflict_panel.set_state)
@@ -671,6 +701,18 @@ class MainWindow(QMainWindow):
         # switch between graph and diff view.
         cp_vm = self._main_vm.commit_panel_view_model()
         cp_vm.selected_file_changed.connect(self._on_commit_file_selected)
+        editor_vm = cp_vm.file_editor
+        self._diff_view.edit_requested.connect(self._on_file_edit_requested)
+        self._diff_view.edit_exit_requested.connect(self._on_file_edit_exit_requested)
+        self._diff_view.save_requested.connect(editor_vm.save_file)
+        self._diff_view.cancel_requested.connect(cp_vm.cancel_file_editing)
+        self._diff_view.file_text_changed.connect(editor_vm.set_text)
+        self._diff_view.editor_history_changed.connect(self._update_undo_redo_actions)
+        self._diff_view.set_save_shortcut(
+            QKeySequence(load_hotkey(self._config, "save_file", "Ctrl+S")),
+        )
+        editor_vm.text_loaded.connect(self._diff_view.set_file_text)
+        editor_vm.state_changed.connect(self._sync_file_editor)
         cp_vm.diff_loading_changed.connect(
             lambda loading: self._on_diff_loading_changed(loading, cp_vm),
         )
@@ -802,12 +844,9 @@ class MainWindow(QMainWindow):
         repo = self._main_vm.repository_manager()
         if repo is None or not repo.is_open:
             return
-        dialog = ConflictResolutionDialog(repo, path, self)
-        dialog.resolved.connect(
-            lambda text, p=path: self._main_vm.resolve_conflict(p, text),
-        )
-        dialog.resolved_bytes.connect(
-            lambda data, p=path: self._main_vm.resolve_conflict_bytes(p, data),
+        dialog = ConflictResolutionDialog(repo, path, self, config_path=self._config_path)
+        dialog.save_result = lambda data: self._main_vm.resolve_conflict_bytes(
+            path, data, snapshot=dialog.viewmodel.snapshot,
         )
         dialog.exec()
 
@@ -823,6 +862,7 @@ class MainWindow(QMainWindow):
     def _on_commit_file_selected(self, path: str | None) -> None:
         cp_vm = self._main_vm.commit_panel_view_model()
         self._diff_source = cp_vm if path is not None else None
+        self._diff_view.set_edit_available(path is not None and not is_image_path(path))
         mode: DiffLineActionMode | None = None
         if path is not None and cp_vm.selected_file_supports_line_actions():
             mode = (
@@ -834,12 +874,15 @@ class MainWindow(QMainWindow):
         self._on_selected_file_changed(path)
 
     def _on_commit_detail_file_selected(self, path: str | None) -> None:
+        self._diff_view.set_edit_available(False)
         self._diff_source = self._right_panel._commit_detail if path is not None else None
         self._diff_view.set_line_action_mode(None)
         self._on_selected_file_changed(path)
 
     def _on_diff_line_action_requested(self, line) -> None:
         cp_vm = self._main_vm.commit_panel_view_model()
+        if cp_vm.file_editor.active:
+            return
         path = cp_vm.selected_file()
         if path is None or not cp_vm.selected_file_supports_line_actions():
             return
@@ -847,6 +890,23 @@ class MainWindow(QMainWindow):
             self._main_vm.unstage_diff_line(path, line)
         else:
             self._main_vm.stage_diff_line(path, line)
+
+    def _sync_file_editor(self) -> None:
+        editor = self._main_vm.commit_panel_view_model().file_editor
+        self._diff_view.set_edit_state(editor.active, editor.dirty, editor.loading, editor.blocked)
+
+    def _on_file_edit_requested(self, active: bool) -> None:
+        panel = self._main_vm.commit_panel_view_model()
+        if active and self._diff_source is panel:
+            panel.begin_file_editing()
+        elif not active:
+            panel.finish_file_editing()
+        self._sync_file_editor()
+
+    def _on_file_edit_exit_requested(self, mode: DiffViewMode) -> None:
+        if self._main_vm.commit_panel_view_model().finish_file_editing():
+            self._diff_view.set_view_mode(mode)
+            self._maybe_request_full_document()
 
     def _on_selected_file_changed(self, path: str | None) -> None:
         """Switch between graph and diff view when a file is selected.
@@ -945,6 +1005,8 @@ class MainWindow(QMainWindow):
             self._maybe_request_full_document()
 
     def _on_diff_loading_changed(self, loading: bool, source: object) -> None:
+        if self._diff_view.is_editing():
+            return
         if source is self._diff_source:
             if loading and not self._requesting_full_document:
                 self._diff_view.clear()
@@ -965,6 +1027,8 @@ class MainWindow(QMainWindow):
         lands back in :meth:`_on_diff_pair_ready`.
         """
         if self._requesting_full_document:
+            return
+        if self._diff_view.is_editing():
             return
         if self._graph_stack.currentWidget() is not self._diff_view:
             return
@@ -1168,15 +1232,18 @@ class MainWindow(QMainWindow):
 
         ``name`` is the ref name as stored on the chip — local branches
         come through as bare ``"main"``, remote-tracking refs as
-        ``"origin/main"``.  The VM's :meth:`checkout_branch` handles
-        the local case directly; remote refs check whether a local
+        ``"origin/main"``. Local names can also contain slashes; they
+        are looked up before interpreting a remote prefix. The VM's
+        ``request_checkout_branch`` opens the branch's existing worktree
+        tab or performs a local checkout; remote refs check whether a local
         tracking branch exists — if not, the safe fetch+create+checkout
         is used; if it does, the user gets a confirmation dialog asking
         whether to hard-reset the local branch to the remote tip
         (matching the left panel's double-click behaviour).
         """
-        if "/" not in name:
-            self._main_vm.checkout_branch(name)
+        # Local names may contain slashes (e.g. agents-ide/run/<id>).
+        if self._main_vm.local_branch_exists(name) or "/" not in name:
+            self._main_vm.request_checkout_branch(name)
             return
         local_name = name.split("/", 1)[1]
         if not self._main_vm.local_branch_exists(local_name):
@@ -1450,14 +1517,8 @@ class MainWindow(QMainWindow):
             # Fire the handler manually so the tab bar widget updates
             # and the repo opens.
             self._on_tab_changed(self._repo_tabs_vm.active_index)
-        # Restore per-repo graph column widths for the active repo.
-        # Ignore saved values whose total is unreasonably small
-        # (stale config from a previous version).
-        graph_widths = load_graph_column_widths(config, active_repo)
-        if graph_widths is not None and len(graph_widths) == 3 and sum(graph_widths) >= 300:
-            self._graph_table.set_divider_positions(
-                [graph_widths[0], graph_widths[0] + graph_widths[1]],
-            )
+        # Graph widths are restored by repository_changed, including when
+        # switching tabs later. A failed open must not change another repo's layout.
         # Restore the diff-view mode (Changes only / Full document).
         # The widget's default is CHANGES_ONLY; setting a new mode
         # re-renders, which is safe even when no file is selected
@@ -1481,14 +1542,13 @@ class MainWindow(QMainWindow):
         those zeroed-out values and instead fall back to the last
         sizes we observed while the panel was visible.
         """
-        self._diff_source = None
-        self._main_vm.commit_panel_view_model().cancel_diff_loading()
-        self._main_vm.cancel_commit_file_diff()
-        self._diff_view.set_loading(False)
+        if not self._main_vm.commit_panel_view_model().file_editor.finish_editing():
+            event.ignore()
+            return
         if self._config_path is not None:
             config = load_config(self._config_path)
             config["window_size"] = [self.width(), self.height()]
-            splitter_sizes: dict[str, list[int]] = {}
+            splitter_sizes = load_splitter_sizes(config)
             if self._top_splitter is not None:
                 if self._left_panel.isVisible() and self._right_panel.isVisible():
                     splitter_sizes[SPLITTER_KEY_HORIZONTAL] = (
@@ -1522,15 +1582,31 @@ class MainWindow(QMainWindow):
             tab_state = self._repo_tabs_vm.save_to_state()
             config["recent_repos"] = tab_state["paths"]
             config["active_repo"] = tab_state["active_path"]
-            # Persist per-repo graph column widths.
-            active = tab_state["active_path"]
-            if active and self._graph_table is not None:
-                divs = self._graph_table.divider_positions()
-                save_graph_column_widths(
-                    config, active,
-                    [divs[0], divs[1] - divs[0], 100],  # [branch_w, graph_w, _]
+            # Merge only layouts visited in this window with the latest disk state.
+            self._remember_graph_layout()
+            for path, widths in self._graph_layout_updates.get(GRAPH_CONFIGS_KEY, {}).items():
+                save_graph_column_widths(config, path, widths)
+            try:
+                save_config(self._config_path, config)
+            except OSError as exc:
+                choice = QMessageBox.warning(
+                    self, "Settings",
+                    f"Could not save settings: {exc}\n\n"
+                    "Discard these layout changes and close? "
+                    "Cancel keeps the window open so you can retry.",
+                    QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
                 )
-            save_config(self._config_path, config)
+                if choice != QMessageBox.StandardButton.Discard:
+                    event.ignore()
+                    return
+        self._diff_source = None
+        self._main_vm.commit_panel_view_model().cancel_diff_loading()
+        self._main_vm.cancel_commit_file_diff()
+        self._diff_view.set_loading(False)
+        self._main_vm.set_auto_fetch_enabled(False)
+        self._main_vm.stop_worktree_refresh()
+        self._main_vm.release_repository_handles()
         self._terminal.close()
         super().closeEvent(event)
 
@@ -1590,8 +1666,7 @@ class MainWindow(QMainWindow):
             # Restore enabled state for undo/redo based on actual
             # command-processor state; close action is enabled only if
             # a repo is open.
-            self._action_undo.setEnabled(self._main_vm.command_processor().can_undo)
-            self._action_redo.setEnabled(self._main_vm.command_processor().can_redo)
+            self._update_undo_redo_actions()
             self._action_close.setEnabled(self._main_vm.repository_manager() is not None)
             self._status.clearMessage()
         # Disable the toolbar buttons that could race with the worker.
@@ -1668,6 +1743,7 @@ class MainWindow(QMainWindow):
         )
 
         label = QLabel(message, container)
+        label.setTextFormat(Qt.TextFormat.PlainText)
         label.setWordWrap(True)
         label.setMaximumWidth(380)
         label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -1734,7 +1810,32 @@ class MainWindow(QMainWindow):
 
         timer.start()
 
+    def _remember_graph_layout(self) -> None:
+        """Keep the visible layout under the repository that actually owns it."""
+        if self._graph_layout_repo_path is not None:
+            first, second = self._graph_table.divider_positions()
+            save_graph_column_widths(
+                self._graph_layout_updates, self._graph_layout_repo_path,
+                [first, second - first, 100],
+            )
+
+    def _restore_graph_layout(self, path: str | None) -> None:
+        previous = self._graph_layout_repo_path
+        if previous == path or (previous and path and _same_path(previous, path)):
+            return
+        self._remember_graph_layout()
+        self._graph_layout_repo_path = path
+        widths = (
+            load_graph_column_widths(self._graph_layout_updates, path)
+            or load_graph_column_widths(self._config, path)
+        )
+        positions = self._default_graph_dividers
+        if widths is not None and sum(widths) >= 300:
+            positions = [widths[0], widths[0] + widths[1]]
+        self._graph_table.set_divider_positions(positions)
+
     def _on_repository_changed(self, path: str | None) -> None:
+        self._restore_graph_layout(path)
         if path is None:
             self._status.showMessage("No repository")
             self._action_close.setEnabled(False)

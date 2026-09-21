@@ -92,6 +92,41 @@ def test_generation_sends_language_prompt_branch_and_diff(api_server):
     assert "test-secret" not in repr(api_server["settings"])
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("summary", [False, True])
+@pytest.mark.parametrize("description", [False, True])
+def test_commit_branch_label_placement(monkeypatch, enabled, summary, description):
+    monkeypatch.setattr(AIClient, "complete", lambda *_: json.dumps({
+        "summary": "feat(core): improve behavior", "description": "Explain the changes.",
+    }))
+    settings = AISettings(base_url="http://localhost", include_branch_name=enabled,
+                          branch_in_summary=summary, branch_in_description=description)
+    result = AIClient(settings).generate_commit_message("+change", "feature/новое")
+    tag = "[feature/новое]"
+    assert result.summary == "feat(core): improve behavior" + (
+        f" {tag}" if enabled and summary else ""
+    )
+    assert result.description == "Explain the changes." + (
+        f"\n\n{tag}" if enabled and description else ""
+    )
+
+
+@pytest.mark.parametrize("branch,tag", [("", ""), ("HEAD", ""), ("refs/heads/main", " [main]")])
+def test_branch_name_without_symbolic_head_or_ref_prefix(monkeypatch, branch, tag):
+    monkeypatch.setattr(AIClient, "complete", lambda *_: '{"summary":"feat: x","description":"x"}')
+    settings = AISettings(base_url="http://localhost", include_branch_name=True)
+    assert AIClient(settings).generate_commit_message("+x", branch).summary == "feat: x" + tag
+
+
+def test_existing_branch_labels_are_not_duplicated(monkeypatch):
+    message = {"summary": "feat: x [main]", "description": "x\n\n[main]"}
+    monkeypatch.setattr(AIClient, "complete", lambda *_: json.dumps(message))
+    settings = AISettings(base_url="http://localhost", include_branch_name=True,
+                          branch_in_description=True)
+    result = AIClient(settings).generate_commit_message("+x", "main")
+    assert result.summary == message["summary"] and result.description == message["description"]
+
+
 def test_connection_checks_chat_completion_without_sending_a_diff(api_server):
     api_server["response"] = {"choices": [{"message": {"content": "OK"}}]}
     client = AIClient(replace(api_server["settings"], api_key=""))
@@ -101,7 +136,58 @@ def test_connection_checks_chat_completion_without_sending_a_diff(api_server):
     assert body["messages"] == [{"role": "user", "content": "Reply with OK."}]
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 404, 429, 500, 302])
+def test_conflict_resolution_uses_configured_http_client(api_server):
+    from src.core.conflict_resolution import ConflictSnapshot
+    from src.utils.ai_conflicts import resolve_with_ai
+
+    api_server["response"] = {"choices": [{"message": {"content": json.dumps({
+        "resolutions": [{"id": 0, "content": "combined\n"}],
+    })}, "finish_reason": "stop"}]}
+    snapshot = ConflictSnapshot("f", b"base\n", b"ours\n", b"theirs\n")
+    assert resolve_with_ai(snapshot, api_server["settings"]) == "combined\n"
+    path, headers, payload = api_server["requests"][0]
+    assert path == "/v1/chat/completions"
+    assert headers["Authorization"] == "Bearer test-secret"
+    assert payload["model"] == "chat-b"
+    assert json.loads(payload["messages"][2]["content"])["conflicts"][0]["ours"] == "ours\n"
+
+
+@pytest.mark.parametrize("status", [200, 413])
+def test_large_conflict_request_is_sent_in_full_and_size_decided_by_provider(api_server, status):
+    from src.core.conflict_resolution import ConflictSnapshot
+    from src.utils.ai_conflicts import resolve_with_ai
+
+    ours = "left " + "ж" * 130_000 + "\n"
+    theirs = "right " + "я" * 140_000 + "\n"
+    context = "контекст " * 20_000
+    settings = replace(api_server["settings"], max_diff_chars=10, conflict_context=context)
+    snapshot = ConflictSnapshot("f", b"base\n", ours.encode(), theirs.encode())
+    api_server["status"] = status
+    if status == 200:
+        api_server["response"] = {"choices": [{"message": {"content": json.dumps({
+            "resolutions": [{"id": 0, "content": "combined\n"}],
+        })}, "finish_reason": "stop"}]}
+        assert resolve_with_ai(snapshot, settings) == "combined\n"
+    else:
+        api_server["response"] = {"error": "test-secret +private source"}
+        with pytest.raises(AIError, match="HTTP 413.*provider.*too large"):
+            resolve_with_ai(snapshot, settings)
+
+    assert len(api_server["requests"]) == 1
+    path, _, payload = api_server["requests"][0]
+    assert path == "/v1/chat/completions"
+    messages = payload["messages"]
+    assert messages[1]["content"] == "User context:\n" + context
+    assert len(messages[2]["content"]) > AISettings().max_diff_chars
+    conflict = json.loads(messages[2]["content"])["conflicts"][0]
+    assert conflict["base"] == "base\n"
+    assert conflict["ours"] == ours
+    assert conflict["theirs"] == theirs
+    assert "-" + ours in conflict["diff"]
+    assert "+" + theirs in conflict["diff"]
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 413, 429, 500, 302])
 def test_http_errors_do_not_leak_key_or_source_and_do_not_follow_redirects(api_server, status):
     api_server.update(status=status, response={"error": "test-secret +private source"})
     with pytest.raises(AIError, match=f"HTTP {status}") as error:

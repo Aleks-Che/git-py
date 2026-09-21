@@ -44,6 +44,8 @@ from src.utils.async_worker import AsyncWorker
 from src.utils.config import default_config_path, load_config
 from src.utils.image_preview import is_image_path
 from src.utils.latest_worker import LatestWorker
+from src.viewmodels.commands import CommandProcessor
+from src.viewmodels.file_editor_viewmodel import FileEditorViewModel
 
 
 def _generate_message(path: str, identity: str, settings: AISettings) -> CommitMessage:
@@ -125,10 +127,18 @@ class CommitPanelViewModel(QObject):
     def __init__(
         self, parent: QObject | None = None, *, config_path: Path | str | None = None,
         async_enabled: bool = False,
+        command_processor: CommandProcessor | None = None,
     ) -> None:
         super().__init__(parent)
         self._config_path = config_path
         self._async_enabled = async_enabled
+        self.file_editor = FileEditorViewModel(
+            command_processor if command_processor is not None else CommandProcessor(self),
+            self, async_enabled=async_enabled,
+        )
+        self.file_editor.error_occurred.connect(self.error_occurred)
+        self.file_editor.saved.connect(self.refresh_status)
+        self.file_editor.editing_finished.connect(self.refresh_selected_diff)
         self._diff_loader = LatestWorker(self)
         self._diff_loader.busy_changed.connect(self.diff_loading_changed)
         self._diff_loader.finished.connect(self._on_diff_loaded)
@@ -283,6 +293,8 @@ class CommitPanelViewModel(QObject):
         Pass ``refresh=False`` to defer the status re-read so the
         caller can batch it inside a background worker.
         """
+        if not self.file_editor.finish_editing():
+            return
         self.cancel_diff_loading()
         self._repo = manager
         self.generation_status_changed.emit("")
@@ -412,7 +424,7 @@ class CommitPanelViewModel(QObject):
                 index_path = _Path(self._repo.repo.path) / "index"
                 if not self._repo.repo.head_is_unborn and not index_path.exists():
                     raise OSError(f"Git index does not exist: {index_path}")
-                raw_status = self._repo.repo.status()
+                raw_status = self._repo.get_raw_status()
                 self._raw_status = dict(raw_status)
                 self._file_changes = self._repo.get_status_from_raw(raw_status)
                 self._staged_files = self._compute_staged_files_from_raw(raw_status)
@@ -421,6 +433,15 @@ class CommitPanelViewModel(QObject):
                 self._file_changes = []
                 self._raw_status = {}
                 self._staged_files = set()
+        self.apply_status_data(self._file_changes, self._staged_files, self._raw_status)
+
+    def apply_status_data(
+        self, file_changes: list[FileChange], staged: set[str], raw_status: dict[str, int],
+    ) -> None:
+        """Publish a status snapshot on the GUI thread, preserving draft and selection."""
+        self._file_changes = file_changes
+        self._staged_files = staged
+        self._raw_status = raw_status
         # Force-close the diff when the selected file disappeared from
         # the working-tree / index status. ``select_file(None)`` is
         # idempotent (no-op when nothing is selected) and emits the
@@ -428,7 +449,7 @@ class CommitPanelViewModel(QObject):
         # main window uses to swap the graph back in.
         if self._selected_file is not None:
             paths = {c.path for c in self._file_changes}
-            if self._selected_file not in paths:
+            if self._selected_file not in paths and not self.file_editor.active:
                 self.select_file(None)
         self.file_changes_changed.emit()
         self.staged_files_changed.emit(sorted(self._staged_files))
@@ -454,11 +475,15 @@ class CommitPanelViewModel(QObject):
         if self._repo is None or not self._repo.is_open:
             return
         try:
+            # Background status reads use a separate repository. Our cached
+            # index may predate external commits/staging; preserve those entries.
+            index = self._repo.repo.index
+            index.read(force=True)
             if self._is_deleted_from_disk(self._repo, path):
-                self._repo.repo.index.remove(path)
+                index.remove(path)
             else:
-                self._repo.repo.index.add(path)
-            self._repo.repo.index.write()
+                index.add(path)
+            index.write()
         except (pygit2.GitError, OSError, KeyError) as exc:
             self.error_occurred.emit(f"Failed to stage {path!r}: {exc}")
             return
@@ -494,6 +519,8 @@ class CommitPanelViewModel(QObject):
         per-file refresh used to do this implicitly via the side
         change).
         """
+        if self.file_editor.active:
+            return
         path = self._selected_file
         if path is None:
             return
@@ -572,16 +599,35 @@ class CommitPanelViewModel(QObject):
         self.refresh_status()
         self._refresh_selected_file_side(path, prefer_staged=False)
 
-    def select_file(self, path: str | None, staged: bool = False) -> None:
+    def select_file(self, path: str | None, staged: bool = False) -> bool:
         """Set the file whose diff is shown in the preview pane.
 
         ``staged=True`` computes the diff between the index and HEAD
         (i.e. what *is* staged), rather than the working tree vs HEAD.
         """
+        if (path, staged) != (self._selected_file, self._selected_file_staged):
+            if not self.file_editor.finish_editing():
+                return False
         self._selected_file = path
         self._selected_file_staged = staged if path is not None else False
         self.selected_file_changed.emit(path)
         self._compute_and_emit_diff(path)
+        return True
+
+    def begin_file_editing(self) -> None:
+        if self._repo is None or self._selected_file is None or not self._repo.repo.workdir:
+            return
+        config = load_config(self._config_path or default_config_path())
+        self.cancel_diff_loading()
+        self.file_editor.begin_editing(
+            self._repo.repo.workdir, self._selected_file, config["file_editor_max_bytes"],
+        )
+
+    def finish_file_editing(self) -> bool:
+        return self.file_editor.finish_editing()
+
+    def cancel_file_editing(self) -> None:
+        self.file_editor.cancel_editing()
 
     def refresh_selected_diff(self) -> None:
         """Recompute the currently selected file diff without changing selection."""
@@ -695,7 +741,7 @@ class CommitPanelViewModel(QObject):
         repo: RepositoryManager,
     ) -> tuple[list[FileChange], set[str], dict[str, int]]:
         """Read and return file changes, staged paths, and raw status flags."""
-        raw_status = repo.repo.status()
+        raw_status = repo.get_raw_status()
         file_changes = repo.get_status_from_raw(raw_status)
         staged = CommitPanelViewModel._compute_staged_files_from_raw(raw_status)
         return file_changes, staged, dict(raw_status)
@@ -713,7 +759,7 @@ class CommitPanelViewModel(QObject):
         ``repo.status()`` call.
         """
         try:
-            return self._compute_staged_files_from_raw(self._repo.repo.status())
+            return self._compute_staged_files_from_raw(self._repo.get_raw_status())
         except (GitError, pygit2.GitError, OSError) as exc:
             self.error_occurred.emit(str(exc))
             return set()
@@ -724,6 +770,8 @@ class CommitPanelViewModel(QObject):
         self._full_document_requested = False
 
     def _compute_and_emit_diff(self, path: str | None) -> None:
+        if self.file_editor.active:
+            return
         self.cancel_diff_loading()
         self._current_diff = ""
         if self._repo is None or not self._repo.is_open or path is None:

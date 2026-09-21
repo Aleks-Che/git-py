@@ -15,6 +15,7 @@ history shape (merge targets, conflict scenarios, ...).
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -62,6 +63,36 @@ def committed_repo(tmp_git_repo: Path) -> RepositoryManager:
     tree2 = manager.repo.index.write_tree()
     manager.repo.create_commit("refs/heads/main", sig, sig, "greet the world", tree2, [c1])
     return manager
+
+
+@pytest.fixture
+def linked_worktree(committed_repo, tmp_path):
+    """A real linked checkout with a separate index on an agents-style branch."""
+    branch = committed_repo.repo.create_branch(
+        "agents-ide/run/test-worktree", committed_repo.repo.head.peel(),
+    )
+    path = tmp_path / "linked worktree"
+    committed_repo.repo.add_worktree("linked", str(path), branch)
+    manager = RepositoryManager(str(path))
+    try:
+        yield manager
+    finally:
+        manager.close()
+        committed_repo.release_handles()
+
+
+@pytest.fixture
+def packed_repo(committed_repo: RepositoryManager):
+    """A packed repo for real Windows handle/rename regressions."""
+    committed_repo.release_handles()
+    subprocess.run(
+        ["git", "-C", committed_repo.path, "repack", "-ad"],
+        check=True, capture_output=True, timeout=15,
+    )
+    try:
+        yield committed_repo
+    finally:
+        committed_repo.close()
 
 
 @pytest.fixture

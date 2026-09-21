@@ -92,16 +92,18 @@ def test_main_window_wires_terminal_repo_path(qtbot, tmp_path) -> None:
     assert isinstance(win._terminal, TerminalWidget)
 
 
-def test_terminal_starts_on_set_repo_path(qtbot, tmp_git_repo) -> None:
-    """Setting a non-None path starts a QProcess."""
+def test_terminal_does_not_start_until_a_command(qtbot, tmp_git_repo) -> None:
+    """Browsing a repo leaves its directory available to external tools."""
     _ensure_app()
     w = TerminalWidget(DARK_THEME)
     qtbot.addWidget(w)
     w.show()
     w.set_repo_path(str(tmp_git_repo))
-    qtbot.waitUntil(lambda: w._process is not None, timeout=3000)
-    assert w._process is not None
-    assert w._process.state() != QProcess.ProcessState.NotRunning
+    qtbot.wait(10)
+    assert w._process is None
+    moved = tmp_git_repo.with_name("moved")
+    tmp_git_repo.rename(moved)
+    moved.rename(tmp_git_repo)
 
 
 def test_terminal_stops_on_set_repo_path_none(qtbot, tmp_git_repo: Path) -> None:
@@ -111,9 +113,16 @@ def test_terminal_stops_on_set_repo_path_none(qtbot, tmp_git_repo: Path) -> None
     qtbot.addWidget(w)
     w.show()
     w.set_repo_path(str(tmp_git_repo))
+    w._input.setText("echo ready")
+    w._input.returnPressed.emit()
     qtbot.waitUntil(lambda: w._process is not None, timeout=3000)
-    w.set_repo_path(None)
+    proc = w._process
+    with qtbot.waitSignal(proc.finished, timeout=3000):
+        w.set_repo_path(None)
     assert w._process is None
+    moved = tmp_git_repo.with_name("moved")
+    tmp_git_repo.rename(moved)
+    moved.rename(tmp_git_repo)
 
 
 def test_terminal_sends_command_to_process(qtbot, tmp_git_repo: Path) -> None:
@@ -125,13 +134,15 @@ def test_terminal_sends_command_to_process(qtbot, tmp_git_repo: Path) -> None:
     qtbot.addWidget(w)
     w.show()
     w.set_repo_path(str(repo))
-    qtbot.waitUntil(lambda: w._process is not None, timeout=3000)
 
     # Feed input through the QLineEdit.
-    w._input.setText("echo hello")
+    w._input.setText("echo hello & echo first-command-delivered")
     w._input.returnPressed.emit()
-    # Give the process time to produce output.
-    qtbot.wait(500)
+    # The input echo contains one copy; actual output must contain a second.
+    qtbot.waitUntil(
+        lambda: w._output.toPlainText().count("first-command-delivered") >= 2,
+        timeout=3000,
+    )
 
     html = w._output.toHtml()
     # The command echo should show up.
@@ -148,3 +159,49 @@ def test_terminal_without_process_shows_warning(qtbot) -> None:
     w._input.returnPressed.emit()
     html = w._output.toHtml()
     assert "no shell running" in html
+
+
+def test_hiding_terminal_keeps_user_started_session(qtbot, tmp_git_repo):
+    w = TerminalWidget(DARK_THEME)
+    qtbot.addWidget(w)
+    w.show()
+    w.set_repo_path(str(tmp_git_repo))
+    w._input.setText("echo running")
+    w._input.returnPressed.emit()
+    qtbot.waitUntil(lambda: w._process.state() == QProcess.ProcessState.Running)
+    proc = w._process
+    w.hide()
+    qtbot.wait(10)
+    assert w._process is proc
+    assert proc.state() == QProcess.ProcessState.Running
+    with qtbot.waitSignal(proc.finished, timeout=3000):
+        w.close()
+
+
+def test_close_before_command_does_not_start_a_delayed_shell(qtbot, tmp_git_repo):
+    w = TerminalWidget(DARK_THEME)
+    qtbot.addWidget(w)
+    w.set_repo_path(str(tmp_git_repo))
+    w.close()
+    qtbot.wait(10)
+    assert w._process is None
+    assert w._repo_path is None
+
+
+def test_open_window_allows_repository_directory_rename(qtbot, packed_repo, tmp_path):
+    win = MainWindow(config_path=tmp_path / "config.json")
+    qtbot.addWidget(win)
+    win.show()
+    win.set_repository(packed_repo)
+    win._main_vm.stop_worktree_refresh()
+    qtbot.wait(10)
+    assert win._terminal._process is None
+    path = Path(packed_repo.path)
+    moved = path.with_name("repo-moved")
+    path.rename(moved)
+    moved.rename(path)
+    assert packed_repo.get_all_history()
+    # Closing the window must release handles even before another idle tick.
+    win.close()
+    path.rename(moved)
+    moved.rename(path)

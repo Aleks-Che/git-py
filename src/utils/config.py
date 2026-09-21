@@ -20,6 +20,8 @@ import json
 import os
 from copy import deepcopy
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+from threading import Lock
 from typing import TYPE_CHECKING, Any
 
 from src.core.operations import DEFAULT_PUSH_TIMEOUT_SECONDS
@@ -49,6 +51,10 @@ SPLITTER_KEY_GRAPH = "graph"
 # Value is ``{repo_path: [branch_lbl_w, graph_w, commit_msg_w]}``.
 GRAPH_CONFIGS_KEY = "graph_configs"
 
+# Concurrent MoveFileEx calls targeting the same JSON can fail with WinError 5.
+# Serialize only replacement; independent temporary files can still be prepared in parallel.
+_CONFIG_REPLACE_LOCK = Lock()
+
 _DEFAULT_CONFIG: dict[str, Any] = {
     "ai": AISettings().to_dict(),
     "theme": "dark",
@@ -56,6 +62,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "hotkeys": {
         "undo": "Ctrl+Z",
         "redo": "Ctrl+Y",
+        "save_file": "Ctrl+S",
         "fetch": "Ctrl+Shift+F",
         "pull": "Ctrl+Shift+P",
         "push": "Ctrl+Shift+U",
@@ -72,6 +79,8 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     # Whether the auto-fetch timer is enabled. Default off; the UI
     # toggle (Stage 9) will flip this on first launch.
     "auto_fetch_enabled": False,
+    # Local filesystem polling, independent of network auto-fetch.
+    "worktree_refresh_interval_ms": 1000,
     # Total duration of a push through the SSH CLI transport, in seconds.
     "push_timeout_seconds": DEFAULT_PUSH_TIMEOUT_SECONDS,
     # Persisted window size. Filled in by :class:`MainWindow` on
@@ -101,6 +110,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     # values so deployments can tune safety/performance without code changes.
     "command_processor_history_size": 100,
     "discard_file_max_backup_bytes": 1024 * 1024,
+    "file_editor_max_bytes": 2 * 1024 * 1024,
     # Diff-view mode in the centre pane (``"changes_only"`` or
     # ``"full_document"``). Restored on launch, persisted on close.
     # See :class:`src.ui.widgets.diff_view_widget.DiffViewWidget`.
@@ -116,14 +126,18 @@ _DEFAULT_CONFIG: dict[str, Any] = {
 # (including a missing key) falls back to ``"changes_only"``.
 _VALID_DIFF_VIEW_MODES = frozenset({"changes_only", "full_document"})
 
-# Keys that must be ints (validation on load; bad values fall back).
-_INT_KEYS = frozenset({
-    "merge_async_threshold",
-    "auto_fetch_interval_ms",
-    "command_processor_history_size",
-    "discard_file_max_backup_bytes",
-    "graph_history_limit",
-})
+# Bounds are checked before passing values to Qt or using them as page sizes.
+_MAX_QT_INT = 2**31 - 1
+_INT_RANGES = {
+    "merge_async_threshold": (0, _MAX_QT_INT),
+    "auto_fetch_interval_ms": (-_MAX_QT_INT, _MAX_QT_INT),
+    "worktree_refresh_interval_ms": (100, 60_000),
+    "command_processor_history_size": (1, _MAX_QT_INT),
+    "discard_file_max_backup_bytes": (0, _MAX_QT_INT),
+    "file_editor_max_bytes": (1, _MAX_QT_INT),
+    "graph_history_limit": (1, _MAX_QT_INT),
+    "push_timeout_seconds": (1, MAX_PUSH_TIMEOUT_SECONDS),
+}
 
 
 def default_ssh_key_path() -> Path:
@@ -174,20 +188,74 @@ def load_config(path: Path | str) -> dict[str, Any]:
     try:
         with p.open("r", encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return defaults
     if not isinstance(data, dict):
         # Top-level JSON must be an object to merge with defaults; lists,
         # numbers, booleans, and ``null`` cannot be updated.
         return defaults
-    return {**defaults, **data}
+    return normalize_config(data)
+
+
+def normalize_config(data: dict[str, Any]) -> dict[str, Any]:
+    """Validate known fields, retaining unknown keys for forward compatibility."""
+    defaults = deepcopy(_DEFAULT_CONFIG)
+    config = {**defaults, **deepcopy(data)}
+    for key, default in defaults.items():
+        value = config[key]
+        if isinstance(default, bool):
+            if not isinstance(value, bool):
+                config[key] = default
+        elif isinstance(default, str):
+            if not isinstance(value, str) or "\0" in value:
+                config[key] = default
+        elif isinstance(default, dict):
+            config[key] = {**default, **value} if isinstance(value, dict) else default
+    for key, (minimum, maximum) in _INT_RANGES.items():
+        value = config[key]
+        if type(value) is not int or not minimum <= value <= maximum:
+            config[key] = defaults[key]
+    if config["auto_fetch_interval_ms"] <= 0:
+        config["auto_fetch_enabled"] = False
+        config["auto_fetch_interval_ms"] = 0
+    config["window_size"] = list(load_window_size(config))
+    config["splitter_sizes"] = load_splitter_sizes(config)
+    config["diff_view_mode"] = load_diff_view_mode(config)
+    recent = config.get("recent_repos")
+    config["recent_repos"] = (
+        list(dict.fromkeys(p for p in recent if _is_path_string(p)))
+        if isinstance(recent, list) else []
+    )
+    if not _is_path_string(config.get("active_repo")):
+        config["active_repo"] = None
+    # Validate known nested fields without discarding extension keys.
+    config["ai"].update(AISettings.from_config(data).to_dict())
+    for action, default in defaults["hotkeys"].items():
+        config["hotkeys"][action] = load_hotkey(config, action, default)
+    if not isinstance(config.get(GRAPH_CONFIGS_KEY, {}), dict):
+        config[GRAPH_CONFIGS_KEY] = {}
+    return config
+
+
+def _is_path_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip()) and "\0" not in value
+
+
+def _repo_path_key(path: Any) -> str | None:
+    """Canonical preference key; ignore malformed persisted path aliases."""
+    if not _is_path_string(path):
+        return None
+    try:
+        return os.path.normcase(str(Path(path).resolve())).replace("\\", "/")
+    except (OSError, ValueError):
+        return None
 
 
 def save_config(path: Path | str, data: dict[str, Any]) -> None:
     """Write ``data`` as pretty-printed JSON to ``path`` atomically.
 
     Parent directories are created on demand. The payload is first
-    written to a sibling ``.tmp`` file and then renamed over the
+    written to a unique sibling ``.tmp`` file and then renamed over the
     destination via :func:`os.replace`; on POSIX (and on Python 3.3+ on
     Windows) the rename is atomic at the filesystem level, so a crash
     or power loss never leaves a half-written config behind. On any
@@ -195,9 +263,13 @@ def save_config(path: Path | str, data: dict[str, Any]) -> None:
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp: Path | None = None
     try:
-        with tmp.open("w", encoding="utf-8") as f:
+        with NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=p.parent,
+            prefix=p.name + ".", suffix=".tmp", delete=False,
+        ) as f:
+            tmp = Path(f.name)
             json.dump(data, f, indent=2)
             f.flush()
             try:
@@ -206,9 +278,11 @@ def save_config(path: Path | str, data: dict[str, Any]) -> None:
                 # fsync isn't supported on some filesystems (e.g. some FUSE
                 # mounts); the rename is still atomic, so swallow.
                 pass
-        os.replace(tmp, p)
+        with _CONFIG_REPLACE_LOCK:
+            os.replace(tmp, p)
     except Exception:
-        tmp.unlink(missing_ok=True)
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
         raise
 
 
@@ -249,7 +323,7 @@ def _coerce_window_size(value: Any) -> tuple[int, int] | None:
         return None
     if not isinstance(raw_w, int) or not isinstance(raw_h, int):
         return None
-    if raw_w <= 0 or raw_h <= 0:
+    if not 0 < raw_w <= _MAX_QT_INT or not 0 < raw_h <= _MAX_QT_INT:
         return None
     return raw_w, raw_h
 
@@ -279,7 +353,7 @@ def _coerce_splitter_sizes(value: Any) -> dict[str, list[int]]:
             if isinstance(s, bool) or not isinstance(s, int):
                 coerced = []
                 break
-            if s < 0:
+            if not 0 <= s <= _MAX_QT_INT:
                 coerced = []
                 break
             coerced.append(s)
@@ -315,7 +389,7 @@ def load_hotkey(
 def load_diff_view_mode(config: dict[str, Any]) -> str:
     """Return the persisted diff-view mode; ``"changes_only"`` on bad / missing."""
     value = config.get("diff_view_mode")
-    if value in _VALID_DIFF_VIEW_MODES:
+    if isinstance(value, str) and value in _VALID_DIFF_VIEW_MODES:
         return value
     return "changes_only"
 
@@ -328,17 +402,26 @@ def load_graph_column_widths(
     Returns ``None`` when no per-repo entry exists — callers should
     fall back to the graph panel's built-in defaults.
     """
-    if not repo_path:
+    if not _is_path_string(repo_path):
         return None
     graph_configs = config.get(GRAPH_CONFIGS_KEY)
     if not isinstance(graph_configs, dict):
         return None
     widths = graph_configs.get(repo_path)
+    if widths is None:
+        repo_key = _repo_path_key(repo_path)
+        if repo_key is None:
+            return None
+        widths = next(
+            (value for key, value in graph_configs.items()
+             if _repo_path_key(key) == repo_key),
+            None,
+        )
     if not isinstance(widths, list) or len(widths) != 3:
         return None
     result: list[int] = []
     for w in widths:
-        if isinstance(w, bool) or not isinstance(w, int) or w <= 0:
+        if type(w) is not int or not 0 < w <= _MAX_QT_INT:
             return None
         result.append(w)
     return result
@@ -352,7 +435,13 @@ def save_graph_column_widths(
     if not isinstance(graph_configs, dict):
         graph_configs = {}
         config[GRAPH_CONFIGS_KEY] = graph_configs
-    graph_configs[repo_path] = list(widths)
+    repo_key = _repo_path_key(repo_path)
+    if repo_key is None:
+        return
+    for key in list(graph_configs):
+        if _repo_path_key(key) == repo_key:
+            del graph_configs[key]
+    graph_configs[repo_key] = list(widths)
 
 
 def load_author_signature(
@@ -372,6 +461,7 @@ def load_author_signature(
 
     if config is None:
         config = {}
+    config = normalize_config(config)
 
     use_default = config.get("use_default_git_credentials", True)
     if use_default:
@@ -426,6 +516,7 @@ __all__ = [
     "load_hotkey",
     "load_push_timeout",
     "load_splitter_sizes",
+    "normalize_config",
     "save_config",
     "save_graph_column_widths",
     "save_ssh_key_paths",
