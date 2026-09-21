@@ -133,9 +133,19 @@ def _sha_color_seed(sha: str) -> int:
     return crc32(sha.encode("utf-8")) % len(BRANCH_PALETTE)
 
 
-def _branch_color_priority(branch: BranchInfo) -> tuple[bool, bool]:
-    """Prefer conventional trunks and local refs when histories converge."""
-    return branch.name.lower() not in _BRANCH_COLOR_OVERRIDES, branch.is_remote
+def _branch_color_priority(branch: BranchInfo) -> tuple[int, bool]:
+    """Prefer main/master, then dev/develop, then other refs at shared ancestry."""
+    name = branch.name.lower()
+    rank = 0 if name in ("main", "master") else 1 if name in ("dev", "develop") else 2
+    return rank, branch.is_remote
+
+
+@dataclass(frozen=True)
+class _BranchContinuation:
+    branch: BranchInfo
+    # A named parent below a merge still identifies its own branch, even if
+    # unlabelled commits separate it from the merge's first-parent edge.
+    crossed_merge: bool = False
 
 
 class CellType(IntEnum):
@@ -570,9 +580,9 @@ def build_graph(
     oid_color_index: dict[str, int] = {}
     lane_color_index: dict[int, int] = {}
     # A ref labels a commit; it does not necessarily own its history. Track
-    # named single-parent continuations by SHA, independently of lane reuse,
+    # named first-parent continuations by SHA, independently of lane reuse,
     # so an idle branch at an older tip cannot recolour the continuing branch.
-    continuing_branches: dict[str, BranchInfo] = {}
+    continuing_branches: dict[str, _BranchContinuation] = {}
     if reserve_head_lane:
         head_branch = color_branch_at_tip.get(head_oid)
         head_color = color_assigner.assign_main_color(0, head_branch.name if head_branch else None)
@@ -727,21 +737,28 @@ def build_graph(
         # --- determine colour index ---
         color_branch = color_branch_at_tip.get(commit.sha)
         continuation = continuing_branches.pop(commit.sha, None)
+        crossed_merge = False
         if continuation is not None and (
-            color_branch is None or color_branch.name.lower() not in _BRANCH_COLOR_OVERRIDES
+            color_branch is None or (
+                not continuation.crossed_merge
+                and color_branch.name.lower() not in _BRANCH_COLOR_OVERRIDES
+            )
         ):
-            color_branch = continuation
+            color_branch = continuation.branch
+            crossed_merge = continuation.crossed_merge
         primary_branch = color_branch.name if color_branch else None
 
-        if color_branch is not None and commit.kind == "commit" and len(commit.parents) == 1:
+        if color_branch is not None and commit.kind == "commit" and commit.parents:
             parent_sha = commit.parents[0]
             previous = continuing_branches.get(parent_sha)
             if previous is None or (
-                _branch_color_priority(color_branch) < _branch_color_priority(previous)
+                _branch_color_priority(color_branch) < _branch_color_priority(previous.branch)
             ):
-                continuing_branches[parent_sha] = color_branch
-        # A merge starts distinct parent histories: retain their named tips'
-        # colours, including a side branch merged as the first parent.
+                continuing_branches[parent_sha] = _BranchContinuation(
+                    color_branch, crossed_merge or len(commit.parents) > 1,
+                )
+        # Only the first parent continues the merging branch. Other parents
+        # keep their own colours; explicit named parents remain boundaries.
 
         commit_color_index: int
         if commit_lane_opt is not None:
