@@ -152,7 +152,42 @@ def test_conflict_resolution_uses_configured_http_client(api_server):
     assert json.loads(payload["messages"][2]["content"])["conflicts"][0]["ours"] == "ours\n"
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 404, 429, 500, 302])
+@pytest.mark.parametrize("status", [200, 413])
+def test_large_conflict_request_is_sent_in_full_and_size_decided_by_provider(api_server, status):
+    from src.core.conflict_resolution import ConflictSnapshot
+    from src.utils.ai_conflicts import resolve_with_ai
+
+    ours = "left " + "ж" * 130_000 + "\n"
+    theirs = "right " + "я" * 140_000 + "\n"
+    context = "контекст " * 20_000
+    settings = replace(api_server["settings"], max_diff_chars=10, conflict_context=context)
+    snapshot = ConflictSnapshot("f", b"base\n", ours.encode(), theirs.encode())
+    api_server["status"] = status
+    if status == 200:
+        api_server["response"] = {"choices": [{"message": {"content": json.dumps({
+            "resolutions": [{"id": 0, "content": "combined\n"}],
+        })}, "finish_reason": "stop"}]}
+        assert resolve_with_ai(snapshot, settings) == "combined\n"
+    else:
+        api_server["response"] = {"error": "test-secret +private source"}
+        with pytest.raises(AIError, match="HTTP 413.*provider.*too large"):
+            resolve_with_ai(snapshot, settings)
+
+    assert len(api_server["requests"]) == 1
+    path, _, payload = api_server["requests"][0]
+    assert path == "/v1/chat/completions"
+    messages = payload["messages"]
+    assert messages[1]["content"] == "User context:\n" + context
+    assert len(messages[2]["content"]) > AISettings().max_diff_chars
+    conflict = json.loads(messages[2]["content"])["conflicts"][0]
+    assert conflict["base"] == "base\n"
+    assert conflict["ours"] == ours
+    assert conflict["theirs"] == theirs
+    assert "-" + ours in conflict["diff"]
+    assert "+" + theirs in conflict["diff"]
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 413, 429, 500, 302])
 def test_http_errors_do_not_leak_key_or_source_and_do_not_follow_redirects(api_server, status):
     api_server.update(status=status, response={"error": "test-secret +private source"})
     with pytest.raises(AIError, match=f"HTTP {status}") as error:

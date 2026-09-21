@@ -1959,7 +1959,6 @@ class GraphTableWidget(QWidget):
         if avail_w < 20:
             return
 
-        commit_color = _row_color(row_data)
         chip_text_color = QColor("#FFFFFF")
         cursor_x = col_left + 6
 
@@ -2013,6 +2012,9 @@ class GraphTableWidget(QWidget):
         hidden_count = max(0, len(sorted_branches) - 1)
 
         for idx, branch in enumerate(branches_to_render):
+            # A branch ref can sit on another branch's continuing history.
+            # Match the popup's stable per-name colour, not the commit's colour.
+            branch_color = QColor(BRANCH_PALETTE[_pick_branch_color(branch.get("name", ""))])
             is_head = branch.get("is_head")
             is_remote = branch.get("is_remote")
             worktree_path = branch.get("worktree_path") if not is_remote else None
@@ -2070,12 +2072,12 @@ class GraphTableWidget(QWidget):
             chip_path.addRoundedRect(cursor_x, chip_top, content_w, chip_h, 4, 4)
             if is_primary:
                 if is_remote_only:
-                    pen = QPen(commit_color, 1.5)
+                    pen = QPen(branch_color, 1.5)
                     painter.setPen(pen)
                     painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
                     painter.drawPath(chip_path)
                 else:
-                    painter.fillPath(chip_path, QBrush(commit_color))
+                    painter.fillPath(chip_path, QBrush(branch_color))
             else:
                 painter.setPen(Qt.PenStyle.NoPen)  # cache only
 
@@ -2123,7 +2125,7 @@ class GraphTableWidget(QWidget):
                 # as a single-coloured wireframe against the dark
                 # background. Picked up here once for the whole
                 # ``if is_primary`` block.
-                content_color = commit_color if is_remote_only else chip_text_color
+                content_color = branch_color if is_remote_only else chip_text_color
 
                 if is_head:
                     ck = QPainterPath()

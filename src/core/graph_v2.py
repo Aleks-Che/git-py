@@ -133,6 +133,11 @@ def _sha_color_seed(sha: str) -> int:
     return crc32(sha.encode("utf-8")) % len(BRANCH_PALETTE)
 
 
+def _branch_color_priority(branch: BranchInfo) -> tuple[bool, bool]:
+    """Prefer conventional trunks and local refs when histories converge."""
+    return branch.name.lower() not in _BRANCH_COLOR_OVERRIDES, branch.is_remote
+
+
 class CellType(IntEnum):
     """Atomic rendering element for one cell of a graph row.
 
@@ -503,10 +508,16 @@ def build_graph(
 
     # SHA -> list of branch names
     oid_to_branches: dict[str, list[str]] = {}
+    color_branch_at_tip: dict[str, BranchInfo] = {}
     head_oid: str | None = None
     for branch in branches:
         if branch.target_sha:
             oid_to_branches.setdefault(branch.target_sha, []).append(branch.name)
+            previous = color_branch_at_tip.get(branch.target_sha)
+            if previous is None or (
+                _branch_color_priority(branch), branch.name
+            ) < (_branch_color_priority(previous), previous.name):
+                color_branch_at_tip[branch.target_sha] = branch
             if branch.is_head:
                 head_oid = branch.target_sha
 
@@ -558,9 +569,13 @@ def build_graph(
     color_assigner = ColorAssigner()
     oid_color_index: dict[str, int] = {}
     lane_color_index: dict[int, int] = {}
+    # A ref labels a commit; it does not necessarily own its history. Track
+    # named single-parent continuations by SHA, independently of lane reuse,
+    # so an idle branch at an older tip cannot recolour the continuing branch.
+    continuing_branches: dict[str, BranchInfo] = {}
     if reserve_head_lane:
-        head_names = oid_to_branches.get(head_oid, [])
-        head_color = color_assigner.assign_main_color(0, head_names[0] if head_names else None)
+        head_branch = color_branch_at_tip.get(head_oid)
+        head_color = color_assigner.assign_main_color(0, head_branch.name if head_branch else None)
         oid_color_index[head_oid] = head_color
         lane_color_index[0] = UNCOMMITTED_COLOR_INDEX
     # Lane -> colour of a pending merge connector: set when a second
@@ -710,21 +725,28 @@ def build_graph(
             connector_active_lanes = list(lanes)
 
         # --- determine colour index ---
-        commit_branch_names = oid_to_branches.get(commit.sha, [])
-        primary_branch = commit_branch_names[0] if commit_branch_names else None
+        color_branch = color_branch_at_tip.get(commit.sha)
+        continuation = continuing_branches.pop(commit.sha, None)
+        if continuation is not None and (
+            color_branch is None or color_branch.name.lower() not in _BRANCH_COLOR_OVERRIDES
+        ):
+            color_branch = continuation
+        primary_branch = color_branch.name if color_branch else None
+
+        if color_branch is not None and commit.kind == "commit" and len(commit.parents) == 1:
+            parent_sha = commit.parents[0]
+            previous = continuing_branches.get(parent_sha)
+            if previous is None or (
+                _branch_color_priority(color_branch) < _branch_color_priority(previous)
+            ):
+                continuing_branches[parent_sha] = color_branch
+        # A merge starts distinct parent histories: retain their named tips'
+        # colours, including a side branch merged as the first parent.
 
         commit_color_index: int
         if commit_lane_opt is not None:
-            # When the commit's SHA is already tracking on a lane (set
-            # earlier by a merge commit's parent processing), prefer
-            # the colour derived from the commit's own branch name
-            # over the lane-cache colour the merge pre-assigned.
-            # Without this, a side-branch tip that lives below a
-            # merge commit gets drawn in the merge's fallback
-            # colour instead of its own ``_pick_branch_color``
-            # colour (e.g. the ``gpt-researcher``
-            # ``3mk4yl/fix-dict-unhashable-bug`` tip rendered in
-            # GREEN instead of GOLD).
+            # Prefer the resolved branch over a lane's fallback, while
+            # preserving explicit side-branch colours below a merge.
             if primary_branch is not None:
                 commit_color_index = color_assigner.assign_color(
                     lane, primary_branch
@@ -836,8 +858,8 @@ def build_graph(
                     lanes.append(None)
                     new_lane = len(lanes) - 1
                 lanes[new_lane] = parent_sha
-                parent_branch_names = oid_to_branches.get(parent_sha, [])
-                parent_branch = parent_branch_names[0] if parent_branch_names else None
+                parent_tip = color_branch_at_tip.get(parent_sha)
+                parent_branch = parent_tip.name if parent_tip else None
                 new_color = color_assigner.assign_fork_sibling_color(
                     new_lane, parent_branch, seed=_sha_color_seed(parent_sha)
                 )
@@ -1216,13 +1238,14 @@ def build_graph(
                 for candidate in range(max_lane + 2):
                     available = True
                     c_idx = candidate * 2
-                    for i in range(head_node_idx):
+                    # Check every row, including the arrival cell at HEAD.
+                    # A short early row says nothing about lanes allocated by
+                    # a later merge; breaking there overwrote a live pipe.
+                    for i in range(head_node_idx + 1):
                         if c_idx < len(nodes[i].cells):
                             if nodes[i].cells[c_idx].cell_type != CellType.EMPTY:
                                 available = False
                                 break
-                        else:
-                            break
                     if available:
                         dist = abs(candidate - head_lane)
                         if dist < best_distance:
@@ -1242,30 +1265,54 @@ def build_graph(
             # Add Pipe to all nodes before HEAD
             pipe_cell_idx = uncommitted_lane * 2
             for i in range(head_node_idx):
-                if nodes[i].cells[pipe_cell_idx].cell_type == CellType.EMPTY:
+                cell = nodes[i].cells[pipe_cell_idx]
+                if cell.cell_type == CellType.EMPTY:
                     nodes[i].cells[pipe_cell_idx] = CellInfo.pipe(UNCOMMITTED_COLOR_INDEX)
+                elif cell.cell_type in (CellType.BRANCH_LEFT, CellType.BRANCH_RIGHT):
+                    # A down-bend already leads to HEAD. Extend it upwards
+                    # without deleting its horizontal arm or recolouring the
+                    # original branch. A plain bend lacks that upper segment.
+                    tee = (
+                        CellType.TEE_LEFT if cell.cell_type == CellType.BRANCH_LEFT
+                        else CellType.TEE_RIGHT
+                    )
+                    pipe_color = (
+                        cell.pipe_color_index if cell.cell_type == CellType.BRANCH_LEFT
+                        else cell.color_index
+                    )
+                    nodes[i].cells[pipe_cell_idx] = CellInfo(
+                        tee, color_index=cell.color_index, pipe_color_index=pipe_color,
+                    )
 
             # Connector from HEAD to uncommitted lane if different
             if uncommitted_lane != head_lane:
                 head_cell_idx2 = head_lane * 2
                 uncommitted_cell_idx = uncommitted_lane * 2
+                head_cells = nodes[head_node_idx].cells
+                if head_cells[head_cell_idx2].cell_type == CellType.COMMIT:
+                    head_cells[head_cell_idx2] = CellInfo(
+                        CellType.TEE_RIGHT if uncommitted_lane > head_lane else CellType.TEE_LEFT,
+                        color_index=UNCOMMITTED_COLOR_INDEX,
+                        pipe_color_index=nodes[head_node_idx].color_index,
+                    )
 
+                first_col, last_col = sorted((head_cell_idx2, uncommitted_cell_idx))
+                for col in range(first_col + 1, last_col):
+                    cell = head_cells[col]
+                    if cell.cell_type == CellType.EMPTY:
+                        head_cells[col] = CellInfo.horizontal(UNCOMMITTED_COLOR_INDEX)
+                    elif cell.cell_type == CellType.PIPE:
+                        # The horizontal crosses, but does not replace, the
+                        # neighbouring branch's vertical continuation.
+                        head_cells[col] = CellInfo.horizontal_pipe(
+                            UNCOMMITTED_COLOR_INDEX, cell.color_index,
+                        )
                 if uncommitted_lane > head_lane:
-                    for col in range(head_cell_idx2 + 1, uncommitted_cell_idx):
-                        if nodes[head_node_idx].cells[col].cell_type == CellType.EMPTY:
-                            nodes[head_node_idx].cells[col] = CellInfo.horizontal(
-                                UNCOMMITTED_COLOR_INDEX,
-                            )
-                    nodes[head_node_idx].cells[uncommitted_cell_idx] = CellInfo.merge_left(
+                    head_cells[uncommitted_cell_idx] = CellInfo.merge_left(
                         UNCOMMITTED_COLOR_INDEX,
                     )
                 else:
-                    for col in range(uncommitted_cell_idx + 1, head_cell_idx2):
-                        if nodes[head_node_idx].cells[col].cell_type == CellType.EMPTY:
-                            nodes[head_node_idx].cells[col] = CellInfo.horizontal(
-                                UNCOMMITTED_COLOR_INDEX,
-                            )
-                    nodes[head_node_idx].cells[uncommitted_cell_idx] = CellInfo.merge_right(
+                    head_cells[uncommitted_cell_idx] = CellInfo.merge_right(
                         UNCOMMITTED_COLOR_INDEX,
                     )
 
@@ -1299,25 +1346,32 @@ def _is_wip_compatible(
 ) -> bool:
     """Return True if a WIP node could sit on *head_lane* above HEAD.
 
-    Lane 0 (the main line) is "free" for the WIP when no row above
+    HEAD's lane is "free" for the WIP when no row above
     HEAD places something at that lane that would interrupt the
     vertical pipe leading from WIP down to HEAD.  Concretely:
 
     * ``EMPTY`` — trivially fine.
-    * ``PIPE`` / ``TEE_*`` / ``MERGE_*`` / ``BRANCH_*`` / ``COMMIT`` —
+    * ``PIPE`` / ``HORIZONTAL_PIPE`` / ``TEE_*`` / ``MERGE_*`` / ``COMMIT`` —
       these all share a vertical line at the cell centre, so the WIP's
       vertical pipe continues through them without a visual break.
-    * ``HORIZONTAL`` / ``HORIZONTAL_PIPE`` — these are *crossings*
-      where the WIP's vertical pipe would be cut by a horizontal line
-      coming from another lane (e.g. a branch from a sibling feature
-      crossing the main line).  Those block the WIP.
+      In particular, a HORIZONTAL_PIPE keeps its independent horizontal
+      and vertical colours; crossing it must not push WIP into another lane.
+    * Plain ``BRANCH_*`` — the down-bend is extended upwards with a TEE.
+      A two-colour relay-split also has a right-hand corridor; replacing
+      that compound bend with a TEE would lose the corridor, so it blocks WIP.
+    * ``HORIZONTAL`` — no existing vertical continuation; keep the
+      separate-lane fallback for this different geometry.
     """
     head_cell_idx = head_lane * 2
-    blocking = {CellType.HORIZONTAL, CellType.HORIZONTAL_PIPE}
+    blocking = {CellType.HORIZONTAL}
     for i in range(head_node_idx):
         if head_cell_idx >= len(nodes[i].cells):
             continue
-        if nodes[i].cells[head_cell_idx].cell_type in blocking:
+        cell = nodes[i].cells[head_cell_idx]
+        if cell.cell_type in blocking or (
+            cell.cell_type == CellType.BRANCH_LEFT
+            and cell.color_index != cell.pipe_color_index
+        ):
             return False
     return True
 

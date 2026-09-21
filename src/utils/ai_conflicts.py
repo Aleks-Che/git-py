@@ -38,8 +38,7 @@ def resolve_with_ai(snapshot: ConflictSnapshot, settings: AISettings) -> str:
         "incoming": snapshot.theirs_label,
         "conflicts": conflicts,
     }, ensure_ascii=False)
-    if len(payload) + len(settings.conflict_context) > settings.max_diff_chars:
-        raise AIError("Conflict is too large for the configured AI limit; resolve it manually.")
+    # Context limits depend on the selected model and are enforced by its provider.
     answer = AIClient(settings).complete([
         {"role": "system", "content": settings.conflict_prompt.strip() + "\n\n"
          'Return only JSON: {"resolutions": [{"id": <integer>, "content": <string>}]}. '

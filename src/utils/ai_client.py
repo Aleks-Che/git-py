@@ -140,6 +140,7 @@ class AIClient:
                 401: "Check the API key.",
                 403: "Check the key permissions and model access.",
                 404: "Check the API base URL and model name.",
+                413: "The provider rejected the request because it is too large.",
                 429: "Rate limit or quota exceeded; try again later.",
                 400: "Check that the model supports Chat Completions and the request size.",
             }

@@ -1,6 +1,5 @@
 """Compact complete conflict payloads, strict answers and protected surrounding text."""
 import json
-from dataclasses import replace
 
 import pytest
 from src.core.conflict_resolution import ConflictSnapshot
@@ -51,13 +50,11 @@ def test_invalid_or_incomplete_answers_are_rejected(monkeypatch, answer):
         resolve_with_ai(_snapshot(), AISettings(base_url="http://localhost"))
 
 
-def test_empty_resolution_and_size_limits(monkeypatch):
+def test_empty_resolution_ignores_commit_diff_limit(monkeypatch):
     monkeypatch.setattr(AIClient, "complete",
                         lambda *args: '{"resolutions":[{"id":1,"content":""}]}')
-    settings = AISettings(base_url="http://localhost")
+    settings = AISettings(base_url="http://localhost", max_diff_chars=10)
     assert resolve_with_ai(_snapshot(), settings) == "header\nfooter\n"
-    with pytest.raises(AIError, match="too large"):
-        resolve_with_ai(_snapshot(), replace(settings, max_diff_chars=10))
 
 
 def test_large_file_small_conflict_is_not_truncated(monkeypatch):
