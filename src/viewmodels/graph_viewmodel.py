@@ -220,6 +220,20 @@ class GraphViewModel(QObject):
         if refresh:
             self.refresh_graph()
 
+    def can_revert_commit(self) -> bool:
+        """Whether a checked-out local branch can accept a new revert operation."""
+        manager = self.repository()
+        if manager is None or not manager.is_open:
+            return False
+        try:
+            repo = manager.repo
+            return (
+                not repo.is_bare and not repo.head_is_unborn and not repo.head_is_detached
+                and repo.state() == pygit2.GIT_REPOSITORY_STATE_NONE
+            )
+        except (GitError, pygit2.GitError):
+            return False
+
     def repository(self) -> RepositoryManager | None:
         return self._repo
 

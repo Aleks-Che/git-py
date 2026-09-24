@@ -244,6 +244,7 @@ class GraphTableWidget(QWidget):
     checkout_commit_requested = Signal(str)
     create_tag_requested = Signal(str)  # target commit SHA
     cherry_pick_commit_requested = Signal(str)
+    revert_commit_requested = Signal(str, int)
     drop_commit_requested = Signal(str)
     edit_commit_message_requested = Signal(str)
     # Multi-select range verb: payload is the selected SHAs, newest
@@ -1004,6 +1005,7 @@ class GraphTableWidget(QWidget):
         * ``commit`` — :attr:`checkout_commit_requested` /
           :attr:`create_tag_requested` /
           :attr:`cherry_pick_commit_requested` /
+          :attr:`revert_commit_requested` (SHA and mainline parent, 0 for non-merge) /
           :attr:`drop_commit_requested` (disabled for merge commits) /
           :attr:`edit_commit_message_requested` /
           :attr:`copy_diff_requested` /
@@ -1070,6 +1072,27 @@ class GraphTableWidget(QWidget):
             row_data = self._row_by_sha(sha)
             parents = (row_data or {}).get("commit", {}).get("parents", [])
             is_merge = len(parents) > 1
+            can_revert = self._view_model.can_revert_commit()
+            if is_merge:
+                revert_menu = menu.addMenu("Revert commit")
+                revert_action = revert_menu.menuAction()
+                for number, parent_sha in enumerate(parents, start=1):
+                    action = revert_menu.addAction(f"Keep parent {number}: {parent_sha[:7]}")
+                    action.setToolTip("Undo the merge changes relative to this parent")
+                    action.triggered.connect(
+                        lambda checked=False, s=sha, p=number:
+                        self.revert_commit_requested.emit(s, p),
+                    )
+            else:
+                revert_action = menu.addAction("Revert commit")
+                revert_action.triggered.connect(
+                    lambda checked=False, s=sha: self.revert_commit_requested.emit(s, 0),
+                )
+            revert_action.setEnabled(can_revert)
+            revert_action.setToolTip(
+                "Create an inverse commit on the current branch" if can_revert else
+                "Switch to a local branch and finish any pending Git operation first",
+            )
             drop_action = menu.addAction("Drop commit")
             drop_action.setEnabled(not is_merge)
             if is_merge:

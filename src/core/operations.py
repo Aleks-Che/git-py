@@ -24,6 +24,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import time
 from collections import Counter
@@ -778,6 +779,42 @@ def ensure_safe_tree_update(
         raise GitError(f"Cannot verify worktree safety before {action}: {exc}") from exc
 
 
+def _untracked_tree_collision(
+    r: pygit2.Repository, path: str, destinations: set[str], directories: set[str],
+) -> str | None:
+    """Find the actual obstruction inside a possibly collapsed status directory.
+
+    libgit2 can report an ignored directory as one entry even with
+    ``untracked_files='all'``. Existing directories may contain unrelated files;
+    inspect only destination paths and their ancestors, without following links.
+    """
+    normalized = os.path.normcase(path).replace("\\", "/").rstrip("/")
+    ancestors = {normalized[:i] for i, char in enumerate(normalized) if char == "/"}
+    if normalized in destinations or ancestors & destinations:
+        return path
+    if normalized not in directories:
+        return None
+    if not path.endswith("/"):
+        return path  # A local file occupies a required directory.
+    for destination in sorted(destinations):
+        if not destination.startswith(normalized + "/"):
+            continue
+        current = Path(r.workdir)
+        parts = destination.split("/")
+        for index, part in enumerate(parts):
+            current = current / part
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                break  # Neither the destination nor any deeper ancestor exists.
+            is_reparse = getattr(info, "st_file_attributes", 0) & getattr(
+                stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0,
+            )
+            if index == len(parts) - 1 or not stat.S_ISDIR(info.st_mode) or is_reparse:
+                return "/".join(parts[:index + 1])
+    return None
+
+
 def _ensure_safe_tree_update(
     repo: RepositoryManager | pygit2.Repository, target: str, action: str,
 ) -> None:
@@ -807,13 +844,9 @@ def _ensure_safe_tree_update(
                 dirty.append(path)
             if not flags & (pygit2.GIT_STATUS_WT_NEW | pygit2.GIT_STATUS_IGNORED):
                 continue
-            normalized = os.path.normcase(path).replace("\\", "/").rstrip("/")
-            ancestors = {
-                normalized[:i] for i, char in enumerate(normalized) if char == "/"
-            }
-            if (normalized in destinations or normalized in directories
-                    or ancestors & destinations):
-                dirty.append(path)
+            collision = _untracked_tree_collision(r, path, destinations, directories)
+            if collision is not None:
+                dirty.append(collision)
         if dirty:
             raise DirtyWorkTreeError(
                 f"Cannot {action}: uncommitted changes or untracked/ignored files "
@@ -1212,6 +1245,143 @@ def revert(
             )
         head = r[r.head.target]
     return _to_commit_info(head)
+
+
+def revert_head_oid(repo: RepositoryManager | pygit2.Repository) -> str | None:
+    """Return the commit being reverted, including in a linked worktree."""
+    with unwrap(repo) as r:
+        marker = _git_dir(r) / "REVERT_HEAD"
+        try:
+            return marker.read_text(encoding="ascii").strip() if marker.is_file() else None
+        except (OSError, UnicodeError) as exc:
+            raise GitError(f"Cannot read revert state: {exc}") from exc
+
+
+def _commit_revert_result(
+    r: pygit2.Repository, sha: str, author: pygit2.Signature | None,
+) -> CommitInfo:
+    """Commit only the prepared index, retaining operation state on failure."""
+    try:
+        commit = r.revparse_single(sha).peel(pygit2.Commit)
+        r.index.read(force=True)
+        if r.index.conflicts:
+            raise MergeConflictError(
+                "Revert still has unresolved conflicts.", conflicting_paths=_collect_conflicts(r),
+            )
+        subject = commit.message.splitlines()[0] if commit.message else str(commit.id)[:7]
+        message = f'Revert "{subject}"\n\nThis reverts commit {commit.id}.\n'
+        result = commit_changes(r, message, author=author, stage_all=False)
+        r.state_cleanup()
+        return result
+    except (KeyError, ValueError, OSError, pygit2.GitError) as exc:
+        raise GitError(f"Cannot complete revert: {exc}") from exc
+
+
+def _ensure_revert_paths_safe(
+    r: pygit2.Repository, commit: pygit2.Commit, mainline: int,
+) -> None:
+    """Protect ignored files too: libgit2's default revert checkout replaces them."""
+    if not commit.parent_ids:
+        return  # Reverting a root only removes paths; it never restores one.
+    parent = commit.parents[mainline - 1 if mainline else 0]
+    destinations = {
+        os.path.normcase(delta.new_file.path).replace("\\", "/")
+        for delta in r.diff(commit.tree, parent.tree).deltas
+        if delta.status != pygit2.GIT_DELTA_DELETED
+    }
+    directories = {
+        path[:i] for path in destinations for i, char in enumerate(path) if char == "/"
+    }
+    for path, flags in r.status(untracked_files="all", ignored=True).items():
+        if not flags & (pygit2.GIT_STATUS_WT_NEW | pygit2.GIT_STATUS_IGNORED):
+            continue
+        collision = _untracked_tree_collision(r, path, destinations, directories)
+        if collision is not None:
+            raise DirtyWorkTreeError(
+                f"Cannot revert: untracked or ignored path {collision!r} would be overwritten. "
+                "Move or stash it first.",
+            )
+
+
+def revert_commit(
+    repo: RepositoryManager | pygit2.Repository,
+    sha: str,
+    *,
+    author: pygit2.Signature | None = None,
+    mainline: int = 0,
+) -> CommitInfo:
+    """Revert ``sha`` with a new commit on the checked-out local branch.
+
+    Require a clean tracked index/worktree and no unfinished Git operation.
+    ``mainline`` is the one-based parent to retain for a merge commit.
+    Conflicts leave REVERT_HEAD and the index available for Continue/Abort.
+    """
+    with unwrap(repo) as r:
+        try:
+            if r.is_bare or r.head_is_unborn or r.head_is_detached:
+                raise GitError("Cannot revert a commit: switch to a local branch first.")
+            if r.state() != pygit2.GIT_REPOSITORY_STATE_NONE:
+                raise GitError("Finish or abort the current Git operation before reverting.")
+            try:
+                commit = r.revparse_single(sha).peel(pygit2.Commit)
+            except (KeyError, ValueError, pygit2.GitError) as exc:
+                raise InvalidRefError(f"Unknown revision: {sha!r}") from exc
+            if len(commit.parent_ids) > 1 and not 1 <= mainline <= len(commit.parent_ids):
+                raise GitError("Choose the mainline parent when reverting a merge commit.")
+            if len(commit.parent_ids) <= 1 and mainline:
+                raise GitError("A mainline parent is only supported for merge commits.")
+            r.index.read(force=True)
+            if any(flags & _CONFLICTING_STATUS_FLAGS for flags in r.status().values()):
+                raise DirtyWorkTreeError("Commit or stash local changes before reverting a commit.")
+            _ensure_revert_paths_safe(r, commit, mainline)
+            if mainline:
+                # pygit2.Repository.revert does not expose the mainline option.
+                completed = _run_git_in_workdir(
+                    r, ["revert", "--no-commit", "-m", str(mainline), str(commit.id)],
+                )
+                r.index.read(force=True)
+                conflicts = _collect_conflicts(r)
+                if conflicts:
+                    raise MergeConflictError(
+                        f"Revert of {sha!r} produced conflicts.", conflicting_paths=conflicts,
+                    )
+                if completed.returncode:
+                    raise GitError(f"Revert failed: {completed.stderr.strip()}")
+            else:
+                revert(r, str(commit.id))
+            if r.index.write_tree() == r.head.peel(pygit2.Commit).tree_id:
+                r.state_cleanup()
+                raise GitError("The selected commit has no changes to revert on this branch.")
+            return _commit_revert_result(r, str(commit.id), author)
+        except (KeyError, ValueError, OSError, pygit2.GitError) as exc:
+            raise GitError(f"Revert failed: {exc}") from exc
+
+
+def complete_revert(
+    repo: RepositoryManager | pygit2.Repository,
+    sha: str,
+    *,
+    author: pygit2.Signature | None = None,
+) -> CommitInfo:
+    """Commit a resolved revert, verifying the operation still matches ``sha``."""
+    with unwrap(repo) as r:
+        if revert_head_oid(r) != sha:
+            raise GitError("The revert operation changed; refresh the repository.")
+        return _commit_revert_result(r, sha, author)
+
+
+def abort_revert(repo: RepositoryManager | pygit2.Repository) -> None:
+    """Abort a single in-progress revert, preserving unrelated local changes."""
+    with unwrap(repo) as r:
+        if not revert_head_oid(r):
+            raise GitError("No revert in progress.")
+        completed = _run_git_in_workdir(r, ["revert", "--abort"])
+        if completed.returncode:
+            raise GitError(f"Cannot abort revert: {completed.stderr.strip()}")
+        try:
+            r.index.read(force=True)
+        except (OSError, pygit2.GitError) as exc:
+            raise GitError(f"Cannot refresh index after aborting revert: {exc}") from exc
 
 
 def drop_commit(
@@ -3182,6 +3352,7 @@ __all__ = [
     "abort_merge",
     "branch_of_commit",
     "abort_rebase",
+    "abort_revert",
     "add_remote",
     "add_to_gitignore",
     "apply_file_from_stash",
@@ -3191,6 +3362,7 @@ __all__ = [
     "commit_changes",
     "complete_merge",
     "complete_rebase_continue",
+    "complete_revert",
     "conflicting_paths",
     "create_branch",
     "delete_branch",
@@ -3210,6 +3382,8 @@ __all__ = [
     "rename_branch",
     "reset",
     "revert",
+    "revert_commit",
+    "revert_head_oid",
     "restore_stash",
     "stash_apply",
     "stash_drop",

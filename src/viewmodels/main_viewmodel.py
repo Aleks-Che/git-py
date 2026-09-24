@@ -497,8 +497,8 @@ class MainViewModel(QObject):
     def _restore_in_progress_operation(self) -> None:
         """Re-enter the conflict state when Git reports an unfinished op.
 
-        Covers an app restart (or an external ``git merge`` /
-        ``git rebase``) while an operation was unresolved: the conflict
+        Covers an app restart (or an external merge, rebase or revert)
+        while an operation was unresolved: the conflict
         UI comes back with the real conflicting paths and the merge
         context recovered from ``MERGE_HEAD`` / the current branch, so
         the user can finish or abort the operation they started.
@@ -510,6 +510,7 @@ class MainViewModel(QObject):
             is_merge_in_progress,
             is_rebase_in_progress,
             merge_head_oid,
+            revert_head_oid,
         )
 
         try:
@@ -529,6 +530,13 @@ class MainViewModel(QObject):
                     upstream=None,
                 )
                 self._log("rebase", "Recovered an in-progress rebase")
+                return
+            revert_sha = revert_head_oid(self._repo_manager)
+            if revert_sha:
+                self._set_conflict_state(
+                    "revert", conflicting_paths=conflicting_paths(self._repo_manager),
+                    sha=revert_sha, auto_commit=True,
+                )
                 return
             self._clear_conflict_state()
         except GitError:
@@ -1406,6 +1414,49 @@ class MainViewModel(QObject):
             return
         self._refresh_all_views()
         self._log("stash", f"File {path!r} stashed")
+
+    def can_stop_tracking(self, paths: list[str]) -> bool:
+        """Expose eligibility for the context menu without giving widgets Git state."""
+        if self._is_busy or self._repo_manager is None or not self._repo_manager.is_open:
+            return False
+        from src.core.tracking import tracked_ignored_paths
+
+        try:
+            return bool(paths) and tracked_ignored_paths(self._repo_manager, paths) == set(paths)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            return False
+
+    @_guard_mutation
+    def stop_tracking_files(self, paths: list[str]) -> None:
+        """Stage removal of ignored files from Git, preserving every working copy."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        if not self._commit_panel_view_model.file_editor.finish_editing():
+            return
+        from src.viewmodels.commands import StopTrackingCommand
+
+        command = StopTrackingCommand(self._repo_manager, paths)
+
+        def stopped() -> None:
+            self._commit_panel_view_model.refresh_status()
+            self._commit_panel_view_model.refresh_selected_diff()
+            self._log(
+                "tracking",
+                "Stopped tracking selected files; local files kept. Commit the removal.",
+            )
+
+        if self._async_enabled:
+            self._run_async(command, stopped, log_tag="tracking")
+            return
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("tracking", f"Stop tracking failed: {exc}", level="error")
+            return
+        stopped()
 
     @_guard_mutation
     def ignore_pattern(self, pattern: str) -> None:
@@ -2699,6 +2750,52 @@ class MainViewModel(QObject):
         self._commit_panel_view_model.refresh_status()
         self._log("revert", f"Revert {sha[:7]!r} staged")
 
+    @_guard_mutation
+    def revert_commit(self, sha: str, mainline: int = 0) -> None:
+        """Create an inverse commit on the current branch from the graph menu."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        from src.viewmodels.commands import RevertCommitCommand
+
+        config = load_config(self._config_path or default_config_path())
+        command = RevertCommitCommand(
+            self._repo_manager, sha, author=load_author_signature(config), mainline=mainline,
+        )
+        self._log("revert", f"Revert commit {sha[:7]}")
+        self._execute_revert_command(command)
+
+    def _execute_revert_command(self, command: object) -> None:
+        from src.viewmodels.commands import AbortRevertCommand
+
+        def succeeded() -> None:
+            self._clear_conflict_state()
+            self._refresh_all_views()
+            message = (
+                "Revert aborted" if isinstance(command, AbortRevertCommand) else "Revert completed"
+            )
+            self._log("revert", message)
+
+        if self._async_enabled:
+            self._run_async(command, succeeded, log_tag="revert")
+            return
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self._on_async_failed(command, exc, log_tag="revert")
+            return
+        succeeded()
+
+    @_guard_mutation
+    def abort_revert(self) -> None:
+        """Cancel the pending revert through the mutation command processor."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        from src.viewmodels.commands import AbortRevertCommand
+
+        self._execute_revert_command(AbortRevertCommand(self._repo_manager))
+
     def abort_merge(self) -> None:
         """Abort the in-progress merge (``git merge --abort``).
 
@@ -3268,9 +3365,10 @@ class MainViewModel(QObject):
         * **rebase** — continue via :func:`complete_rebase_continue`.
           If more commits still conflict, the conflict state is left
           in place so the user can resolve the next round.
-        * **cherry-pick / revert** — clear the conflict state and let
-          the user commit through the normal commit panel; the staged
-          change is already in the index.
+        * **revert from the graph** — commit the resolved inverse;
+          Continue also accepts files resolved with an external editor.
+        * **cherry-pick / staging-only revert** — clear the conflict
+          state and let the user commit through the normal commit panel.
 
         On errors the failure is surfaced through
         :attr:`error_occurred` and the conflict state is unchanged.
@@ -3376,6 +3474,15 @@ class MainViewModel(QObject):
                 self._on_async_failed(command, exc, log_tag="rebase")
                 return
             continued()
+            return
+        if operation == "revert" and self._conflict_state.get("auto_commit"):
+            from src.viewmodels.commands import RevertCommitCommand
+
+            config = load_config(self._config_path or default_config_path())
+            self._execute_revert_command(RevertCommitCommand(
+                self._repo_manager, self._conflict_state["sha"], continue_revert=True,
+                author=load_author_signature(config),
+            ))
             return
         if operation in ("cherry-pick", "revert"):
             self._clear_conflict_state()
@@ -3662,6 +3769,7 @@ class MainViewModel(QObject):
     def _is_async_redo_candidate(command: object) -> bool:
         """Return whether executing or undoing a command can block on Git."""
         from src.viewmodels.commands import (
+            AbortRevertCommand,
             ContinueRebaseCommand,
             DropCommitCommand,
             EditCommitMessageCommand,
@@ -3671,14 +3779,17 @@ class MainViewModel(QObject):
             PullCommand,
             PushCommand,
             RebaseCommand,
+            RevertCommitCommand,
             SquashCommitsCommand,
+            StopTrackingCommand,
         )
 
         return isinstance(
             command,
             ContinueRebaseCommand | DropCommitCommand | EditCommitMessageCommand
             | FetchAndCheckoutCommand | FetchCommand | MergeCommand | PullCommand
-            | PushCommand | RebaseCommand | SquashCommitsCommand,
+            | PushCommand | RebaseCommand | RevertCommitCommand | AbortRevertCommand
+            | SquashCommitsCommand | StopTrackingCommand,
         )
 
     def _run_async_redo(self, command: object) -> None:
@@ -3712,6 +3823,20 @@ class MainViewModel(QObject):
         message = str(exc)
         # Domain exceptions we surface with a dedicated path.
         from src.core.exceptions import MergeConflictError, RebaseConflictError
+        from src.core.operations import conflicting_paths, revert_head_oid
+        from src.viewmodels.commands import RevertCommitCommand
+
+        if isinstance(command, RevertCommitCommand) and self._repo_manager is not None:
+            sha = revert_head_oid(self._repo_manager)
+            if sha:
+                self._set_conflict_state(
+                    "revert", conflicting_paths=conflicting_paths(self._repo_manager),
+                    sha=sha, auto_commit=True,
+                )
+                if not isinstance(exc, MergeConflictError) and not silent:
+                    self.error_occurred.emit(message)
+                self._log("revert", f"Revert needs attention: {message}", level="warn")
+                return
 
         if isinstance(exc, MergeConflictError):
             if log_tag:

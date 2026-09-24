@@ -118,11 +118,11 @@ class ConflictPanel(QFrame):
             row = paths.index(selected_path) if selected_path in paths else 0
             self._files.setCurrentRow(row)
         self._resolve_btn.setEnabled(has_paths)
-        # Continue is meaningful for the operations the VM can finish
-        # (merge / rebase); cherry-pick / revert finish via the normal
-        # commit panel instead.
-        self._continue_btn.setEnabled(self._operation in ("merge", "rebase"))
-        self._abort_btn.setEnabled(self._operation in ("merge", "rebase"))
+        can_finish = self._operation in ("merge", "rebase") or (
+            self._operation == "revert" and bool(state.get("auto_commit"))
+        )
+        self._continue_btn.setEnabled(can_finish)
+        self._abort_btn.setEnabled(can_finish)
         self.show()
 
     def operation(self) -> str | None:

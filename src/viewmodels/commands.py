@@ -29,12 +29,14 @@ from src.core.operations import (
     DEFAULT_PUSH_TIMEOUT_SECONDS,
     abort_merge,
     abort_rebase,
+    abort_revert,
     add_remote,
     add_to_gitignore,
     checkout_branch,
     checkout_commit,
     cherry_pick,
     commit_changes,
+    complete_revert,
     create_branch,
     create_tag,
     delete_branch,
@@ -60,6 +62,7 @@ from src.core.operations import (
     restore_stash,
     restore_stash_apply_state,
     revert,
+    revert_commit,
     snapshot_index_entry,
     snapshot_stash_apply_state,
     squash_commits,
@@ -73,6 +76,7 @@ from src.core.operations import (
     unstage_diff_line,
 )
 from src.core.repository import RepositoryManager
+from src.core.tracking import TrackingSnapshot, set_tracking, snapshot_tracking
 
 
 class GitCommand(ABC):
@@ -1179,6 +1183,70 @@ class SquashCommitsCommand(GitCommand):
         return f"squash {len(self._shas)} commits"
 
 
+class RevertCommitCommand(GitCommand):
+    """Create/complete a revert; retain its resolved commit for safe Undo/Redo."""
+
+    def __init__(
+        self, repo: RepositoryManager, sha: str, *, author: pygit2.Signature | None = None,
+        mainline: int = 0, continue_revert: bool = False,
+    ) -> None:
+        self._repo = repo
+        self._sha = sha
+        self._author = author
+        self._mainline = mainline
+        self._continue_revert = continue_revert
+        self._previous_head: str | None = None
+        self._new_head: str | None = None
+        self._head_ref: str | None = None
+
+    def execute(self) -> None:
+        if self._new_head is not None:
+            _ensure_head_at(self._repo, self._previous_head, "redo the revert", self._head_ref)
+            _ensure_no_uncommitted_changes(self._repo, "redo the revert", self._new_head)
+            reset(self._repo, self._new_head, mode="hard")
+            return
+        self._previous_head = _current_head_oid(self._repo)
+        if self._previous_head is not None:
+            self._head_ref = self._repo.repo.head.name
+        if self._continue_revert:
+            result = complete_revert(self._repo, self._sha, author=self._author)
+        else:
+            result = revert_commit(
+                self._repo, self._sha, author=self._author, mainline=self._mainline,
+            )
+        self._new_head = result.sha
+
+    def undo(self) -> None:
+        if self._previous_head is None or self._new_head is None:
+            return
+        _ensure_head_at(self._repo, self._new_head, "undo the revert", self._head_ref)
+        _ensure_no_uncommitted_changes(self._repo, "undo the revert", self._previous_head)
+        reset(self._repo, self._previous_head, mode="hard")
+
+    @property
+    def name(self) -> str:
+        return f"revert commit {self._sha[:7]}"
+
+
+class AbortRevertCommand(GitCommand):
+    """Cancel an unfinished revert without adding an undoable history entry."""
+
+    is_noop = True
+
+    def __init__(self, repo: RepositoryManager) -> None:
+        self._repo = repo
+
+    def execute(self) -> None:
+        abort_revert(self._repo)
+
+    def undo(self) -> None:
+        pass
+
+    @property
+    def name(self) -> str:
+        return "abort revert"
+
+
 class RevertCommand(GitCommand):
     """Revert ``sha``; undo by resetting --mixed (mirror of cherry-pick).
 
@@ -1885,6 +1953,30 @@ class SaveFileCommand(GitCommand):
         return f"save {self._snapshot.path}"
 
 
+class StopTrackingCommand(GitCommand):
+    """Remove selected ignored files from the index, keeping working copies."""
+
+    def __init__(self, repo: RepositoryManager, paths: list[str]) -> None:
+        self._repo = repo
+        self._paths = list(dict.fromkeys(paths))
+        self._snapshot: TrackingSnapshot | None = None
+
+    def execute(self) -> None:
+        snapshot = self._snapshot or snapshot_tracking(self._repo, self._paths)
+        set_tracking(self._repo, snapshot, tracked=False)
+        self._snapshot = snapshot
+
+    def undo(self) -> None:
+        if self._snapshot is not None:
+            set_tracking(self._repo, self._snapshot, tracked=True)
+
+    @property
+    def name(self) -> str:
+        return f"stop tracking {self._paths[0]}" if len(self._paths) == 1 else (
+            f"stop tracking {len(self._paths)} files"
+        )
+
+
 class IgnoreCommand(GitCommand):
     """Add a pattern to ``.gitignore``; undo removes the last line.
 
@@ -2233,6 +2325,8 @@ __all__ = [
     "RemoveRemoteCommand",
     "RenameBranchCommand",
     "RevertCommand",
+    "RevertCommitCommand",
+    "AbortRevertCommand",
     "StashApplyCommand",
     "StashDropCommand",
     "StashPopCommand",

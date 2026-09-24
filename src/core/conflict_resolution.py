@@ -85,7 +85,10 @@ def load_conflict(repo: RepositoryManager, path: str) -> ConflictSnapshot:
             if marker.exists():
                 oid = marker.read_text(encoding="ascii").strip().splitlines()[0]
                 operation = f"{name}:{oid}"
-                theirs_label = _commit_label(r, oid)
+                theirs_label = (
+                    f"Before reverted changes ({oid[:7]})" if name == "REVERT_HEAD"
+                    else _commit_label(r, oid)
+                )
                 break
         identity = (str(Path(r.path).resolve()), r.head.name, str(r.head.target), operation,
                     *(f"{e.id}:{e.mode}:{e.path}" if e else "" for e in entries))

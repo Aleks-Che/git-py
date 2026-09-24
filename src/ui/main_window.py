@@ -593,6 +593,7 @@ class MainWindow(QMainWindow):
         self._graph_table.cherry_pick_commit_requested.connect(
             self._main_vm.cherry_pick_commit,
         )
+        self._graph_table.revert_commit_requested.connect(self._main_vm.revert_commit)
         self._graph_table.drop_commit_requested.connect(self._on_drop_commit)
         self._graph_table.edit_commit_message_requested.connect(
             self._on_edit_commit_message,
@@ -856,6 +857,8 @@ class MainWindow(QMainWindow):
             self._main_vm.abort_merge()
         elif operation == "rebase":
             self._main_vm.abort_rebase()
+        elif operation == "revert":
+            self._main_vm.abort_revert()
 
     # ----- diff view (replaces graph on file selection) ---------------
 

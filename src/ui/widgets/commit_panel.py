@@ -31,6 +31,7 @@ never holds Git state and never calls ``pygit2`` directly.
 from __future__ import annotations
 
 import os as _os
+from collections.abc import Callable
 
 from PySide6.QtCore import (
     QEvent,
@@ -210,7 +211,9 @@ class CommitPanel(QWidget):
         unstaged_header_row.addWidget(self._unstaged_expander, stretch=1)
         unstaged_header_row.addWidget(self._stage_all_button)
 
-        self._unstaged_list = FileListView(staged=False, parent=self)
+        self._unstaged_list = FileListView(
+            staged=False, parent=self, can_stop_tracking=self._main_vm.can_stop_tracking,
+        )
         self._unstaged_list.clicked.connect(self._on_unstaged_index_clicked)
         self._unstaged_list.stage_file_requested.connect(self._on_stage_file)
         self._unstaged_list.context_action_requested.connect(
@@ -251,7 +254,9 @@ class CommitPanel(QWidget):
         staged_header_row.addWidget(self._staged_expander, stretch=1)
         staged_header_row.addWidget(self._unstage_all_button)
 
-        self._staged_list = FileListView(staged=True, parent=self)
+        self._staged_list = FileListView(
+            staged=True, parent=self, can_stop_tracking=self._main_vm.can_stop_tracking,
+        )
         self._staged_list.clicked.connect(self._on_staged_index_clicked)
         self._staged_list.stage_file_requested.connect(self._on_unstage_file)
         self._staged_list.context_action_requested.connect(
@@ -537,7 +542,9 @@ class CommitPanel(QWidget):
     # ----- context menu handlers --------------------------------------
 
     def _on_unstaged_context_action(self, action: str, path: str) -> None:
-        if action == "stage":
+        if action == "stop_tracking":
+            self._main_vm.stop_tracking_files([path])
+        elif action == "stage":
             self._main_vm.stage_file(path)
         elif action == "discard":
             self._main_vm.discard_file_changes(path)
@@ -567,7 +574,9 @@ class CommitPanel(QWidget):
             self._main_vm.delete_file_from_disk(path)
 
     def _on_staged_context_action(self, action: str, path: str) -> None:
-        if action == "unstage":
+        if action == "stop_tracking":
+            self._main_vm.stop_tracking_files([path])
+        elif action == "unstage":
             self._main_vm.unstage_file(path)
         elif action == "discard":
             self._main_vm.discard_file_changes(path)
@@ -597,6 +606,9 @@ class CommitPanel(QWidget):
             self._main_vm.delete_file_from_disk(path)
 
     def _on_unstaged_batch_context_action(self, action: str, paths: list[str]) -> None:
+        if action == "stop_tracking":
+            self._main_vm.stop_tracking_files(paths)
+            return
         if action == "copy_diff":
             self._main_vm.copy_files_diff(paths, staged=False)
             return
@@ -604,6 +616,9 @@ class CommitPanel(QWidget):
             self._on_unstaged_context_action(action, path)
 
     def _on_staged_batch_context_action(self, action: str, paths: list[str]) -> None:
+        if action == "stop_tracking":
+            self._main_vm.stop_tracking_files(paths)
+            return
         if action == "copy_diff":
             self._main_vm.copy_files_diff(paths, staged=True)
             return
@@ -694,9 +709,13 @@ class FileListView(QListView):
     batch_context_action_requested = Signal(str, list)
     """Emitted with ``(action, [path, ...])`` for multi-file context-menu actions."""
 
-    def __init__(self, *, staged: bool, parent=None) -> None:
+    def __init__(
+        self, *, staged: bool, parent=None,
+        can_stop_tracking: Callable[[list[str]], bool] | None = None,
+    ) -> None:
         super().__init__(parent)
         self._staged = staged
+        self._can_stop_tracking = can_stop_tracking
         self._model = FileListModel(self)
         self._delegate = FileListDelegate(staged, self)
         self.setModel(self._model)
@@ -776,6 +795,31 @@ class FileListView(QListView):
             return
         menu.exec(self.viewport().mapToGlobal(position))
 
+    def _add_stop_tracking_action(self, menu: QMenu, selected: list[str]) -> None:
+        if self._can_stop_tracking is None or not self._can_stop_tracking(selected):
+            return
+        paths = list(selected)
+        label = (
+            "Stop Tracking (Keep Local File)" if len(paths) == 1
+            else f"Stop Tracking {len(paths)} Files (Keep Local Files)"
+        )
+        action = menu.addAction(label)
+        menu.setToolTipsVisible(True)
+        action.setToolTip(
+            "These files match ignore rules but are already tracked. "
+            "Keep them on disk and stage their removal from Git, then commit the removal.",
+        )
+        if len(paths) == 1:
+            action.triggered.connect(
+                lambda checked=False: self.context_action_requested.emit("stop_tracking", paths[0]),
+            )
+        else:
+            action.triggered.connect(
+                lambda checked=False: self.batch_context_action_requested.emit(
+                    "stop_tracking", paths,
+                ),
+            )
+
     def _build_context_menu(self, selected: list[str]) -> QMenu | None:
         """Build (but do not exec) the right-click menu for *selected*.
 
@@ -824,6 +868,8 @@ class FileListView(QListView):
                     "ignore", paths,
                 ),
             )
+
+            self._add_stop_tracking_action(menu, selected)
 
             act = menu.addAction(f"Delete {n} Files")
             act.triggered.connect(
@@ -896,6 +942,8 @@ class FileListView(QListView):
                 ignore_ext.triggered.connect(
                     lambda checked=False, p=path: _emit("ignore_ext", p),
                 )
+
+            self._add_stop_tracking_action(menu, selected)
 
             menu.addSeparator()
 
