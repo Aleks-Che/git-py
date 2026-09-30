@@ -82,6 +82,30 @@ def linked_worktree(committed_repo, tmp_path):
 
 
 @pytest.fixture
+def make_stale_index():
+    """Reproduce the stale CRLF size / LF content reported in math-portal."""
+    def make(manager, paths=("stale [1].txt", "stale [2].txt")):
+        repo = manager.repo
+        root = Path(repo.workdir)
+        (root / ".gitattributes").write_bytes(b"stale* text eol=lf\n")
+        repo.index.add(".gitattributes")
+        for path in paths:
+            (root / path).write_bytes(b"first\r\nsecond\r\n")
+            repo.index.add(path)
+        repo.index.write()
+        signature = repo.head.peel().author
+        repo.create_commit(
+            "HEAD", signature, signature, "Files with normalized line endings",
+            repo.index.write_tree(), [repo.head.target],
+        )
+        for path in paths:
+            (root / path).write_bytes(b"first\nsecond\n")
+        return list(paths)
+
+    return make
+
+
+@pytest.fixture
 def packed_repo(committed_repo: RepositoryManager):
     """A packed repo for real Windows handle/rename regressions."""
     committed_repo.release_handles()

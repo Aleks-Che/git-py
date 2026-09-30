@@ -542,7 +542,9 @@ class CommitPanel(QWidget):
     # ----- context menu handlers --------------------------------------
 
     def _on_unstaged_context_action(self, action: str, path: str) -> None:
-        if action == "stop_tracking":
+        if action == "repair":
+            self._main_vm.repair_file_status([path])
+        elif action == "stop_tracking":
             self._main_vm.stop_tracking_files([path])
         elif action == "stage":
             self._main_vm.stage_file(path)
@@ -606,6 +608,9 @@ class CommitPanel(QWidget):
             self._main_vm.delete_file_from_disk(path)
 
     def _on_unstaged_batch_context_action(self, action: str, paths: list[str]) -> None:
+        if action == "repair":
+            self._main_vm.repair_file_status(paths)
+            return
         if action == "stop_tracking":
             self._main_vm.stop_tracking_files(paths)
             return
@@ -820,6 +825,22 @@ class FileListView(QListView):
                 ),
             )
 
+    def _add_repair_action(self, menu: QMenu, selected: list[str]) -> None:
+        if self._staged:
+            return
+        paths = list(selected)
+        action = menu.addAction(
+            "Repair File Status" if len(paths) == 1 else f"Repair Status of {len(paths)} Files",
+        )
+        menu.setToolTipsVisible(True)
+        action.setToolTip(
+            "Clear a false modified status when the file has no actual changes. "
+            "Keeps file contents and staged changes; refuses real unstaged changes.",
+        )
+        action.triggered.connect(
+            lambda checked=False: self.batch_context_action_requested.emit("repair", paths),
+        )
+
     def _build_context_menu(self, selected: list[str]) -> QMenu | None:
         """Build (but do not exec) the right-click menu for *selected*.
 
@@ -855,6 +876,7 @@ class FileListView(QListView):
                 ),
             )
 
+            self._add_repair_action(menu, selected)
             act = menu.addAction(f"Discard {n} Files")
             act.triggered.connect(
                 lambda checked=False, paths=selected: self.batch_context_action_requested.emit(
@@ -905,6 +927,7 @@ class FileListView(QListView):
                     lambda checked=False, p=path: _emit("stage", p),
                 )
 
+            self._add_repair_action(menu, selected)
             discard_action = menu.addAction("Discard Changes")
             discard_action.triggered.connect(
                 lambda checked=False, p=path: _emit("discard", p),

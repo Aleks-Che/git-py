@@ -1367,6 +1367,36 @@ class MainViewModel(QObject):
         self._refresh_all_views()
         self._log("discard", "All changes discarded")
 
+    def repair_file_status(self, paths: list[str]) -> None:
+        """Clear false modifications without changing file contents or staging."""
+        if self._repo_manager is None or not self._repo_manager.is_open:
+            self.error_occurred.emit("No repository open.")
+            return
+        if self._is_busy:
+            self.error_occurred.emit("Another operation is already in progress.")
+            return
+        if not self._commit_panel_view_model.file_editor.finish_editing():
+            return
+        from src.viewmodels.commands import RepairFileStatusCommand
+
+        command = RepairFileStatusCommand(self._repo_manager, paths)
+
+        def repaired() -> None:
+            self._refresh_all_views()
+            self._commit_panel_view_model.refresh_selected_diff()
+            self._log("repair", "File status repaired; file contents and staging preserved.")
+
+        if self._async_enabled:
+            self._run_async(command, repaired, log_tag="repair")
+            return
+        try:
+            self._command_processor.execute(command)
+        except GitError as exc:
+            self.error_occurred.emit(str(exc))
+            self._log("repair", f"Repair failed: {exc}", level="error")
+            return
+        repaired()
+
     def discard_file_changes(self, path: str) -> None:
         """Discard uncommitted changes for a single file via :class:`DiscardFileCommand`.
 

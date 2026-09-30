@@ -25,6 +25,7 @@ from src.core.conflict_resolution import ConflictSnapshot, write_resolution
 from src.core.diff_parser import ParsedDiffLine
 from src.core.exceptions import GitError, MergeConflictError
 from src.core.file_edit import TextFileSnapshot, replace_text_file
+from src.core.index_repair import repair_file_status
 from src.core.operations import (
     DEFAULT_PUSH_TIMEOUT_SECONDS,
     abort_merge,
@@ -116,6 +117,26 @@ class GitCommand(ABC):
     def timestamp(self) -> float | None:
         """Wall-clock time when :class:`CommandProcessor` executed this command, or ``None``."""
         return self._timestamp
+
+
+class RepairFileStatusCommand(GitCommand):
+    """Refresh index metadata; there is no content change to undo."""
+
+    is_noop = True
+
+    def __init__(self, repo: RepositoryManager, paths: list[str]) -> None:
+        self._repo = repo
+        self._paths = list(paths)
+
+    @property
+    def name(self) -> str:
+        return "Repair File Status"
+
+    def execute(self) -> None:
+        repair_file_status(self._repo, self._paths)
+
+    def undo(self) -> None:
+        pass
 
 
 class CommandProcessor(QObject):
@@ -2322,6 +2343,7 @@ __all__ = [
     "PullCommand",
     "PushCommand",
     "RebaseCommand",
+    "RepairFileStatusCommand",
     "RemoveRemoteCommand",
     "RenameBranchCommand",
     "RevertCommand",
