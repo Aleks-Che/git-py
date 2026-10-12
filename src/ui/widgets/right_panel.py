@@ -1,6 +1,6 @@
 """Right panel: container that swaps the WIP and commit-detail views.
 
-The right side of the main window has three distinct modes:
+The right side of the main window has four distinct modes:
 
 * **Commit-input mode** — :class:`CommitPanel` is shown. This is the
   state when the user has selected the WIP (uncommitted-changes) node
@@ -11,6 +11,8 @@ The right side of the main window has three distinct modes:
   message / info / file list.
 * **Other-worktree mode** — branch, path, changed-file count and a button
   requesting a repository tab for that checkout.
+* **Conflict mode** — conflicting files and Continue/Abort, visible while a
+  Git operation is unfinished regardless of graph selection.
 
 The panel is hidden entirely when no commit is selected. The
 :class:`MainViewModel.selection_changed` signal is the single source
@@ -32,6 +34,7 @@ from src.viewmodels.main_viewmodel import MainViewModel
 
 from .commit_detail_panel import CommitDetailPanel
 from .commit_panel import CommitPanel
+from .conflict_panel import ConflictPanel
 
 
 class RightPanel(QWidget):
@@ -72,6 +75,8 @@ class RightPanel(QWidget):
         self._stack.addWidget(self._commit_input)   # index 0
         self._stack.addWidget(self._commit_detail)  # index 1
         self._stack.addWidget(self._worktree_panel)  # index 2
+        self.conflict_panel = ConflictPanel(self)
+        self._stack.addWidget(self.conflict_panel)
         self._stack.setCurrentIndex(0)
 
         layout = QVBoxLayout(self)
@@ -85,8 +90,14 @@ class RightPanel(QWidget):
         self.setVisible(False)
 
         self._main_vm.selection_changed.connect(self._on_selection_changed)
+        self._main_vm.conflict_state_changed.connect(self._on_conflict_state_changed)
         # Synchronise with the VM's current state in case the panel
         # was constructed after a selection was already made.
+        self._on_selection_changed(self._main_vm.selected_commit_sha())
+        self._on_conflict_state_changed(self._main_vm.conflict_state())
+
+    def _on_conflict_state_changed(self, state: dict | None) -> None:
+        self.conflict_panel.set_state(state)
         self._on_selection_changed(self._main_vm.selected_commit_sha())
 
     # ----- selection-driven mode switching ----------------------------
@@ -105,6 +116,12 @@ class RightPanel(QWidget):
         hiding the panel, since ``show_commit`` is not on that
         path.
         """
+        if self._main_vm.conflict_state() is not None:
+            self._main_vm.commit_panel_view_model().select_file(None)
+            self._commit_detail.select_file(None)
+            self._stack.setCurrentWidget(self.conflict_panel)
+            self.setVisible(True)
+            return
         if sha is None:
             self._main_vm.commit_panel_view_model().select_file(None)
             self._commit_detail.select_file(None)

@@ -7,12 +7,13 @@ Undo/Redo round-trip of a merge that was completed after a conflict
 """
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from threading import Event
 
 import pygit2
 import pytest
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 from src.core.exceptions import GitError
 from src.core.operations import (
@@ -24,7 +25,6 @@ from src.core.operations import (
     is_rebase_in_progress,
 )
 from src.core.repository import RepositoryManager
-from src.ui.dialogs.conflict_resolution_dialog import ConflictResolutionDialog
 from src.ui.main_window import MainWindow
 from src.ui.widgets.conflict_panel import ConflictPanel
 from src.viewmodels.commit_panel_viewmodel import CommitPanelViewModel
@@ -96,12 +96,11 @@ def test_conflict_panel_shows_files_and_merge_completes(
     window.close()
 
 
-def test_conflict_resolve_dialog_routes_to_vm(
+def test_conflict_editor_routes_to_vm(
     qtbot,
     committed_repo: RepositoryManager,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The per-file dialog's ``resolved`` payload reaches the VM."""
+    """A click on the right opens an embedded editor and saves through the VM."""
     _build_conflict(committed_repo)
     window = MainWindow()
     qtbot.addWidget(window)
@@ -111,29 +110,30 @@ def test_conflict_resolve_dialog_routes_to_vm(
     vm.merge_branch("feature")
     assert vm.conflict_state() is not None
 
-    def _fake_exec(self: ConflictResolutionDialog) -> int:
-        # The user picks "Accept Theirs"-style content and confirms.
-        self.set_result_text("resolved via dialog\n")
-        self._on_mark_resolved()
-        return 1
-
-    monkeypatch.setattr(ConflictResolutionDialog, "exec", _fake_exec)
-    window._on_conflict_resolve("hello.txt")
+    panel = window._conflict_panel
+    qtbot.mouseClick(panel._files.viewport(), Qt.MouseButton.LeftButton,
+                     pos=panel._files.visualItemRect(panel._files.item(0)).center())
+    editor = window._conflict_editor
+    assert window._graph_stack.currentWidget() is editor
+    assert not editor.isWindow()
+    assert QApplication.activeModalWidget() is None
+    editor.set_result_text("resolved via editor\n")
+    editor._on_mark_resolved()
 
     assert vm.conflict_state() is None
     assert not is_merge_in_progress(committed_repo)
     assert (Path(committed_repo.path) / "hello.txt").read_text() == (
-        "resolved via dialog\n"
+        "resolved via editor\n"
     )
     assert len(_head_commit(committed_repo).parent_ids) == 2
     window.close()
 
 
 @pytest.mark.parametrize("selected_row", [None, 1])
-def test_resolve_button_opens_dialog_with_multiple_conflicts(
+def test_single_click_opens_editor_with_multiple_conflicts(
     qtbot, committed_repo, selected_row,
 ) -> None:
-    """Resolve opens the editor even before the user selects a file."""
+    """Every conflicting file is directly accessible from the right panel."""
     paths = ("hello.txt", "second.txt", "third.txt")
     _build_conflict(committed_repo, paths)
     window = MainWindow()
@@ -146,30 +146,16 @@ def test_resolve_button_opens_dialog_with_multiple_conflicts(
     if selected_row is not None:
         panel._files.setCurrentRow(selected_row)
     expected_path = panel._files.item(selected_row or 0).text()
-    opened_paths = []
-
-    def close_editor() -> None:
-        dialog = QApplication.activeModalWidget()
-        if isinstance(dialog, ConflictResolutionDialog):
-            try:
-                assert dialog.isVisible()
-                opened_paths.append(dialog.viewmodel.snapshot.path)
-            finally:
-                dialog.reject()
-
-    timer = QTimer(window)
-    timer.setSingleShot(True)
-    timer.timeout.connect(close_editor)
-    timer.start(0)
-    try:
-        qtbot.mouseClick(panel._resolve_btn, Qt.MouseButton.LeftButton)
-    finally:
-        timer.stop()
-        window.close()
-
-    assert opened_paths == [expected_path]
+    item = panel._files.item(selected_row or 0)
+    qtbot.mouseClick(panel._files.viewport(), Qt.MouseButton.LeftButton,
+                     pos=panel._files.visualItemRect(item).center())
+    assert window._conflict_editor.viewmodel.snapshot.path == expected_path
+    assert window._graph_stack.currentWidget() is window._conflict_editor
+    assert window._right_panel._stack.currentWidget() is panel
+    assert QApplication.activeModalWidget() is None
     assert is_merge_in_progress(committed_repo)
     assert window._main_vm.conflict_state()["conflicting_paths"] == list(paths)
+    window.close()
 
 
 @pytest.mark.parametrize("change", ["worktree", "index", "head"])
@@ -602,14 +588,15 @@ def test_conflict_panel_emits_resolve_and_abort(qtbot) -> None:
 
 
 @pytest.mark.parametrize("paths", [["a.txt"], ["a.txt", "b.txt", "c.txt"]])
-def test_conflict_panel_resolve_defaults_to_first_file(qtbot, paths) -> None:
+def test_conflict_panel_single_click_resolves_first_file(qtbot, paths) -> None:
     panel = ConflictPanel()
     qtbot.addWidget(panel)
     panel.set_state({"in_progress": True, "operation": "merge", "conflicting_paths": paths})
     resolved = []
     panel.resolve_requested.connect(resolved.append)
 
-    qtbot.mouseClick(panel._resolve_btn, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(panel._files.viewport(), Qt.MouseButton.LeftButton,
+                     pos=panel._files.visualItemRect(panel._files.item(0)).center())
 
     assert resolved == [paths[0]]
     assert panel._files.currentItem().text() == paths[0]
@@ -637,9 +624,203 @@ def test_conflict_panel_refresh_preserves_selection(qtbot, paths, expected) -> N
     panel.resolve_requested.connect(resolved.append)
 
     panel.set_state({**state, "conflicting_paths": paths})
-    qtbot.mouseClick(panel._resolve_btn, Qt.MouseButton.LeftButton)
+    if expected:
+        item = panel._files.currentItem()
+        qtbot.mouseClick(panel._files.viewport(), Qt.MouseButton.LeftButton,
+                         pos=panel._files.visualItemRect(item).center())
 
     assert resolved == ([expected] if expected else [])
-    assert panel._resolve_btn.isEnabled() == bool(expected)
     item = panel._files.currentItem()
     assert (item.text() if item else None) == expected
+
+
+def _external_git(manager, *args):
+    manager.release_handles()
+    return subprocess.run(
+        ["git", "-C", manager.path, "-c", "user.name=Tester",
+         "-c", "user.email=tester@example.com", *args],
+        capture_output=True, timeout=15,
+    )
+
+
+@pytest.mark.parametrize("detection", ["open", "focus", "monitor", "sync"])
+def test_external_merge_is_detected_and_resolved_inline(qtbot, committed_repo, detection):
+    _build_conflict(committed_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    vm = window._main_vm
+    if detection != "open":
+        window.set_repository(committed_repo)
+        if detection != "monitor":
+            vm.stop_worktree_refresh()
+            qtbot.waitUntil(lambda: vm._worktree_refresh_worker is None)
+        else:
+            vm._worktree_refresh_timer.setInterval(50)
+    result = _external_git(committed_repo, "merge", "--no-ff", "feature")
+    assert result.returncode == 1, result.stderr
+    assert is_merge_in_progress(committed_repo)
+    if detection == "open":
+        window.set_repository(committed_repo)
+    elif detection == "focus":
+        window._on_app_state_changed(Qt.ApplicationState.ApplicationActive)
+    elif detection == "sync":
+        vm._async_enabled = False
+        vm.refresh_state()
+    qtbot.waitUntil(lambda: vm.conflict_state() is not None and not vm.is_busy())
+    panel = window._conflict_panel
+    assert panel.isVisible() and window._right_panel.isVisible()
+    assert panel._files.item(0).text() == "hello.txt"
+    assert window._graph_stack.currentWidget() is window._graph_table
+    qtbot.mouseClick(panel._files.viewport(), Qt.MouseButton.LeftButton,
+                     pos=panel._files.visualItemRect(panel._files.item(0)).center())
+    editor = window._conflict_editor
+    assert editor.isVisible() and not editor.isWindow()
+    assert QApplication.activeModalWidget() is None
+    editor.theirs_check.click()
+    assert editor.result_text() == "feature hi\n"
+    editor._on_mark_resolved()
+    assert vm.conflict_state() is None
+    assert not is_merge_in_progress(committed_repo)
+    assert len(committed_repo.repo.head.peel().parent_ids) == 2
+    assert window._graph_stack.currentWidget() is window._graph_table
+    assert not panel.isVisible()
+    window.close()
+
+
+def test_inline_drafts_survive_file_switch_refresh_and_back(qtbot, committed_repo):
+    _build_conflict(committed_repo, ("hello.txt", "second.txt"))
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(committed_repo)
+    vm = window._main_vm
+    vm.merge_branch("feature")
+    window._on_conflict_resolve("hello.txt")
+    editor = window._conflict_editor
+    first_vm = editor.viewmodel
+    editor.ours_check.click()
+    editor.set_result_text("first draft\n")
+    window._on_conflict_resolve("second.txt")
+    editor.theirs_check.click()
+    assert editor.result_text() == "feature hi\n"
+    window._on_conflict_resolve("hello.txt")
+    assert editor.viewmodel is first_vm
+    assert editor.result_text() == "first draft\n"
+    vm.refresh_state()
+    qtbot.waitUntil(lambda: not vm.is_busy())
+    assert editor.viewmodel is first_vm and editor.result_text() == "first draft\n"
+    assert editor.isVisible()
+    editor.request_close()
+    assert window._graph_stack.currentWidget() is window._graph_table
+    window._on_conflict_resolve("hello.txt")
+    assert editor.result_text() == "first draft\n"
+    editor._on_mark_resolved()
+    assert vm.conflict_state()["conflicting_paths"] == ["second.txt"]
+    assert window._conflict_panel._files.count() == 1
+    window._on_conflict_resolve("second.txt")
+    assert editor.result_text() == "feature hi\n"
+    editor._on_mark_resolved()
+    assert vm.conflict_state() is None and not vm._conflict_editors
+    assert (Path(committed_repo.path) / "hello.txt").read_text() == "first draft\n"
+    assert (Path(committed_repo.path) / "second.txt").read_text() == "feature hi\n"
+    window.close()
+
+
+@pytest.mark.parametrize("external_action", ["abort", "resolve", "switch"])
+def test_inline_editor_closes_when_operation_disappears(qtbot, committed_repo, external_action):
+    _build_conflict(committed_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(committed_repo)
+    vm = window._main_vm
+    vm.merge_branch("feature")
+    window._on_conflict_resolve("hello.txt")
+    window._conflict_editor.set_result_text("draft\n")
+    if external_action == "switch":
+        vm.set_repository(None)
+    else:
+        if external_action == "abort":
+            assert _external_git(committed_repo, "merge", "--abort").returncode == 0
+        else:
+            (Path(committed_repo.path) / "hello.txt").write_text("external\n")
+            assert _external_git(committed_repo, "add", "hello.txt").returncode == 0
+        vm.refresh_state()
+        qtbot.waitUntil(lambda: not vm.is_busy())
+    assert window._graph_stack.currentWidget() is window._graph_table
+    assert not vm._conflict_editors
+    if external_action == "resolve":
+        assert window._conflict_panel._files.count() == 0
+        window._conflict_panel._continue_btn.click()
+    assert vm.conflict_state() is None
+    window.close()
+
+
+def test_inline_failed_save_preserves_draft_and_external_file(qtbot, committed_repo):
+    _build_conflict(committed_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(committed_repo)
+    vm = window._main_vm
+    vm.merge_branch("feature")
+    window._on_conflict_resolve("hello.txt")
+    editor = window._conflict_editor
+    editor.set_result_text("my draft\n")
+    path = Path(committed_repo.path) / "hello.txt"
+    path.write_bytes(b"external edit\n")
+    editor._on_mark_resolved()
+    assert editor.isVisible() and editor.result_text() == "my draft\n"
+    assert not editor._message.isHidden()
+    assert path.read_bytes() == b"external edit\n"
+    assert vm.conflict_state()["conflicting_paths"] == ["hello.txt"]
+    window.close()
+
+
+def test_inline_load_error_is_visible_and_repository_switch_clears_it(
+    qtbot, committed_repo, monkeypatch,
+):
+    _build_conflict(committed_repo)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(committed_repo)
+    window._main_vm.merge_branch("feature")
+
+    def fail_load(*args):
+        raise GitError("This conflict requires an external editor")
+
+    monkeypatch.setattr("src.viewmodels.conflict_editor_viewmodel.load_conflict", fail_load)
+    window._on_conflict_resolve("hello.txt")
+    editor = window._conflict_editor
+    assert editor.isVisible() and not editor._message.isHidden()
+    assert "external editor" in editor._message.text()
+    assert not editor.viewmodel.can_resolve
+    window._main_vm.set_repository(None)
+    qtbot.wait(1)
+    assert window._graph_stack.currentWidget() is window._graph_table
+    window.close()
+
+
+def test_binary_conflict_can_be_resolved_inline(qtbot, committed_repo):
+    create_branch(committed_repo, "feature")
+    for branch in ("feature", "main"):
+        checkout_branch(committed_repo, branch)
+        (Path(committed_repo.path) / "hello.txt").write_bytes(b"\x00" + branch.encode())
+        committed_repo.repo.index.add("hello.txt")
+        committed_repo.repo.index.write()
+        commit_changes(committed_repo, branch, stage_all=False)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_repository(committed_repo)
+    window._main_vm.merge_branch("feature")
+    window._on_conflict_resolve("hello.txt")
+    editor = window._conflict_editor
+    assert editor.is_binary()
+    editor._accept_theirs_btn.click()
+    editor._on_mark_resolved()
+    assert window._main_vm.conflict_state() is None
+    assert (Path(committed_repo.path) / "hello.txt").read_bytes() == b"\x00feature"
+    window.close()

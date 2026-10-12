@@ -4,12 +4,13 @@ from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import QDialog
 from src.core.conflict_resolution import ConflictSnapshot
 from src.ui.dialogs.ai_conflict_dialog import AIConflictDialog
-from src.ui.dialogs.conflict_resolution_dialog import ConflictResolutionDialog
+from src.ui.widgets.conflict_editor_widget import ConflictEditorWidget
 from src.utils.ai_config import AISettings
 
 
 def _dialog(qtbot, tmp_path):
-    dialog = ConflictResolutionDialog(config_path=tmp_path / "config.json")
+    dialog = ConflictEditorWidget(config_path=tmp_path / "config.json")
+    dialog.resize(1180, 820)
     qtbot.addWidget(dialog)
     dialog.viewmodel.set_snapshot(ConflictSnapshot(
         "example.py", b"header\nold\nfooter\n",
@@ -112,11 +113,14 @@ def test_layout_persists_without_overwriting_ai_settings(qtbot, tmp_path):
     dialog = _dialog(qtbot, tmp_path)
     dialog.resize(1300, 900)
     dialog._sources.setSizes([500, 750])
-    dialog.reject()
+    dialog.request_close()
     saved = load_config(path)
     assert saved["ai"]["model"] == "my-model"
     assert saved["ai"]["conflict_prompt"] == "custom prompt"
-    assert saved["conflict_editor_layout"]["window_size"] == [1300, 900]
-    restored = ConflictResolutionDialog(config_path=path)
+    sizes = saved["conflict_editor_layout"]["splitter_sizes"]
+    assert sizes["sources"][1] > sizes["sources"][0]
+    restored = ConflictEditorWidget(config_path=path)
     qtbot.addWidget(restored)
-    assert restored.width() == 1300 and restored.height() == 900
+    restored.resize(1300, 900)
+    restored.show()
+    assert restored._sources.sizes()[1] > restored._sources.sizes()[0]

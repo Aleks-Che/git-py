@@ -1,4 +1,4 @@
-"""UI tests for :class:`ConflictResolutionDialog`.
+"""UI tests for :class:`ConflictEditorWidget`.
 
 The dialog is exercised under ``pytest-qt`` (``QT_QPA_PLATFORM=offscreen``
 on headless CI). Tests use real ``pygit2`` repositories with an
@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pygit2
 from src.core.repository import RepositoryManager
-from src.ui.dialogs.conflict_resolution_dialog import (
-    ConflictResolutionDialog,
+from src.ui.widgets.conflict_editor_widget import (
+    ConflictEditorWidget,
     ConflictResolver,
 )
 
@@ -62,7 +62,7 @@ def _trigger_conflict(mgr: RepositoryManager) -> None:
 
 
 def test_dialog_initializes_with_no_conflict(qtbot) -> None:
-    dialog = ConflictResolutionDialog()
+    dialog = ConflictEditorWidget()
     qtbot.addWidget(dialog)
     dialog.show()
     # No conflict loaded yet — all panels empty.
@@ -75,7 +75,7 @@ def test_dialog_initializes_with_no_conflict(qtbot) -> None:
 def test_dialog_loads_two_sides_from_index(qtbot, tmp_path: Path) -> None:
     mgr = _build_conflict_repo(tmp_path)
     _trigger_conflict(mgr)
-    dialog = ConflictResolutionDialog(mgr, "hello.txt")
+    dialog = ConflictEditorWidget(mgr, "hello.txt")
     qtbot.addWidget(dialog)
     dialog.show()
     assert dialog.ours_view.toPlainText() == "main says hi"
@@ -88,7 +88,7 @@ def test_dialog_loads_two_sides_from_index(qtbot, tmp_path: Path) -> None:
 def test_dialog_set_conflict_via_method(qtbot, tmp_path: Path) -> None:
     mgr = _build_conflict_repo(tmp_path)
     _trigger_conflict(mgr)
-    dialog = ConflictResolutionDialog()
+    dialog = ConflictEditorWidget()
     qtbot.addWidget(dialog)
     dialog.show()
     dialog.set_conflict(mgr, "hello.txt")
@@ -99,7 +99,7 @@ def test_dialog_set_conflict_via_method(qtbot, tmp_path: Path) -> None:
 def test_dialog_path_label_updates(qtbot, tmp_path: Path) -> None:
     mgr = _build_conflict_repo(tmp_path)
     _trigger_conflict(mgr)
-    dialog = ConflictResolutionDialog(mgr, "hello.txt")
+    dialog = ConflictEditorWidget(mgr, "hello.txt")
     qtbot.addWidget(dialog)
     assert dialog._path_label.text() == "hello.txt"  # noqa: SLF001
 
@@ -110,7 +110,7 @@ def test_dialog_path_label_updates(qtbot, tmp_path: Path) -> None:
 def test_accept_ours_copies_to_result(qtbot, tmp_path: Path) -> None:
     mgr = _build_conflict_repo(tmp_path)
     _trigger_conflict(mgr)
-    dialog = ConflictResolutionDialog(mgr, "hello.txt")
+    dialog = ConflictEditorWidget(mgr, "hello.txt")
     qtbot.addWidget(dialog)
     dialog.ours_check.click()
     assert dialog.result_text() == "main says hi\n"
@@ -119,7 +119,7 @@ def test_accept_ours_copies_to_result(qtbot, tmp_path: Path) -> None:
 def test_accept_theirs_copies_to_result(qtbot, tmp_path: Path) -> None:
     mgr = _build_conflict_repo(tmp_path)
     _trigger_conflict(mgr)
-    dialog = ConflictResolutionDialog(mgr, "hello.txt")
+    dialog = ConflictEditorWidget(mgr, "hello.txt")
     qtbot.addWidget(dialog)
     dialog.theirs_check.click()
     assert dialog.result_text() == "feature says hi\n"
@@ -128,7 +128,7 @@ def test_accept_theirs_copies_to_result(qtbot, tmp_path: Path) -> None:
 def test_accept_both_concatenates(qtbot, tmp_path: Path) -> None:
     mgr = _build_conflict_repo(tmp_path)
     _trigger_conflict(mgr)
-    dialog = ConflictResolutionDialog(mgr, "hello.txt")
+    dialog = ConflictEditorWidget(mgr, "hello.txt")
     qtbot.addWidget(dialog)
     dialog.ours_check.click()
     dialog.theirs_check.click()
@@ -138,7 +138,7 @@ def test_accept_both_concatenates(qtbot, tmp_path: Path) -> None:
 def test_result_view_is_editable(qtbot, tmp_path: Path) -> None:
     mgr = _build_conflict_repo(tmp_path)
     _trigger_conflict(mgr)
-    dialog = ConflictResolutionDialog(mgr, "hello.txt")
+    dialog = ConflictEditorWidget(mgr, "hello.txt")
     qtbot.addWidget(dialog)
     dialog.set_result_text("custom merge result\n")
     assert dialog.result_text() == "custom merge result\n"
@@ -150,7 +150,7 @@ def test_result_view_is_editable(qtbot, tmp_path: Path) -> None:
 def test_mark_resolved_emits_resolved_signal(qtbot, tmp_path: Path) -> None:
     mgr = _build_conflict_repo(tmp_path)
     _trigger_conflict(mgr)
-    dialog = ConflictResolutionDialog(mgr, "hello.txt")
+    dialog = ConflictEditorWidget(mgr, "hello.txt")
     qtbot.addWidget(dialog)
     dialog.set_result_text("final result\n")
 
@@ -164,11 +164,11 @@ def test_mark_resolved_emits_resolved_signal(qtbot, tmp_path: Path) -> None:
 
 
 def test_cancel_does_not_emit_resolved(qtbot) -> None:
-    dialog = ConflictResolutionDialog()
+    dialog = ConflictEditorWidget()
     qtbot.addWidget(dialog)
     captured: list[str] = []
     dialog.resolved.connect(captured.append)
-    dialog.reject()
+    dialog.request_close()
     assert captured == []
 
 

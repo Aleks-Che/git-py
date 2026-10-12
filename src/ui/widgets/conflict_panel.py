@@ -1,8 +1,8 @@
 """Persistent conflict-state panel.
 
-Shown above the graph while a merge / rebase / cherry-pick / revert is
+Shown in the right panel while a merge / rebase / cherry-pick / revert is
 stopped on conflicts. The panel lists the conflicting files, opens the
-per-file resolution dialog (``Resolve…``), and offers the operation
+embedded per-file editor on a single click, and offers the operation
 level actions: **Continue** (finish the merge / rebase once every
 conflict is resolved — including files resolved with an external
 editor) and **Abort** (roll the operation back).
@@ -13,7 +13,7 @@ intent signals; ``MainWindow`` routes those to the ViewModel.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -34,7 +34,7 @@ _OPERATION_LABELS = {
 
 
 class ConflictPanel(QFrame):
-    """Banner with the conflicting file list and Continue/Abort actions."""
+    """Conflicting files and Continue/Abort actions in the right sidebar."""
 
     resolve_requested = Signal(str)
     continue_requested = Signal()
@@ -52,22 +52,21 @@ class ConflictPanel(QFrame):
         layout = QVBoxLayout(self)
 
         self._title = QLabel("Conflict")
+        self._title.setWordWrap(True)
         self._title.setStyleSheet("font-weight: bold;")
         layout.addWidget(self._title)
 
         self._subtitle = QLabel("")
+        self._subtitle.setTextFormat(Qt.TextFormat.PlainText)
+        self._subtitle.setWordWrap(True)
         layout.addWidget(self._subtitle)
 
         self._files = QListWidget(self)
-        self._files.setMaximumHeight(100)
-        self._files.itemDoubleClicked.connect(self._on_item_activated)
-        layout.addWidget(self._files)
+        self._files.itemClicked.connect(self._on_item_activated)
+        self._files.itemActivated.connect(self._on_item_activated)
+        layout.addWidget(self._files, 1)
 
         button_row = QHBoxLayout()
-        self._resolve_btn = QPushButton("Resolve…", self)
-        self._resolve_btn.clicked.connect(self._on_resolve_clicked)
-        button_row.addWidget(self._resolve_btn)
-
         self._continue_btn = QPushButton("Continue", self)
         self._continue_btn.clicked.connect(self.continue_requested.emit)
         button_row.addWidget(self._continue_btn)
@@ -87,7 +86,6 @@ class ConflictPanel(QFrame):
         if not state or not state.get("in_progress"):
             self._operation = None
             self._files.clear()
-            self._resolve_btn.setEnabled(False)
             self.hide()
             return
         self._operation = state.get("operation")
@@ -113,11 +111,9 @@ class ConflictPanel(QFrame):
             QListWidgetItem(path, self._files)
         has_paths = bool(paths)
         if has_paths:
-            # Keep the user's file across refreshes; otherwise make Resolve
-            # immediately usable, including when several files conflict.
+            # Retain selection without reopening or replacing the current draft.
             row = paths.index(selected_path) if selected_path in paths else 0
             self._files.setCurrentRow(row)
-        self._resolve_btn.setEnabled(has_paths)
         can_finish = self._operation in ("merge", "rebase") or (
             self._operation == "revert" and bool(state.get("auto_commit"))
         )
@@ -136,11 +132,6 @@ class ConflictPanel(QFrame):
         if item is None and self._files.count():
             item = self._files.item(0)
         return item.text() if item is not None else None
-
-    def _on_resolve_clicked(self) -> None:
-        path = self._selected_path()
-        if path:
-            self.resolve_requested.emit(path)
 
     def _on_item_activated(self, item: QListWidgetItem) -> None:
         self.resolve_requested.emit(item.text())

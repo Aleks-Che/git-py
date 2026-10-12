@@ -16,11 +16,11 @@ from pathlib import Path
 import pygit2
 from src.core.models import CommitInfo
 from src.core.repository import RepositoryManager
-from src.ui.dialogs.conflict_resolution_dialog import (
-    ConflictResolutionDialog,
+from src.ui.widgets.commit_detail_panel import _format_info
+from src.ui.widgets.conflict_editor_widget import (
+    ConflictEditorWidget,
     _is_binary_blob,
 )
-from src.ui.widgets.commit_detail_panel import _format_info
 from src.viewmodels.main_viewmodel import MainViewModel
 
 # --------------------------------------------------------------------------
@@ -104,7 +104,7 @@ def test_binary_conflict_writes_raw_bytes_not_placeholder(
     end-to-end.
     """
     mgr, ours_bytes = _build_binary_conflict_repo(tmp_path)
-    dialog = ConflictResolutionDialog(mgr, "bin.dat")
+    dialog = ConflictEditorWidget(mgr, "bin.dat")
     qtbot.addWidget(dialog)
     dialog.show()
     # The dialog must report the conflict as binary, not text.

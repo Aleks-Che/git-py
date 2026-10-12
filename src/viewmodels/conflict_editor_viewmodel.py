@@ -51,6 +51,7 @@ class ConflictEditorViewModel(QObject):
         super().__init__(parent)
         self.config_path = config_path or default_config_path()
         self.snapshot: ConflictSnapshot | None = None
+        self.load_error = ""
         self.regions = []
         self._source_rows: dict[str, list[ConflictRow]] = {"ours": [], "theirs": []}
         self._result: list[ResultLine] = []
@@ -70,6 +71,7 @@ class ConflictEditorViewModel(QObject):
             self.set_snapshot(load_conflict(repo, path))
         except GitError as exc:
             self.cancel_ai()
+            self.load_error = str(exc)
             self.snapshot = None
             self.regions = []
             self._source_rows = {"ours": [], "theirs": []}
@@ -79,6 +81,7 @@ class ConflictEditorViewModel(QObject):
 
     def set_snapshot(self, snapshot: ConflictSnapshot) -> None:
         self.cancel_ai()
+        self.load_error = ""
         self.snapshot = snapshot
         self._source_rows = {"ours": [], "theirs": []}
         self._result = []
@@ -94,6 +97,7 @@ class ConflictEditorViewModel(QObject):
                 self.regions = compare_three_way(*texts)
             except GitError as exc:
                 self.snapshot = None
+                self.load_error = str(exc)
                 self.error_occurred.emit(str(exc))
                 self.changed.emit()
                 return

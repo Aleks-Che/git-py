@@ -44,7 +44,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 
-from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QPointF, QRect, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -74,6 +74,15 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.graph_v2 import BRANCH_PALETTE, UNCOMMITTED_COLOR_INDEX, _pick_branch_color
+from src.ui.widgets.branch_drag import (
+    BRANCH_MIME as _CHIP_MIME,  # noqa: F401 - compatibility for callers
+)
+from src.ui.widgets.branch_drag import (
+    LOCAL_BRANCH,
+    REMOTE_BRANCH,
+    branch_mime_data,
+    read_branch_mime,
+)
 from src.utils.avatar import make_avatar_pixmap
 from src.utils.theme import DARK_THEME, Theme
 from src.viewmodels.graph_viewmodel import GraphViewModel
@@ -85,7 +94,6 @@ from src.viewmodels.graph_viewmodel import GraphViewModel
 # example). The plain text is also set so external consumers — the
 # OS clipboard, an ``xdnd`` listener in another app — still get a
 # useful payload.
-_CHIP_MIME = "application/x-git-py-branch-chip"
 
 # Press-to-drag promotion threshold, in widget pixels. Anything
 # shorter is treated as a click (single / double), anything longer
@@ -354,6 +362,10 @@ class GraphTableWidget(QWidget):
         self._drag_press_chip: dict | None = None
         self._drag_press_pos: QPoint | None = None
         self._drag_active_chip: dict | None = None
+        self._drag_scroll_direction = 0
+        self._drag_scroll_timer = QTimer(self)
+        self._drag_scroll_timer.setInterval(40)
+        self._drag_scroll_timer.timeout.connect(self._scroll_during_drag)
 
         self._dividers: list[int] = [180, 500]
         self._dragging_divider: int = -1
@@ -2643,9 +2655,11 @@ class GraphTableWidget(QWidget):
         cleanup resets the press state so the next press starts
         fresh.
         """
-        mime = QMimeData()
-        mime.setData(_CHIP_MIME, chip["display"].encode("utf-8"))
-        mime.setText(chip["display"])
+        mime = branch_mime_data(
+            chip["full_name"], REMOTE_BRANCH if chip["is_remote"] else LOCAL_BRANCH,
+        )
+        self._popup_show_timer.stop()
+        self._hide_branch_popup()
         drag = QDrag(self)
         drag.setMimeData(mime)
         # The pixmap is what the user sees dragged under the cursor.
@@ -2669,7 +2683,10 @@ class GraphTableWidget(QWidget):
         # payload-only drags where the source is not consumed by
         # the drop.  The user can still move the mouse freely and
         # cancel the drag with Esc.
-        drag.exec(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)
+        try:
+            drag.exec(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)
+        finally:
+            self._stop_drag_scroll()
         # After the drag returns the user has released the mouse —
         # treat the press as fully consumed.  ``mouseReleaseEvent``
         # will fire too but the state is already cleared, so the
@@ -2680,17 +2697,58 @@ class GraphTableWidget(QWidget):
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
         """Accept the drag if it carries a branch-chip payload."""
-        if event.mimeData().hasFormat(_CHIP_MIME):
+        if read_branch_mime(event.mimeData()):
+            self._popup_show_timer.stop()
+            self._hide_branch_popup()
             event.acceptProposedAction()
             return
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # noqa: N802
         """Accept the move so Qt shows the drop indicator."""
-        if event.mimeData().hasFormat(_CHIP_MIME):
+        if read_branch_mime(event.mimeData()):
+            self._update_drag_scroll(event.position().toPoint())
             event.acceptProposedAction()
             return
+        self._stop_drag_scroll()
         super().dragMoveEvent(event)
+
+    def _update_drag_scroll(self, position: QPoint) -> None:
+        top = self._cfg.header_height
+        bottom = self.height() - self._h_scrollbars[0].sizeHint().height()
+        margin = min(self._cfg.row_height * 2, max(1, (bottom - top) // 3))
+        direction = 0
+        if self.rect().contains(position):
+            if position.y() < top + margin:
+                direction = -1
+            elif position.y() >= bottom - margin:
+                direction = 1
+        self._drag_scroll_direction = direction
+        if direction:
+            if not self._drag_scroll_timer.isActive():
+                self._drag_scroll_timer.start()
+        else:
+            self._stop_drag_scroll()
+
+    def _scroll_during_drag(self) -> None:
+        step = max(1, self._cfg.row_height // 2)
+        self._scrollbar.setValue(
+            self._scrollbar.value() + self._drag_scroll_direction * step,
+        )
+        if self._drag_scroll_direction > 0:
+            self._maybe_request_more_history(self._scrollbar.value())
+
+    def _stop_drag_scroll(self) -> None:
+        self._drag_scroll_timer.stop()
+        self._drag_scroll_direction = 0
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        self._stop_drag_scroll()
+        super().dragLeaveEvent(event)
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        self._stop_drag_scroll()
+        super().hideEvent(event)
 
     def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
         """Resolve the drop target and either act on it or ignore.
@@ -2704,13 +2762,16 @@ class GraphTableWidget(QWidget):
         it to the merge / rebase verbs without the widget having to
         know the VM's API.
         """
-        mime = event.mimeData()
-        if not mime.hasFormat(_CHIP_MIME):
+        self._stop_drag_scroll()
+        payload = read_branch_mime(event.mimeData())
+        if payload is None:
             super().dropEvent(event)
             return
-        source = mime.text()
+        source, _kind = payload
+        # Scroll updates are deferred paints; hit-test the current chip positions.
+        self.repaint()
         target_chip = self._branch_chip_at(event.pos().x(), event.pos().y())
-        if target_chip is None or not source:
+        if target_chip is None or target_chip["is_remote"]:
             event.acceptProposedAction()
             return
         if source == target_chip["display"]:
@@ -2719,8 +2780,8 @@ class GraphTableWidget(QWidget):
             # menu would just confuse the user.
             event.acceptProposedAction()
             return
-        self.branch_dropped_on_branch.emit(source, target_chip["display"])
         event.acceptProposedAction()
+        self.branch_dropped_on_branch.emit(source, target_chip["full_name"])
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         mods = event.modifiers()

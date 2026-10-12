@@ -91,6 +91,7 @@ git-py/
 │   │   │   ├── graph_panel.py      # активный GraphTableWidget и BranchStackPopup
 │   │   │   ├── graph_widget.py     # прежний GraphWidget для совместимости
 │   │   │   ├── left_panel.py       # дерево веток, тегов, stash и контекстные действия
+│   │   │   ├── branch_drag.py      # общий MIME для переноса веток между деревом и графом
 │   │   │   ├── right_panel.py      # переключение WIP / деталей коммита
 │   │   │   ├── commit_panel.py     # интерфейс подготовки коммита
 │   │   │   ├── ai_settings_panel.py # URL, ключ, провайдер и выбор модели
@@ -98,7 +99,8 @@ git-py/
 │   │   │   ├── diff_view_widget.py # отображение diff и действия над строками
 │   │   │   ├── image_view_widget.py # изображения: масштаб, Fit, 100%, перемещение
 │   │   │   ├── file_list_model.py  # модель списка файлов
-│   │   │   ├── conflict_panel.py   # конфликты, Resolve / Continue / Abort
+│   │   │   ├── conflict_panel.py   # файлы конфликтов справа, Continue / Abort
+│   │   │   ├── conflict_editor_widget.py # встроенный редактор вместо diff
 │   │   │   ├── conflict_text_widget.py # подсветка и +/− из gutter обычного diff
 │   │   │   ├── repo_bar_widget.py  # вкладки репозиториев
 │   │   │   ├── search_bar.py       # поиск коммитов
@@ -108,7 +110,6 @@ git-py/
 │   │   └── dialogs/
 │   │       ├── open_or_clone_dialog.py
 │   │       ├── clone_dialog.py     # клонирование и SshKeyDialog
-│   │       ├── conflict_resolution_dialog.py
 │   │       ├── ai_conflict_dialog.py # общий промпт и контекст разрешения конфликтов
 │   │       ├── remote_manage_dialog.py
 │   │       ├── ai_prompts_dialog.py # промпт, язык и пресеты сообщения
@@ -166,7 +167,7 @@ ViewModel графа, коммита и веток. `MainWindow` связыва�
 | Граф | `RepositoryManager.get_all_history` → `GraphViewModel` → `graph_v2.build_graph` → `graph_to_dicts` → `GraphTableWidget` |
 | Выбор коммита и diff | `selection_changed`, `request_commit_detail`, `request_commit_file_diff` → `RightPanel` / `DiffViewWidget` |
 | Ветки и tracking | `RepositoryManager.branches` → `BranchPanelViewModel` → `LeftPanel`; операции — в `MainViewModel` |
-| Конфликт | `MergeConflictError` → `conflict_state_changed` → `ConflictPanel` / `ConflictResolutionDialog` |
+| Конфликт | `MergeConflictError` или `read_conflict_state` → `conflict_state_changed` → `ConflictPanel` / `ConflictEditorWidget` |
 | Undo/Redo | `MainViewModel.undo/redo` → `CommandProcessor`; обновление UI через `stack_changed` |
 
 ## Правила изменения поведения
@@ -402,9 +403,26 @@ Stage All и ручным/сгенерированным сообщением: `
 - `AsyncWorker.failed` передаёт объект исключения: сначала разбирается его тип
   и контекст конфликта, затем формируется сообщение для UI.
 
+### Перенос веток
+
+`branch_drag.py` задаёт общий payload: полное имя ветки и признак local/remote.
+`LeftPanel` включает native drag в режиме CopyAction: дерево ссылок не
+перемещается при drop. Поддерживаются дерево → дерево, граф → дерево и
+дерево → граф. На локальной целевой ветке открывается общее меню Merge/Rebase;
+merge передаёт `no_ff=True`. Группы, теги, пустое место и перенос на себя
+операцию не запускают. Remote-источник сохраняет имя remote.
+
+У верхнего и нижнего края графа таймер продолжает прокрутку при неподвижном
+курсоре и использует существующую подгрузку истории. Уход от края/из графа,
+drop, отмена drag и скрытие графа останавливают прокрутку.
+Регрессии: `tests/ui/test_branch_drag.py`, `test_left_panel.py`, `test_graph_widget.py`.
+
 ### Конфликты и внешние изменения
 
-`ConflictResolutionDialog` показывает две выровненные версии: слева целевую,
+`ConflictPanel` занимает правую панель на время незавершённой операции.
+Один клик по конфликтному файлу открывает `ConflictEditorWidget` вместо diff;
+отдельного окна разрешения конфликтов нет. Continue и Abort находятся под списком.
+Редактор показывает две выровненные версии: слева целевую,
 справа вливаемую, с ветками, SHA и заголовками коммитов. Третье поле снизу —
 результат. `core/conflict_resolution.py` сравнивает обе стороны с общим предком:
 независимые изменения попадают в результат сразу; конфликтующие строки выбирает
@@ -418,7 +436,17 @@ Stage All и ручным/сгенерированным сообщением: `
 `ConflictTextWidget` повторно использует gutter и цвета обычного diff и выделяет
 также изменённые символы. Результат редактируется вручную; его неизменённые
 перенесённые строки сохраняют связь с источником для удаления через минус.
-Размеры диалога и двух splitter хранятся в `conflict_editor_layout` через config.
+Размеры двух splitter хранятся в `conflict_editor_layout` через config.
+`MainViewModel` хранит отдельный `ConflictEditorViewModel` для каждого открытого
+файла: переключение файлов и возврат к графу не теряют черновики. При смене
+файла AI-запрос отменяется. Решённые файлы, завершение/отмена операции и смена
+репозитория освобождают соответствующие черновики.
+
+`core/worktree_status.py::read_conflict_state` читает стадии индекса и маркеры
+операции. Снимок применяется при открытии, полном обновлении и фоновом опросе:
+merge, начатый во внешнем клиенте, показывает тот же список файлов.
+Неизменившаяся операция сохраняет исходный контекст, черновики и отложенный
+Continue; новый шаг rebase или другая операция сбрасывает устаревшие редакторы.
 
 «Решить с помощью AI» открывает общую инструкцию (`ai.conflict_prompt`) и
 пользовательский контекст (`ai.conflict_context`), сохраняемые для следующих

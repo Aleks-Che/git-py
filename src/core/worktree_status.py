@@ -135,6 +135,46 @@ def read_other_worktree_changes(
     return sorted(result, key=lambda entry: entry.path)
 
 
+def read_conflict_state(manager: RepositoryManager) -> dict | None:
+    """Read operation context and index conflicts, including external Git work."""
+    from src.core.operations import conflicting_paths, is_rebase_in_progress
+
+    try:
+        repo = manager.repo
+        git_dir = Path(repo.path)
+        markers = {}
+        for name in ("MERGE_HEAD", "REBASE_HEAD", "REVERT_HEAD", "CHERRY_PICK_HEAD",
+                     "rebase-merge/msgnum", "rebase-apply/next"):
+            try:
+                markers[name] = (git_dir / name).read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                pass
+        paths = conflicting_paths(manager)
+        target = None if repo.head_is_unborn or repo.head_is_detached else repo.head.shorthand
+        head = None if repo.head_is_unborn else str(repo.head.target)
+        context = {}
+        if is_rebase_in_progress(manager):
+            operation = "rebase"
+        elif markers.get("MERGE_HEAD"):
+            operation = "merge"
+            context = {"source": markers["MERGE_HEAD"].splitlines()[0], "target": target}
+        elif markers.get("REVERT_HEAD"):
+            operation = "revert"
+            context = {"sha": markers["REVERT_HEAD"], "auto_commit": True}
+        elif markers.get("CHERRY_PICK_HEAD"):
+            operation = "cherry-pick"
+        elif paths:
+            operation = "conflict"
+        else:
+            return None
+        return {
+            "operation": operation, "conflicting_paths": paths, "in_progress": True,
+            "identity": (head, target, tuple(sorted(markers.items()))), **context,
+        }
+    except (pygit2.GitError, OSError, KeyError, ValueError) as exc:
+        raise GitError(f"Cannot read Git operation state: {exc}") from exc
+
+
 def read_worktree_status(
     manager: RepositoryManager, selected_path: str | None, staged: bool,
 ) -> WorktreeStatus:

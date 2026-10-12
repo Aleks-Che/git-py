@@ -69,13 +69,12 @@ from PySide6.QtWidgets import (
 from src.core.exceptions import GitError, RepositoryNotFoundError
 from src.core.repository import RepositoryManager
 from src.ui.dialogs.clone_dialog import CloneDialog
-from src.ui.dialogs.conflict_resolution_dialog import ConflictResolutionDialog
 from src.ui.dialogs.open_or_clone_dialog import OpenOrCloneDialog
 from src.ui.dialogs.remote_manage_dialog import RemoteManageDialog
 from src.ui.dialogs.settings_dialog import SettingsDialog
 from src.ui.icons import toolbar_icon
 from src.ui.widgets.action_history_widget import ActionHistoryWidget
-from src.ui.widgets.conflict_panel import ConflictPanel
+from src.ui.widgets.conflict_editor_widget import ConflictEditorWidget
 from src.ui.widgets.diff_view_widget import (
     DiffLineActionMode,
     DiffViewMode,
@@ -679,23 +678,27 @@ class MainWindow(QMainWindow):
         self._graph_stack.addWidget(self._diff_view)     # index 1
         self._image_view = ImageViewWidget(self)
         self._graph_stack.addWidget(self._image_view)    # index 2
+        self._conflict_editor = ConflictEditorWidget(parent=self, config_path=self._config_path)
+        self._graph_stack.addWidget(self._conflict_editor)
+        self._conflict_editor.save_result = self._save_conflict_result
+        self._conflict_editor.close_requested.connect(self._close_conflict_editor)
+        self._main_vm.busy_changed.connect(
+            lambda busy: self._conflict_editor.setEnabled(not busy),
+        )
         self._main_vm.file_image_ready.connect(self._image_view.show_result)
 
-        # Persistent conflict banner (review finding 5): shown above
-        # the graph while a merge / rebase is stopped on conflicts.
-        # Routes the per-file editor, Continue and Abort into the VM.
-        self._conflict_panel = ConflictPanel(self)
+        # The right panel lists conflicts; the centre holds the selected draft.
+        self._conflict_panel = self._right_panel.conflict_panel
         self._conflict_panel.resolve_requested.connect(self._on_conflict_resolve)
         self._conflict_panel.continue_requested.connect(
             self._main_vm.request_continue_operation,
         )
         self._conflict_panel.abort_requested.connect(self._on_conflict_abort)
-        self._main_vm.conflict_state_changed.connect(self._conflict_panel.set_state)
+        self._main_vm.conflict_state_changed.connect(self._on_conflict_state_changed)
 
         centre = QWidget(self)
         centre_layout = QVBoxLayout(centre)
         centre_layout.setContentsMargins(0, 0, 0, 0)
-        centre_layout.addWidget(self._conflict_panel)
         centre_layout.addWidget(self._graph_stack, stretch=1)
 
         # Wire the commit panel VM's file selection signals to
@@ -835,21 +838,39 @@ class MainWindow(QMainWindow):
     # ----- conflict workflow (panel + per-file editor) ------------------
 
     def _on_conflict_resolve(self, path: str) -> None:
-        """Open the per-file resolution dialog for ``path``.
-
-        The dialog emits either ``resolved`` (text) or
-        ``resolved_bytes`` (binary); both are routed to the matching
-        ViewModel verb, which stages the file and finishes the merge /
-        rebase once the last conflict is resolved.
-        """
-        repo = self._main_vm.repository_manager()
-        if repo is None or not repo.is_open:
+        """Show the file's draft in the same area as the diff."""
+        if not self._main_vm.commit_panel_view_model().file_editor.finish_editing():
             return
-        dialog = ConflictResolutionDialog(repo, path, self, config_path=self._config_path)
-        dialog.save_result = lambda data: self._main_vm.resolve_conflict_bytes(
-            path, data, snapshot=dialog.viewmodel.snapshot,
-        )
-        dialog.exec()
+        editor = self._main_vm.conflict_editor(path)
+        if editor is None:
+            return
+        if self._conflict_editor.viewmodel is editor:
+            self._graph_stack.setCurrentWidget(self._conflict_editor)
+            return
+        self._diff_source = None
+        self._on_selected_file_changed(path)
+        self._diff_view.set_loading(False)
+        self._conflict_editor.set_viewmodel(editor)
+        self._graph_stack.setCurrentWidget(self._conflict_editor)
+
+    def _save_conflict_result(self, data: bytes) -> bool:
+        snapshot = self._conflict_editor.viewmodel.snapshot
+        return bool(snapshot and self._main_vm.resolve_conflict_bytes(
+            snapshot.path, data, snapshot=snapshot,
+        ))
+
+    def _close_conflict_editor(self) -> None:
+        self._conflict_editor.set_viewmodel(None)
+        self._on_selected_file_changed(None)
+
+    def _on_conflict_state_changed(self, _state: dict) -> None:
+        editor = self._conflict_editor.viewmodel
+        if (
+            (editor.snapshot is not None
+             or self._graph_stack.currentWidget() is self._conflict_editor)
+            and not self._main_vm.has_conflict_editor(editor)
+        ):
+            self._close_conflict_editor()
 
     def _on_conflict_abort(self, operation: str) -> None:
         """Route the panel's Abort to the matching VM verb."""
@@ -863,6 +884,12 @@ class MainWindow(QMainWindow):
     # ----- diff view (replaces graph on file selection) ---------------
 
     def _on_commit_file_selected(self, path: str | None) -> None:
+        state = self._main_vm.conflict_state()
+        if state and path in state["conflicting_paths"]:
+            self._on_conflict_resolve(path)
+            return
+        if path is None and self._graph_stack.currentWidget() is self._conflict_editor:
+            return
         cp_vm = self._main_vm.commit_panel_view_model()
         self._diff_source = cp_vm if path is not None else None
         self._diff_view.set_edit_available(path is not None and not is_image_path(path))
@@ -877,6 +904,8 @@ class MainWindow(QMainWindow):
         self._on_selected_file_changed(path)
 
     def _on_commit_detail_file_selected(self, path: str | None) -> None:
+        if path is None and self._graph_stack.currentWidget() is self._conflict_editor:
+            return
         self._diff_view.set_edit_available(False)
         self._diff_source = self._right_panel._commit_detail if path is not None else None
         self._diff_view.set_line_action_mode(None)
@@ -1323,10 +1352,13 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QMenu
 
         actions = self._build_branch_drop_actions(source, target)
+        if not actions:
+            return
         menu = QMenu(self)
         for action in actions:
             menu.addAction(action)
         menu.exec(QCursor.pos())
+        menu.deleteLater()
 
     def _build_branch_drop_actions(
         self, source: str, target: str,
@@ -1349,25 +1381,12 @@ class MainWindow(QMainWindow):
         a merge by dropping one branch onto another, so the
         history should show a merge — not silently move the ref.
         """
-        actions: list[QAction] = []
-        merge_label = f"Merge {source} into {target}"
-        merge_action = QAction(merge_label, self)
-        merge_action.triggered.connect(
-            lambda checked=False, s=source, t=target: (
-                self._main_vm.merge_branch(s, target=t, no_ff=True)
-            ),
+        if not source or source == target or not self._main_vm.local_branch_exists(target):
+            return []
+        source_kind = (
+            "local_branch" if self._main_vm.local_branch_exists(source) else "remote_branch"
         )
-        actions.append(merge_action)
-
-        rebase_label = f"Rebase {source} onto {target}"
-        rebase_action = QAction(rebase_label, self)
-        rebase_action.triggered.connect(
-            lambda checked=False, s=source, t=target: (
-                self._on_graph_branch_rebase(s, t)
-            ),
-        )
-        actions.append(rebase_action)
-        return actions
+        return self._left_panel._drop_actions(source, target, source_kind)
 
     def _current_branch_shorthand(self) -> str:
         """Return the current branch shorthand, or ``""`` when no repo / unborn."""

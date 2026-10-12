@@ -52,6 +52,7 @@ from src.core.models import BranchAttribution, RemoteInfo
 from src.core.repository import RepositoryManager
 from src.core.worktree_status import (
     read_branch_worktrees,
+    read_conflict_state,
     read_other_worktree_changes,
     read_worktree_status,
 )
@@ -69,6 +70,7 @@ from src.utils.latest_worker import LatestWorker
 from src.viewmodels.branch_panel_viewmodel import BranchPanelViewModel
 from src.viewmodels.commands import CommandProcessor
 from src.viewmodels.commit_panel_viewmodel import CommitPanelViewModel
+from src.viewmodels.conflict_editor_viewmodel import ConflictEditorViewModel
 from src.viewmodels.graph_viewmodel import GraphViewModel
 
 
@@ -172,6 +174,7 @@ class MainViewModel(QObject):
         # ``None`` means "no conflict in progress". When a dict is
         # present it carries the operation context (see class docstring).
         self._conflict_state: dict | None = None
+        self._conflict_editors: dict[str, ConflictEditorViewModel] = {}
         self._is_busy: bool = False
         # Keep strong references to active :class:`AsyncWorker` objects so
         # they are not garbage collected while the worker thread is running.
@@ -505,40 +508,8 @@ class MainViewModel(QObject):
         """
         if self._repo_manager is None or not self._repo_manager.is_open:
             return
-        from src.core.operations import (
-            conflicting_paths,
-            is_merge_in_progress,
-            is_rebase_in_progress,
-            merge_head_oid,
-            revert_head_oid,
-        )
-
         try:
-            if is_merge_in_progress(self._repo_manager):
-                self._set_conflict_state(
-                    "merge",
-                    conflicting_paths=conflicting_paths(self._repo_manager),
-                    source=merge_head_oid(self._repo_manager),
-                    target=self._current_branch_shorthand(),
-                )
-                self._log("merge", "Recovered an in-progress merge")
-                return
-            if is_rebase_in_progress(self._repo_manager):
-                self._set_conflict_state(
-                    "rebase",
-                    conflicting_paths=conflicting_paths(self._repo_manager),
-                    upstream=None,
-                )
-                self._log("rebase", "Recovered an in-progress rebase")
-                return
-            revert_sha = revert_head_oid(self._repo_manager)
-            if revert_sha:
-                self._set_conflict_state(
-                    "revert", conflicting_paths=conflicting_paths(self._repo_manager),
-                    sha=revert_sha, auto_commit=True,
-                )
-                return
-            self._clear_conflict_state()
+            self._apply_conflict_state(read_conflict_state(self._repo_manager))
         except GitError:
             # Best-effort recovery — a corrupt state file must not
             # block opening the repository.
@@ -571,6 +542,7 @@ class MainViewModel(QObject):
             self._commit_panel_view_model.refresh_status()
             debug_print(f"[worker] sync refresh_status took {_time.monotonic() - _t0:.2f}s")
             self._branch_panel_view_model.refresh()
+            self._restore_in_progress_operation()
             debug_print(f"[worker] sync refresh took {_time.monotonic() - _t0:.2f}s")
             return
         if self._is_busy:
@@ -640,6 +612,7 @@ class MainViewModel(QObject):
                 branch_data = (
                     BranchPanelViewModel._compute_branch_data(worker_repo)
                 )
+                conflict_state = read_conflict_state(worker_repo)
                 _elapsed3 = _wt.monotonic() - _t3
                 _nbranches = len(branch_data.get("local_branches", []))
                 debug_print(
@@ -657,6 +630,7 @@ class MainViewModel(QObject):
                 "staged": staged,
                 "raw_status": raw_status,
                 "branch_data": branch_data,
+                "conflict_state": conflict_state,
             }
 
         def _on_result(result: object) -> None:
@@ -689,6 +663,7 @@ class MainViewModel(QObject):
             )
             self._commit_panel_view_model.recompute_selected_diff()
             self._branch_panel_view_model._apply_branch_data(branch_data)
+            self._apply_conflict_state(data["conflict_state"])
             load_succeeded = True
             debug_print("[worker::ui] data applied, calling _on_repo_load_finished")
             self._on_repo_load_finished()
@@ -973,6 +948,7 @@ class MainViewModel(QObject):
             return
         try:
             self._refresh_all_views()
+            self._restore_in_progress_operation()
         except GitError as exc:
             self.error_occurred.emit(f"Failed to refresh: {exc}")
             self._log("refresh", f"Refresh failed: {exc}", level="error")
@@ -1037,7 +1013,7 @@ class MainViewModel(QObject):
                         raw_status=snapshot.raw_status,
                         branch_worktrees=branch_worktrees,
                     )
-                return snapshot, changes, staged, rows, error
+                return snapshot, changes, staged, rows, error, read_conflict_state(worker_manager)
             finally:
                 worker_manager.close()
 
@@ -1045,7 +1021,7 @@ class MainViewModel(QObject):
             if revision != self._worktree_refresh_revision:
                 return
             self._worktree_refresh_error = ""
-            snapshot, changes, staged, rows, graph_error = result
+            snapshot, changes, staged, rows, graph_error, conflict_state = result
             changed = snapshot.raw_status != panel._raw_status
             if changed:
                 panel.apply_status_data(changes, staged, snapshot.raw_status)
@@ -1053,6 +1029,7 @@ class MainViewModel(QObject):
                 self._graph_view_model.graph_updated.emit(rows)
             if graph_error is not None:
                 self._log("refresh", f"WIP graph refresh failed: {graph_error}", level="error")
+            self._apply_conflict_state(conflict_state)
             if (selected, staged_side) == (
                 panel.selected_file(), panel.selected_file_is_staged(),
             ) and selected is not None:
@@ -3450,9 +3427,11 @@ class MainViewModel(QObject):
         except GitError as exc:
             self.error_occurred.emit(str(exc))
             return
+        self._conflict_state["conflicting_paths"] = paths
+        self._discard_conflict_editors(keep=paths)
+        self.conflict_state_changed.emit(dict(self._conflict_state))
         if paths:
-            self._conflict_state["conflicting_paths"] = paths
-            self.conflict_state_changed.emit(dict(self._conflict_state))
+            self._commit_panel_view_model.refresh_status()
             self._log("conflict", f"Still {len(paths)} conflicting file(s) remaining")
             return
 
@@ -3664,6 +3643,45 @@ class MainViewModel(QObject):
     def conflict_state(self) -> dict | None:
         """Return a copy of the current conflict state, or ``None``."""
         return None if self._conflict_state is None else dict(self._conflict_state)
+
+    def conflict_editor(self, path: str) -> ConflictEditorViewModel | None:
+        """Keep each file's draft while navigating within the current operation."""
+        if (
+            self._repo_manager is None or self._conflict_state is None
+            or path not in self._conflict_state["conflicting_paths"]
+        ):
+            return None
+        editor = self._conflict_editors.get(path)
+        if editor is None or editor.snapshot is None:
+            if editor is None:
+                editor = ConflictEditorViewModel(self, self._config_path)
+                self._conflict_editors[path] = editor
+            editor.load(self._repo_manager, path)
+        return editor
+
+    def _discard_conflict_editors(self, keep: list[str] | tuple[str, ...] = ()) -> None:
+        for path in list(self._conflict_editors):
+            if path not in keep:
+                editor = self._conflict_editors.pop(path)
+                editor.cancel_ai()
+                editor.deleteLater()
+
+    def has_conflict_editor(self, editor: ConflictEditorViewModel) -> bool:
+        return editor in self._conflict_editors.values()
+
+    def _apply_conflict_state(self, state: dict | None) -> None:
+        if state is None:
+            self._clear_conflict_state()
+            return
+        current = self._conflict_state
+        if current is not None and current.get("identity") == state["identity"]:
+            paths = state["conflicting_paths"]
+            if current["conflicting_paths"] != paths:
+                current["conflicting_paths"] = paths
+                self._discard_conflict_editors(keep=paths)
+                self.conflict_state_changed.emit(dict(current))
+            return
+        self._set_conflict_state(**state)
 
     def is_busy(self) -> bool:
         """Return ``True`` while a long-running async operation is in progress."""
@@ -3971,6 +3989,14 @@ class MainViewModel(QObject):
         **context: object,
     ) -> None:
         """Enter the conflict state and emit :attr:`conflict_state_changed`."""
+        self._discard_conflict_editors()
+        if "identity" not in context and self._repo_manager is not None:
+            try:
+                snapshot = read_conflict_state(self._repo_manager)
+                if snapshot:
+                    context["identity"] = snapshot["identity"]
+            except GitError:
+                pass
         self._conflict_state = {
             "in_progress": True,
             "conflicting_paths": list(conflicting_paths),
@@ -3986,6 +4012,7 @@ class MainViewModel(QObject):
         if self._conflict_state is None:
             return
         op = self._conflict_state.get("operation", "unknown")
+        self._discard_conflict_editors()
         self._conflict_state = None
         self._continue_after_repo_load = None
         self._log(op, "Conflict state cleared")

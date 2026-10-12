@@ -37,9 +37,8 @@ Drag-and-drop: dragging a local branch onto another local branch
 opens a small menu with **Merge {source} into {target}** and
 **Rebase {source} onto {target}**. The actual operations are
 invoked on :class:`MainViewModel`; the panel never touches Git
-state directly. The ``source == target`` and ``source is the
-current branch`` cases are filtered out — both would be no-ops
-or merge into self.
+state directly. Dropping a branch on itself is ignored. The same
+payload supports transfers to and from the graph.
 
 All actions ultimately call the corresponding verb method on
 :class:`MainViewModel`; the panel never raises Git errors itself,
@@ -47,10 +46,11 @@ the ViewModel forwards them to its ``error_occurred`` signal.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QMimeData, Qt
+from PySide6.QtCore import Qt
 from PySide6.QtGui import (
     QAction,
     QColor,
+    QDrag,
     QDragEnterEvent,
     QDragMoveEvent,
     QDropEvent,
@@ -70,6 +70,10 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.exceptions import GitError
+from src.ui.widgets.branch_drag import (
+    branch_mime_data,
+    read_branch_mime,
+)
 from src.utils.theme import DARK_THEME
 from src.viewmodels.branch_panel_viewmodel import BranchPanelViewModel
 from src.viewmodels.main_viewmodel import MainViewModel
@@ -89,12 +93,6 @@ _KIND_LOCAL_BRANCH = "local_branch"
 _KIND_REMOTE_BRANCH = "remote_branch"
 _KIND_TAG = "tag"
 _KIND_STASH = "stash"
-
-# Custom MIME type carrying the discriminator of a drag source.
-# ``application/x-git-py-branch-kind`` holds the bare ``_KIND_*`` value
-# so the drop handler knows whether the drag came from a local or
-# remote branch row (the two paths produce different menus).
-_BRANCH_KIND_MIME = "application/x-git-py-branch-kind"
 
 # Group header labels.
 _GROUP_BRANCHES = "Branches"
@@ -125,6 +123,9 @@ class LeftPanel(QTreeWidget):
         self.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
         self.setExpandsOnDoubleClick(False)  # we handle double-click ourselves
         self.setAcceptDrops(True)
+        self.setDragEnabled(True)
+        self.setDragDropMode(QTreeWidget.DragDropMode.DragDrop)
+        self.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.setDropIndicatorShown(True)
 
         self._placeholder = QTreeWidgetItem([_PLACEHOLDER_TEXT])
@@ -322,7 +323,7 @@ class LeftPanel(QTreeWidget):
         return None
 
     def _update_drag_state(self) -> None:
-        """Enable drag on local and remote-branch leaves; the drop handler is the Stage 5 stub.
+        """Enable drag on local and remote-branch leaves.
 
         Both groups get :attr:`Qt.ItemFlag.ItemIsDragEnabled` because
         the user may want to drag a remote-tracking branch onto a
@@ -332,9 +333,7 @@ class LeftPanel(QTreeWidget):
         ``main`` produces a merge/rebase menu; ``origin/main`` →
         ``main`` produces a fetch+checkout dialog).
         """
-        # QTreeWidget is drag-enabled wholesale when any item has
-        # ItemIsDragEnabled. We toggle that flag on individual items in
-        # the local- and remote-branch groups.
+        # Native dragging is enabled on the view; leaves carry branch payloads.
         groups = [
             g for g in (self._group_local, self._group_remote)
             if g is not None
@@ -984,40 +983,47 @@ class LeftPanel(QTreeWidget):
         downstream consumers that only know how to read text (e.g.
         another ``QTreeWidget`` accepting the same drag) keep working.
         """
-        data = super().mimeData(items)
         if not items:
-            return data
+            return None
         item = items[0]
         kind = item.data(0, _ROLE_KIND)
         if kind not in (_KIND_LOCAL_BRANCH, _KIND_REMOTE_BRANCH):
-            return data
+            return None
         name = item.data(0, _ROLE_NAME)
-        if isinstance(data, QMimeData) and name:
-            data.setText(str(name))
-            data.setData(_BRANCH_KIND_MIME, str(kind).encode("utf-8"))
-        return data
+        return branch_mime_data(str(name), kind) if name else None
+
+    def startDrag(self, _supported_actions) -> None:  # noqa: N802
+        mime = self.mimeData(self.selectedItems())
+        if mime is None:
+            return
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
-        mime = event.mimeData()
-        if mime.hasText() and mime.hasFormat(_BRANCH_KIND_MIME):
+        if read_branch_mime(event.mimeData()):
             event.acceptProposedAction()
         else:
-            super().dragEnterEvent(event)
+            event.ignore()
 
     def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # noqa: N802
-        mime = event.mimeData()
-        if mime.hasText() and mime.hasFormat(_BRANCH_KIND_MIME):
+        payload = read_branch_mime(event.mimeData())
+        target = self.itemAt(event.position().toPoint())
+        if (
+            payload and target is not None
+            and target.data(0, _ROLE_KIND) == _KIND_LOCAL_BRANCH
+            and target.data(0, _ROLE_NAME) != payload[0]
+        ):
             event.acceptProposedAction()
         else:
-            super().dragMoveEvent(event)
+            event.ignore()
 
     def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802 - Qt override
-        mime = event.mimeData()
-        if not mime.hasText() or not mime.hasFormat(_BRANCH_KIND_MIME):
-            super().dropEvent(event)
+        payload = read_branch_mime(event.mimeData())
+        if payload is None:
+            event.ignore()
             return
-        source_name = mime.text()
-        source_kind = bytes(mime.data(_BRANCH_KIND_MIME)).decode("utf-8")
+        source_name, source_kind = payload
         target_item = self.itemAt(event.position().toPoint())
         actions = self._on_drop(source_name, source_kind, target_item)
         if not actions:
@@ -1030,8 +1036,9 @@ class LeftPanel(QTreeWidget):
         # the drop point in viewport-relative coordinates and map it
         # up to global screen coordinates so the menu actually
         # appears under the cursor.
-        menu.exec(self.viewport().mapToGlobal(event.position().toPoint()))
         event.acceptProposedAction()
+        menu.exec(self.viewport().mapToGlobal(event.position().toPoint()))
+        menu.deleteLater()
 
     def _on_drop(
         self,

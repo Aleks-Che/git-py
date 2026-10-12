@@ -25,7 +25,7 @@ from src.core.exceptions import GitError
 from src.core.repository import RepositoryManager
 from src.ui.dialogs.ai_conflict_dialog import AIConflictDialog
 from src.ui.widgets.conflict_text_widget import ConflictTextWidget
-from src.utils.config import load_config, load_splitter_sizes, load_window_size, save_config
+from src.utils.config import load_config, load_splitter_sizes, save_config
 from src.viewmodels.conflict_editor_viewmodel import ConflictEditorViewModel
 
 
@@ -36,27 +36,24 @@ class ConflictResolver:
         raise NotImplementedError
 
 
-class ConflictResolutionDialog(QDialog):
+class ConflictEditorWidget(QWidget):
     resolved = Signal(str)
     resolved_bytes = Signal(bytes)
+    saved = Signal(str)
+    close_requested = Signal()
 
     def __init__(self, repo: RepositoryManager | None = None, path: str | None = None,
                  parent: QWidget | None = None, *, config_path: Path | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Разрешение конфликта")
-        self.resize(1180, 820)
-        self.viewmodel = ConflictEditorViewModel(self, config_path)
+        self._empty_viewmodel = ConflictEditorViewModel(self, config_path)
+        self.viewmodel = self._empty_viewmodel
         self.save_result: Callable[[bytes], bool] | None = None
         self._layout_config_path = config_path
+        self._layout_used = False
         self._rendering = False
         self._build_ui()
         self._restore_layout()
-        self.viewmodel.changed.connect(self._render)
-        self.viewmodel.busy_changed.connect(self._on_busy)
-        self.viewmodel.error_occurred.connect(self._show_error)
-        self.viewmodel.ai_finished.connect(self._on_ai_finished)
-        self.finished.connect(self.viewmodel.cancel_ai)
-        self.finished.connect(self._save_layout)
+        self._connect_viewmodel()
         if repo is not None and path is not None:
             self.set_conflict(repo, path)
         else:
@@ -66,11 +63,9 @@ class ConflictResolutionDialog(QDialog):
         layout = QVBoxLayout(self)
         self._path_label = QLabel("(no file)")
         self._path_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._path_label.setWordWrap(True)
+        self._path_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout.addWidget(self._path_label)
-        hint = QLabel("+ добавляет строку, − возвращает её наверх. Галочки добавляют всю сторону. "
-                      "Порядок выбора сохраняется внутри каждого конфликта.")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
         self._splitter = QSplitter(Qt.Orientation.Vertical)
         self._sources = QSplitter(Qt.Orientation.Horizontal)
         self.ours_view = ConflictTextWidget("ours")
@@ -97,7 +92,7 @@ class ConflictResolutionDialog(QDialog):
             self._sources.addWidget(container)
             checkbox.clicked.connect(lambda checked, side=side:
                                      self.viewmodel.select_side(side, checked))
-            view.row_action_requested.connect(self.viewmodel.add_line)
+            view.row_action_requested.connect(lambda *args: self.viewmodel.add_line(*args))
         self.ours_view.verticalScrollBar().valueChanged.connect(
             self.theirs_view.verticalScrollBar().setValue)
         self.theirs_view.verticalScrollBar().valueChanged.connect(
@@ -110,17 +105,19 @@ class ConflictResolutionDialog(QDialog):
         result = QWidget()
         result_layout = QVBoxLayout(result)
         result_layout.setContentsMargins(0, 0, 0, 0)
-        result_layout.addWidget(QLabel("Результат — можно редактировать вручную"))
+        result_layout.addWidget(QLabel("Результат"))
         self._result_view = ConflictTextWidget("result")
-        self._result_view.row_action_requested.connect(self.viewmodel.remove_line)
+        self._result_view.row_action_requested.connect(
+            lambda *args: self.viewmodel.remove_line(*args),
+        )
         self._result_view.textChanged.connect(self._on_text_changed)
         result_layout.addWidget(self._result_view)
         self._splitter.addWidget(result)
         self._splitter.setSizes([400, 300])
         layout.addWidget(self._splitter, 1)
         row = QHBoxLayout()
-        self._accept_ours_btn = QPushButton("Выбрать целевую версию")
-        self._accept_theirs_btn = QPushButton("Выбрать вливаемую версию")
+        self._accept_ours_btn = QPushButton("Целевая версия")
+        self._accept_theirs_btn = QPushButton("Вливаемая версия")
         self._accept_ours_btn.clicked.connect(self.accept_ours_bytes)
         self._accept_theirs_btn.clicked.connect(self.accept_theirs_bytes)
         row.addWidget(self._accept_ours_btn)
@@ -129,7 +126,7 @@ class ConflictResolutionDialog(QDialog):
         self._ai_btn.clicked.connect(self._open_ai)
         row.addWidget(self._ai_btn)
         self._cancel_ai_btn = QPushButton("Отменить AI")
-        self._cancel_ai_btn.clicked.connect(self.viewmodel.cancel_ai)
+        self._cancel_ai_btn.clicked.connect(lambda: self.viewmodel.cancel_ai())
         self._cancel_ai_btn.hide()
         row.addWidget(self._cancel_ai_btn)
         row.addStretch()
@@ -149,9 +146,47 @@ class ConflictResolutionDialog(QDialog):
         self._button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
                                             | QDialogButtonBox.StandardButton.Cancel)
         self._button_box.button(QDialogButtonBox.StandardButton.Ok).setText("Сохранить решение")
+        self._button_box.button(QDialogButtonBox.StandardButton.Cancel).setText("К графу")
         self._button_box.accepted.connect(self._on_mark_resolved)
-        self._button_box.rejected.connect(self.reject)
+        self._button_box.rejected.connect(self.request_close)
         layout.addWidget(self._button_box)
+
+    def _connect_viewmodel(self) -> None:
+        self.viewmodel.changed.connect(self._render)
+        self.viewmodel.busy_changed.connect(self._on_busy)
+        self.viewmodel.error_occurred.connect(self._show_error)
+        self.viewmodel.ai_finished.connect(self._on_ai_finished)
+
+    def set_viewmodel(self, viewmodel: ConflictEditorViewModel | None) -> None:
+        viewmodel = viewmodel or self._empty_viewmodel
+        if viewmodel is self.viewmodel:
+            return
+        self.viewmodel.cancel_ai()
+        self.viewmodel.changed.disconnect(self._render)
+        self.viewmodel.busy_changed.disconnect(self._on_busy)
+        self.viewmodel.error_occurred.disconnect(self._show_error)
+        self.viewmodel.ai_finished.disconnect(self._on_ai_finished)
+        self.viewmodel = viewmodel
+        self._connect_viewmodel()
+        self._message.hide()
+        self._on_busy(viewmodel.is_busy)
+        if viewmodel.load_error:
+            self._show_error(viewmodel.load_error)
+        self._scroll_to_conflict()
+
+    def request_close(self) -> None:
+        self.viewmodel.cancel_ai()
+        self._save_layout()
+        self.close_requested.emit()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        self.viewmodel.cancel_ai()
+        self._save_layout()
+        super().hideEvent(event)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        self._layout_used = True
+        super().showEvent(event)
 
     def set_conflict(self, repo: RepositoryManager, path: str) -> None:
         self._message.hide()
@@ -201,6 +236,7 @@ class ConflictResolutionDialog(QDialog):
         self._result_view.setReadOnly(binary or vm.is_busy or snapshot is None)
         self._accept_ours_btn.setVisible(binary)
         self._accept_theirs_btn.setVisible(binary)
+        self._ai_btn.setVisible(not binary)
         self._ai_btn.setEnabled(snapshot is not None and not binary and not vm.is_busy)
         self._button_box.button(QDialogButtonBox.StandardButton.Ok).setEnabled(vm.can_resolve)
         self._status.setText("AI решает конфликты…" if vm.is_busy else
@@ -258,18 +294,16 @@ class ConflictResolutionDialog(QDialog):
         layout = config.get("conflict_editor_layout", {})
         if not isinstance(layout, dict):
             return
-        self.resize(*load_window_size({"window_size": layout.get("window_size", [1180, 820])}))
         sizes = load_splitter_sizes(layout)
         for name, splitter in (("sources", self._sources), ("result", self._splitter)):
             if len(sizes.get(name, [])) == 2 and all(sizes[name]):
                 splitter.setSizes(sizes[name])
 
     def _save_layout(self) -> None:
-        if self._layout_config_path is None:
+        if self._layout_config_path is None or not self._layout_used:
             return
         config = load_config(self._layout_config_path)
         config["conflict_editor_layout"] = {
-            "window_size": [self.width(), self.height()],
             "splitter_sizes": {"sources": self._sources.sizes(), "result": self._splitter.sizes()},
         }
         try:
@@ -285,14 +319,17 @@ class ConflictResolutionDialog(QDialog):
         except GitError as exc:
             self._show_error(str(exc))
             return
+        path = self.viewmodel.snapshot.path
+        binary = self.is_binary()
+        result_text = self.result_text()
         if self.save_result is not None and not self.save_result(data):
             self._show_error("Не удалось сохранить решение. Черновик оставлен открытым.")
             return
-        if self.is_binary():
+        if binary:
             self.resolved_bytes.emit(data)
         else:
-            self.resolved.emit(self.result_text())
-        self.accept()
+            self.resolved.emit(result_text)
+        self.saved.emit(path)
 
 
-__all__ = ["ConflictResolutionDialog", "ConflictResolver"]
+__all__ = ["ConflictEditorWidget", "ConflictResolver"]

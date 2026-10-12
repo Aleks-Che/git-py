@@ -36,7 +36,17 @@
 - `ui/widgets/commit_panel.py` – панель коммита: список файлов с чекбоксами, просмотр диффа выбранного файла, поле сообщения, кнопка commit.
 - `ui/widgets/left_panel.py` – дерево ссылок (QTreeWidget) с группировкой по типам: локальные ветки, удалённые, теги, stash. Группа `Remote` скрывается целиком (`setHidden(True)`) если `BranchPanelViewModel._suppress_same_name_remotes` оставила её пустой.
 - `ui/widgets/terminal_widget.py` – встроенный терминал (на основе QTermWidget или эмуляция через QProcess).
-- `ui/dialogs/` – диалоги: разрешения конфликтов, настройки, клонирования, создания репозитория и т.д.
+- `ui/widgets/conflict_panel.py` – список конфликтных файлов в правой панели,
+  Continue/Abort. Один клик открывает `conflict_editor_widget.py` в центральном
+  стеке вместо diff. Черновики файлов принадлежат `ConflictEditorViewModel`
+  и сохраняются в `MainViewModel` до разрешения или смены операции/репозитория.
+- `core/worktree_status.py::read_conflict_state` – read-only снимок незавершённой
+  операции и конфликтов, в том числе возникших во внешнем Git-клиенте.
+  Применяется через MainViewModel при открытии, обновлении и фоновом мониторинге.
+- `ui/widgets/branch_drag.py` – общий MIME для drag веток между графом и деревом;
+  меню вызывает существующие команды MainViewModel. Прокрутка графа у края
+  во время drag использует тот же scrollbar и механизм подгрузки истории.
+- `ui/dialogs/` – диалоги: настройки, AI-промпт, клонирование, создание репозитория и т.д.
 
 ### 4. Инфраструктура
 - `utils/signals.py` – централизованные сигналы приложения (например, `repository_changed`, `operation_finished`).
